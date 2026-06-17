@@ -280,6 +280,7 @@ restore_generated_paths_on_default_branch() {
 
     if git -C "$repo_root" ls-files --error-unmatch "$repo_path" >/dev/null 2>&1; then
       git -C "$repo_root" restore --staged --worktree -- "$repo_path"
+      git -C "$repo_root" clean -fdx -- "$repo_path"
     else
       rm -rf "$repo_root/$repo_path"
     fi

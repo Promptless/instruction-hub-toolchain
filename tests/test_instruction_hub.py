@@ -432,6 +432,35 @@ def test_action_check_rejects_hub_root_outside_checkout(tmp_path: Path) -> None:
     assert "hub-root must be inside the git checkout" in result.stderr
 
 
+def test_action_build_cleans_untracked_files_under_tracked_generated_paths(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "build-clean-tracked-generated-path", targets=("claude", "codex"))
+    build_hub(repo)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "track generated instruction hub output")
+    stale_generated_file = repo / "dist/claude/obsolete/dead.json"
+    stale_generated_file.parent.mkdir(parents=True)
+    stale_generated_file.write_text("{}\n")
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/run.sh")],
+        cwd=repo,
+        env={
+            **os.environ,
+            "GITHUB_ACTION_PATH": str(REPO_ROOT),
+            "GITHUB_WORKSPACE": str(repo),
+            "INPUT_MODE": "build",
+            "INPUT_HUB_ROOT": ".",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not stale_generated_file.exists()
+    assert _git_output(repo, "status", "--short") == ""
+
+
 def test_action_publish_rejects_non_branch_ref(tmp_path: Path) -> None:
     repo = _init_action_repo(tmp_path / "publish-tag-ref", targets=("claude",))
 
@@ -787,6 +816,18 @@ def test_validate_rejects_symlinked_assets_root(tmp_path: Path) -> None:
 
     with pytest.raises(InstructionHubError, match="assets.*symlink"):
         validate_hub(hub_root)
+
+
+def test_validate_allows_json_array_files_inside_skill_assets(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    skill_root = hub_root / "assets/skills/json-fixture"
+    init_hub(hub_root)
+    skill_root.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# JSON Fixture\n")
+    (skill_root / "examples").mkdir()
+    (skill_root / "examples/data.json").write_text(json.dumps([{"name": "safe fixture"}]))
+
+    validate_hub(hub_root)
 
 
 def test_validate_rejects_literal_mcp_secrets(tmp_path: Path) -> None:

@@ -10,7 +10,7 @@ from promptless_instruction_hub.fs import (
     JsonValue,
     directory_hash,
     file_hash,
-    read_json_mapping,
+    read_json_value,
     read_yaml_mapping,
     read_yaml_value,
 )
@@ -315,7 +315,7 @@ def _requires_env_placeholder(key_path: tuple[str, ...], joined_key: str) -> boo
 
 def _read_structured_file(path: Path) -> object:
     if path.suffix == ".json":
-        return read_json_mapping(path)
+        return read_json_value(path)
     return read_yaml_value(path)
 
 

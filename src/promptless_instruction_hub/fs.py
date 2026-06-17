@@ -66,12 +66,18 @@ def read_yaml_value(path: Path) -> JsonValue:
 def read_json_mapping(path: Path) -> dict[str, JsonValue]:
     """Read a JSON file and require a top-level object."""
 
-    raw_data = json.loads(path.read_text())
-    validated = validate_json_value(raw_data, path)
+    validated = read_json_value(path)
     if not isinstance(validated, dict):
         msg = f"{path} must contain a JSON object"
         raise ValueError(msg)
     return validated
+
+
+def read_json_value(path: Path) -> JsonValue:
+    """Read a JSON file and return JSON-compatible data."""
+
+    raw_data = json.loads(path.read_text())
+    return validate_json_value(raw_data, path)
 
 
 def write_yaml(path: Path, data: JsonValue) -> None:
