@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.promptless.ai/instruction-hub-release-manifest.schema.json",
+  "title": "Promptless Instruction Hub Release Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "org",
+    "plugin",
+    "stable_packages",
+    "targets",
+    "target_hashes",
+    "assets",
+    "release_id",
+    "release_hash"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "org": {
+      "type": "string",
+      "minLength": 1
+    },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "version"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string"
+        }
+      }
+    },
+    "stable_packages": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+      },
+      "uniqueItems": true
+    },
+    "targets": {
+      "type": "array",
+      "items": {
+        "enum": ["claude", "codex", "gemini", "cursor"]
+      },
+      "uniqueItems": true
+    },
+    "target_hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "claude": {
+          "$ref": "#/$defs/sha256"
+        },
+        "codex": {
+          "$ref": "#/$defs/sha256"
+        },
+        "gemini": {
+          "$ref": "#/$defs/sha256"
+        },
+        "cursor": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ref", "id", "type", "title", "source_path", "content_hash", "support"],
+        "properties": {
+          "ref": {
+            "type": "string",
+            "pattern": "^(skill|rule|agent|command|hook|mcp):[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+          },
+          "type": {
+            "enum": ["skill", "rule", "agent", "command", "hook", "mcp"]
+          },
+          "title": {
+            "type": ["string", "null"]
+          },
+          "source_path": {
+            "type": ["string", "null"]
+          },
+          "content_hash": {
+            "$ref": "#/$defs/sha256"
+          },
+          "support": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "claude": {
+                "$ref": "#/$defs/target_support"
+              },
+              "codex": {
+                "$ref": "#/$defs/target_support"
+              },
+              "gemini": {
+                "$ref": "#/$defs/target_support"
+              },
+              "cursor": {
+                "$ref": "#/$defs/target_support"
+              }
+            }
+          }
+        }
+      }
+    },
+    "release_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "release_hash": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "target_support": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "enum": ["agent-skill", "native", "projected", "unsupported"]
+        },
+        "source": {
+          "type": ["string", "null"]
+        },
+        "reason": {
+          "type": ["string", "null"]
+        }
+      }
+    }
+  }
+}

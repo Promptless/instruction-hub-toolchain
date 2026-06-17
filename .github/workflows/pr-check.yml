@@ -1,0 +1,25 @@
+name: Instruction Hub PR Check
+
+on:
+  workflow_call:
+    inputs:
+      hub-root:
+        description: Path to the Instruction Hub root.
+        required: false
+        type: string
+        default: .
+      mode:
+        description: Action mode to run for PR checks.
+        required: false
+        type: string
+        default: build
+
+jobs:
+  instruction-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Promptless/instruction-hub-action@v0
+        with:
+          mode: ${{ inputs.mode }}
+          hub-root: ${{ inputs.hub-root }}

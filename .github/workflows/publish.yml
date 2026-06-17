@@ -1,0 +1,30 @@
+name: Publish Instruction Hub
+
+on:
+  workflow_call:
+    inputs:
+      hub-root:
+        description: Path to the Instruction Hub root.
+        required: false
+        type: string
+        default: .
+      release-branch:
+        description: Branch that receives generated artifacts.
+        required: false
+        type: string
+        default: release/stable
+
+jobs:
+  instruction-hub:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: Promptless/instruction-hub-action@v0
+        with:
+          mode: publish
+          hub-root: ${{ inputs.hub-root }}
+          release-branch: ${{ inputs.release-branch }}
