@@ -355,6 +355,58 @@ def test_action_script_rejects_generated_paths_outside_hub(generated_paths: str)
     assert "inside hub-root" in result.stderr
 
 
+def test_action_publish_skips_claude_pointer_when_claude_target_is_disabled(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    remote_root = tmp_path / "remote.git"
+    _git(tmp_path, "init", "--bare", str(remote_root))
+    _git(tmp_path, "init", "-b", "main", str(hub_root))
+    _git(hub_root, "config", "user.email", "instruction-hub@example.com")
+    _git(hub_root, "config", "user.name", "Instruction Hub Test")
+    _git(hub_root, "remote", "add", "origin", str(remote_root))
+    init_hub(hub_root)
+    (hub_root / ".promptless/instruction-hub.yaml").write_text(
+        "\n".join(
+            [
+                "org: Promptless",
+                "plugin_id: promptless-instruction-hub",
+                "plugin_name: Promptless Instruction Hub",
+                "plugin_version: 0.1.0",
+                "stable_packages:",
+                "  - core",
+                "targets:",
+                "  - codex",
+                "",
+            ]
+        )
+    )
+    _git(hub_root, "add", ".promptless/instruction-hub.yaml", "packages/core.yaml")
+    _git(hub_root, "commit", "-m", "initialize hub")
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/run.sh")],
+        cwd=hub_root,
+        env={
+            **os.environ,
+            "GITHUB_ACTION_PATH": str(REPO_ROOT),
+            "GITHUB_REPOSITORY": "Promptless/test-instruction-hub",
+            "GITHUB_REF_NAME": "main",
+            "GITHUB_WORKSPACE": str(hub_root),
+            "INPUT_MODE": "publish",
+            "INPUT_HUB_ROOT": ".",
+            "INPUT_RELEASE_BRANCH": "release/stable",
+            "INPUT_UPDATE_CLAUDE_POINTER": "true",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "No Claude marketplace was generated" in result.stdout
+    assert not (hub_root / ".claude-plugin/marketplace.json").exists()
+    assert _git_output(hub_root, "ls-remote", "--heads", "origin", "release/stable").strip()
+
+
 def test_validate_rejects_unknown_package_refs(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -527,3 +579,7 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
 
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _git_output(cwd: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, text=True, capture_output=True).stdout

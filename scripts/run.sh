@@ -165,7 +165,7 @@ write_claude_pointer() {
 
   if [[ ! -f "$marketplace_path" ]]; then
     echo "No Claude marketplace was generated; skipping default-branch Claude pointer."
-    return
+    return 1
   fi
 
   mkdir -p "$(dirname "$destination_path")"
@@ -235,8 +235,9 @@ case "$mode" in
     publish_release_branch "$hub_rel"
     restore_generated_paths_on_default_branch "$hub_rel"
     if [[ "$update_claude_pointer" == "true" ]]; then
-      write_claude_pointer "$payload_root" "$hub_rel"
-      commit_claude_pointer "$hub_rel"
+      if write_claude_pointer "$payload_root" "$hub_rel"; then
+        commit_claude_pointer "$hub_rel"
+      fi
     fi
     rm -rf "$payload_root"
     ;;
