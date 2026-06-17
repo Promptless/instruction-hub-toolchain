@@ -20,9 +20,35 @@ fi
 hub_root="$(cd "$hub_root" && pwd)"
 
 declare -a generated_paths=()
+
+reject_generated_path() {
+  local path="$1"
+  echo "Invalid generated-path '$path': entries must be relative paths inside hub-root without empty, '.', or '..' components." >&2
+  exit 2
+}
+
+append_generated_path() {
+  local path="$1"
+  [[ -z "$path" ]] && return
+  [[ "$path" = /* ]] && reject_generated_path "$path"
+  while [[ "$path" == */ ]]; do
+    path="${path%/}"
+  done
+  [[ -z "$path" || "$path" == "." ]] && reject_generated_path "$1"
+
+  local components=()
+  local IFS="/"
+  read -r -a components <<< "$path"
+  for component in "${components[@]}"; do
+    [[ -z "$component" || "$component" == "." || "$component" == ".." ]] && reject_generated_path "$1"
+  done
+
+  generated_paths+=("$path")
+}
+
 while IFS= read -r line; do
   for path in $line; do
-    [[ -n "$path" ]] && generated_paths+=("$path")
+    append_generated_path "$path"
   done
 done <<< "$generated_paths_input"
 

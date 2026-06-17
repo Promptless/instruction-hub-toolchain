@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -330,6 +331,28 @@ def test_build_renders_projected_rules_native_cursor_rules_and_mcp_assets(tmp_pa
     assert codex_mcp_config["trace-reporter"]["env"]["PROMPTLESS_API_KEY"] == "${PROMPTLESS_API_KEY}"
     cursor_mcp_config = json.loads((hub_root / "dist/cursor/mcp.json").read_text())
     assert "trace-reporter" in cursor_mcp_config["mcpServers"]
+
+
+@pytest.mark.parametrize("generated_paths", ["/tmp/dist", "..", ".", "dist/../assets", "dist//codex"])
+def test_action_script_rejects_generated_paths_outside_hub(generated_paths: str) -> None:
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/run.sh")],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "GITHUB_ACTION_PATH": str(REPO_ROOT),
+            "INPUT_MODE": "check",
+            "INPUT_HUB_ROOT": ".",
+            "INPUT_GENERATED_PATHS": generated_paths,
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "generated-path" in result.stderr
+    assert "inside hub-root" in result.stderr
 
 
 def test_validate_rejects_unknown_package_refs(tmp_path: Path) -> None:

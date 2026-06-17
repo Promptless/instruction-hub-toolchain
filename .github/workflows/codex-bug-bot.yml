@@ -124,51 +124,64 @@ jobs:
 
       - name: Build prompt
         if: ${{ env.OPENAI_API_KEY != '' }}
-        run: |
-          cat > .bugbot-prompt.md <<'PROMPT_EOF'
-          You are a software expert checking for bugs potentially introduced by PR #${{ steps.pr_context.outputs.number }} for ${{ github.repository }}.
+        uses: actions/github-script@v7
+        env:
+          PR_CONTEXT_NUMBER: ${{ steps.pr_context.outputs.number }}
+          PR_CONTEXT_MERGE_BASE_SHA: ${{ steps.pr_context.outputs.merge_base_sha }}
+          PR_CONTEXT_HEAD_SHA: ${{ steps.pr_context.outputs.head_sha }}
+          PR_CONTEXT_TITLE: ${{ steps.pr_context.outputs.title }}
+          PR_CONTEXT_BODY: ${{ steps.pr_context.outputs.body }}
+        with:
+          script: |
+            const fs = require('fs');
 
-          Examine ONLY the changes introduced by this pull request:
-            Base commit (merge-base): ${{ steps.pr_context.outputs.merge_base_sha }}
-            Head commit: ${{ steps.pr_context.outputs.head_sha }}
+            const lines = [
+              `You are a software expert checking for bugs potentially introduced by PR #${process.env.PR_CONTEXT_NUMBER} for ${context.repo.owner}/${context.repo.repo}.`,
+              '',
+              'Examine ONLY the changes introduced by this pull request:',
+              `  Base commit (merge-base): ${process.env.PR_CONTEXT_MERGE_BASE_SHA}`,
+              `  Head commit: ${process.env.PR_CONTEXT_HEAD_SHA}`,
+              '',
+              'Goal:',
+              '  - Detect high-risk bugs, regressions, unsafe edge cases, or missing error handling introduced by these changes.',
+              '  - Focus on correctness issues that could affect customer hub builds, generated plugin compatibility, release publishing, or action security.',
+              '  - For changes under `src/` or `tests/`, verify compiler, scanner, renderer, manifest, and CLI behavior against the tests and fixtures.',
+              '  - For changes under `.github/workflows/`, `action.yml`, or `scripts/`, check GitHub Actions permissions, checkout/ref safety, shell failure behavior, and publish-mode side effects.',
+              "  - When the diff adds or modifies calls to an external service's API or SDK, verify the endpoint, method, or action contract against official docs. You have network access; do not trust memory.",
+              '  - Ignore style, naming, formatting, or issues that pre-exist on the base branch. A separate linter action reports those issues.',
+              '  - Ignore type-checking issues. A separate type checker action reports those issues.',
+              '',
+              'Output format:',
+              'You MUST output a single JSON object with this schema:',
+              '{',
+              '  "summary": "A brief overall summary of your findings (or \'No new bugs detected in this PR.\' if clean)",',
+              '  "inline_comments": [',
+              '    {',
+              '      "path": "relative/file/path.py",',
+              '      "line": 42,',
+              '      "body": "**[High]** Explanation of the bug and remediation suggestion."',
+              '    }',
+              '  ]',
+              '}',
+              '',
+              'Rules for the JSON:',
+              '- "path" must be relative to the repo root',
+              '- "line" must be a line number in the HEAD version of the file that appears in the diff',
+              '- "body" must start with **[High]**, **[Medium]**, or **[Low]** severity label followed by a concise explanation and remediation suggestion',
+              '- If no issues found, set inline_comments to an empty array',
+              '',
+              'Write the JSON output to a file called /tmp/bugbot-review.json, then print the contents of that file as your final message.',
+              '',
+              'Additional context:',
+              `Title: ${process.env.PR_CONTEXT_TITLE || ''}`,
+              'Body:',
+              '----',
+              process.env.PR_CONTEXT_BODY || '',
+              '----',
+              '',
+            ];
 
-          Goal:
-            - Detect high-risk bugs, regressions, unsafe edge cases, or missing error handling introduced by these changes.
-            - Focus on correctness issues that could affect customer hub builds, generated plugin compatibility, release publishing, or action security.
-            - For changes under `src/` or `tests/`, verify compiler, scanner, renderer, manifest, and CLI behavior against the tests and fixtures.
-            - For changes under `.github/workflows/`, `action.yml`, or `scripts/`, check GitHub Actions permissions, checkout/ref safety, shell failure behavior, and publish-mode side effects.
-            - When the diff adds or modifies calls to an external service's API or SDK, verify the endpoint, method, or action contract against official docs. You have network access; do not trust memory.
-            - Ignore style, naming, formatting, or issues that pre-exist on the base branch. A separate linter action reports those issues.
-            - Ignore type-checking issues. A separate type checker action reports those issues.
-
-          Output format:
-          You MUST output a single JSON object with this schema:
-          {
-            "summary": "A brief overall summary of your findings (or 'No new bugs detected in this PR.' if clean)",
-            "inline_comments": [
-              {
-                "path": "relative/file/path.py",
-                "line": 42,
-                "body": "**[High]** Explanation of the bug and remediation suggestion."
-              }
-            ]
-          }
-
-          Rules for the JSON:
-          - "path" must be relative to the repo root
-          - "line" must be a line number in the HEAD version of the file that appears in the diff
-          - "body" must start with **[High]**, **[Medium]**, or **[Low]** severity label followed by a concise explanation and remediation suggestion
-          - If no issues found, set inline_comments to an empty array
-
-          Write the JSON output to a file called /tmp/bugbot-review.json, then print the contents of that file as your final message.
-
-          Additional context:
-          Title: ${{ steps.pr_context.outputs.title }}
-          Body:
-          ----
-          ${{ steps.pr_context.outputs.body }}
-          ----
-          PROMPT_EOF
+            fs.writeFileSync('.bugbot-prompt.md', lines.join('\n'));
 
       - name: Run Codex bug analysis
         if: ${{ env.OPENAI_API_KEY != '' }}
