@@ -60,6 +60,13 @@ validate_source_branch() {
   validate_branch_name "source-branch" "$1"
 }
 
+validate_distinct_publish_branches() {
+  if [[ "$release_branch" == "$source_branch" ]]; then
+    echo "Invalid release-branch '$release_branch': release-branch must differ from source-branch." >&2
+    exit 2
+  fi
+}
+
 normalize_bool_input() {
   local label="$1"
   local value="$2"
@@ -110,6 +117,9 @@ done <<< "$generated_paths_input"
 
 validate_release_branch "$release_branch"
 validate_source_branch "$source_branch"
+if [[ "$mode" == "publish" ]]; then
+  validate_distinct_publish_branches
+fi
 update_claude_pointer="$(normalize_bool_input "update-claude-pointer" "$update_claude_pointer")"
 
 pi() {
@@ -152,6 +162,30 @@ require_publish_source_ref() {
   fi
 }
 
+github_repository_url() {
+  local token="${1:-}"
+  python - "$token" "${GITHUB_SERVER_URL:-https://github.com}" "$GITHUB_REPOSITORY" <<'PY'
+from urllib.parse import quote, urlsplit, urlunsplit
+import sys
+
+token = sys.argv[1]
+server_url = sys.argv[2].rstrip("/")
+repository = sys.argv[3]
+
+parts = urlsplit(server_url)
+if not parts.scheme or not parts.netloc:
+    raise SystemExit(f"GITHUB_SERVER_URL must include scheme and host: {server_url}")
+
+netloc = parts.netloc
+if token:
+    netloc = f"x-access-token:{quote(token, safe='')}@{netloc}"
+
+base_path = parts.path.rstrip("/")
+repo_path = f"{base_path}/{repository}.git" if base_path else f"/{repository}.git"
+print(urlunsplit((parts.scheme, netloc, repo_path, "", "")))
+PY
+}
+
 configure_push_credentials() {
   if [[ -z "$github_token" || -z "${GITHUB_REPOSITORY:-}" ]]; then
     return
@@ -159,7 +193,7 @@ configure_push_credentials() {
   if [[ -z "$original_origin_url" ]]; then
     original_origin_url="$(git -C "$repo_root" remote get-url origin)"
   fi
-  git -C "$repo_root" remote set-url origin "https://x-access-token:${github_token}@github.com/${GITHUB_REPOSITORY}.git"
+  git -C "$repo_root" remote set-url origin "$(github_repository_url "$github_token")"
 }
 
 restore_push_credentials() {
@@ -290,7 +324,7 @@ write_claude_pointer() {
   fi
 
   mkdir -p "$(dirname "$destination_path")"
-  python - "$marketplace_path" "$destination_path" "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}.git" "$release_branch" "$plugin_path" <<'PY'
+  python - "$marketplace_path" "$destination_path" "$(github_repository_url)" "$release_branch" "$plugin_path" <<'PY'
 from pathlib import Path
 import json
 import sys

@@ -466,6 +466,15 @@ def test_action_publish_rejects_unexpected_source_branch(tmp_path: Path) -> None
     assert "Publish mode must run from source branch 'main'" in result.stderr
 
 
+def test_action_publish_rejects_release_branch_equal_to_source_branch(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-same-branch", targets=("claude",))
+
+    result = _run_action(repo, tmp_path / "github-output.txt", release_branch="main")
+
+    assert result.returncode == 2
+    assert "release-branch must differ from source-branch" in result.stderr
+
+
 def test_action_publish_writes_release_branch_and_claude_git_pointer(tmp_path: Path) -> None:
     repo = _init_action_repo(tmp_path / "publish", targets=("claude", "codex"))
     output_path = tmp_path / "github-output.txt"
@@ -483,6 +492,68 @@ def test_action_publish_writes_release_branch_and_claude_git_pointer(tmp_path: P
         "ref": "release/stable",
     }
     assert output_path.read_text() == "release-branch=release/stable\n"
+
+
+def test_action_publish_uses_github_server_url_for_push_credentials(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-enterprise", targets=("claude",))
+    fake_git_bin = tmp_path / "fake-git-bin"
+    fake_git_bin.mkdir()
+    fake_git_log = tmp_path / "fake-git.log"
+    real_git = shutil.which("git")
+    assert real_git is not None
+    fake_git = fake_git_bin / "git"
+    fake_git.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+args=("$@")
+command_index=0
+while [[ "$command_index" -lt "${#args[@]}" ]]; do
+  case "${args[$command_index]}" in
+    -C | -c | --git-dir | --work-tree)
+      command_index=$((command_index + 2))
+      ;;
+    --*)
+      command_index=$((command_index + 1))
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+command="${args[$command_index]:-}"
+subcommand="${args[$((command_index + 1))]:-}"
+if [[ "$command" == "remote" && "$subcommand" == "set-url" ]]; then
+  printf '%s\\n' "$*" >> "$FAKE_GIT_LOG"
+  exit 0
+fi
+if [[ "$command" == "push" ]]; then
+  printf '%s\\n' "$*" >> "$FAKE_GIT_LOG"
+  exit 0
+fi
+exec "$REAL_GIT" "$@"
+"""
+    )
+    fake_git.chmod(0o755)
+
+    result = _run_action(
+        repo,
+        tmp_path / "github-output.txt",
+        extra_env={
+            "FAKE_GIT_LOG": str(fake_git_log),
+            "GITHUB_SERVER_URL": "https://github.enterprise.example",
+            "INPUT_GITHUB_TOKEN": "enterprise-token",
+            "PATH": f"{fake_git_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "REAL_GIT": real_git,
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected_remote = "https://x-access-token:enterprise-token@github.enterprise.example/Promptless/instruction-hub-test.git"
+    log_text = fake_git_log.read_text()
+    assert expected_remote in log_text
+    assert "https://x-access-token:enterprise-token@github.com/" not in log_text
+    pointer = json.loads((repo / ".claude-plugin/marketplace.json").read_text())
+    assert pointer["plugins"][0]["source"]["url"] == "https://github.enterprise.example/Promptless/instruction-hub-test.git"
 
 
 def test_action_publish_second_run_is_noop(tmp_path: Path) -> None:
