@@ -539,6 +539,65 @@ def test_validate_rejects_literal_mcp_authorization_headers(tmp_path: Path) -> N
         validate_hub(hub_root)
 
 
+def test_validate_rejects_literal_secret_mcp_arg_values(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    (hub_root / "assets/mcps/bad.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "bad": {
+                        "command": "bad",
+                        "args": ["--token", "literal-secret"],
+                    }
+                }
+            }
+        )
+    )
+
+    with pytest.raises(InstructionHubError, match=r"args\.1"):
+        validate_hub(hub_root)
+
+
+def test_validate_rejects_literal_secret_mcp_inline_arg_values(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    (hub_root / "assets/mcps/bad.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "bad": {
+                        "command": "bad",
+                        "args": ["--api-key=literal-secret"],
+                    }
+                }
+            }
+        )
+    )
+
+    with pytest.raises(InstructionHubError, match=r"args\.0"):
+        validate_hub(hub_root)
+
+
+def test_validate_accepts_env_placeholder_mcp_arg_values(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    (hub_root / "assets/mcps/good.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "good": {
+                        "command": "good",
+                        "args": ["--token", "${MCP_TOKEN}"],
+                    }
+                }
+            }
+        )
+    )
+
+    validate_hub(hub_root)
+
+
 def test_validate_rejects_unimplemented_target_support_source(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)

@@ -244,6 +244,7 @@ def _validate_secret_values(path: Path, value: object, key_path: tuple[str, ...]
             _validate_secret_values(path, child, (*key_path, key))
         return
     if isinstance(value, list):
+        _validate_secret_arg_values(path, value, key_path)
         for index, child in enumerate(value):
             _validate_secret_values(path, child, (*key_path, str(index)))
         return
@@ -253,10 +254,44 @@ def _validate_secret_values(path: Path, value: object, key_path: tuple[str, ...]
     joined_key = ".".join(normalized_key_path)
     if not _requires_env_placeholder(normalized_key_path, joined_key):
         return
-    if value.startswith("${") and value.endswith("}"):
+    if _is_env_placeholder(value):
         return
-    if value.startswith("env:"):
+    _raise_literal_secret(path, key_path)
+
+
+def _validate_secret_arg_values(path: Path, values: list[object], key_path: tuple[str, ...]) -> None:
+    if not key_path or _normalize_key_fragment(key_path[-1]) != "args":
         return
+    for index, value in enumerate(values):
+        if not isinstance(value, str):
+            continue
+        flag, separator, inline_value = value.partition("=")
+        if not _is_secret_arg_flag(flag):
+            continue
+        if separator:
+            if not _is_env_placeholder(inline_value):
+                _raise_literal_secret(path, (*key_path, str(index)))
+            continue
+        next_index = index + 1
+        if next_index >= len(values):
+            continue
+        next_value = values[next_index]
+        if isinstance(next_value, str) and not next_value.startswith("-") and not _is_env_placeholder(next_value):
+            _raise_literal_secret(path, (*key_path, str(next_index)))
+
+
+def _is_secret_arg_flag(value: str) -> bool:
+    if not value.startswith("-"):
+        return False
+    normalized = _normalize_key_fragment(value.lstrip("-"))
+    return _requires_env_placeholder((normalized,), normalized)
+
+
+def _is_env_placeholder(value: str) -> bool:
+    return (value.startswith("${") and value.endswith("}")) or value.startswith("env:")
+
+
+def _raise_literal_secret(path: Path, key_path: tuple[str, ...]) -> None:
     msg = f"{path} contains a literal secret-looking value at {'.'.join(key_path)}; use an env placeholder"
     raise InstructionHubError(msg)
 
