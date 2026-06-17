@@ -483,7 +483,7 @@ def test_validate_rejects_malformed_asset_candidates(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are unavailable on this platform")
-def test_validate_rejects_symlinked_assets(tmp_path: Path) -> None:
+def test_validate_rejects_symlinked_skill_files(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     secret_path = tmp_path / "outside-secret.md"
     skill_root = hub_root / "assets/skills/leak"
@@ -491,6 +491,18 @@ def test_validate_rejects_symlinked_assets(tmp_path: Path) -> None:
     skill_root.mkdir(parents=True)
     secret_path.write_text("# Leaked\n\nexternal content\n")
     os.symlink(secret_path, skill_root / "SKILL.md")
+
+    with pytest.raises(InstructionHubError, match="symlink"):
+        validate_hub(hub_root)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are unavailable on this platform")
+def test_validate_rejects_symlinked_mcp_files(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    outside_asset = tmp_path / "outside.json"
+    init_hub(hub_root)
+    outside_asset.write_text("{}\n")
+    os.symlink(outside_asset, hub_root / "assets/mcps/leak.json")
 
     with pytest.raises(InstructionHubError, match="symlink"):
         validate_hub(hub_root)
