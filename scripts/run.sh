@@ -95,7 +95,7 @@ publish_release_branch() {
   git -C "$repo_root" config user.email "$commit_user_email"
 
   if git -C "$repo_root" ls-remote --exit-code --heads origin "$release_branch" >/dev/null 2>&1; then
-    git -C "$repo_root" fetch origin "$release_branch"
+    git -C "$repo_root" fetch origin "+refs/heads/$release_branch:refs/remotes/origin/$release_branch"
     git -C "$repo_root" worktree add -B "$release_branch" "$worktree" "origin/$release_branch"
   else
     git -C "$repo_root" worktree add --detach "$worktree" HEAD

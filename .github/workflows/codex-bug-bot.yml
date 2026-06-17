@@ -135,7 +135,7 @@ jobs:
           Goal:
             - Detect high-risk bugs, regressions, unsafe edge cases, or missing error handling introduced by these changes.
             - Focus on correctness issues that could affect customer hub builds, generated plugin compatibility, release publishing, or action security.
-            - For changes under `python-core/`, verify compiler, scanner, renderer, manifest, and CLI behavior against the tests and fixtures.
+            - For changes under `src/` or `tests/`, verify compiler, scanner, renderer, manifest, and CLI behavior against the tests and fixtures.
             - For changes under `.github/workflows/`, `action.yml`, or `scripts/`, check GitHub Actions permissions, checkout/ref safety, shell failure behavior, and publish-mode side effects.
             - When the diff adds or modifies calls to an external service's API or SDK, verify the endpoint, method, or action contract against official docs. You have network access; do not trust memory.
             - Ignore style, naming, formatting, or issues that pre-exist on the base branch. A separate linter action reports those issues.

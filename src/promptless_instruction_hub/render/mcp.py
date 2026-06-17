@@ -7,20 +7,13 @@ from pathlib import Path
 from promptless_instruction_hub.fs import JsonValue, read_json_mapping, read_yaml_mapping, write_json
 from promptless_instruction_hub.models import Harness, LoadedAsset
 
-STATUS_MCP_SERVER_NAME = "promptless-instruction-hub-status"
 MCP_SERVER_CONFIG_KEYS = {"command", "url", "type", "args", "env", "headers", "transport"}
 
 
 def collect_mcp_servers(target: Harness, assets: list[LoadedAsset]) -> dict[str, JsonValue]:
     """Collect MCP server definitions supported by one target harness."""
 
-    servers: dict[str, JsonValue] = {
-        STATUS_MCP_SERVER_NAME: {
-            "command": "promptless-instruction-hub",
-            "args": ["mcp-status", "--manifest", ".promptless/release.json"],
-            "env": {},
-        }
-    }
+    servers: dict[str, JsonValue] = {}
     mcp_assets = sorted(
         (asset for asset in assets if asset.type == "mcp"),
         key=lambda asset: (_mcp_asset_priority(asset, target), asset.id),

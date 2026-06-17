@@ -89,8 +89,7 @@ def test_scan_imports_cursor_only_mcp_config(tmp_path: Path) -> None:
     assert "source_path: .cursor/mcp.json" in mcp_metadata
     assert "claude:" in mcp_metadata
     assert "mode: unsupported" in mcp_metadata
-    codex_mcp_config = json.loads((hub_root / "dist/codex/.mcp.json").read_text())
-    assert "cursor-debug" not in codex_mcp_config
+    assert not (hub_root / "dist/codex/.mcp.json").exists()
     cursor_mcp_config = json.loads((hub_root / "dist/cursor/mcp.json").read_text())
     assert cursor_mcp_config["mcpServers"]["cursor-debug"]["args"] == ["--token", "${CURSOR_DEBUG_TOKEN}"]
 
@@ -195,12 +194,7 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     mcp_config = json.loads((hub_root / "dist/codex/.mcp.json").read_text())
     assert mcp_config["fixture-trace"]["env"]["PROMPTLESS_API_KEY"] == "${PROMPTLESS_API_KEY}"
     assert mcp_config["fixture-docs"]["url"] == "https://example.invalid/mcp"
-    assert "promptless-instruction-hub-status" in mcp_config
-    assert mcp_config["promptless-instruction-hub-status"]["args"] == [
-        "mcp-status",
-        "--manifest",
-        ".promptless/release.json",
-    ]
+    assert "promptless-instruction-hub-status" not in mcp_config
     release_manifest = json.loads((hub_root / ".promptless/releases/current.json").read_text())
     assert "git_commit" not in release_manifest
     assert set(release_manifest["target_hashes"]) == {"claude", "codex", "cursor", "gemini"}
