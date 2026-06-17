@@ -419,6 +419,17 @@ def test_validate_rejects_malformed_asset_candidates(tmp_path: Path) -> None:
         validate_hub(hub_root)
 
 
+def test_validate_rejects_symlinked_assets(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    outside_asset = tmp_path / "outside.json"
+    init_hub(hub_root)
+    outside_asset.write_text("{}\n")
+    (hub_root / "assets/mcps/leak.json").symlink_to(outside_asset)
+
+    with pytest.raises(InstructionHubError, match="symlink"):
+        validate_hub(hub_root)
+
+
 def test_validate_rejects_literal_mcp_secrets(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)

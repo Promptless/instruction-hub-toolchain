@@ -40,6 +40,10 @@ DEFAULT_TITLES = {
 def load_assets(hub_root: Path) -> dict[str, LoadedAsset]:
     """Load all supported assets under the hub's `assets/` directory."""
 
+    assets_root = hub_root / ASSETS_DIR
+    if assets_root.exists():
+        _reject_symlinks_under(assets_root)
+
     assets: dict[str, LoadedAsset] = {}
     for asset in _iter_assets(hub_root):
         if asset.ref in assets:
@@ -129,6 +133,18 @@ def _iter_assets(hub_root: Path) -> Iterable[LoadedAsset]:
         if not kind_dir.exists():
             continue
         yield from _iter_non_skill_assets(kind_dir, asset_kind)
+
+
+def _reject_symlinks_under(path: Path) -> None:
+    if path.is_symlink():
+        msg = f"asset paths must not be symlinks: {path}"
+        raise InstructionHubError(msg)
+    if not path.is_dir():
+        return
+    for child in path.rglob("*"):
+        if child.is_symlink():
+            msg = f"asset paths must not be symlinks: {child}"
+            raise InstructionHubError(msg)
 
 
 def _iter_non_skill_assets(kind_dir: Path, asset_kind: AssetKind) -> Iterable[LoadedAsset]:
