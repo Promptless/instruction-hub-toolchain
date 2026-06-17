@@ -6,21 +6,98 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: python-core/uv.lock
+
+      - name: Sync dependencies
+        run: uv --project python-core sync --frozen
+
+      - run: bash -n scripts/run.sh
+      - run: uv --project python-core run ruff check python-core/src python-core/tests
+      - run: uv --project python-core run ruff format --check python-core/src python-core/tests
+
+  typecheck:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: python-core/uv.lock
+
+      - name: Sync dependencies
+        run: uv --project python-core sync --frozen
+
+      - name: Run ty
+        run: uv --project python-core run ty check python-core/src python-core/tests --extra-search-path "${GITHUB_WORKSPACE}/python-core/src"
+
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: bash -n scripts/run.sh
-      - run: uv run --project python-core pytest
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: python-core/uv.lock
+
+      - name: Sync dependencies
+        run: uv --project python-core sync --frozen
+
+      - name: Run tests
+        run: uv --project python-core run pytest python-core/tests -q
 
   local-action:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv run --project python-core promptless-instruction-hub init --hub test-hub
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: python-core/uv.lock
+
+      - name: Sync dependencies
+        run: uv --project python-core sync --frozen
+
+      - run: uv --project python-core run promptless-instruction-hub init --hub test-hub
       - uses: ./
         with:
           mode: build

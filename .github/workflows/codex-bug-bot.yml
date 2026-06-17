@@ -1,0 +1,320 @@
+name: Codex Bug Bot
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Pull request number to analyze
+        required: true
+        type: string
+      reasoning_effort:
+        description: Codex reasoning effort
+        required: false
+        default: high
+        type: choice
+        options:
+          - none
+          - medium
+          - high
+          - extended
+          - thorough
+  workflow_call:
+    inputs:
+      pull_request_number:
+        required: true
+        type: string
+      reasoning_effort:
+        required: false
+        default: high
+        type: string
+
+concurrency:
+  group: codex-bug/${{ github.event.pull_request.number || github.event.inputs.pull_request_number || inputs.pull_request_number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  codex-bug-bot-review:
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        (github.event.pull_request != null && github.event.pull_request.draft == false)
+      }}
+    runs-on: ubuntu-latest
+    outputs:
+      final_message: ${{ steps.run_codex.outputs['final-message'] }}
+      pr_number: ${{ steps.pr_context.outputs.number }}
+      head_sha: ${{ steps.pr_context.outputs.head_sha }}
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pull_request_number || inputs.pull_request_number }}
+      CODEX_REASONING: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.reasoning_effort || github.event_name == 'workflow_call' && inputs.reasoning_effort || 'high' }}
+    steps:
+      - name: Ensure pull request number is available
+        run: |
+          if [ -z "${PR_NUMBER}" ]; then
+            echo "PR number is required for this workflow."
+            exit 1
+          fi
+
+      - name: Load pull request context
+        id: pr_context
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const prNumber = Number(process.env.PR_NUMBER);
+            if (!Number.isFinite(prNumber) || prNumber <= 0) {
+              core.setFailed('Valid pull request number is required.');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            const { data: comparison } = await github.rest.repos.compareCommitsWithBasehead({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              basehead: `${pr.base.sha}...${pr.head.sha}`,
+            });
+
+            const mergeBaseSha = comparison.merge_base_commit?.sha ?? '';
+            if (!mergeBaseSha) {
+              core.setFailed('Unable to determine merge base for this pull request.');
+              return;
+            }
+
+            core.setOutput('number', pr.number.toString());
+            core.setOutput('base_ref', pr.base.ref);
+            core.setOutput('base_sha', pr.base.sha);
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('merge_base_sha', mergeBaseSha);
+            core.setOutput('title', pr.title ?? '');
+            core.setOutput('body', pr.body ?? '');
+
+            if (pr.draft) {
+              core.warning('Codex bug bot normally skips draft PRs; re-run after marking ready for review.');
+            }
+
+      - name: Checkout pull request merge commit
+        uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ steps.pr_context.outputs.number }}/merge
+          fetch-depth: 0
+
+      - name: Build prompt
+        run: |
+          cat > .bugbot-prompt.md <<'PROMPT_EOF'
+          You are a software expert checking for bugs potentially introduced by PR #${{ steps.pr_context.outputs.number }} for ${{ github.repository }}.
+
+          Examine ONLY the changes introduced by this pull request:
+            Base commit (merge-base): ${{ steps.pr_context.outputs.merge_base_sha }}
+            Head commit: ${{ steps.pr_context.outputs.head_sha }}
+
+          Goal:
+            - Detect high-risk bugs, regressions, unsafe edge cases, or missing error handling introduced by these changes.
+            - Focus on correctness issues that could affect customer hub builds, generated plugin compatibility, release publishing, or action security.
+            - For changes under `python-core/`, verify compiler, scanner, renderer, manifest, and CLI behavior against the tests and fixtures.
+            - For changes under `.github/workflows/`, `action.yml`, or `scripts/`, check GitHub Actions permissions, checkout/ref safety, shell failure behavior, and publish-mode side effects.
+            - When the diff adds or modifies calls to an external service's API or SDK, verify the endpoint, method, or action contract against official docs. You have network access; do not trust memory.
+            - Ignore style, naming, formatting, or issues that pre-exist on the base branch. A separate linter action reports those issues.
+            - Ignore type-checking issues. A separate type checker action reports those issues.
+
+          Output format:
+          You MUST output a single JSON object with this schema:
+          {
+            "summary": "A brief overall summary of your findings (or 'No new bugs detected in this PR.' if clean)",
+            "inline_comments": [
+              {
+                "path": "relative/file/path.py",
+                "line": 42,
+                "body": "**[High]** Explanation of the bug and remediation suggestion."
+              }
+            ]
+          }
+
+          Rules for the JSON:
+          - "path" must be relative to the repo root
+          - "line" must be a line number in the HEAD version of the file that appears in the diff
+          - "body" must start with **[High]**, **[Medium]**, or **[Low]** severity label followed by a concise explanation and remediation suggestion
+          - If no issues found, set inline_comments to an empty array
+
+          Write the JSON output to a file called /tmp/bugbot-review.json, then print the contents of that file as your final message.
+
+          Additional context:
+          Title: ${{ steps.pr_context.outputs.title }}
+          Body:
+          ----
+          ${{ steps.pr_context.outputs.body }}
+          ----
+          PROMPT_EOF
+
+      - name: Run Codex bug analysis
+        id: run_codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ env.OPENAI_API_KEY }}
+          sandbox: danger-full-access
+          codex-args: '["--config","reasoning.effort=${{ env.CODEX_REASONING }}"]'
+          prompt-file: .bugbot-prompt.md
+          allow-bots: true
+          allow-bot-users: promptless[bot]
+
+  post-codex-feedback:
+    runs-on: ubuntu-latest
+    needs: codex-bug-bot-review
+    if: needs.codex-bug-bot-review.outputs.final_message != ''
+    steps:
+      - name: Post Bug Bot review with inline comments
+        uses: actions/github-script@v7
+        env:
+          CODEX_FINAL_MESSAGE: ${{ needs.codex-bug-bot-review.outputs.final_message }}
+          PR_NUMBER: ${{ needs.codex-bug-bot-review.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.codex-bug-bot-review.outputs.head_sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const raw = (process.env.CODEX_FINAL_MESSAGE || '').trim();
+            if (!raw) {
+              core.info('No Codex findings to report.');
+              return;
+            }
+
+            const prNumber = Number(process.env.PR_NUMBER);
+            if (!Number.isFinite(prNumber) || prNumber <= 0) {
+              core.setFailed('Unable to determine pull request number for comment.');
+              return;
+            }
+
+            let review = null;
+            try {
+              let jsonStr = raw;
+              const fenceMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+              if (fenceMatch) {
+                jsonStr = fenceMatch[1];
+              }
+              if (!jsonStr.trim().startsWith('{')) {
+                const objMatch = jsonStr.match(/(\{[\s\S]*\})\s*$/);
+                if (objMatch) {
+                  jsonStr = objMatch[1];
+                }
+              }
+              review = JSON.parse(jsonStr);
+            } catch (e) {
+              core.warning(`Could not parse Bug Bot JSON output, falling back to plain comment: ${e.message}`);
+            }
+
+            if (!review || typeof review.summary !== 'string') {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `## Codex Bug Bot\n\n${raw}`,
+              });
+              return;
+            }
+
+            const inlineComments = Array.isArray(review.inline_comments) ? review.inline_comments : [];
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            const validLines = new Set();
+            for (const file of files) {
+              if (!file.patch) continue;
+              let currentLine = 0;
+              for (const diffLine of file.patch.split('\n')) {
+                const hunkMatch = diffLine.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                if (hunkMatch) {
+                  currentLine = parseInt(hunkMatch[1], 10);
+                  continue;
+                }
+                if (diffLine.startsWith('-')) continue;
+                if (diffLine.startsWith('+') || diffLine.startsWith(' ')) {
+                  validLines.add(`${file.filename}:${currentLine}`);
+                  currentLine++;
+                }
+              }
+            }
+
+            const comments = [];
+            const droppedComments = [];
+            for (const comment of inlineComments) {
+              if (!comment.path || !comment.line || !comment.body) {
+                droppedComments.push({
+                  path: comment.path || '(missing path)',
+                  line: comment.line || '(missing line)',
+                  body: comment.body || '(missing body)',
+                  reason: 'missing required inline comment fields',
+                });
+                continue;
+              }
+
+              const key = `${comment.path}:${comment.line}`;
+              if (validLines.has(key)) {
+                comments.push({
+                  path: comment.path,
+                  line: comment.line,
+                  side: 'RIGHT',
+                  body: comment.body,
+                });
+              } else {
+                droppedComments.push({
+                  path: comment.path,
+                  line: comment.line,
+                  body: comment.body,
+                  reason: 'line is not present in the commentable PR diff',
+                });
+              }
+            }
+
+            if (droppedComments.length > 0) {
+              core.warning(`Preserving ${droppedComments.length} Bug Bot finding(s) in the top-level comment because GitHub could not accept them inline.`);
+            }
+
+            const bodyParts = [`## Codex Bug Bot\n\n${review.summary}`];
+            if (comments.length > 0) {
+              bodyParts.push(`_${comments.length} inline comment(s) below._`);
+            }
+            if (droppedComments.length > 0) {
+              const droppedBody = droppedComments.map((comment) => {
+                return `**${comment.path}:${comment.line}** (${comment.reason})\n\n${comment.body}`;
+              }).join('\n\n');
+              bodyParts.push(`_${droppedComments.length} generated inline comment(s) could not be posted inline; preserving them here._\n\n${droppedBody}`);
+            }
+
+            const commitId = process.env.HEAD_SHA;
+            if (comments.length > 0) {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                commit_id: commitId,
+                event: 'COMMENT',
+                body: bodyParts.join('\n\n'),
+                comments: comments,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: bodyParts.join('\n\n'),
+              });
+            }
