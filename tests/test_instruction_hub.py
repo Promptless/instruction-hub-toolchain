@@ -548,12 +548,17 @@ exec "$REAL_GIT" "$@"
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    expected_remote = "https://x-access-token:enterprise-token@github.enterprise.example/Promptless/instruction-hub-test.git"
+    expected_remote = (
+        "https://x-access-token:enterprise-token@github.enterprise.example/Promptless/instruction-hub-test.git"
+    )
     log_text = fake_git_log.read_text()
     assert expected_remote in log_text
     assert "https://x-access-token:enterprise-token@github.com/" not in log_text
     pointer = json.loads((repo / ".claude-plugin/marketplace.json").read_text())
-    assert pointer["plugins"][0]["source"]["url"] == "https://github.enterprise.example/Promptless/instruction-hub-test.git"
+    assert (
+        pointer["plugins"][0]["source"]["url"]
+        == "https://github.enterprise.example/Promptless/instruction-hub-test.git"
+    )
 
 
 def test_action_publish_second_run_is_noop(tmp_path: Path) -> None:
