@@ -561,6 +561,80 @@ exec "$REAL_GIT" "$@"
     )
 
 
+def test_action_publish_authenticates_before_release_branch_inspection(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-private-existing-branch", targets=("claude", "codex"))
+    first = _run_action(repo, tmp_path / "github-output-first.txt")
+    assert first.returncode == 0, first.stdout + first.stderr
+
+    fake_git_bin = tmp_path / "private-fake-git-bin"
+    fake_git_bin.mkdir()
+    fake_git_log = tmp_path / "private-fake-git.log"
+    fake_auth_marker = tmp_path / "private-fake-git-authenticated"
+    real_git = shutil.which("git")
+    assert real_git is not None
+    fake_git = fake_git_bin / "git"
+    fake_git.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+args=("$@")
+command_index=0
+while [[ "$command_index" -lt "${#args[@]}" ]]; do
+  case "${args[$command_index]}" in
+    -C | -c | --git-dir | --work-tree)
+      command_index=$((command_index + 2))
+      ;;
+    --*)
+      command_index=$((command_index + 1))
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+command="${args[$command_index]:-}"
+subcommand="${args[$((command_index + 1))]:-}"
+if [[ "$command" == "remote" && "$subcommand" == "set-url" ]]; then
+  remote_url="${args[$((command_index + 3))]:-}"
+  printf 'set-url %s\\n' "$remote_url" >> "$FAKE_GIT_LOG"
+  if [[ "$remote_url" == https://x-access-token:private-token@* ]]; then
+    printf 'authenticated\\n' > "$FAKE_GIT_AUTH_MARKER"
+  else
+    rm -f "$FAKE_GIT_AUTH_MARKER"
+  fi
+  exit 0
+fi
+if [[ "$command" == "ls-remote" || "$command" == "fetch" ]]; then
+  printf '%s %s\\n' "$command" "$*" >> "$FAKE_GIT_LOG"
+  if [[ ! -f "$FAKE_GIT_AUTH_MARKER" ]]; then
+    echo "authentication required" >&2
+    exit 128
+  fi
+fi
+exec "$REAL_GIT" "$@"
+"""
+    )
+    fake_git.chmod(0o755)
+
+    second = _run_action(
+        repo,
+        tmp_path / "github-output-second.txt",
+        extra_env={
+            "FAKE_GIT_AUTH_MARKER": str(fake_auth_marker),
+            "FAKE_GIT_LOG": str(fake_git_log),
+            "INPUT_GITHUB_TOKEN": "private-token",
+            "PATH": f"{fake_git_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "REAL_GIT": real_git,
+        },
+    )
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    log_lines = fake_git_log.read_text().splitlines()
+    for remote_command in ("ls-remote", "fetch"):
+        command_index = next(index for index, line in enumerate(log_lines) if line.startswith(remote_command))
+        assert command_index > 0
+        assert "x-access-token:private-token" in log_lines[command_index - 1]
+
+
 def test_action_publish_second_run_is_noop(tmp_path: Path) -> None:
     repo = _init_action_repo(tmp_path / "publish-noop", targets=("claude", "codex"))
 

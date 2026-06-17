@@ -214,6 +214,38 @@ push_origin_ref() {
   return "$status"
 }
 
+remote_release_branch_exists() {
+  local status=0
+  configure_push_credentials
+  git -C "$repo_root" ls-remote --exit-code --heads origin "$release_branch" >/dev/null 2>&1 || status=$?
+  restore_push_credentials
+
+  case "$status" in
+    0)
+      return 0
+      ;;
+    2)
+      return 1
+      ;;
+    *)
+      echo "Failed to inspect release branch '$release_branch' on origin; check checkout credentials or github-token." >&2
+      exit 1
+      ;;
+  esac
+}
+
+fetch_release_branch() {
+  local status=0
+  configure_push_credentials
+  git -C "$repo_root" fetch origin "+refs/heads/$release_branch:refs/remotes/origin/$release_branch" || status=$?
+  restore_push_credentials
+
+  if [[ "$status" -ne 0 ]]; then
+    echo "Failed to fetch existing release branch '$release_branch' from origin." >&2
+    exit 1
+  fi
+}
+
 copy_generated_paths() {
   local destination_root="$1"
   local hub_rel="$2"
@@ -264,8 +296,8 @@ publish_release_branch() {
   git -C "$repo_root" config user.name "$commit_user_name"
   git -C "$repo_root" config user.email "$commit_user_email"
 
-  if git -C "$repo_root" ls-remote --exit-code --heads origin "$release_branch" >/dev/null 2>&1; then
-    git -C "$repo_root" fetch origin "+refs/heads/$release_branch:refs/remotes/origin/$release_branch"
+  if remote_release_branch_exists; then
+    fetch_release_branch
     git -C "$repo_root" worktree add -B "$release_branch" "$worktree" "origin/$release_branch"
   else
     git -C "$repo_root" worktree add --detach "$worktree" HEAD
