@@ -1,4 +1,4 @@
-name: Promptless Instruction Hub
+name: Promptless Instruction Hub Toolchain
 description: Build, validate, and publish Promptless Instruction Hub artifacts.
 
 inputs:
@@ -31,11 +31,11 @@ inputs:
   commit-user-name:
     description: Git author name for publish-mode commits.
     required: false
-    default: promptless-instruction-hub-action[bot]
+    default: github-actions[bot]
   commit-user-email:
     description: Git author email for publish-mode commits.
     required: false
-    default: 197982258+promptless-instruction-hub-action[bot]@users.noreply.github.com
+    default: 41898282+github-actions[bot]@users.noreply.github.com
   commit-message:
     description: Commit message for publish-mode release branch updates.
     required: false

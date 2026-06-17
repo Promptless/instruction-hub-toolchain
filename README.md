@@ -1,4 +1,4 @@
-# Promptless Instruction Hub Action
+# Promptless Instruction Hub Toolchain
 
 This repository is the canonical public toolchain for Promptless Instruction
 Hub repositories. It bundles the Python compiler in `python-core/` and exposes a
@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: Promptless/instruction-hub-action@v0
+      - uses: Promptless/instruction-hub-toolchain@v0
         with:
           mode: publish
 ```
