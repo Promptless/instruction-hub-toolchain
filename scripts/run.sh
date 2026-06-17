@@ -4,8 +4,10 @@ set -euo pipefail
 mode="${INPUT_MODE:-build}"
 hub_root_input="${INPUT_HUB_ROOT:-.}"
 release_branch="${INPUT_RELEASE_BRANCH:-release/stable}"
+source_branch="${INPUT_SOURCE_BRANCH:-main}"
 generated_paths_input="${INPUT_GENERATED_PATHS:-dist .agents/plugins .claude-plugin .cursor-plugin .promptless/releases .promptless/channels}"
 update_claude_pointer="${INPUT_UPDATE_CLAUDE_POINTER:-true}"
+github_token="${INPUT_GITHUB_TOKEN:-}"
 commit_user_name="${INPUT_COMMIT_USER_NAME:-github-actions[bot]}"
 commit_user_email="${INPUT_COMMIT_USER_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}"
 commit_message="${INPUT_COMMIT_MESSAGE:-Update Instruction Hub release}"
@@ -22,6 +24,7 @@ hub_root="$(cd "$hub_root" && pwd)"
 declare -a generated_paths=()
 declare -a release_worktrees=()
 declare -a temp_paths=()
+original_origin_url=""
 
 cleanup_temp_paths() {
   for worktree_path in "${release_worktrees[@]}"; do
@@ -36,16 +39,41 @@ cleanup_temp_paths() {
 
 trap cleanup_temp_paths EXIT
 
-validate_release_branch() {
-  local branch="$1"
+validate_branch_name() {
+  local label="$1"
+  local branch="$2"
   if [[ -z "$branch" || "$branch" == -* || "$branch" == *$'\n'* || "$branch" == *$'\r'* ]]; then
-    echo "Invalid release-branch: must be a non-empty git branch name without control characters." >&2
+    echo "Invalid $label: must be a non-empty git branch name without control characters." >&2
     exit 2
   fi
   if ! git check-ref-format "refs/heads/$branch" >/dev/null 2>&1; then
-    echo "Invalid release-branch '$branch': expected a valid git branch name." >&2
+    echo "Invalid $label '$branch': expected a valid git branch name." >&2
     exit 2
   fi
+}
+
+validate_release_branch() {
+  validate_branch_name "release-branch" "$1"
+}
+
+validate_source_branch() {
+  validate_branch_name "source-branch" "$1"
+}
+
+normalize_bool_input() {
+  local label="$1"
+  local value="$2"
+  local normalized
+  normalized="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+  case "$normalized" in
+    true | false)
+      printf '%s\n' "$normalized"
+      ;;
+    *)
+      echo "Invalid $label '$value': expected true or false." >&2
+      exit 2
+      ;;
+  esac
 }
 
 reject_generated_path() {
@@ -81,6 +109,8 @@ while IFS= read -r line; do
 done <<< "$generated_paths_input"
 
 validate_release_branch "$release_branch"
+validate_source_branch "$source_branch"
+update_claude_pointer="$(normalize_bool_input "update-claude-pointer" "$update_claude_pointer")"
 
 pi() {
   uv run --project "$GITHUB_ACTION_PATH" promptless-instruction-hub "$@"
@@ -99,6 +129,55 @@ except ValueError as exc:
     raise SystemExit(f"hub-root must be inside the git checkout: {hub_root}") from exc
 print("" if str(rel) == "." else rel.as_posix())
 PY
+}
+
+require_publish_source_ref() {
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    if [[ "${GITHUB_REF_TYPE:-}" != "branch" ]]; then
+      echo "Publish mode must run from branch ref '$source_branch'; got ref type '${GITHUB_REF_TYPE:-unset}'." >&2
+      exit 2
+    fi
+    if [[ "${GITHUB_REF_NAME:-}" != "$source_branch" ]]; then
+      echo "Publish mode must run from source branch '$source_branch'; got '${GITHUB_REF_NAME:-unset}'." >&2
+      exit 2
+    fi
+    return
+  fi
+
+  local current_branch
+  current_branch="$(git -C "$repo_root" branch --show-current)"
+  if [[ -n "$current_branch" && "$current_branch" != "$source_branch" ]]; then
+    echo "Publish mode must run from source branch '$source_branch'; got '$current_branch'." >&2
+    exit 2
+  fi
+}
+
+configure_push_credentials() {
+  if [[ -z "$github_token" || -z "${GITHUB_REPOSITORY:-}" ]]; then
+    return
+  fi
+  if [[ -z "$original_origin_url" ]]; then
+    original_origin_url="$(git -C "$repo_root" remote get-url origin)"
+  fi
+  git -C "$repo_root" remote set-url origin "https://x-access-token:${github_token}@github.com/${GITHUB_REPOSITORY}.git"
+}
+
+restore_push_credentials() {
+  if [[ -z "$original_origin_url" ]]; then
+    return
+  fi
+  git -C "$repo_root" remote set-url origin "$original_origin_url"
+  original_origin_url=""
+}
+
+push_origin_ref() {
+  local cwd="$1"
+  local refspec="$2"
+  local status=0
+  configure_push_credentials
+  git -C "$cwd" push origin "$refspec" || status=$?
+  restore_push_credentials
+  return "$status"
 }
 
 copy_generated_paths() {
@@ -175,7 +254,7 @@ publish_release_branch() {
 
   if ! git -C "$worktree" diff --cached --quiet; then
     git -C "$worktree" commit -m "$commit_message"
-    git -C "$worktree" push origin "HEAD:$release_branch"
+    push_origin_ref "$worktree" "HEAD:$release_branch"
   else
     echo "No release branch changes to publish."
   fi
@@ -238,7 +317,6 @@ PY
 
 commit_claude_pointer() {
   local hub_rel="$1"
-  local branch_name="${GITHUB_REF_NAME:-$(git -C "$repo_root" branch --show-current)}"
   local pointer_path
   if [[ -n "$hub_rel" ]]; then
     pointer_path="$hub_rel/.claude-plugin/marketplace.json"
@@ -249,7 +327,7 @@ commit_claude_pointer() {
   git -C "$repo_root" add "$pointer_path"
   if ! git -C "$repo_root" diff --cached --quiet -- "$pointer_path"; then
     git -C "$repo_root" commit -m "Update Claude Instruction Hub pointer"
-    git -C "$repo_root" push origin "HEAD:$branch_name"
+    push_origin_ref "$repo_root" "HEAD:$source_branch"
   else
     echo "No Claude pointer changes to publish."
   fi
@@ -263,10 +341,12 @@ case "$mode" in
     restore_generated_paths_on_default_branch "$hub_rel"
     ;;
   check)
+    hub_relative_path >/dev/null
     pi validate --hub "$hub_root"
     pi build --hub "$hub_root" --check
     ;;
   publish)
+    require_publish_source_ref
     hub_rel="$(hub_relative_path)"
     payload_root="$(mktemp -d)"
     temp_paths+=("$payload_root")

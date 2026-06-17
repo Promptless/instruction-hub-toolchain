@@ -71,9 +71,9 @@ class HubConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    org: str
+    org: str = Field(min_length=1)
     plugin_id: str
-    plugin_name: str
+    plugin_name: str = Field(min_length=1)
     plugin_version: str
     stable_packages: list[str] = Field(default_factory=lambda: ["core"])
     targets: list[Harness] = Field(default_factory=lambda: list(SUPPORTED_HARNESSES))

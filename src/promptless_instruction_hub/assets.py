@@ -5,8 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-import yaml
-
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import (
     JsonValue,
@@ -14,7 +12,7 @@ from promptless_instruction_hub.fs import (
     file_hash,
     read_json_mapping,
     read_yaml_mapping,
-    validate_json_value,
+    read_yaml_value,
 )
 from promptless_instruction_hub.models import (
     ASSET_KINDS,
@@ -68,12 +66,21 @@ def validate_no_symlinks(hub_root: Path) -> None:
     """Reject symlinks in source assets so builds cannot dereference files outside the hub."""
 
     asset_root = hub_root / ASSETS_DIR
+    if asset_root.is_symlink():
+        msg = f"{asset_root} is a symlink; Instruction Hub assets must be regular files or directories"
+        raise InstructionHubError(msg)
     if not asset_root.exists():
         return
+    real_asset_root = asset_root.resolve()
     for source_path in sorted(asset_root.rglob("*")):
         if source_path.is_symlink():
             msg = f"{source_path} is a symlink; Instruction Hub assets must be regular files or directories"
             raise InstructionHubError(msg)
+        try:
+            source_path.resolve().relative_to(real_asset_root)
+        except ValueError as exc:
+            msg = f"{source_path} resolves outside {asset_root}; Instruction Hub assets must stay inside assets/"
+            raise InstructionHubError(msg) from exc
 
 
 def default_skill_support() -> dict[Harness, TargetSupport]:
@@ -309,7 +316,7 @@ def _requires_env_placeholder(key_path: tuple[str, ...], joined_key: str) -> boo
 def _read_structured_file(path: Path) -> object:
     if path.suffix == ".json":
         return read_json_mapping(path)
-    return validate_json_value(yaml.safe_load(path.read_text()), path)
+    return read_yaml_value(path)
 
 
 def _find_skill_file(skill_dir: Path) -> Path | None:

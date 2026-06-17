@@ -8,6 +8,7 @@ from pathlib import Path
 from promptless_instruction_hub.assets import load_assets, validate_no_literal_secrets, validate_no_symlinks
 from promptless_instruction_hub.config import load_hub_config, load_packages
 from promptless_instruction_hub.errors import InstructionHubError
+from promptless_instruction_hub.mcp_config import read_mcp_servers
 from promptless_instruction_hub.models import HubConfig, LoadedAsset, PackageDefinition
 
 SUPPORT_MODES_BY_ASSET_TYPE = {
@@ -40,6 +41,7 @@ def validate_hub(hub_root: Path) -> ValidationResult:
     assets = load_assets(root)
     validate_no_literal_secrets(root)
     _validate_target_support(config, assets)
+    _validate_mcp_assets(assets)
     stable_assets = _resolve_stable_assets(config, packages, assets)
     return ValidationResult(config=config, packages=packages, assets=assets, stable_assets=stable_assets)
 
@@ -61,6 +63,12 @@ def _validate_support_modes(asset: LoadedAsset) -> None:
         allowed = ", ".join(sorted(allowed_modes))
         msg = f"{asset.ref} declares unsupported mode {support.mode!r} for {target}; allowed modes: {allowed}"
         raise InstructionHubError(msg)
+
+
+def _validate_mcp_assets(assets: dict[str, LoadedAsset]) -> None:
+    for asset in assets.values():
+        if asset.type == "mcp":
+            read_mcp_servers(asset.path, default_server_name=asset.id)
 
 
 def _resolve_stable_assets(

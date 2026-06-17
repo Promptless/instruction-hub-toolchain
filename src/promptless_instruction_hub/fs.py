@@ -10,6 +10,8 @@ from pathlib import Path
 
 import yaml
 
+from promptless_instruction_hub.errors import InstructionHubError
+
 JsonScalar = str | int | float | bool | None
 JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
@@ -41,14 +43,24 @@ def validate_json_value(value: object, path: Path | str, key_path: tuple[str, ..
 def read_yaml_mapping(path: Path) -> dict[str, JsonValue]:
     """Read a YAML file and require a top-level mapping."""
 
-    raw_data = yaml.safe_load(path.read_text()) if path.exists() else {}
-    validated = validate_json_value(raw_data, path)
+    validated = read_yaml_value(path)
     if validated is None:
         return {}
     if not isinstance(validated, dict):
         msg = f"{path} must contain a YAML mapping"
         raise ValueError(msg)
     return validated
+
+
+def read_yaml_value(path: Path) -> JsonValue:
+    """Read a YAML file and return JSON-compatible data."""
+
+    try:
+        raw_data = yaml.safe_load(path.read_text()) if path.exists() else {}
+    except yaml.YAMLError as exc:
+        msg = f"{path} contains malformed YAML: {exc}"
+        raise InstructionHubError(msg) from exc
+    return validate_json_value(raw_data, path)
 
 
 def read_json_mapping(path: Path) -> dict[str, JsonValue]:

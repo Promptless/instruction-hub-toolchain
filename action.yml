@@ -14,6 +14,10 @@ inputs:
     description: Branch that receives generated Instruction Hub artifacts in publish mode.
     required: false
     default: release/stable
+  source-branch:
+    description: Branch allowed to run publish mode and receive default-branch pointer updates.
+    required: false
+    default: main
   generated-paths:
     description: Whitespace-separated generated paths relative to hub-root.
     required: false
@@ -28,6 +32,10 @@ inputs:
     description: Commit a default-branch Claude marketplace pointer that targets the release branch in publish mode.
     required: false
     default: "true"
+  github-token:
+    description: Token used only for publish-mode git pushes when checkout credentials are not persisted.
+    required: false
+    default: ""
   commit-user-name:
     description: Git author name for publish-mode commits.
     required: false
@@ -50,7 +58,7 @@ runs:
   using: composite
   steps:
     - name: Set up uv
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
 
     - name: Run Instruction Hub
       id: instruction-hub
@@ -59,8 +67,10 @@ runs:
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_HUB_ROOT: ${{ inputs.hub-root }}
         INPUT_RELEASE_BRANCH: ${{ inputs.release-branch }}
+        INPUT_SOURCE_BRANCH: ${{ inputs.source-branch }}
         INPUT_GENERATED_PATHS: ${{ inputs.generated-paths }}
         INPUT_UPDATE_CLAUDE_POINTER: ${{ inputs.update-claude-pointer }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
         INPUT_COMMIT_USER_NAME: ${{ inputs.commit-user-name }}
         INPUT_COMMIT_USER_EMAIL: ${{ inputs.commit-user-email }}
         INPUT_COMMIT_MESSAGE: ${{ inputs.commit-message }}

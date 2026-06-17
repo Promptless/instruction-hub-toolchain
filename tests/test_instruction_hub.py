@@ -390,6 +390,82 @@ def test_action_script_rejects_invalid_release_branch() -> None:
     assert "Invalid release-branch" in result.stderr
 
 
+def test_action_script_rejects_invalid_update_claude_pointer() -> None:
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/run.sh")],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "GITHUB_ACTION_PATH": str(REPO_ROOT),
+            "INPUT_MODE": "check",
+            "INPUT_HUB_ROOT": ".",
+            "INPUT_UPDATE_CLAUDE_POINTER": "tru",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "Invalid update-claude-pointer" in result.stderr
+
+
+def test_action_check_rejects_hub_root_outside_checkout(tmp_path: Path) -> None:
+    outside_hub = tmp_path / "outside-hub"
+    outside_hub.mkdir()
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/run.sh")],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "GITHUB_ACTION_PATH": str(REPO_ROOT),
+            "INPUT_MODE": "check",
+            "INPUT_HUB_ROOT": str(outside_hub),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "hub-root must be inside the git checkout" in result.stderr
+
+
+def test_action_publish_rejects_non_branch_ref(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-tag-ref", targets=("claude",))
+
+    result = _run_action(
+        repo,
+        tmp_path / "github-output.txt",
+        extra_env={
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_REF_TYPE": "tag",
+            "GITHUB_REF_NAME": "v1.0.0",
+        },
+    )
+
+    assert result.returncode == 2
+    assert "Publish mode must run from branch ref 'main'" in result.stderr
+
+
+def test_action_publish_rejects_unexpected_source_branch(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-wrong-branch", targets=("claude",))
+
+    result = _run_action(
+        repo,
+        tmp_path / "github-output.txt",
+        extra_env={
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_REF_TYPE": "branch",
+            "GITHUB_REF_NAME": "feature/instructions",
+        },
+    )
+
+    assert result.returncode == 2
+    assert "Publish mode must run from source branch 'main'" in result.stderr
+
+
 def test_action_publish_writes_release_branch_and_claude_git_pointer(tmp_path: Path) -> None:
     repo = _init_action_repo(tmp_path / "publish", targets=("claude", "codex"))
     output_path = tmp_path / "github-output.txt"
@@ -407,6 +483,31 @@ def test_action_publish_writes_release_branch_and_claude_git_pointer(tmp_path: P
         "ref": "release/stable",
     }
     assert output_path.read_text() == "release-branch=release/stable\n"
+
+
+def test_action_publish_second_run_is_noop(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-noop", targets=("claude", "codex"))
+
+    first = _run_action(repo, tmp_path / "github-output-first.txt")
+    second = _run_action(repo, tmp_path / "github-output-second.txt")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "No release branch changes to publish." in second.stdout
+    assert "No Claude pointer changes to publish." in second.stdout
+
+
+def test_action_publish_supports_subdirectory_hub_root_and_custom_release_branch(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-subdir", targets=("claude",), hub_root_name="hub")
+
+    result = _run_action(repo, tmp_path / "github-output.txt", hub_root="hub", release_branch="release/custom")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    _git(repo, "fetch", "origin", "release/custom")
+    assert json.loads(_git_output(repo, "show", "origin/release/custom:hub/dist/claude/.claude-plugin/plugin.json"))
+    pointer = json.loads((repo / "hub/.claude-plugin/marketplace.json").read_text())
+    assert pointer["plugins"][0]["source"]["path"] == "hub/dist/claude"
+    assert pointer["plugins"][0]["source"]["ref"] == "release/custom"
 
 
 def test_action_publish_skips_claude_pointer_when_claude_target_is_absent(tmp_path: Path) -> None:
@@ -464,6 +565,22 @@ def test_validate_rejects_unsafe_asset_ids(tmp_path: Path) -> None:
         validate_hub(hub_root)
 
 
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        "org: ''\nplugin_id: acme-instruction-hub\nplugin_name: Acme Instruction Hub\nplugin_version: 0.1.0\n",
+        "org: Acme\nplugin_id: acme-instruction-hub\nplugin_name: ''\nplugin_version: 0.1.0\n",
+    ],
+)
+def test_validate_rejects_empty_required_config_strings(tmp_path: Path, config_text: str) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    (hub_root / ".promptless/instruction-hub.yaml").write_text(config_text)
+
+    with pytest.raises(ValueError, match="String should have at least 1 character"):
+        validate_hub(hub_root)
+
+
 def test_validate_rejects_metadata_type_mismatch(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -506,6 +623,19 @@ def test_validate_rejects_symlinked_mcp_files(tmp_path: Path) -> None:
     os.symlink(outside_asset, hub_root / "assets/mcps/leak.json")
 
     with pytest.raises(InstructionHubError, match="symlink"):
+        validate_hub(hub_root)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are unavailable on this platform")
+def test_validate_rejects_symlinked_assets_root(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    outside_assets = tmp_path / "outside-assets"
+    init_hub(hub_root)
+    shutil.rmtree(hub_root / "assets")
+    outside_assets.mkdir()
+    os.symlink(outside_assets, hub_root / "assets")
+
+    with pytest.raises(InstructionHubError, match="assets.*symlink"):
         validate_hub(hub_root)
 
 
@@ -596,6 +726,55 @@ def test_validate_accepts_env_placeholder_mcp_arg_values(tmp_path: Path) -> None
     )
 
     validate_hub(hub_root)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"mcpServers": []},
+        {"servers": "bad"},
+        {"bad-server": "bad"},
+    ],
+)
+def test_validate_rejects_malformed_mcp_server_shapes(tmp_path: Path, payload: object) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    (hub_root / "assets/mcps/bad.json").write_text(json.dumps(payload))
+
+    with pytest.raises(InstructionHubError, match="MCP server"):
+        validate_hub(hub_root)
+
+
+def test_build_rejects_same_priority_duplicate_mcp_servers(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    (hub_root / "packages/core.yaml").write_text(
+        "\n".join(
+            [
+                "id: core",
+                "name: Core",
+                "includes:",
+                "  - mcp:first",
+                "  - mcp:second",
+                "",
+            ]
+        )
+    )
+    (hub_root / "assets/mcps/first.json").write_text(json.dumps({"shared": {"command": "first"}}))
+    (hub_root / "assets/mcps/second.json").write_text(json.dumps({"shared": {"command": "second"}}))
+
+    with pytest.raises(InstructionHubError, match="duplicate MCP server 'shared'"):
+        build_hub(hub_root)
+
+
+def test_validate_wraps_malformed_yaml_with_path(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    config_path = hub_root / ".promptless/instruction-hub.yaml"
+    config_path.write_text("org: [\n")
+
+    with pytest.raises(InstructionHubError, match=re.escape(str(config_path))):
+        validate_hub(hub_root)
 
 
 def test_validate_rejects_unimplemented_target_support_source(tmp_path: Path) -> None:
@@ -735,14 +914,15 @@ def _git_output(cwd: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=cwd, check=True, text=True, capture_output=True).stdout
 
 
-def _init_action_repo(root: Path, *, targets: tuple[str, ...]) -> Path:
+def _init_action_repo(root: Path, *, targets: tuple[str, ...], hub_root_name: str = ".") -> Path:
     remote = root / "remote.git"
     repo = root / "repo"
     root.mkdir(parents=True)
     _git(root, "init", "--bare", str(remote))
     repo.mkdir()
-    init_hub(repo, org="Acme")
-    _write_hub_config(repo, targets)
+    hub_root = repo if hub_root_name == "." else repo / hub_root_name
+    init_hub(hub_root, org="Acme")
+    _write_hub_config(hub_root, targets)
     _git(repo, "init", "-b", "main")
     _git(repo, "config", "user.email", "instruction-hub@example.com")
     _git(repo, "config", "user.name", "Instruction Hub Test")
@@ -772,23 +952,36 @@ def _write_hub_config(hub_root: Path, targets: tuple[str, ...]) -> None:
     )
 
 
-def _run_action(repo: Path, output_path: Path) -> subprocess.CompletedProcess[str]:
+def _run_action(
+    repo: Path,
+    output_path: Path,
+    *,
+    hub_root: str = ".",
+    release_branch: str = "release/stable",
+    source_branch: str = "main",
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = {
+        **os.environ,
+        "GITHUB_ACTION_PATH": str(REPO_ROOT),
+        "GITHUB_WORKSPACE": str(repo),
+        "GITHUB_REPOSITORY": "Promptless/instruction-hub-test",
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_REF_NAME": source_branch,
+        "GITHUB_REF_TYPE": "branch",
+        "GITHUB_OUTPUT": str(output_path),
+        "INPUT_MODE": "publish",
+        "INPUT_HUB_ROOT": hub_root,
+        "INPUT_RELEASE_BRANCH": release_branch,
+        "INPUT_SOURCE_BRANCH": source_branch,
+        "INPUT_UPDATE_CLAUDE_POINTER": "true",
+    }
+    if extra_env is not None:
+        env.update(extra_env)
     return subprocess.run(
         ["bash", str(REPO_ROOT / "scripts/run.sh")],
         cwd=repo,
-        env={
-            **os.environ,
-            "GITHUB_ACTION_PATH": str(REPO_ROOT),
-            "GITHUB_WORKSPACE": str(repo),
-            "GITHUB_REPOSITORY": "Promptless/instruction-hub-test",
-            "GITHUB_SERVER_URL": "https://github.com",
-            "GITHUB_REF_NAME": "main",
-            "GITHUB_OUTPUT": str(output_path),
-            "INPUT_MODE": "publish",
-            "INPUT_HUB_ROOT": ".",
-            "INPUT_RELEASE_BRANCH": "release/stable",
-            "INPUT_UPDATE_CLAUDE_POINTER": "true",
-        },
+        env=env,
         text=True,
         capture_output=True,
         check=False,

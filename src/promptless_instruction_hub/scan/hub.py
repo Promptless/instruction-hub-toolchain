@@ -13,18 +13,17 @@ from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import (
     JsonValue,
     file_hash,
-    read_json_mapping,
     read_yaml_mapping,
     write_json,
     write_yaml,
 )
+from promptless_instruction_hub.mcp_config import read_mcp_servers
 from promptless_instruction_hub.models import Harness, PackageDefinition, TargetSupport
 
 SKILL_SOURCE_DIR = Path(".agents/skills")
 ROOT_MCP_CONFIG_CANDIDATES = (Path(".mcp.json"), Path("mcp.json"), Path("mcp.yaml"), Path("mcp.yml"))
 CURSOR_MCP_CONFIG = Path(".cursor/mcp.json")
 REPO_CONTEXT_FILES = ("AGENTS.md", "CLAUDE.md", "GEMINI.md")
-MCP_SERVER_CONFIG_KEYS = {"command", "url", "type", "args", "env", "headers", "transport"}
 
 
 @dataclass(frozen=True)
@@ -219,16 +218,7 @@ def _first_existing_source_path(source_root: Path, candidates: tuple[Path, ...])
 
 
 def _read_mcp_servers(path: Path) -> dict[str, JsonValue]:
-    raw_data = read_json_mapping(path) if path.suffix == ".json" else read_yaml_mapping(path)
-    mcp_servers = raw_data.get("mcpServers")
-    if isinstance(mcp_servers, dict):
-        return {str(key): value for key, value in mcp_servers.items()}
-    servers = raw_data.get("servers")
-    if isinstance(servers, dict):
-        return {str(key): value for key, value in servers.items()}
-    if _looks_like_mcp_server_config(raw_data):
-        return {path.stem.removeprefix("."): raw_data}
-    return {str(key): value for key, value in raw_data.items()}
+    return read_mcp_servers(path, default_server_name=path.stem.removeprefix("."))
 
 
 def _mcp_servers_subset(candidate_servers: dict[str, JsonValue], source_servers: dict[str, JsonValue]) -> bool:
@@ -239,10 +229,6 @@ def _cursor_only_mcp_support() -> dict[Harness, TargetSupport]:
     support = unsupported_support("Cursor-specific MCP config is only distributed to Cursor.")
     support["cursor"] = TargetSupport(mode="native")
     return support
-
-
-def _looks_like_mcp_server_config(value: dict[str, JsonValue]) -> bool:
-    return any(key in value for key in MCP_SERVER_CONFIG_KEYS)
 
 
 def _slugify(value: str) -> str:

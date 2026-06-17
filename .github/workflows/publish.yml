@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: release/stable
+      source-branch:
+        description: Branch allowed to publish generated artifacts.
+        required: false
+        type: string
+        default: main
 
 jobs:
   instruction-hub:
@@ -20,11 +25,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: Promptless/instruction-hub-toolchain@v0
         with:
           mode: publish
           hub-root: ${{ inputs.hub-root }}
           release-branch: ${{ inputs.release-branch }}
+          source-branch: ${{ inputs.source-branch }}
+          github-token: ${{ github.token }}

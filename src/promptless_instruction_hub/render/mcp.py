@@ -4,16 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from promptless_instruction_hub.fs import JsonValue, read_json_mapping, read_yaml_mapping, write_json
+from promptless_instruction_hub.errors import InstructionHubError
+from promptless_instruction_hub.fs import JsonValue, write_json
+from promptless_instruction_hub.mcp_config import read_mcp_servers
 from promptless_instruction_hub.models import Harness, LoadedAsset
-
-MCP_SERVER_CONFIG_KEYS = {"command", "url", "type", "args", "env", "headers", "transport"}
 
 
 def collect_mcp_servers(target: Harness, assets: list[LoadedAsset]) -> dict[str, JsonValue]:
     """Collect MCP server definitions supported by one target harness."""
 
     servers: dict[str, JsonValue] = {}
+    server_origins: dict[str, tuple[int, str]] = {}
     mcp_assets = sorted(
         (asset for asset in assets if asset.type == "mcp"),
         key=lambda asset: (_mcp_asset_priority(asset, target), asset.id),
@@ -22,7 +23,18 @@ def collect_mcp_servers(target: Harness, assets: list[LoadedAsset]) -> dict[str,
         support = asset.metadata.support[target]
         if support.mode == "unsupported":
             continue
-        servers.update(_read_mcp_servers(asset))
+        priority = _mcp_asset_priority(asset, target)
+        for server_name, server_config in read_mcp_servers(asset.path, default_server_name=asset.id).items():
+            previous_origin = server_origins.get(server_name)
+            if previous_origin is not None:
+                previous_priority, previous_ref = previous_origin
+                if previous_priority == priority:
+                    msg = f"duplicate MCP server {server_name!r} for {target}: {previous_ref} and {asset.ref}"
+                    raise InstructionHubError(msg)
+                if previous_priority > priority:
+                    continue
+            servers[server_name] = server_config
+            server_origins[server_name] = (priority, asset.ref)
     return servers
 
 
@@ -38,36 +50,6 @@ def write_mcp_config(target_root: Path, target: Harness, mcp_servers: dict[str, 
     if target == "gemini":
         return
     write_json(target_root / ".mcp.json", {"mcpServers": mcp_servers})
-
-
-def _read_mcp_servers(asset: LoadedAsset) -> dict[str, JsonValue]:
-    raw_data = _read_asset_structured_mapping(asset)
-    mcp_servers = raw_data.get("mcpServers")
-    if isinstance(mcp_servers, dict):
-        return {str(key): value for key, value in mcp_servers.items()}
-    servers = raw_data.get("servers")
-    if isinstance(servers, dict):
-        return {str(key): value for key, value in servers.items()}
-    if _looks_like_mcp_server_config(raw_data):
-        return {asset.id: raw_data}
-    return {str(key): value for key, value in raw_data.items()}
-
-
-def _read_asset_structured_mapping(asset: LoadedAsset) -> dict[str, JsonValue]:
-    source_path = asset.path
-    if source_path.is_dir():
-        for candidate_name in (".mcp.json", "mcp.json", "mcp.yaml", "mcp.yml"):
-            candidate = source_path / candidate_name
-            if candidate.exists():
-                source_path = candidate
-                break
-    if source_path.suffix == ".json":
-        return read_json_mapping(source_path)
-    return read_yaml_mapping(source_path)
-
-
-def _looks_like_mcp_server_config(value: dict[str, JsonValue]) -> bool:
-    return any(key in value for key in MCP_SERVER_CONFIG_KEYS)
 
 
 def _mcp_asset_priority(asset: LoadedAsset, target: Harness) -> int:
