@@ -16,8 +16,9 @@ from promptless_instruction_hub.errors import BuildCheckFailedError, Instruction
 from promptless_instruction_hub.mcp_status import STATUS_TOOL_NAME, run_status_mcp
 from promptless_instruction_hub.scan.hub import scan_hub
 
-FIXTURES = Path(__file__).parent / "fixtures"
-SCHEMAS = Path(__file__).parents[2] / "schemas"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = REPO_ROOT / "tests/fixtures"
+SCHEMAS = REPO_ROOT / "schemas"
 
 
 def test_init_creates_empty_hub_contract(tmp_path: Path) -> None:

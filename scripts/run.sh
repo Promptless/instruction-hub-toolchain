@@ -27,7 +27,7 @@ while IFS= read -r line; do
 done <<< "$generated_paths_input"
 
 pi() {
-  uv run --project "$GITHUB_ACTION_PATH/python-core" promptless-instruction-hub "$@"
+  uv run --project "$GITHUB_ACTION_PATH" promptless-instruction-hub "$@"
 }
 
 hub_relative_path() {

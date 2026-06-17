@@ -1,7 +1,7 @@
 # Promptless Instruction Hub Toolchain
 
 This repository is the canonical public toolchain for Promptless Instruction
-Hub repositories. It bundles the Python compiler in `python-core/` and exposes a
+Hub repositories. It bundles the Python compiler and exposes a
 composite GitHub Action for validating, building, and publishing generated hub
 artifacts.
 
@@ -25,7 +25,7 @@ jobs:
 The action runs the bundled compiler directly:
 
 ```bash
-uv run --project "$GITHUB_ACTION_PATH/python-core" promptless-instruction-hub <command>
+uv run --project "$GITHUB_ACTION_PATH" promptless-instruction-hub <command>
 ```
 
 ## Modes

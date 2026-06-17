@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: Promptless/instruction-hub-action@v0
+      - uses: Promptless/instruction-hub-toolchain@v0
         with:
           mode: ${{ inputs.mode }}
           hub-root: ${{ inputs.hub-root }}
