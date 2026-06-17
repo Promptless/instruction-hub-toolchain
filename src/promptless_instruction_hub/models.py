@@ -54,7 +54,6 @@ class TargetSupport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: SupportMode
-    source: str | None = None
     reason: str | None = None
 
     @model_validator(mode="after")

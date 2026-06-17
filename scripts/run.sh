@@ -20,6 +20,33 @@ fi
 hub_root="$(cd "$hub_root" && pwd)"
 
 declare -a generated_paths=()
+declare -a release_worktrees=()
+declare -a temp_paths=()
+
+cleanup_temp_paths() {
+  for worktree_path in "${release_worktrees[@]}"; do
+    if [[ -d "$worktree_path" ]]; then
+      git -C "$repo_root" worktree remove "$worktree_path" --force >/dev/null 2>&1 || rm -rf "$worktree_path"
+    fi
+  done
+  for temp_path in "${temp_paths[@]}"; do
+    rm -rf "$temp_path"
+  done
+}
+
+trap cleanup_temp_paths EXIT
+
+validate_release_branch() {
+  local branch="$1"
+  if [[ -z "$branch" || "$branch" == -* || "$branch" == *$'\n'* || "$branch" == *$'\r'* ]]; then
+    echo "Invalid release-branch: must be a non-empty git branch name without control characters." >&2
+    exit 2
+  fi
+  if ! git check-ref-format "refs/heads/$branch" >/dev/null 2>&1; then
+    echo "Invalid release-branch '$branch': expected a valid git branch name." >&2
+    exit 2
+  fi
+}
 
 reject_generated_path() {
   local path="$1"
@@ -47,10 +74,13 @@ append_generated_path() {
 }
 
 while IFS= read -r line; do
-  for path in $line; do
+  read -r -a path_tokens <<< "$line"
+  for path in "${path_tokens[@]}"; do
     append_generated_path "$path"
   done
 done <<< "$generated_paths_input"
+
+validate_release_branch "$release_branch"
 
 pi() {
   uv run --project "$GITHUB_ACTION_PATH" promptless-instruction-hub "$@"
@@ -116,6 +146,7 @@ publish_release_branch() {
   local worktree
   worktree="$(mktemp -d)"
   rm -rf "$worktree"
+  release_worktrees+=("$worktree")
 
   git -C "$repo_root" config user.name "$commit_user_name"
   git -C "$repo_root" config user.email "$commit_user_email"
@@ -126,7 +157,13 @@ publish_release_branch() {
   else
     git -C "$repo_root" worktree add --detach "$worktree" HEAD
     git -C "$worktree" checkout --orphan "$release_branch"
-    git -C "$worktree" rm -rf . >/dev/null 2>&1 || true
+    if [[ -n "$(git -C "$worktree" ls-files)" ]]; then
+      git -C "$worktree" rm -rf .
+    fi
+    if [[ -n "$(git -C "$worktree" ls-files)" ]]; then
+      echo "Failed to clear tracked files before creating release branch '$release_branch'." >&2
+      exit 1
+    fi
   fi
 
   copy_generated_paths "$worktree" "$hub_rel"
@@ -168,26 +205,28 @@ write_claude_pointer() {
     return 1
   fi
 
+  if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
+    echo "GITHUB_REPOSITORY is required to write the Claude pointer." >&2
+    exit 2
+  fi
+
   mkdir -p "$(dirname "$destination_path")"
-  python - "$marketplace_path" "$destination_path" "${GITHUB_REPOSITORY:-}" "$release_branch" "$plugin_path" <<'PY'
+  python - "$marketplace_path" "$destination_path" "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}.git" "$release_branch" "$plugin_path" <<'PY'
 from pathlib import Path
 import json
 import sys
 
 source_path = Path(sys.argv[1])
 destination_path = Path(sys.argv[2])
-repository = sys.argv[3]
+repository_url = sys.argv[3]
 release_branch = sys.argv[4]
 plugin_path = sys.argv[5]
-
-if not repository:
-    raise SystemExit("GITHUB_REPOSITORY is required to write the Claude pointer")
 
 marketplace = json.loads(source_path.read_text())
 for plugin in marketplace.get("plugins", []):
     plugin["source"] = {
         "source": "git-subdir",
-        "url": repository,
+        "url": repository_url,
         "path": plugin_path,
         "ref": release_branch,
     }
@@ -218,9 +257,10 @@ commit_claude_pointer() {
 
 case "$mode" in
   build)
+    hub_rel="$(hub_relative_path)"
     pi validate --hub "$hub_root"
     pi build --hub "$hub_root"
-    restore_generated_paths_on_default_branch "$(hub_relative_path)"
+    restore_generated_paths_on_default_branch "$hub_rel"
     ;;
   check)
     pi validate --hub "$hub_root"
@@ -229,6 +269,7 @@ case "$mode" in
   publish)
     hub_rel="$(hub_relative_path)"
     payload_root="$(mktemp -d)"
+    temp_paths+=("$payload_root")
     pi validate --hub "$hub_root"
     pi build --hub "$hub_root"
     copy_generated_paths "$payload_root" "$hub_rel"
@@ -239,7 +280,6 @@ case "$mode" in
         commit_claude_pointer "$hub_rel"
       fi
     fi
-    rm -rf "$payload_root"
     ;;
   *)
     echo "Unsupported mode: $mode. Expected build, check, or publish." >&2
@@ -248,5 +288,5 @@ case "$mode" in
 esac
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-  echo "release-branch=$release_branch" >> "$GITHUB_OUTPUT"
+  printf 'release-branch=%s\n' "$release_branch" >> "$GITHUB_OUTPUT"
 fi

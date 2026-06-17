@@ -59,12 +59,18 @@ def _import_skills(hub_root: Path, source_root: Path) -> list[str]:
     if not skills_root.exists():
         return []
     imported: list[str] = []
+    seen_asset_ids: dict[str, Path] = {}
     for source_skill in sorted(path for path in skills_root.iterdir() if path.is_dir()):
         skill_file = _find_skill_file(source_skill)
         if skill_file is None:
             msg = f"source skill directory must contain SKILL.md: {source_skill}"
             raise InstructionHubError(msg)
         asset_id = _slugify(source_skill.name)
+        previous_source = seen_asset_ids.get(asset_id)
+        if previous_source is not None:
+            msg = f"source skill directories {previous_source} and {source_skill} both map to asset id {asset_id!r}"
+            raise InstructionHubError(msg)
+        seen_asset_ids[asset_id] = source_skill
         destination = hub_root / "assets/skills" / asset_id
         _copy_skill_tree(source_skill, destination, skill_file)
         imported.append(asset_id)
@@ -156,6 +162,9 @@ def _copy_skill_tree(source_skill: Path, destination: Path, skill_file: Path) ->
         relative_path = source_path.relative_to(source_skill)
         if any(part in skip_names for part in relative_path.parts):
             continue
+        if source_path.is_symlink():
+            msg = f"source skill contains a symlink that cannot be imported: {source_path}"
+            raise InstructionHubError(msg)
         target_relative_path = Path("SKILL.md") if source_path == skill_file else relative_path
         target_path = destination / target_relative_path
         if source_path.is_dir():

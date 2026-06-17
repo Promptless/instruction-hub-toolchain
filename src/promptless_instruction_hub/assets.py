@@ -29,6 +29,7 @@ from promptless_instruction_hub.models import (
 ASSETS_DIR = Path("assets")
 METADATA_FILE = "asset.yaml"
 SECRET_KEY_FRAGMENTS = ("token", "secret", "password", "api_key", "apikey", "private_key")
+SECRET_KEY_NAMES = {"authorization", "cookie", "proxy_authorization", "x_api_key"}
 SUPPORTED_FILE_SUFFIXES = (".md", ".yaml", ".yml", ".json")
 SIDECAR_METADATA_SUFFIX = ".asset.yaml"
 DEFAULT_TITLES = {
@@ -39,10 +40,6 @@ DEFAULT_TITLES = {
 
 def load_assets(hub_root: Path) -> dict[str, LoadedAsset]:
     """Load all supported assets under the hub's `assets/` directory."""
-
-    assets_root = hub_root / ASSETS_DIR
-    if assets_root.exists():
-        _reject_symlinks_under(assets_root)
 
     assets: dict[str, LoadedAsset] = {}
     for asset in _iter_assets(hub_root):
@@ -65,6 +62,18 @@ def validate_no_literal_secrets(hub_root: Path) -> None:
         if data is None:
             continue
         _validate_secret_values(source_path, data, ())
+
+
+def validate_no_symlinks(hub_root: Path) -> None:
+    """Reject symlinks in source assets so builds cannot dereference files outside the hub."""
+
+    asset_root = hub_root / ASSETS_DIR
+    if not asset_root.exists():
+        return
+    for source_path in sorted(asset_root.rglob("*")):
+        if source_path.is_symlink():
+            msg = f"{source_path} is a symlink; Instruction Hub assets must be regular files or directories"
+            raise InstructionHubError(msg)
 
 
 def default_skill_support() -> dict[Harness, TargetSupport]:
@@ -133,18 +142,6 @@ def _iter_assets(hub_root: Path) -> Iterable[LoadedAsset]:
         if not kind_dir.exists():
             continue
         yield from _iter_non_skill_assets(kind_dir, asset_kind)
-
-
-def _reject_symlinks_under(path: Path) -> None:
-    if path.is_symlink():
-        msg = f"asset paths must not be symlinks: {path}"
-        raise InstructionHubError(msg)
-    if not path.is_dir():
-        return
-    for child in path.rglob("*"):
-        if child.is_symlink():
-            msg = f"asset paths must not be symlinks: {child}"
-            raise InstructionHubError(msg)
 
 
 def _iter_non_skill_assets(kind_dir: Path, asset_kind: AssetKind) -> Iterable[LoadedAsset]:
@@ -252,8 +249,9 @@ def _validate_secret_values(path: Path, value: object, key_path: tuple[str, ...]
         return
     if not isinstance(value, str):
         return
-    joined_key = ".".join(key_path).lower()
-    if not any(fragment in joined_key for fragment in SECRET_KEY_FRAGMENTS):
+    normalized_key_path = tuple(_normalize_key_fragment(key) for key in key_path)
+    joined_key = ".".join(normalized_key_path)
+    if not _requires_env_placeholder(normalized_key_path, joined_key):
         return
     if value.startswith("${") and value.endswith("}"):
         return
@@ -261,6 +259,16 @@ def _validate_secret_values(path: Path, value: object, key_path: tuple[str, ...]
         return
     msg = f"{path} contains a literal secret-looking value at {'.'.join(key_path)}; use an env placeholder"
     raise InstructionHubError(msg)
+
+
+def _normalize_key_fragment(key: str) -> str:
+    return key.lower().replace("-", "_")
+
+
+def _requires_env_placeholder(key_path: tuple[str, ...], joined_key: str) -> bool:
+    if any(key in SECRET_KEY_NAMES for key in key_path):
+        return True
+    return any(fragment in joined_key for fragment in SECRET_KEY_FRAGMENTS)
 
 
 def _read_structured_file(path: Path) -> object:
