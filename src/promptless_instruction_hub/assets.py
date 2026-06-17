@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 import yaml
@@ -259,7 +259,7 @@ def _validate_secret_values(path: Path, value: object, key_path: tuple[str, ...]
     _raise_literal_secret(path, key_path)
 
 
-def _validate_secret_arg_values(path: Path, values: list[object], key_path: tuple[str, ...]) -> None:
+def _validate_secret_arg_values(path: Path, values: Sequence[object], key_path: tuple[str, ...]) -> None:
     if not key_path or _normalize_key_fragment(key_path[-1]) != "args":
         return
     for index, value in enumerate(values):
