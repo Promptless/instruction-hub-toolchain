@@ -37,7 +37,8 @@
           "minLength": 1
         },
         "version": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9]\\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?$"
         }
       }
     },
@@ -139,15 +140,28 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["mode"],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "unsupported"
+              }
+            },
+            "required": ["mode"]
+          },
+          "then": {
+            "required": ["reason"]
+          }
+        }
+      ],
       "properties": {
         "mode": {
           "enum": ["agent-skill", "native", "projected", "unsupported"]
         },
-        "source": {
-          "type": ["string", "null"]
-        },
         "reason": {
-          "type": ["string", "null"]
+          "type": "string",
+          "minLength": 1
         }
       }
     }

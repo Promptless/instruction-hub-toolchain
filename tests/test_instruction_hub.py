@@ -153,6 +153,21 @@ def test_scan_normalizes_lowercase_skill_file_to_canonical_name(tmp_path: Path) 
     build_hub(hub_root)
 
 
+def test_scan_rejects_skill_slug_collisions(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    source_root = tmp_path / "source"
+    first_skill = source_root / ".agents/skills/Review Docs"
+    second_skill = source_root / ".agents/skills/review-docs"
+    first_skill.mkdir(parents=True)
+    second_skill.mkdir(parents=True)
+    (first_skill / "SKILL.md").write_text("# First\n")
+    (second_skill / "SKILL.md").write_text("# Second\n")
+    init_hub(hub_root)
+
+    with pytest.raises(InstructionHubError, match="both map to asset id"):
+        scan_hub(hub_root, source_root)
+
+
 def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -355,6 +370,54 @@ def test_action_script_rejects_generated_paths_outside_hub(generated_paths: str)
     assert "inside hub-root" in result.stderr
 
 
+def test_action_script_rejects_invalid_release_branch() -> None:
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/run.sh")],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "GITHUB_ACTION_PATH": str(REPO_ROOT),
+            "INPUT_MODE": "check",
+            "INPUT_HUB_ROOT": ".",
+            "INPUT_RELEASE_BRANCH": "bad\nbranch",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "Invalid release-branch" in result.stderr
+
+
+def test_action_publish_writes_release_branch_and_claude_git_pointer(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish", targets=("claude", "codex"))
+    output_path = tmp_path / "github-output.txt"
+
+    result = _run_action(repo, output_path)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    _git(repo, "fetch", "origin", "release/stable")
+    assert json.loads(_git_output(repo, "show", "origin/release/stable:dist/claude/.claude-plugin/plugin.json"))
+    pointer = json.loads((repo / ".claude-plugin/marketplace.json").read_text())
+    assert pointer["plugins"][0]["source"] == {
+        "source": "git-subdir",
+        "url": "https://github.com/Promptless/instruction-hub-test.git",
+        "path": "dist/claude",
+        "ref": "release/stable",
+    }
+    assert output_path.read_text() == "release-branch=release/stable\n"
+
+
+def test_action_publish_skips_claude_pointer_when_claude_target_is_absent(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-codex-only", targets=("codex",))
+
+    result = _run_action(repo, tmp_path / "github-output.txt")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (repo / ".claude-plugin/marketplace.json").exists()
+
+
 def test_validate_rejects_unknown_package_refs(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -419,6 +482,20 @@ def test_validate_rejects_malformed_asset_candidates(tmp_path: Path) -> None:
         validate_hub(hub_root)
 
 
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are unavailable on this platform")
+def test_validate_rejects_symlinked_assets(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    secret_path = tmp_path / "outside-secret.md"
+    skill_root = hub_root / "assets/skills/leak"
+    init_hub(hub_root)
+    skill_root.mkdir(parents=True)
+    secret_path.write_text("# Leaked\n\nexternal content\n")
+    os.symlink(secret_path, skill_root / "SKILL.md")
+
+    with pytest.raises(InstructionHubError, match="symlink"):
+        validate_hub(hub_root)
+
+
 def test_validate_rejects_literal_mcp_secrets(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -426,6 +503,65 @@ def test_validate_rejects_literal_mcp_secrets(tmp_path: Path) -> None:
     mcp_path.write_text("api_token: sk-live-secret\n")
 
     with pytest.raises(InstructionHubError, match="literal secret"):
+        validate_hub(hub_root)
+
+
+def test_validate_rejects_literal_mcp_authorization_headers(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    (hub_root / "assets/mcps/bad.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "bad": {
+                        "url": "https://example.invalid/mcp",
+                        "headers": {"Authorization": "Bearer literal-secret"},
+                    }
+                }
+            }
+        )
+    )
+
+    with pytest.raises(InstructionHubError, match="literal secret"):
+        validate_hub(hub_root)
+
+
+def test_validate_rejects_unimplemented_target_support_source(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    (hub_root / "assets/rules/source-mode.md").write_text("# Source Mode\n")
+    (hub_root / "assets/rules/source-mode.asset.yaml").write_text(
+        "\n".join(
+            [
+                "support:",
+                "  codex:",
+                "    mode: projected",
+                "    source: native",
+                "",
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match="source"):
+        validate_hub(hub_root)
+
+
+def test_validate_rejects_mcp_support_modes_that_cannot_render(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    (hub_root / "assets/mcps/trace.json").write_text(json.dumps({"trace": {"command": "trace-agent"}}))
+    (hub_root / "assets/mcps/trace.asset.yaml").write_text(
+        "\n".join(
+            [
+                "support:",
+                "  codex:",
+                "    mode: projected",
+                "",
+            ]
+        )
+    )
+
+    with pytest.raises(InstructionHubError, match="mcp:trace declares unsupported mode"):
         validate_hub(hub_root)
 
 
@@ -512,7 +648,76 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
     assert "git_commit" not in schema["properties"]
     asset_schema = schema["properties"]["assets"]["items"]
     assert asset_schema["required"] == ["ref", "id", "type", "title", "source_path", "content_hash", "support"]
+    assert "pattern" in schema["properties"]["plugin"]["properties"]["version"]
+    target_support_schema = schema["$defs"]["target_support"]
+    assert "source" not in target_support_schema["properties"]
+    assert target_support_schema["properties"]["reason"] == {"type": "string", "minLength": 1}
+    assert target_support_schema["allOf"][0]["then"]["required"] == ["reason"]
 
 
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _git_output(cwd: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, text=True, capture_output=True).stdout
+
+
+def _init_action_repo(root: Path, *, targets: tuple[str, ...]) -> Path:
+    remote = root / "remote.git"
+    repo = root / "repo"
+    root.mkdir(parents=True)
+    _git(root, "init", "--bare", str(remote))
+    repo.mkdir()
+    init_hub(repo, org="Acme")
+    _write_hub_config(repo, targets)
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "instruction-hub@example.com")
+    _git(repo, "config", "user.name", "Instruction Hub Test")
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "initial hub")
+    _git(repo, "push", "-u", "origin", "main")
+    return repo
+
+
+def _write_hub_config(hub_root: Path, targets: tuple[str, ...]) -> None:
+    target_lines = "\n".join(f"  - {target}" for target in targets)
+    (hub_root / ".promptless/instruction-hub.yaml").write_text(
+        "\n".join(
+            [
+                "org: Acme",
+                "plugin_id: acme-instruction-hub",
+                "plugin_name: Acme Instruction Hub",
+                "plugin_version: 0.1.0",
+                "stable_packages:",
+                "  - core",
+                "targets:",
+                target_lines,
+                "",
+            ]
+        )
+    )
+
+
+def _run_action(repo: Path, output_path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/run.sh")],
+        cwd=repo,
+        env={
+            **os.environ,
+            "GITHUB_ACTION_PATH": str(REPO_ROOT),
+            "GITHUB_WORKSPACE": str(repo),
+            "GITHUB_REPOSITORY": "Promptless/instruction-hub-test",
+            "GITHUB_SERVER_URL": "https://github.com",
+            "GITHUB_REF_NAME": "main",
+            "GITHUB_OUTPUT": str(output_path),
+            "INPUT_MODE": "publish",
+            "INPUT_HUB_ROOT": ".",
+            "INPUT_RELEASE_BRANCH": "release/stable",
+            "INPUT_UPDATE_CLAUDE_POINTER": "true",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )

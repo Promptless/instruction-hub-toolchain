@@ -5,10 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from promptless_instruction_hub.assets import load_assets, validate_no_literal_secrets
+from promptless_instruction_hub.assets import load_assets, validate_no_literal_secrets, validate_no_symlinks
 from promptless_instruction_hub.config import load_hub_config, load_packages
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.models import HubConfig, LoadedAsset, PackageDefinition
+
+SUPPORT_MODES_BY_ASSET_TYPE = {
+    "skill": {"agent-skill", "native", "projected", "unsupported"},
+    "rule": {"native", "projected", "unsupported"},
+    "agent": {"native", "projected", "unsupported"},
+    "command": {"native", "projected", "unsupported"},
+    "hook": {"native", "projected", "unsupported"},
+    "mcp": {"native", "unsupported"},
+}
 
 
 @dataclass(frozen=True)
@@ -27,6 +36,7 @@ def validate_hub(hub_root: Path) -> ValidationResult:
     root = hub_root.resolve()
     config = load_hub_config(root)
     packages = load_packages(root)
+    validate_no_symlinks(root)
     assets = load_assets(root)
     validate_no_literal_secrets(root)
     _validate_target_support(config, assets)
@@ -40,6 +50,17 @@ def _validate_target_support(config: HubConfig, assets: dict[str, LoadedAsset]) 
         if missing_targets:
             msg = f"{asset.ref} is missing target support for: {', '.join(missing_targets)}"
             raise InstructionHubError(msg)
+        _validate_support_modes(asset)
+
+
+def _validate_support_modes(asset: LoadedAsset) -> None:
+    allowed_modes = SUPPORT_MODES_BY_ASSET_TYPE[asset.type]
+    for target, support in sorted(asset.metadata.support.items()):
+        if support.mode in allowed_modes:
+            continue
+        allowed = ", ".join(sorted(allowed_modes))
+        msg = f"{asset.ref} declares unsupported mode {support.mode!r} for {target}; allowed modes: {allowed}"
+        raise InstructionHubError(msg)
 
 
 def _resolve_stable_assets(

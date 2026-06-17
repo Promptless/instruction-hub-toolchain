@@ -40,8 +40,7 @@ concurrency:
 
 permissions:
   contents: read
-  issues: write
-  pull-requests: write
+  pull-requests: read
 
 jobs:
   codex-bug-bot-review:
@@ -50,6 +49,9 @@ jobs:
         github.event_name != 'pull_request' ||
         (github.event.pull_request != null && github.event.pull_request.draft == false)
       }}
+    permissions:
+      contents: read
+      pull-requests: read
     runs-on: ubuntu-latest
     outputs:
       final_message: ${{ steps.run_codex.outputs['final-message'] }}
@@ -121,6 +123,7 @@ jobs:
         with:
           ref: refs/pull/${{ steps.pr_context.outputs.number }}/merge
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Build prompt
         if: ${{ env.OPENAI_API_KEY != '' }}
@@ -189,7 +192,7 @@ jobs:
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ env.OPENAI_API_KEY }}
-          sandbox: danger-full-access
+          sandbox: workspace-write
           codex-args: '["--config","reasoning.effort=${{ env.CODEX_REASONING }}"]'
           prompt-file: .bugbot-prompt.md
           allow-bots: true
@@ -199,6 +202,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: codex-bug-bot-review
     if: needs.codex-bug-bot-review.outputs.final_message != ''
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     steps:
       - name: Post Bug Bot review with inline comments
         uses: actions/github-script@v7
