@@ -1,0 +1,77 @@
+name: Promptless Instruction Hub Toolchain
+description: Build, validate, and publish Promptless Instruction Hub artifacts.
+
+inputs:
+  mode:
+    description: build, check, or publish.
+    required: false
+    default: build
+  hub-root:
+    description: Path to the Instruction Hub root within the checked-out repository.
+    required: false
+    default: .
+  release-branch:
+    description: Branch that receives generated Instruction Hub artifacts in publish mode.
+    required: false
+    default: release/stable
+  source-branch:
+    description: Branch allowed to run publish mode and receive default-branch pointer updates.
+    required: false
+    default: main
+  generated-paths:
+    description: Whitespace-separated generated paths relative to hub-root.
+    required: false
+    default: >-
+      dist
+      .agents/plugins
+      .claude-plugin
+      .cursor-plugin
+      .promptless/releases
+      .promptless/channels
+  update-claude-pointer:
+    description: Commit a default-branch Claude marketplace pointer that targets the release branch in publish mode.
+    required: false
+    default: "true"
+  github-token:
+    description: Token used only for publish-mode git pushes when checkout credentials are not persisted.
+    required: false
+    default: ""
+  commit-user-name:
+    description: Git author name for publish-mode commits.
+    required: false
+    default: github-actions[bot]
+  commit-user-email:
+    description: Git author email for publish-mode commits.
+    required: false
+    default: 41898282+github-actions[bot]@users.noreply.github.com
+  commit-message:
+    description: Commit message for publish-mode release branch updates.
+    required: false
+    default: Update Instruction Hub release
+
+outputs:
+  release-branch:
+    description: Release branch updated by publish mode.
+    value: ${{ steps.instruction-hub.outputs.release-branch }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up uv
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+
+    - name: Run Instruction Hub
+      id: instruction-hub
+      shell: bash
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_HUB_ROOT: ${{ inputs.hub-root }}
+        INPUT_RELEASE_BRANCH: ${{ inputs.release-branch }}
+        INPUT_SOURCE_BRANCH: ${{ inputs.source-branch }}
+        INPUT_GENERATED_PATHS: ${{ inputs.generated-paths }}
+        INPUT_UPDATE_CLAUDE_POINTER: ${{ inputs.update-claude-pointer }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_COMMIT_USER_NAME: ${{ inputs.commit-user-name }}
+        INPUT_COMMIT_USER_EMAIL: ${{ inputs.commit-user-email }}
+        INPUT_COMMIT_MESSAGE: ${{ inputs.commit-message }}
+      run: "$GITHUB_ACTION_PATH/scripts/run.sh"
