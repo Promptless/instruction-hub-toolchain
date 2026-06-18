@@ -29,7 +29,34 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: Promptless/instruction-hub-toolchain@v0
+      - name: Resolve toolchain ref
+        id: toolchain-ref
+        shell: bash
+        env:
+          EXPECTED_WORKFLOW_PREFIX: Promptless/instruction-hub-toolchain/.github/workflows/publish.yml@
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$JOB_WORKFLOW_REF" != "$EXPECTED_WORKFLOW_PREFIX"* ]]; then
+            echo "Unexpected reusable workflow ref: $JOB_WORKFLOW_REF" >&2
+            exit 2
+          fi
+
+          toolchain_ref="${JOB_WORKFLOW_REF#"$EXPECTED_WORKFLOW_PREFIX"}"
+          if [[ -z "$toolchain_ref" ]]; then
+            echo "Unable to resolve toolchain ref from job.workflow_ref." >&2
+            exit 2
+          fi
+
+          printf 'ref=%s\n' "$toolchain_ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: Promptless/instruction-hub-toolchain
+          ref: ${{ steps.toolchain-ref.outputs.ref }}
+          path: .promptless-instruction-hub-toolchain
+          persist-credentials: false
+      - uses: ./.promptless-instruction-hub-toolchain
         with:
           mode: publish
           hub-root: ${{ inputs.hub-root }}

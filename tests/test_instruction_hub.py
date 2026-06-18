@@ -20,6 +20,7 @@ from promptless_instruction_hub.scan.hub import scan_hub
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests/fixtures"
 SCHEMAS = REPO_ROOT / "schemas"
+WORKFLOWS = REPO_ROOT / ".github/workflows"
 
 
 def _assert_codex_plugin_ingestion_contract(plugin_root: Path) -> None:
@@ -69,6 +70,21 @@ def _assert_codex_plugin_ingestion_contract(plugin_root: Path) -> None:
 def _assert_non_empty_string(value: object, field_path: str) -> None:
     assert isinstance(value, str), f"{field_path} must be a string"
     assert value, f"{field_path} must not be empty"
+
+
+@pytest.mark.parametrize("workflow_name", ["pr-check.yml", "publish.yml"])
+def test_reusable_workflows_run_caller_pinned_toolchain_ref(workflow_name: str) -> None:
+    workflow_text = (WORKFLOWS / workflow_name).read_text()
+
+    assert "Promptless/instruction-hub-toolchain@v0" not in workflow_text
+    assert (
+        f"EXPECTED_WORKFLOW_PREFIX: Promptless/instruction-hub-toolchain/.github/workflows/{workflow_name}@"
+    ) in workflow_text
+    assert "JOB_WORKFLOW_REF: ${{ job.workflow_ref }}" in workflow_text
+    assert "repository: Promptless/instruction-hub-toolchain" in workflow_text
+    assert "ref: ${{ steps.toolchain-ref.outputs.ref }}" in workflow_text
+    assert "path: .promptless-instruction-hub-toolchain" in workflow_text
+    assert "uses: ./.promptless-instruction-hub-toolchain" in workflow_text
 
 
 def test_init_creates_empty_hub_contract(tmp_path: Path) -> None:
