@@ -42,7 +42,7 @@ def write_mcp_config(target_root: Path, target: Harness, mcp_servers: dict[str, 
     """Write the MCP config shape expected by one target harness."""
 
     if target == "codex":
-        write_json(target_root / ".mcp.json", mcp_servers)
+        write_json(target_root / ".mcp.json", {"mcpServers": mcp_servers})
         return
     if target == "cursor":
         write_json(target_root / "mcp.json", {"mcpServers": mcp_servers})

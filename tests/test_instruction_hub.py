@@ -22,6 +22,46 @@ FIXTURES = REPO_ROOT / "tests/fixtures"
 SCHEMAS = REPO_ROOT / "schemas"
 
 
+def _assert_codex_plugin_ingestion_contract(plugin_root: Path) -> None:
+    manifest_path = plugin_root / ".codex-plugin/plugin.json"
+    manifest_data: object = json.loads(manifest_path.read_text())
+    assert isinstance(manifest_data, dict)
+
+    for field in ("name", "version", "description"):
+        _assert_non_empty_string(manifest_data.get(field), f"plugin.json {field}")
+    assert re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", manifest_data["version"])
+
+    author_data = manifest_data.get("author")
+    assert isinstance(author_data, dict)
+    _assert_non_empty_string(author_data.get("name"), "plugin.json author.name")
+
+    interface_data = manifest_data.get("interface")
+    assert isinstance(interface_data, dict)
+    for field in ("displayName", "shortDescription", "longDescription", "developerName", "category"):
+        _assert_non_empty_string(interface_data.get(field), f"plugin.json interface.{field}")
+
+    capabilities_data = interface_data.get("capabilities")
+    assert isinstance(capabilities_data, list)
+    assert all(isinstance(capability, str) and capability for capability in capabilities_data)
+    assert "defaultPrompt" in interface_data or "default_prompt" in interface_data
+
+    if "mcpServers" not in manifest_data:
+        return
+    assert manifest_data["mcpServers"] == "./.mcp.json"
+    mcp_data: object = json.loads((plugin_root / ".mcp.json").read_text())
+    assert isinstance(mcp_data, dict)
+    assert set(mcp_data) == {"mcpServers"}
+    servers_data = mcp_data["mcpServers"]
+    assert isinstance(servers_data, dict)
+    assert all(isinstance(server_name, str) and server_name for server_name in servers_data)
+    assert all(isinstance(server_config, dict) for server_config in servers_data.values())
+
+
+def _assert_non_empty_string(value: object, field_path: str) -> None:
+    assert isinstance(value, str), f"{field_path} must be a string"
+    assert value, f"{field_path} must not be empty"
+
+
 def test_init_creates_empty_hub_contract(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
 
@@ -132,7 +172,7 @@ def test_scan_imports_cursor_mcp_override_when_root_differs(tmp_path: Path) -> N
     assert "mcp:repo-mcp" in core_package
     assert "mcp:cursor-mcp" in core_package
     codex_mcp_config = json.loads((hub_root / "dist/codex/.mcp.json").read_text())
-    assert codex_mcp_config["shared"]["command"] == "root-server"
+    assert codex_mcp_config["mcpServers"]["shared"]["command"] == "root-server"
     cursor_mcp_config = json.loads((hub_root / "dist/cursor/mcp.json").read_text())
     assert cursor_mcp_config["mcpServers"]["shared"]["command"] == "cursor-server"
 
@@ -179,6 +219,7 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     assert first.release_hash == second.release_hash
     assert (hub_root / "dist/claude/.claude-plugin/plugin.json").exists()
     assert (hub_root / "dist/codex/.codex-plugin/plugin.json").exists()
+    _assert_codex_plugin_ingestion_contract(hub_root / "dist/codex")
     assert (hub_root / "dist/gemini/gemini-extension.json").exists()
     assert (hub_root / "dist/cursor/.cursor-plugin/plugin.json").exists()
     assert (hub_root / "dist/cursor/skills/review-docs/SKILL.md").exists()
@@ -200,7 +241,16 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     codex_manifest = json.loads((hub_root / "dist/codex/.codex-plugin/plugin.json").read_text())
     assert codex_manifest["skills"] == "./skills/"
     assert codex_manifest["mcpServers"] == "./.mcp.json"
+    assert codex_manifest["author"]["name"] == "Promptless"
     assert codex_manifest["interface"]["displayName"] == "Promptless Instruction Hub"
+    assert (
+        codex_manifest["interface"]["longDescription"]
+        == "Promptless Instruction Hub distributes governed agent instructions for Promptless."
+    )
+    assert codex_manifest["interface"]["capabilities"] == ["Skills", "MCP servers"]
+    assert codex_manifest["interface"]["defaultPrompt"] == [
+        "Use Promptless Instruction Hub instructions for this task."
+    ]
     cursor_manifest = json.loads((hub_root / "dist/cursor/.cursor-plugin/plugin.json").read_text())
     assert cursor_manifest["skills"] == "./skills/"
     gemini_manifest = json.loads((hub_root / "dist/gemini/gemini-extension.json").read_text())
@@ -208,9 +258,9 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     assert gemini_manifest["mcpServers"]["fixture-trace"]["env"]["PROMPTLESS_API_KEY"] == "${PROMPTLESS_API_KEY}"
     assert (hub_root / "dist/codex/.promptless/release.json").exists()
     mcp_config = json.loads((hub_root / "dist/codex/.mcp.json").read_text())
-    assert mcp_config["fixture-trace"]["env"]["PROMPTLESS_API_KEY"] == "${PROMPTLESS_API_KEY}"
-    assert mcp_config["fixture-docs"]["url"] == "https://example.invalid/mcp"
-    assert "promptless-instruction-hub-status" not in mcp_config
+    assert mcp_config["mcpServers"]["fixture-trace"]["env"]["PROMPTLESS_API_KEY"] == "${PROMPTLESS_API_KEY}"
+    assert mcp_config["mcpServers"]["fixture-docs"]["url"] == "https://example.invalid/mcp"
+    assert "promptless-instruction-hub-status" not in mcp_config["mcpServers"]
     release_manifest = json.loads((hub_root / ".promptless/releases/current.json").read_text())
     assert "git_commit" not in release_manifest
     assert set(release_manifest["target_hashes"]) == {"claude", "codex", "cursor", "gemini"}
@@ -343,7 +393,7 @@ def test_build_renders_projected_rules_native_cursor_rules_and_mcp_assets(tmp_pa
     assert (hub_root / "dist/codex/projected/codex/team-style.md").read_text().startswith("# Team Style")
     assert "alwaysApply: false" in (hub_root / "dist/cursor/rules/team-style.mdc").read_text()
     codex_mcp_config = json.loads((hub_root / "dist/codex/.mcp.json").read_text())
-    assert codex_mcp_config["trace-reporter"]["env"]["PROMPTLESS_API_KEY"] == "${PROMPTLESS_API_KEY}"
+    assert codex_mcp_config["mcpServers"]["trace-reporter"]["env"]["PROMPTLESS_API_KEY"] == "${PROMPTLESS_API_KEY}"
     cursor_mcp_config = json.loads((hub_root / "dist/cursor/mcp.json").read_text())
     assert "trace-reporter" in cursor_mcp_config["mcpServers"]
 
