@@ -57,9 +57,16 @@ def _import_skills(hub_root: Path, source_root: Path) -> list[str]:
     skills_root = source_root / SKILL_SOURCE_DIR
     if not skills_root.exists():
         return []
+    _ensure_source_path_importable(skills_root, source_root, "source skills directory")
     imported: list[str] = []
     seen_asset_ids: dict[str, Path] = {}
-    for source_skill in sorted(path for path in skills_root.iterdir() if path.is_dir()):
+    for source_skill in sorted(skills_root.iterdir()):
+        if source_skill.is_symlink():
+            msg = f"source skill directory cannot be a symlink: {source_skill}"
+            raise InstructionHubError(msg)
+        if not source_skill.is_dir():
+            continue
+        _ensure_source_path_importable(source_skill, source_root, "source skill directory")
         skill_file = _find_skill_file(source_skill)
         if skill_file is None:
             msg = f"source skill directory must contain SKILL.md: {source_skill}"
@@ -71,7 +78,7 @@ def _import_skills(hub_root: Path, source_root: Path) -> list[str]:
             raise InstructionHubError(msg)
         seen_asset_ids[asset_id] = source_skill
         destination = hub_root / "assets/skills" / asset_id
-        _copy_skill_tree(source_skill, destination, skill_file)
+        _copy_skill_tree(source_skill, destination, skill_file, source_root)
         imported.append(asset_id)
     return imported
 
@@ -91,8 +98,12 @@ def _import_mcp_configs(hub_root: Path, source_root: Path) -> list[str]:
         imported.append("repo-mcp")
 
     cursor_mcp_path = source_root / CURSOR_MCP_CONFIG
+    if cursor_mcp_path.is_symlink():
+        msg = f"source MCP config cannot be a symlink: {cursor_mcp_path}"
+        raise InstructionHubError(msg)
     if not cursor_mcp_path.is_file():
         return imported
+    _ensure_source_path_importable(cursor_mcp_path, source_root, "source MCP config")
 
     cursor_servers = _read_mcp_servers(cursor_mcp_path)
     if root_servers and _mcp_servers_subset(cursor_servers, root_servers):
@@ -152,7 +163,7 @@ def _inventory_repo_context(hub_root: Path, source_root: Path) -> list[str]:
     return [str(file["path"]) for file in files]
 
 
-def _copy_skill_tree(source_skill: Path, destination: Path, skill_file: Path) -> None:
+def _copy_skill_tree(source_skill: Path, destination: Path, skill_file: Path, source_root: Path) -> None:
     skip_names = {".pytest_cache", ".ruff_cache", "__pycache__"}
     if destination.exists():
         shutil.rmtree(destination)
@@ -164,6 +175,7 @@ def _copy_skill_tree(source_skill: Path, destination: Path, skill_file: Path) ->
         if source_path.is_symlink():
             msg = f"source skill contains a symlink that cannot be imported: {source_path}"
             raise InstructionHubError(msg)
+        _ensure_source_path_importable(source_path, source_root, "source skill file")
         target_relative_path = Path("SKILL.md") if source_path == skill_file else relative_path
         target_path = destination / target_relative_path
         if source_path.is_dir():
@@ -182,6 +194,7 @@ def _copy_mcp_config(
     title: str | None = None,
     support: dict[Harness, TargetSupport] | None = None,
 ) -> None:
+    _ensure_source_path_importable(source_path, source_root, "source MCP config")
     destination = hub_root / "assets/mcps" / f"{asset_id}{source_path.suffix}"
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source_path, destination)
@@ -204,6 +217,9 @@ def _copy_mcp_config(
 
 def _find_skill_file(skill_dir: Path) -> Path | None:
     for child in sorted(skill_dir.iterdir()):
+        if child.is_symlink():
+            msg = f"source skill contains a symlink that cannot be imported: {child}"
+            raise InstructionHubError(msg)
         if child.is_file() and child.name.lower() == "skill.md":
             return child
     return None
@@ -212,9 +228,27 @@ def _find_skill_file(skill_dir: Path) -> Path | None:
 def _first_existing_source_path(source_root: Path, candidates: tuple[Path, ...]) -> Path | None:
     for relative_path in candidates:
         source_path = source_root / relative_path
+        if source_path.is_symlink():
+            msg = f"source MCP config cannot be a symlink: {source_path}"
+            raise InstructionHubError(msg)
         if source_path.is_file():
+            _ensure_source_path_importable(source_path, source_root, "source MCP config")
             return source_path
     return None
+
+
+def _ensure_source_path_importable(source_path: Path, source_root: Path, label: str) -> None:
+    if source_path.is_symlink():
+        msg = f"{label} cannot be a symlink: {source_path}"
+        raise InstructionHubError(msg)
+    try:
+        resolved_path = source_path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        msg = f"{label} does not exist: {source_path}"
+        raise InstructionHubError(msg) from exc
+    if not resolved_path.is_relative_to(source_root):
+        msg = f"{label} must stay inside source root: {source_path}"
+        raise InstructionHubError(msg)
 
 
 def _read_mcp_servers(path: Path) -> dict[str, JsonValue]:

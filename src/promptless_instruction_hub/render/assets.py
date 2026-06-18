@@ -21,7 +21,7 @@ def render_assets_for_target(target_root: Path, target: Harness, assets: list[Lo
         if support.mode == "unsupported" or asset.type == "mcp":
             continue
         if support.mode == "agent-skill":
-            _render_agent_skill(target_root, asset)
+            _render_agent_skill(target_root, target, asset)
             rendered["skills"].append(asset.id)
             continue
         if target == "cursor" and support.mode in {"projected", "native"} and asset.type in {"skill", "rule"}:
@@ -38,13 +38,47 @@ def render_assets_for_target(target_root: Path, target: Harness, assets: list[Lo
     return {key: sorted(values) for key, values in rendered.items() if values}
 
 
-def _render_agent_skill(target_root: Path, asset: LoadedAsset) -> None:
+def _render_agent_skill(target_root: Path, target: Harness, asset: LoadedAsset) -> None:
     destination = target_root / "skills" / asset.id
     if asset.path.is_dir():
         copy_tree(asset.path, destination, skip_names={METADATA_FILE})
+        if target == "codex":
+            _normalize_codex_skill(destination, asset)
         return
     destination.mkdir(parents=True, exist_ok=True)
+    if target == "codex":
+        skill_path = destination / "SKILL.md"
+        skill_path.write_text(_codex_skill_contents(asset.path.read_text(), asset))
+        return
     shutil.copy2(asset.path, destination / "SKILL.md")
+
+
+def _normalize_codex_skill(destination: Path, asset: LoadedAsset) -> None:
+    source_skill_path = _find_markdown_file(destination, "skill.md")
+    if source_skill_path.exists():
+        contents = source_skill_path.read_text()
+        if source_skill_path.name != "SKILL.md":
+            source_skill_path.unlink()
+    else:
+        contents = _read_asset_markdown(asset)
+    (destination / "SKILL.md").write_text(_codex_skill_contents(contents, asset))
+
+
+def _codex_skill_contents(contents: str, asset: LoadedAsset) -> str:
+    if _has_yaml_frontmatter(contents):
+        return contents if contents.endswith("\n") else contents + "\n"
+    title = asset.metadata.title or asset.id
+    frontmatter = f"---\nname: {json.dumps(asset.id)}\ndescription: {json.dumps(title)}\n---"
+    body = contents.rstrip()
+    if not body:
+        return frontmatter + "\n"
+    return f"{frontmatter}\n\n{body}\n"
+
+
+def _has_yaml_frontmatter(contents: str) -> bool:
+    if not contents.startswith("---\n"):
+        return False
+    return any(line == "---" for line in contents.splitlines()[1:])
 
 
 def _render_cursor_rule(target_root: Path, asset: LoadedAsset) -> None:

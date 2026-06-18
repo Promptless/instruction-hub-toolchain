@@ -45,6 +45,15 @@ def _assert_codex_plugin_ingestion_contract(plugin_root: Path) -> None:
     assert all(isinstance(capability, str) and capability for capability in capabilities_data)
     assert "defaultPrompt" in interface_data or "default_prompt" in interface_data
 
+    if manifest_data.get("skills") is not None:
+        assert manifest_data["skills"] == "./skills/"
+        skill_files = sorted((plugin_root / "skills").glob("*/SKILL.md"))
+        assert skill_files
+        for skill_file in skill_files:
+            skill_contents = skill_file.read_text()
+            assert skill_contents.startswith("---\n")
+            assert any(line == "---" for line in skill_contents.splitlines()[1:])
+
     if "mcpServers" not in manifest_data:
         return
     assert manifest_data["mcpServers"] == "./.mcp.json"
@@ -208,6 +217,50 @@ def test_scan_rejects_skill_slug_collisions(tmp_path: Path) -> None:
         scan_hub(hub_root, source_root)
 
 
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are unavailable on this platform")
+def test_scan_rejects_symlinked_source_skill_directories(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    source_root = tmp_path / "source"
+    outside_skill = tmp_path / "outside-skill"
+    outside_skill.mkdir()
+    (outside_skill / "SKILL.md").write_text("# Outside\n")
+    (source_root / ".agents/skills").mkdir(parents=True)
+    os.symlink(outside_skill, source_root / ".agents/skills/outside")
+    init_hub(hub_root)
+
+    with pytest.raises(InstructionHubError, match="symlink"):
+        scan_hub(hub_root, source_root)
+
+    assert not (hub_root / "assets/skills/outside").exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are unavailable on this platform")
+@pytest.mark.parametrize(
+    ("mcp_path", "asset_path"),
+    [
+        (Path(".mcp.json"), Path("assets/mcps/repo-mcp.json")),
+        (Path(".cursor/mcp.json"), Path("assets/mcps/cursor-mcp.json")),
+    ],
+)
+def test_scan_rejects_symlinked_source_mcp_configs(
+    tmp_path: Path,
+    mcp_path: Path,
+    asset_path: Path,
+) -> None:
+    hub_root = tmp_path / "hub"
+    source_root = tmp_path / "source"
+    outside_mcp = tmp_path / "outside-mcp.json"
+    outside_mcp.write_text(json.dumps({"mcpServers": {"leak": {"command": "leak"}}}))
+    (source_root / mcp_path.parent).mkdir(parents=True, exist_ok=True)
+    os.symlink(outside_mcp, source_root / mcp_path)
+    init_hub(hub_root)
+
+    with pytest.raises(InstructionHubError, match="symlink"):
+        scan_hub(hub_root, source_root)
+
+    assert not (hub_root / asset_path).exists()
+
+
 def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -220,6 +273,8 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     assert (hub_root / "dist/claude/.claude-plugin/plugin.json").exists()
     assert (hub_root / "dist/codex/.codex-plugin/plugin.json").exists()
     _assert_codex_plugin_ingestion_contract(hub_root / "dist/codex")
+    codex_skill = (hub_root / "dist/codex/skills/review-docs/SKILL.md").read_text()
+    assert codex_skill.startswith('---\nname: "review-docs"\ndescription: "Review Docs"\n---\n\n# Review Docs\n')
     assert (hub_root / "dist/gemini/gemini-extension.json").exists()
     assert (hub_root / "dist/cursor/.cursor-plugin/plugin.json").exists()
     assert (hub_root / "dist/cursor/skills/review-docs/SKILL.md").exists()
@@ -810,6 +865,26 @@ def test_validate_rejects_empty_required_config_strings(tmp_path: Path, config_t
         validate_hub(hub_root)
 
 
+def test_validate_rejects_empty_target_list(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    (hub_root / ".promptless/instruction-hub.yaml").write_text(
+        "\n".join(
+            [
+                "org: Acme",
+                "plugin_id: acme-instruction-hub",
+                "plugin_name: Acme Instruction Hub",
+                "plugin_version: 0.1.0",
+                "targets: []",
+                "",
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match="at least 1 item"):
+        validate_hub(hub_root)
+
+
 def test_validate_rejects_metadata_type_mismatch(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -1145,6 +1220,12 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
     assert "source" not in target_support_schema["properties"]
     assert target_support_schema["properties"]["reason"] == {"type": "string", "minLength": 1}
     assert target_support_schema["allOf"][0]["then"]["required"] == ["reason"]
+
+
+def test_instruction_hub_schema_requires_at_least_one_target() -> None:
+    schema = json.loads((SCHEMAS / "instruction-hub.schema.json").read_text())
+
+    assert schema["properties"]["targets"]["minItems"] == 1
 
 
 def _git(cwd: Path, *args: str) -> None:

@@ -76,7 +76,7 @@ class HubConfig(BaseModel):
     plugin_name: str = Field(min_length=1)
     plugin_version: str
     stable_packages: list[str] = Field(default_factory=lambda: ["core"])
-    targets: list[Harness] = Field(default_factory=lambda: list(SUPPORTED_HARNESSES))
+    targets: list[Harness] = Field(default_factory=lambda: list(SUPPORTED_HARNESSES), min_length=1)
 
     @field_validator("plugin_id")
     @classmethod
