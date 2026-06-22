@@ -764,6 +764,35 @@ def test_action_publish_writes_release_branch_and_marketplace_pointers_for_stabl
     assert output_path.read_text() == "release-branch=release/stable\n"
 
 
+def test_action_publish_commits_ignored_marketplace_pointers(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-ignored-pointers", targets=("claude", "codex", "cursor"))
+    (repo / ".gitignore").write_text(
+        "\n".join(
+            [
+                "/dist/",
+                "/.agents/plugins/",
+                "/.claude-plugin/",
+                "/.cursor-plugin/",
+                "/.promptless/releases/",
+                "/.promptless/channels/",
+                "",
+            ]
+        )
+    )
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore generated instruction hub output")
+
+    result = _run_action(repo, tmp_path / "github-output.txt")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for pointer_path in (
+        ".agents/plugins/marketplace.json",
+        ".claude-plugin/marketplace.json",
+        ".cursor-plugin/marketplace.json",
+    ):
+        assert pointer_path in _git_output(repo, "ls-files").splitlines()
+
+
 @pytest.mark.parametrize(
     ("env_name", "disabled_pointer", "enabled_pointers"),
     [

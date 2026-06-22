@@ -370,9 +370,9 @@ publish_release_branch() {
 
   copy_payload_generated_paths "$payload_root" "$worktree" "$hub_rel"
   if [[ -n "$hub_rel" ]]; then
-    git -C "$worktree" add -A "$hub_rel"
+    git -C "$worktree" add -f -A "$hub_rel"
   else
-    git -C "$worktree" add -A .
+    git -C "$worktree" add -f -A .
   fi
 
   if ! git -C "$worktree" diff --cached --quiet; then
@@ -552,7 +552,7 @@ commit_prepared_marketplace_pointers() {
     fi
   done
 
-  git -C "$repo_root" add -A -- "${pointer_paths[@]}"
+  git -C "$repo_root" add -f -A -- "${pointer_paths[@]}"
   if ! git -C "$repo_root" diff --cached --quiet -- "${pointer_paths[@]}"; then
     git -C "$repo_root" commit -m "Update Instruction Hub marketplace pointers"
     push_origin_ref "$repo_root" "HEAD:$source_branch"
