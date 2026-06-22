@@ -800,6 +800,35 @@ def test_action_publish_respects_disabled_marketplace_pointer(
         assert (repo / pointer_path).exists()
 
 
+@pytest.mark.parametrize(
+    ("target", "pointer_path"),
+    [
+        ("claude", Path(".claude-plugin/marketplace.json")),
+        ("codex", Path(".agents/plugins/marketplace.json")),
+        ("cursor", Path(".cursor-plugin/marketplace.json")),
+    ],
+)
+def test_action_publish_custom_generated_paths_keep_generated_marketplace_pointer(
+    tmp_path: Path,
+    target: str,
+    pointer_path: Path,
+) -> None:
+    repo = _init_action_repo(tmp_path / f"publish-custom-paths-{target}", targets=(target,))
+    first = _run_action(repo, tmp_path / "github-output-first.txt")
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert (repo / pointer_path).exists()
+
+    second = _run_action(
+        repo,
+        tmp_path / "github-output-second.txt",
+        extra_env={"INPUT_GENERATED_PATHS": "dist .promptless/releases .promptless/channels"},
+    )
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert (repo / pointer_path).exists()
+    assert pointer_path.as_posix() in _git_output(repo, "ls-files").splitlines()
+
+
 def test_action_publish_fails_cursor_pointer_when_repository_is_not_owner_repo(tmp_path: Path) -> None:
     repo = _init_action_repo(tmp_path / "publish-bad-cursor-repository", targets=("cursor",))
 

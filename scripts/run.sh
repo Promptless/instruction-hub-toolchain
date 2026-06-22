@@ -272,6 +272,32 @@ copy_generated_paths() {
   done
 }
 
+copy_marketplace_files() {
+  local destination_root="$1"
+  local hub_rel="$2"
+  local marketplace_paths=(
+    ".claude-plugin/marketplace.json"
+    ".agents/plugins/marketplace.json"
+    ".cursor-plugin/marketplace.json"
+  )
+
+  for marketplace_path in "${marketplace_paths[@]}"; do
+    local source_path="$hub_root/$marketplace_path"
+    local destination_path
+    if [[ -n "$hub_rel" ]]; then
+      destination_path="$destination_root/$hub_rel/$marketplace_path"
+    else
+      destination_path="$destination_root/$marketplace_path"
+    fi
+
+    rm -f "$destination_path"
+    if [[ -f "$source_path" ]]; then
+      mkdir -p "$(dirname "$destination_path")"
+      cp "$source_path" "$destination_path"
+    fi
+  done
+}
+
 copy_payload_generated_paths() {
   local source_root="$1"
   local destination_root="$2"
@@ -361,7 +387,7 @@ publish_release_branch() {
 
 prepare_marketplace_pointer() {
   local platform="$1"
-  local payload_root="$2"
+  local marketplace_root="$2"
   local pointer_root="$3"
   local hub_rel="$4"
   local label
@@ -391,10 +417,10 @@ prepare_marketplace_pointer() {
       ;;
   esac
 
-  marketplace_path="$payload_root/$marketplace_relative_path"
+  marketplace_path="$marketplace_root/$marketplace_relative_path"
   destination_relative_path="$marketplace_relative_path"
   if [[ -n "$hub_rel" ]]; then
-    marketplace_path="$payload_root/$hub_rel/$marketplace_relative_path"
+    marketplace_path="$marketplace_root/$hub_rel/$marketplace_relative_path"
     destination_relative_path="$hub_rel/$marketplace_relative_path"
   fi
   destination_path="$repo_root/$destination_relative_path"
@@ -551,21 +577,23 @@ case "$mode" in
     require_publish_source_ref
     hub_rel="$(hub_relative_path)"
     payload_root="$(mktemp -d)"
+    marketplace_root="$(mktemp -d)"
     pointer_root="$(mktemp -d)"
-    temp_paths+=("$payload_root" "$pointer_root")
+    temp_paths+=("$payload_root" "$marketplace_root" "$pointer_root")
     pi validate --hub "$hub_root"
     pi build --hub "$hub_root"
     copy_generated_paths "$payload_root" "$hub_rel"
+    copy_marketplace_files "$marketplace_root" "$hub_rel"
     restore_generated_paths_on_default_branch "$hub_rel"
     marketplace_pointer_paths=()
     if [[ "$update_claude_pointer" == "true" ]]; then
-      prepare_marketplace_pointer "claude" "$payload_root" "$pointer_root" "$hub_rel"
+      prepare_marketplace_pointer "claude" "$marketplace_root" "$pointer_root" "$hub_rel"
     fi
     if [[ "$update_codex_pointer" == "true" ]]; then
-      prepare_marketplace_pointer "codex" "$payload_root" "$pointer_root" "$hub_rel"
+      prepare_marketplace_pointer "codex" "$marketplace_root" "$pointer_root" "$hub_rel"
     fi
     if [[ "$update_cursor_pointer" == "true" ]]; then
-      prepare_marketplace_pointer "cursor" "$payload_root" "$pointer_root" "$hub_rel"
+      prepare_marketplace_pointer "cursor" "$marketplace_root" "$pointer_root" "$hub_rel"
     fi
     publish_release_branch "$hub_rel" "$payload_root"
     commit_prepared_marketplace_pointers "$pointer_root" "${marketplace_pointer_paths[@]}"
