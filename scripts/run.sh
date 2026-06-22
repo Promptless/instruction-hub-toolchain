@@ -272,6 +272,30 @@ copy_generated_paths() {
   done
 }
 
+copy_payload_generated_paths() {
+  local source_root="$1"
+  local destination_root="$2"
+  local hub_rel="$3"
+
+  for generated_path in "${generated_paths[@]}"; do
+    local source_path
+    local destination_path
+    if [[ -n "$hub_rel" ]]; then
+      source_path="$source_root/$hub_rel/$generated_path"
+      destination_path="$destination_root/$hub_rel/$generated_path"
+    else
+      source_path="$source_root/$generated_path"
+      destination_path="$destination_root/$generated_path"
+    fi
+
+    rm -rf "$destination_path"
+    if [[ -e "$source_path" ]]; then
+      mkdir -p "$(dirname "$destination_path")"
+      cp -R "$source_path" "$destination_path"
+    fi
+  done
+}
+
 restore_generated_paths_on_default_branch() {
   local hub_rel="$1"
 
@@ -294,6 +318,7 @@ restore_generated_paths_on_default_branch() {
 
 publish_release_branch() {
   local hub_rel="$1"
+  local payload_root="$2"
   local worktree
   worktree="$(mktemp -d)"
   rm -rf "$worktree"
@@ -317,7 +342,7 @@ publish_release_branch() {
     fi
   fi
 
-  copy_generated_paths "$worktree" "$hub_rel"
+  copy_payload_generated_paths "$payload_root" "$worktree" "$hub_rel"
   if [[ -n "$hub_rel" ]]; then
     git -C "$worktree" add -A "$hub_rel"
   else
@@ -334,15 +359,17 @@ publish_release_branch() {
   git -C "$repo_root" worktree remove "$worktree" --force
 }
 
-write_marketplace_pointer() {
+prepare_marketplace_pointer() {
   local platform="$1"
   local payload_root="$2"
-  local hub_rel="$3"
+  local pointer_root="$3"
+  local hub_rel="$4"
   local label
   local marketplace_relative_path
   local marketplace_path
   local destination_relative_path
   local destination_path
+  local prepared_path
   local repository_url
 
   case "$platform" in
@@ -371,6 +398,7 @@ write_marketplace_pointer() {
     destination_relative_path="$hub_rel/$marketplace_relative_path"
   fi
   destination_path="$repo_root/$destination_relative_path"
+  prepared_path="$pointer_root/$destination_relative_path"
 
   if [[ ! -f "$marketplace_path" ]]; then
     local destination_tracked=false
@@ -386,7 +414,6 @@ write_marketplace_pointer() {
     fi
     if [[ -e "$destination_path" || "$destination_tracked" == "true" ]]; then
       echo "No $label marketplace was generated; removing stale source-branch $label pointer."
-      rm -f "$destination_path"
       marketplace_pointer_paths+=("$destination_relative_path")
     else
       echo "No $label marketplace was generated; skipping source-branch $label pointer."
@@ -400,8 +427,8 @@ write_marketplace_pointer() {
   fi
 
   repository_url="$(github_repository_url)"
-  mkdir -p "$(dirname "$destination_path")"
-  python - "$platform" "$marketplace_path" "$destination_path" "$repository_url" "$release_branch" "$hub_rel" "$GITHUB_REPOSITORY" <<'PY'
+  mkdir -p "$(dirname "$prepared_path")"
+  python - "$platform" "$marketplace_path" "$prepared_path" "$repository_url" "$release_branch" "$hub_rel" "$GITHUB_REPOSITORY" <<'PY'
 from pathlib import Path
 import json
 import sys
@@ -478,13 +505,26 @@ PY
   marketplace_pointer_paths+=("$destination_relative_path")
 }
 
-commit_marketplace_pointers() {
+commit_prepared_marketplace_pointers() {
+  local pointer_root="$1"
+  shift
   local pointer_paths=("$@")
 
   if [[ "${#pointer_paths[@]}" -eq 0 ]]; then
     echo "No marketplace pointers to publish."
     return
   fi
+
+  for pointer_path in "${pointer_paths[@]}"; do
+    local prepared_path="$pointer_root/$pointer_path"
+    local destination_path="$repo_root/$pointer_path"
+    if [[ -f "$prepared_path" ]]; then
+      mkdir -p "$(dirname "$destination_path")"
+      cp "$prepared_path" "$destination_path"
+    else
+      rm -f "$destination_path"
+    fi
+  done
 
   git -C "$repo_root" add -A -- "${pointer_paths[@]}"
   if ! git -C "$repo_root" diff --cached --quiet -- "${pointer_paths[@]}"; then
@@ -511,23 +551,24 @@ case "$mode" in
     require_publish_source_ref
     hub_rel="$(hub_relative_path)"
     payload_root="$(mktemp -d)"
-    temp_paths+=("$payload_root")
+    pointer_root="$(mktemp -d)"
+    temp_paths+=("$payload_root" "$pointer_root")
     pi validate --hub "$hub_root"
     pi build --hub "$hub_root"
     copy_generated_paths "$payload_root" "$hub_rel"
-    publish_release_branch "$hub_rel"
     restore_generated_paths_on_default_branch "$hub_rel"
     marketplace_pointer_paths=()
     if [[ "$update_claude_pointer" == "true" ]]; then
-      write_marketplace_pointer "claude" "$payload_root" "$hub_rel"
+      prepare_marketplace_pointer "claude" "$payload_root" "$pointer_root" "$hub_rel"
     fi
     if [[ "$update_codex_pointer" == "true" ]]; then
-      write_marketplace_pointer "codex" "$payload_root" "$hub_rel"
+      prepare_marketplace_pointer "codex" "$payload_root" "$pointer_root" "$hub_rel"
     fi
     if [[ "$update_cursor_pointer" == "true" ]]; then
-      write_marketplace_pointer "cursor" "$payload_root" "$hub_rel"
+      prepare_marketplace_pointer "cursor" "$payload_root" "$pointer_root" "$hub_rel"
     fi
-    commit_marketplace_pointers "${marketplace_pointer_paths[@]}"
+    publish_release_branch "$hub_rel" "$payload_root"
+    commit_prepared_marketplace_pointers "$pointer_root" "${marketplace_pointer_paths[@]}"
     ;;
   *)
     echo "Unsupported mode: $mode. Expected build, check, or publish." >&2

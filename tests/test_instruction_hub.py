@@ -807,6 +807,7 @@ def test_action_publish_fails_cursor_pointer_when_repository_is_not_owner_repo(t
 
     assert result.returncode == 2
     assert "GITHUB_REPOSITORY must be owner/repo" in result.stderr
+    assert not _remote_branch_exists(repo, "release/stable")
     assert not (repo / ".cursor-plugin/marketplace.json").exists()
 
 
@@ -1481,6 +1482,21 @@ def _git(cwd: Path, *args: str) -> None:
 
 def _git_output(cwd: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=cwd, check=True, text=True, capture_output=True).stdout
+
+
+def _remote_branch_exists(cwd: Path, branch: str) -> bool:
+    result = subprocess.run(
+        ["git", "ls-remote", "--exit-code", "--heads", "origin", branch],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 2:
+        return False
+    raise AssertionError(result.stdout + result.stderr)
 
 
 def _init_action_repo(root: Path, *, targets: tuple[str, ...], hub_root_name: str = ".") -> Path:
