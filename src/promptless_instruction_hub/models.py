@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -75,7 +76,7 @@ class HubConfig(BaseModel):
     plugin_id: str
     plugin_name: str = Field(min_length=1)
     plugin_version: str
-    stable_packages: list[str] = Field(default_factory=lambda: ["core"])
+    stable_packages: list[str] = Field(default_factory=lambda: ["core"], min_length=1)
     targets: list[Harness] = Field(default_factory=lambda: list(SUPPORTED_HARNESSES), min_length=1)
 
     @field_validator("plugin_id")
@@ -118,7 +119,7 @@ class PackageDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    name: str
+    name: str = Field(min_length=1)
     owners: list[str] = Field(default_factory=list)
     includes: list[str] = Field(default_factory=list)
 
@@ -180,6 +181,14 @@ class LoadedAsset(BaseModel):
         """Ensure loaded asset IDs remain safe path segments."""
 
         return validate_identifier(value, "asset id")
+
+
+@dataclass(frozen=True)
+class StablePackage:
+    """Resolved stable package and the assets to render into its plugin payload."""
+
+    definition: PackageDefinition
+    assets: tuple[LoadedAsset, ...]
 
 
 def _validate_unique(values: Sequence[str], field_name: str) -> None:

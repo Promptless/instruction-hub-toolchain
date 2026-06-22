@@ -7,6 +7,8 @@ release_branch="${INPUT_RELEASE_BRANCH:-release/stable}"
 source_branch="${INPUT_SOURCE_BRANCH:-main}"
 generated_paths_input="${INPUT_GENERATED_PATHS:-dist .agents/plugins .claude-plugin .cursor-plugin .promptless/releases .promptless/channels}"
 update_claude_pointer="${INPUT_UPDATE_CLAUDE_POINTER:-true}"
+update_codex_pointer="${INPUT_UPDATE_CODEX_POINTER:-true}"
+update_cursor_pointer="${INPUT_UPDATE_CURSOR_POINTER:-true}"
 github_token="${INPUT_GITHUB_TOKEN:-}"
 commit_user_name="${INPUT_COMMIT_USER_NAME:-github-actions[bot]}"
 commit_user_email="${INPUT_COMMIT_USER_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}"
@@ -23,6 +25,7 @@ hub_root="$(cd "$hub_root" && pwd)"
 
 declare -a generated_paths=()
 declare -a release_worktrees=()
+declare -a marketplace_pointer_paths=()
 declare -a temp_paths=()
 original_origin_url=""
 
@@ -121,6 +124,8 @@ if [[ "$mode" == "publish" ]]; then
   validate_distinct_publish_branches
 fi
 update_claude_pointer="$(normalize_bool_input "update-claude-pointer" "$update_claude_pointer")"
+update_codex_pointer="$(normalize_bool_input "update-codex-pointer" "$update_codex_pointer")"
+update_cursor_pointer="$(normalize_bool_input "update-cursor-pointer" "$update_cursor_pointer")"
 
 pi() {
   uv run --project "$GITHUB_ACTION_PATH" promptless-instruction-hub "$@"
@@ -267,6 +272,30 @@ copy_generated_paths() {
   done
 }
 
+copy_payload_generated_paths() {
+  local source_root="$1"
+  local destination_root="$2"
+  local hub_rel="$3"
+
+  for generated_path in "${generated_paths[@]}"; do
+    local source_path
+    local destination_path
+    if [[ -n "$hub_rel" ]]; then
+      source_path="$source_root/$hub_rel/$generated_path"
+      destination_path="$destination_root/$hub_rel/$generated_path"
+    else
+      source_path="$source_root/$generated_path"
+      destination_path="$destination_root/$generated_path"
+    fi
+
+    rm -rf "$destination_path"
+    if [[ -e "$source_path" ]]; then
+      mkdir -p "$(dirname "$destination_path")"
+      cp -R "$source_path" "$destination_path"
+    fi
+  done
+}
+
 restore_generated_paths_on_default_branch() {
   local hub_rel="$1"
 
@@ -289,6 +318,7 @@ restore_generated_paths_on_default_branch() {
 
 publish_release_branch() {
   local hub_rel="$1"
+  local payload_root="$2"
   local worktree
   worktree="$(mktemp -d)"
   rm -rf "$worktree"
@@ -312,7 +342,7 @@ publish_release_branch() {
     fi
   fi
 
-  copy_generated_paths "$worktree" "$hub_rel"
+  copy_payload_generated_paths "$payload_root" "$worktree" "$hub_rel"
   if [[ -n "$hub_rel" ]]; then
     git -C "$worktree" add -A "$hub_rel"
   else
@@ -329,74 +359,179 @@ publish_release_branch() {
   git -C "$repo_root" worktree remove "$worktree" --force
 }
 
-write_claude_pointer() {
-  local payload_root="$1"
-  local hub_rel="$2"
+prepare_marketplace_pointer() {
+  local platform="$1"
+  local payload_root="$2"
+  local pointer_root="$3"
+  local hub_rel="$4"
+  local label
+  local marketplace_relative_path
   local marketplace_path
+  local destination_relative_path
   local destination_path
-  local plugin_path
+  local prepared_path
+  local repository_url
 
+  case "$platform" in
+    claude)
+      label="Claude"
+      marketplace_relative_path=".claude-plugin/marketplace.json"
+      ;;
+    codex)
+      label="Codex"
+      marketplace_relative_path=".agents/plugins/marketplace.json"
+      ;;
+    cursor)
+      label="Cursor"
+      marketplace_relative_path=".cursor-plugin/marketplace.json"
+      ;;
+    *)
+      echo "Unsupported marketplace pointer platform: $platform" >&2
+      exit 2
+      ;;
+  esac
+
+  marketplace_path="$payload_root/$marketplace_relative_path"
+  destination_relative_path="$marketplace_relative_path"
   if [[ -n "$hub_rel" ]]; then
-    marketplace_path="$payload_root/$hub_rel/.claude-plugin/marketplace.json"
-    destination_path="$repo_root/$hub_rel/.claude-plugin/marketplace.json"
-    plugin_path="$hub_rel/dist/claude"
-  else
-    marketplace_path="$payload_root/.claude-plugin/marketplace.json"
-    destination_path="$repo_root/.claude-plugin/marketplace.json"
-    plugin_path="dist/claude"
+    marketplace_path="$payload_root/$hub_rel/$marketplace_relative_path"
+    destination_relative_path="$hub_rel/$marketplace_relative_path"
   fi
+  destination_path="$repo_root/$destination_relative_path"
+  prepared_path="$pointer_root/$destination_relative_path"
 
   if [[ ! -f "$marketplace_path" ]]; then
-    echo "No Claude marketplace was generated; skipping default-branch Claude pointer."
-    return 1
+    local destination_tracked=false
+    local tracking_status=0
+    if git -C "$repo_root" ls-files --error-unmatch "$destination_relative_path" >/dev/null 2>&1; then
+      destination_tracked=true
+    else
+      tracking_status=$?
+      if [[ "$tracking_status" -ne 1 ]]; then
+        echo "Failed to inspect tracked marketplace pointer path: $destination_relative_path" >&2
+        exit 1
+      fi
+    fi
+    if [[ -e "$destination_path" || "$destination_tracked" == "true" ]]; then
+      echo "No $label marketplace was generated; removing stale source-branch $label pointer."
+      marketplace_pointer_paths+=("$destination_relative_path")
+    else
+      echo "No $label marketplace was generated; skipping source-branch $label pointer."
+    fi
+    return
   fi
 
   if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
-    echo "GITHUB_REPOSITORY is required to write the Claude pointer." >&2
+    echo "GITHUB_REPOSITORY is required to write marketplace pointers." >&2
     exit 2
   fi
 
-  mkdir -p "$(dirname "$destination_path")"
-  python - "$marketplace_path" "$destination_path" "$(github_repository_url)" "$release_branch" "$plugin_path" <<'PY'
+  repository_url="$(github_repository_url)"
+  mkdir -p "$(dirname "$prepared_path")"
+  python - "$platform" "$marketplace_path" "$prepared_path" "$repository_url" "$release_branch" "$hub_rel" "$GITHUB_REPOSITORY" <<'PY'
 from pathlib import Path
 import json
 import sys
 
-source_path = Path(sys.argv[1])
-destination_path = Path(sys.argv[2])
-repository_url = sys.argv[3]
-release_branch = sys.argv[4]
-plugin_path = sys.argv[5]
+platform = sys.argv[1]
+source_path = Path(sys.argv[2])
+destination_path = Path(sys.argv[3])
+repository_url = sys.argv[4]
+release_branch = sys.argv[5]
+hub_rel = sys.argv[6].strip("/")
+github_repository = sys.argv[7]
 
-marketplace = json.loads(source_path.read_text())
-for plugin in marketplace.get("plugins", []):
-    plugin["source"] = {
-        "source": "git-subdir",
-        "url": repository_url,
-        "path": plugin_path,
+
+def fail(message: str) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def normalize_local_path(local_path: str) -> str:
+    path = local_path.strip().removeprefix("./").rstrip("/")
+    parts = path.split("/")
+    if not path or path.startswith("/") or any(part in {"", ".", ".."} for part in parts):
+        fail(f"Invalid {platform} marketplace source path: {local_path}")
+    return f"{hub_rel}/{path}" if hub_rel else path
+
+
+def plugin_local_path(plugin: dict[str, object]) -> str:
+    source = plugin.get("source")
+    if platform in {"claude", "cursor"}:
+        if not isinstance(source, str):
+            fail(f"Expected {platform} marketplace source to be a string.")
+        return normalize_local_path(source)
+    if not isinstance(source, dict) or source.get("source") != "local":
+        fail("Expected Codex marketplace source to be a local source object.")
+    path = source.get("path")
+    if not isinstance(path, str):
+        fail("Expected Codex marketplace source path to be a string.")
+    return normalize_local_path(path)
+
+
+def cursor_source(path: str) -> dict[str, str]:
+    owner, separator, repo = github_repository.partition("/")
+    if separator != "/" or not owner or not repo:
+        fail(f"GITHUB_REPOSITORY must be owner/repo, got: {github_repository}")
+    return {
+        "type": "github",
+        "owner": owner,
+        "repo": repo,
+        "path": path,
         "ref": release_branch,
     }
+
+marketplace = json.loads(source_path.read_text())
+plugins = marketplace.get("plugins")
+if not isinstance(plugins, list):
+    fail("Expected marketplace plugins to be a list.")
+for plugin in plugins:
+    if not isinstance(plugin, dict):
+        fail("Expected marketplace plugins to be objects.")
+    path = plugin_local_path(plugin)
+    if platform == "cursor":
+        plugin["source"] = cursor_source(path)
+    else:
+        plugin["source"] = {
+            "source": "git-subdir",
+            "url": repository_url,
+            "path": path,
+            "ref": release_branch,
+        }
     plugin.pop("version", None)
 
 destination_path.write_text(json.dumps(marketplace, indent=2, sort_keys=True) + "\n")
 PY
+  marketplace_pointer_paths+=("$destination_relative_path")
 }
 
-commit_claude_pointer() {
-  local hub_rel="$1"
-  local pointer_path
-  if [[ -n "$hub_rel" ]]; then
-    pointer_path="$hub_rel/.claude-plugin/marketplace.json"
-  else
-    pointer_path=".claude-plugin/marketplace.json"
+commit_prepared_marketplace_pointers() {
+  local pointer_root="$1"
+  shift
+  local pointer_paths=("$@")
+
+  if [[ "${#pointer_paths[@]}" -eq 0 ]]; then
+    echo "No marketplace pointers to publish."
+    return
   fi
 
-  git -C "$repo_root" add "$pointer_path"
-  if ! git -C "$repo_root" diff --cached --quiet -- "$pointer_path"; then
-    git -C "$repo_root" commit -m "Update Claude Instruction Hub pointer"
+  for pointer_path in "${pointer_paths[@]}"; do
+    local prepared_path="$pointer_root/$pointer_path"
+    local destination_path="$repo_root/$pointer_path"
+    if [[ -f "$prepared_path" ]]; then
+      mkdir -p "$(dirname "$destination_path")"
+      cp "$prepared_path" "$destination_path"
+    else
+      rm -f "$destination_path"
+    fi
+  done
+
+  git -C "$repo_root" add -A -- "${pointer_paths[@]}"
+  if ! git -C "$repo_root" diff --cached --quiet -- "${pointer_paths[@]}"; then
+    git -C "$repo_root" commit -m "Update Instruction Hub marketplace pointers"
     push_origin_ref "$repo_root" "HEAD:$source_branch"
   else
-    echo "No Claude pointer changes to publish."
+    echo "No marketplace pointer changes to publish."
   fi
 }
 
@@ -416,17 +551,24 @@ case "$mode" in
     require_publish_source_ref
     hub_rel="$(hub_relative_path)"
     payload_root="$(mktemp -d)"
-    temp_paths+=("$payload_root")
+    pointer_root="$(mktemp -d)"
+    temp_paths+=("$payload_root" "$pointer_root")
     pi validate --hub "$hub_root"
     pi build --hub "$hub_root"
     copy_generated_paths "$payload_root" "$hub_rel"
-    publish_release_branch "$hub_rel"
     restore_generated_paths_on_default_branch "$hub_rel"
+    marketplace_pointer_paths=()
     if [[ "$update_claude_pointer" == "true" ]]; then
-      if write_claude_pointer "$payload_root" "$hub_rel"; then
-        commit_claude_pointer "$hub_rel"
-      fi
+      prepare_marketplace_pointer "claude" "$payload_root" "$pointer_root" "$hub_rel"
     fi
+    if [[ "$update_codex_pointer" == "true" ]]; then
+      prepare_marketplace_pointer "codex" "$payload_root" "$pointer_root" "$hub_rel"
+    fi
+    if [[ "$update_cursor_pointer" == "true" ]]; then
+      prepare_marketplace_pointer "cursor" "$payload_root" "$pointer_root" "$hub_rel"
+    fi
+    publish_release_branch "$hub_rel" "$payload_root"
+    commit_prepared_marketplace_pointers "$pointer_root" "${marketplace_pointer_paths[@]}"
     ;;
   *)
     echo "Unsupported mode: $mode. Expected build, check, or publish." >&2

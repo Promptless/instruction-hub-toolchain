@@ -5,25 +5,31 @@ from __future__ import annotations
 from pathlib import Path
 
 from promptless_instruction_hub.fs import JsonValue
-from promptless_instruction_hub.models import HubConfig
+from promptless_instruction_hub.models import HubConfig, PackageDefinition
 
 RenderedAssets = dict[str, list[str]]
 
 
-def base_plugin_manifest(config: HubConfig) -> dict[str, JsonValue]:
+def base_plugin_manifest(config: HubConfig, package: PackageDefinition) -> dict[str, JsonValue]:
     """Return manifest fields shared by all generated target plugins."""
 
     return {
-        "name": config.plugin_id,
+        "name": package_plugin_id(config, package),
         "version": config.plugin_version,
-        "description": plugin_description(config),
+        "description": plugin_description(config, package),
     }
 
 
-def plugin_description(config: HubConfig) -> str:
+def package_plugin_id(config: HubConfig, package: PackageDefinition) -> str:
+    """Return the hub-scoped plugin identifier for a stable package."""
+
+    return f"{config.plugin_id}-{package.id}"
+
+
+def plugin_description(config: HubConfig, package: PackageDefinition) -> str:
     """Return the stable user-facing plugin description."""
 
-    return f"Governed agent instructions for {config.org}."
+    return f"Governed agent instructions for {config.org}: {package.name}."
 
 
 def manifest_key_for(asset_type: str) -> str:
