@@ -16,7 +16,7 @@ from promptless_instruction_hub.render.mcp import collect_mcp_servers, write_mcp
 
 
 def render_target_plugins(output_root: Path, config: HubConfig, packages: tuple[StablePackage, ...]) -> None:
-    """Render one plugin directory per stable package and target harness."""
+    """Render per-package target plugin directories and target marketplace manifests."""
 
     for marketplace_root in (".agents/plugins", ".claude-plugin", ".cursor-plugin"):
         (output_root / marketplace_root).mkdir(parents=True, exist_ok=True)

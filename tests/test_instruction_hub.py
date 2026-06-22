@@ -697,40 +697,111 @@ def test_action_publish_rejects_release_branch_equal_to_source_branch(tmp_path: 
     assert "release-branch must differ from source-branch" in result.stderr
 
 
-def test_action_publish_writes_release_branch_and_marketplace_pointers(tmp_path: Path) -> None:
+def test_action_publish_writes_release_branch_and_marketplace_pointers_for_stable_packages(tmp_path: Path) -> None:
     repo = _init_action_repo(tmp_path / "publish", targets=("claude", "codex", "cursor"))
     output_path = tmp_path / "github-output.txt"
+    _configure_split_package_hub(repo, ("claude", "codex", "cursor"))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "split stable packages")
 
     result = _run_action(repo, output_path)
 
     assert result.returncode == 0, result.stdout + result.stderr
     _git(repo, "fetch", "origin", "release/stable")
-    assert json.loads(_git_output(repo, "show", "origin/release/stable:dist/claude/core/.claude-plugin/plugin.json"))
-    assert json.loads(_git_output(repo, "show", "origin/release/stable:dist/codex/core/.codex-plugin/plugin.json"))
-    assert json.loads(_git_output(repo, "show", "origin/release/stable:dist/cursor/core/.cursor-plugin/plugin.json"))
+    for target in ("claude", "codex", "cursor"):
+        for package in ("dev", "ops"):
+            manifest_name = {
+                "claude": ".claude-plugin/plugin.json",
+                "codex": ".codex-plugin/plugin.json",
+                "cursor": ".cursor-plugin/plugin.json",
+            }[target]
+            assert json.loads(
+                _git_output(repo, "show", f"origin/release/stable:dist/{target}/{package}/{manifest_name}")
+            )
+
     claude_pointer = json.loads((repo / ".claude-plugin/marketplace.json").read_text())
-    assert claude_pointer["plugins"][0]["source"] == {
-        "source": "git-subdir",
-        "url": "https://github.com/Promptless/instruction-hub-test.git",
-        "path": "dist/claude/core",
-        "ref": "release/stable",
-    }
+    assert [(plugin["name"], plugin["source"]["path"]) for plugin in claude_pointer["plugins"]] == [
+        ("dev", "dist/claude/dev"),
+        ("ops", "dist/claude/ops"),
+    ]
+    assert all(plugin["source"]["source"] == "git-subdir" for plugin in claude_pointer["plugins"])
+    assert all(
+        plugin["source"]["url"] == "https://github.com/Promptless/instruction-hub-test.git"
+        for plugin in claude_pointer["plugins"]
+    )
+    assert all(plugin["source"]["ref"] == "release/stable" for plugin in claude_pointer["plugins"])
+    assert all("version" not in plugin for plugin in claude_pointer["plugins"])
+
     codex_pointer = json.loads((repo / ".agents/plugins/marketplace.json").read_text())
-    assert codex_pointer["plugins"][0]["source"] == {
-        "source": "git-subdir",
-        "url": "https://github.com/Promptless/instruction-hub-test.git",
-        "path": "dist/codex/core",
-        "ref": "release/stable",
-    }
+    assert [(plugin["name"], plugin["source"]["path"]) for plugin in codex_pointer["plugins"]] == [
+        ("dev", "dist/codex/dev"),
+        ("ops", "dist/codex/ops"),
+    ]
+    assert all(plugin["source"]["source"] == "git-subdir" for plugin in codex_pointer["plugins"])
+    assert all(
+        plugin["source"]["url"] == "https://github.com/Promptless/instruction-hub-test.git"
+        for plugin in codex_pointer["plugins"]
+    )
+    assert all(plugin["source"]["ref"] == "release/stable" for plugin in codex_pointer["plugins"])
+    assert all("version" not in plugin for plugin in codex_pointer["plugins"])
+
     cursor_pointer = json.loads((repo / ".cursor-plugin/marketplace.json").read_text())
-    assert cursor_pointer["plugins"][0]["source"] == {
-        "owner": "Promptless",
-        "path": "dist/cursor/core",
-        "ref": "release/stable",
-        "repo": "instruction-hub-test",
-        "type": "github",
-    }
+    assert [(plugin["name"], plugin["source"]["path"]) for plugin in cursor_pointer["plugins"]] == [
+        ("dev", "dist/cursor/dev"),
+        ("ops", "dist/cursor/ops"),
+    ]
+    assert all(plugin["source"]["owner"] == "Promptless" for plugin in cursor_pointer["plugins"])
+    assert all(plugin["source"]["repo"] == "instruction-hub-test" for plugin in cursor_pointer["plugins"])
+    assert all(plugin["source"]["ref"] == "release/stable" for plugin in cursor_pointer["plugins"])
+    assert all(plugin["source"]["type"] == "github" for plugin in cursor_pointer["plugins"])
+    assert all("version" not in plugin for plugin in cursor_pointer["plugins"])
     assert output_path.read_text() == "release-branch=release/stable\n"
+
+
+@pytest.mark.parametrize(
+    ("env_name", "disabled_pointer", "enabled_pointers"),
+    [
+        (
+            "INPUT_UPDATE_CLAUDE_POINTER",
+            Path(".claude-plugin/marketplace.json"),
+            (Path(".agents/plugins/marketplace.json"), Path(".cursor-plugin/marketplace.json")),
+        ),
+        (
+            "INPUT_UPDATE_CODEX_POINTER",
+            Path(".agents/plugins/marketplace.json"),
+            (Path(".claude-plugin/marketplace.json"), Path(".cursor-plugin/marketplace.json")),
+        ),
+        (
+            "INPUT_UPDATE_CURSOR_POINTER",
+            Path(".cursor-plugin/marketplace.json"),
+            (Path(".claude-plugin/marketplace.json"), Path(".agents/plugins/marketplace.json")),
+        ),
+    ],
+)
+def test_action_publish_respects_disabled_marketplace_pointer(
+    tmp_path: Path,
+    env_name: str,
+    disabled_pointer: Path,
+    enabled_pointers: tuple[Path, Path],
+) -> None:
+    repo = _init_action_repo(tmp_path / f"publish-disable-{env_name.lower()}", targets=("claude", "codex", "cursor"))
+
+    result = _run_action(repo, tmp_path / "github-output.txt", extra_env={env_name: "false"})
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (repo / disabled_pointer).exists()
+    for pointer_path in enabled_pointers:
+        assert (repo / pointer_path).exists()
+
+
+def test_action_publish_fails_cursor_pointer_when_repository_is_not_owner_repo(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-bad-cursor-repository", targets=("cursor",))
+
+    result = _run_action(repo, tmp_path / "github-output.txt", extra_env={"GITHUB_REPOSITORY": "bad"})
+
+    assert result.returncode == 2
+    assert "GITHUB_REPOSITORY must be owner/repo" in result.stderr
+    assert not (repo / ".cursor-plugin/marketplace.json").exists()
 
 
 def test_action_publish_uses_github_server_url_for_push_credentials(tmp_path: Path) -> None:
@@ -887,7 +958,7 @@ def test_action_publish_second_run_is_noop(tmp_path: Path) -> None:
 
 
 def test_action_publish_supports_subdirectory_hub_root_and_custom_release_branch(tmp_path: Path) -> None:
-    repo = _init_action_repo(tmp_path / "publish-subdir", targets=("claude",), hub_root_name="hub")
+    repo = _init_action_repo(tmp_path / "publish-subdir", targets=("claude", "codex", "cursor"), hub_root_name="hub")
 
     result = _run_action(repo, tmp_path / "github-output.txt", hub_root="hub", release_branch="release/custom")
 
@@ -896,9 +967,19 @@ def test_action_publish_supports_subdirectory_hub_root_and_custom_release_branch
     assert json.loads(
         _git_output(repo, "show", "origin/release/custom:hub/dist/claude/core/.claude-plugin/plugin.json")
     )
-    pointer = json.loads((repo / "hub/.claude-plugin/marketplace.json").read_text())
-    assert pointer["plugins"][0]["source"]["path"] == "hub/dist/claude/core"
-    assert pointer["plugins"][0]["source"]["ref"] == "release/custom"
+    assert json.loads(_git_output(repo, "show", "origin/release/custom:hub/dist/codex/core/.codex-plugin/plugin.json"))
+    assert json.loads(
+        _git_output(repo, "show", "origin/release/custom:hub/dist/cursor/core/.cursor-plugin/plugin.json")
+    )
+    claude_pointer = json.loads((repo / "hub/.claude-plugin/marketplace.json").read_text())
+    assert claude_pointer["plugins"][0]["source"]["path"] == "hub/dist/claude/core"
+    assert claude_pointer["plugins"][0]["source"]["ref"] == "release/custom"
+    codex_pointer = json.loads((repo / "hub/.agents/plugins/marketplace.json").read_text())
+    assert codex_pointer["plugins"][0]["source"]["path"] == "hub/dist/codex/core"
+    assert codex_pointer["plugins"][0]["source"]["ref"] == "release/custom"
+    cursor_pointer = json.loads((repo / "hub/.cursor-plugin/marketplace.json").read_text())
+    assert cursor_pointer["plugins"][0]["source"]["path"] == "hub/dist/cursor/core"
+    assert cursor_pointer["plugins"][0]["source"]["ref"] == "release/custom"
 
 
 def test_action_publish_skips_claude_pointer_when_claude_target_is_absent(tmp_path: Path) -> None:
@@ -911,6 +992,35 @@ def test_action_publish_skips_claude_pointer_when_claude_target_is_absent(tmp_pa
     assert not (repo / ".claude-plugin/marketplace.json").exists()
     pointer = json.loads((repo / ".agents/plugins/marketplace.json").read_text())
     assert pointer["plugins"][0]["source"]["path"] == "dist/codex/core"
+
+
+def test_validate_rejects_empty_stable_packages(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    (hub_root / ".promptless/instruction-hub.yaml").write_text(
+        "\n".join(
+            [
+                "org: Acme",
+                "plugin_id: acme-instruction-hub",
+                "plugin_name: Acme Instruction Hub",
+                "plugin_version: 0.1.0",
+                "stable_packages: []",
+                "",
+            ]
+        )
+    )
+
+    with pytest.raises(InstructionHubError, match="stable_packages"):
+        validate_hub(hub_root)
+
+
+def test_validate_rejects_empty_package_name(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    (hub_root / "packages/core.yaml").write_text("id: core\nname: ''\nincludes: []\n")
+
+    with pytest.raises(InstructionHubError, match="name"):
+        validate_hub(hub_root)
 
 
 def test_validate_rejects_unknown_package_refs(tmp_path: Path) -> None:
@@ -970,7 +1080,7 @@ def test_validate_rejects_empty_required_config_strings(tmp_path: Path, config_t
     init_hub(hub_root)
     (hub_root / ".promptless/instruction-hub.yaml").write_text(config_text)
 
-    with pytest.raises(ValueError, match="String should have at least 1 character"):
+    with pytest.raises(InstructionHubError, match="String should have at least 1 character"):
         validate_hub(hub_root)
 
 
@@ -990,7 +1100,7 @@ def test_validate_rejects_empty_target_list(tmp_path: Path) -> None:
         )
     )
 
-    with pytest.raises(ValueError, match="at least 1 item"):
+    with pytest.raises(InstructionHubError, match="at least 1 item"):
         validate_hub(hub_root)
 
 
@@ -1331,9 +1441,10 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
     assert target_support_schema["allOf"][0]["then"]["required"] == ["reason"]
 
 
-def test_instruction_hub_schema_requires_at_least_one_target() -> None:
+def test_instruction_hub_schema_requires_non_empty_lists() -> None:
     schema = json.loads((SCHEMAS / "instruction-hub.schema.json").read_text())
 
+    assert schema["properties"]["stable_packages"]["minItems"] == 1
     assert schema["properties"]["targets"]["minItems"] == 1
 
 
@@ -1381,6 +1492,32 @@ def _write_hub_config(hub_root: Path, targets: tuple[str, ...]) -> None:
             ]
         )
     )
+
+
+def _configure_split_package_hub(hub_root: Path, targets: tuple[str, ...]) -> None:
+    target_lines = "\n".join(f"  - {target}" for target in targets)
+    (hub_root / ".promptless/instruction-hub.yaml").write_text(
+        "\n".join(
+            [
+                "org: Acme",
+                "plugin_id: acme-instruction-hub",
+                "plugin_name: Acme Instruction Hub",
+                "plugin_version: 0.1.0",
+                "stable_packages:",
+                "  - dev",
+                "  - ops",
+                "targets:",
+                target_lines,
+                "",
+            ]
+        )
+    )
+    (hub_root / "packages/dev.yaml").write_text("id: dev\nname: Dev\nincludes:\n  - skill:authoring-tools\n")
+    (hub_root / "packages/ops.yaml").write_text("id: ops\nname: Ops\nincludes:\n  - skill:runbooks\n")
+    (hub_root / "assets/skills/authoring-tools").mkdir(parents=True, exist_ok=True)
+    (hub_root / "assets/skills/authoring-tools/SKILL.md").write_text("# Authoring Tools\n")
+    (hub_root / "assets/skills/runbooks").mkdir(parents=True, exist_ok=True)
+    (hub_root / "assets/skills/runbooks/SKILL.md").write_text("# Runbooks\n")
 
 
 def _run_action(

@@ -25,6 +25,7 @@ hub_root="$(cd "$hub_root" && pwd)"
 
 declare -a generated_paths=()
 declare -a release_worktrees=()
+declare -a marketplace_pointer_paths=()
 declare -a temp_paths=()
 original_origin_url=""
 
@@ -340,7 +341,9 @@ write_marketplace_pointer() {
   local label
   local marketplace_relative_path
   local marketplace_path
+  local destination_relative_path
   local destination_path
+  local repository_url
 
   case "$platform" in
     claude)
@@ -362,15 +365,16 @@ write_marketplace_pointer() {
   esac
 
   marketplace_path="$payload_root/$marketplace_relative_path"
-  destination_path="$repo_root/$marketplace_relative_path"
+  destination_relative_path="$marketplace_relative_path"
   if [[ -n "$hub_rel" ]]; then
     marketplace_path="$payload_root/$hub_rel/$marketplace_relative_path"
-    destination_path="$repo_root/$hub_rel/$marketplace_relative_path"
+    destination_relative_path="$hub_rel/$marketplace_relative_path"
   fi
+  destination_path="$repo_root/$destination_relative_path"
 
   if [[ ! -f "$marketplace_path" ]]; then
     echo "No $label marketplace was generated; skipping default-branch $label pointer."
-    return 1
+    return
   fi
 
   if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
@@ -378,8 +382,9 @@ write_marketplace_pointer() {
     exit 2
   fi
 
+  repository_url="$(github_repository_url)"
   mkdir -p "$(dirname "$destination_path")"
-  python - "$platform" "$marketplace_path" "$destination_path" "$(github_repository_url)" "$release_branch" "$hub_rel" "$GITHUB_REPOSITORY" <<'PY'
+  python - "$platform" "$marketplace_path" "$destination_path" "$repository_url" "$release_branch" "$hub_rel" "$GITHUB_REPOSITORY" <<'PY'
 from pathlib import Path
 import json
 import sys
@@ -393,11 +398,16 @@ hub_rel = sys.argv[6].strip("/")
 github_repository = sys.argv[7]
 
 
+def fail(message: str) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
 def normalize_local_path(local_path: str) -> str:
     path = local_path.strip().removeprefix("./").rstrip("/")
     parts = path.split("/")
     if not path or path.startswith("/") or any(part in {"", ".", ".."} for part in parts):
-        raise SystemExit(f"Invalid {platform} marketplace source path: {local_path}")
+        fail(f"Invalid {platform} marketplace source path: {local_path}")
     return f"{hub_rel}/{path}" if hub_rel else path
 
 
@@ -405,20 +415,20 @@ def plugin_local_path(plugin: dict[str, object]) -> str:
     source = plugin.get("source")
     if platform in {"claude", "cursor"}:
         if not isinstance(source, str):
-            raise SystemExit(f"Expected {platform} marketplace source to be a string.")
+            fail(f"Expected {platform} marketplace source to be a string.")
         return normalize_local_path(source)
     if not isinstance(source, dict) or source.get("source") != "local":
-        raise SystemExit("Expected Codex marketplace source to be a local source object.")
+        fail("Expected Codex marketplace source to be a local source object.")
     path = source.get("path")
     if not isinstance(path, str):
-        raise SystemExit("Expected Codex marketplace source path to be a string.")
+        fail("Expected Codex marketplace source path to be a string.")
     return normalize_local_path(path)
 
 
 def cursor_source(path: str) -> dict[str, str]:
     owner, separator, repo = github_repository.partition("/")
     if separator != "/" or not owner or not repo:
-        raise SystemExit(f"GITHUB_REPOSITORY must be owner/repo, got: {github_repository}")
+        fail(f"GITHUB_REPOSITORY must be owner/repo, got: {github_repository}")
     return {
         "type": "github",
         "owner": owner,
@@ -428,7 +438,12 @@ def cursor_source(path: str) -> dict[str, str]:
     }
 
 marketplace = json.loads(source_path.read_text())
-for plugin in marketplace.get("plugins", []):
+plugins = marketplace.get("plugins")
+if not isinstance(plugins, list):
+    fail("Expected marketplace plugins to be a list.")
+for plugin in plugins:
+    if not isinstance(plugin, dict):
+        fail("Expected marketplace plugins to be objects.")
     path = plugin_local_path(plugin)
     if platform == "cursor":
         plugin["source"] = cursor_source(path)
@@ -443,28 +458,11 @@ for plugin in marketplace.get("plugins", []):
 
 destination_path.write_text(json.dumps(marketplace, indent=2, sort_keys=True) + "\n")
 PY
+  marketplace_pointer_paths+=("$destination_relative_path")
 }
 
 commit_marketplace_pointers() {
-  local hub_rel="$1"
-  local pointer_paths=()
-  local pointer_path
-  local pointer_rel_paths=(
-    ".claude-plugin/marketplace.json"
-    ".agents/plugins/marketplace.json"
-    ".cursor-plugin/marketplace.json"
-  )
-  local relative_path
-
-  for relative_path in "${pointer_rel_paths[@]}"; do
-    pointer_path="$relative_path"
-    if [[ -n "$hub_rel" ]]; then
-      pointer_path="$hub_rel/$relative_path"
-    fi
-    if [[ -f "$repo_root/$pointer_path" ]]; then
-      pointer_paths+=("$pointer_path")
-    fi
-  done
+  local pointer_paths=("$@")
 
   if [[ "${#pointer_paths[@]}" -eq 0 ]]; then
     echo "No marketplace pointers to publish."
@@ -502,19 +500,17 @@ case "$mode" in
     copy_generated_paths "$payload_root" "$hub_rel"
     publish_release_branch "$hub_rel"
     restore_generated_paths_on_default_branch "$hub_rel"
-    wrote_marketplace_pointer="false"
-    if [[ "$update_claude_pointer" == "true" ]] && write_marketplace_pointer "claude" "$payload_root" "$hub_rel"; then
-      wrote_marketplace_pointer="true"
+    marketplace_pointer_paths=()
+    if [[ "$update_claude_pointer" == "true" ]]; then
+      write_marketplace_pointer "claude" "$payload_root" "$hub_rel"
     fi
-    if [[ "$update_codex_pointer" == "true" ]] && write_marketplace_pointer "codex" "$payload_root" "$hub_rel"; then
-      wrote_marketplace_pointer="true"
+    if [[ "$update_codex_pointer" == "true" ]]; then
+      write_marketplace_pointer "codex" "$payload_root" "$hub_rel"
     fi
-    if [[ "$update_cursor_pointer" == "true" ]] && write_marketplace_pointer "cursor" "$payload_root" "$hub_rel"; then
-      wrote_marketplace_pointer="true"
+    if [[ "$update_cursor_pointer" == "true" ]]; then
+      write_marketplace_pointer "cursor" "$payload_root" "$hub_rel"
     fi
-    if [[ "$wrote_marketplace_pointer" == "true" ]]; then
-      commit_marketplace_pointers "$hub_rel"
-    fi
+    commit_marketplace_pointers "${marketplace_pointer_paths[@]}"
     ;;
   *)
     echo "Unsupported mode: $mode. Expected build, check, or publish." >&2

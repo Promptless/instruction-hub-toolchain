@@ -36,7 +36,8 @@ uv run --project "$GITHUB_ACTION_PATH" promptless-instruction-hub <command>
 - `build`: validate the hub and run a build without committing generated files.
 - `check`: validate the hub and fail if committed generated output is stale.
 - `publish`: build generated output from `source-branch`, push it to
-  `release/stable`, and update default-branch marketplace pointers.
+  `release/stable`, and update `source-branch` marketplace pointers for
+  generated targets.
 
 Customer hubs should usually use `build` for pull requests and `publish` after
 changes merge to the default branch. Use `check` only for repositories that
