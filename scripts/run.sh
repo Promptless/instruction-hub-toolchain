@@ -373,7 +373,24 @@ write_marketplace_pointer() {
   destination_path="$repo_root/$destination_relative_path"
 
   if [[ ! -f "$marketplace_path" ]]; then
-    echo "No $label marketplace was generated; skipping default-branch $label pointer."
+    local destination_tracked=false
+    local tracking_status=0
+    if git -C "$repo_root" ls-files --error-unmatch "$destination_relative_path" >/dev/null 2>&1; then
+      destination_tracked=true
+    else
+      tracking_status=$?
+      if [[ "$tracking_status" -ne 1 ]]; then
+        echo "Failed to inspect tracked marketplace pointer path: $destination_relative_path" >&2
+        exit 1
+      fi
+    fi
+    if [[ -e "$destination_path" || "$destination_tracked" == "true" ]]; then
+      echo "No $label marketplace was generated; removing stale source-branch $label pointer."
+      rm -f "$destination_path"
+      marketplace_pointer_paths+=("$destination_relative_path")
+    else
+      echo "No $label marketplace was generated; skipping source-branch $label pointer."
+    fi
     return
   fi
 
@@ -469,7 +486,7 @@ commit_marketplace_pointers() {
     return
   fi
 
-  git -C "$repo_root" add -- "${pointer_paths[@]}"
+  git -C "$repo_root" add -A -- "${pointer_paths[@]}"
   if ! git -C "$repo_root" diff --cached --quiet -- "${pointer_paths[@]}"; then
     git -C "$repo_root" commit -m "Update Instruction Hub marketplace pointers"
     push_origin_ref "$repo_root" "HEAD:$source_branch"

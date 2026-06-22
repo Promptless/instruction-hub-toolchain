@@ -372,6 +372,7 @@ def test_build_renders_stable_packages_as_separate_marketplace_plugins(tmp_path:
     build_hub(hub_root)
 
     assert [stable_package.definition.id for stable_package in validation.stable_packages] == ["dev", "ops"]
+    assert [asset.ref for asset in validation.stable_assets] == ["skill:authoring-tools", "skill:runbooks"]
     assert (hub_root / "dist/codex/dev/skills/authoring-tools/SKILL.md").exists()
     assert not (hub_root / "dist/codex/dev/skills/runbooks/SKILL.md").exists()
     assert (hub_root / "dist/codex/ops/skills/runbooks/SKILL.md").exists()
@@ -992,6 +993,27 @@ def test_action_publish_skips_claude_pointer_when_claude_target_is_absent(tmp_pa
     assert not (repo / ".claude-plugin/marketplace.json").exists()
     pointer = json.loads((repo / ".agents/plugins/marketplace.json").read_text())
     assert pointer["plugins"][0]["source"]["path"] == "dist/codex/core"
+
+
+def test_action_publish_removes_stale_pointer_when_target_is_removed(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-removed-target", targets=("claude", "codex"))
+    first = _run_action(repo, tmp_path / "github-output-first.txt")
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert (repo / ".claude-plugin/marketplace.json").exists()
+
+    _write_hub_config(repo, ("codex",))
+    _git(repo, "add", ".promptless/instruction-hub.yaml")
+    _git(repo, "commit", "-m", "remove claude target")
+
+    second = _run_action(repo, tmp_path / "github-output-second.txt")
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "removing stale source-branch Claude pointer" in second.stdout
+    assert not (repo / ".claude-plugin/marketplace.json").exists()
+    assert ".claude-plugin/marketplace.json" not in _git_output(repo, "ls-files").splitlines()
+    _git(repo, "fetch", "origin", "release/stable")
+    release_files = _git_output(repo, "ls-tree", "-r", "--name-only", "origin/release/stable").splitlines()
+    assert ".claude-plugin/marketplace.json" not in release_files
 
 
 def test_validate_rejects_empty_stable_packages(tmp_path: Path) -> None:

@@ -29,7 +29,12 @@ class ValidationResult:
     packages: dict[str, PackageDefinition]
     assets: dict[str, LoadedAsset]
     stable_packages: tuple[StablePackage, ...]
-    stable_assets: tuple[LoadedAsset, ...]
+
+    @property
+    def stable_assets(self) -> tuple[LoadedAsset, ...]:
+        """Return stable assets derived from the configured stable packages."""
+
+        return _resolve_stable_assets(self.stable_packages)
 
 
 def validate_hub(hub_root: Path) -> ValidationResult:
@@ -44,13 +49,11 @@ def validate_hub(hub_root: Path) -> ValidationResult:
     _validate_target_support(config, assets)
     _validate_mcp_assets(assets)
     stable_packages = _resolve_stable_packages(config, packages, assets)
-    stable_assets = _resolve_stable_assets(stable_packages)
     return ValidationResult(
         config=config,
         packages=packages,
         assets=assets,
         stable_packages=stable_packages,
-        stable_assets=stable_assets,
     )
 
 
