@@ -7,7 +7,12 @@ from pathlib import Path
 
 from promptless_instruction_hub.fs import write_json
 from promptless_instruction_hub.models import HubConfig, PackageDefinition, StablePackage
-from promptless_instruction_hub.render.common import RenderedAssets, base_plugin_manifest, plugin_description
+from promptless_instruction_hub.render.common import (
+    RenderedAssets,
+    base_plugin_manifest,
+    package_plugin_id,
+    plugin_description,
+)
 
 
 def write_manifest(
@@ -42,7 +47,7 @@ def write_marketplace(output_root: Path, config: HubConfig, packages: Sequence[S
         "metadata": {"description": f"{config.plugin_name} marketplace."},
         "plugins": [
             {
-                "name": stable_package.definition.id,
+                "name": package_plugin_id(config, stable_package.definition),
                 "source": f"dist/cursor/{stable_package.definition.id}",
                 "description": plugin_description(config, stable_package.definition),
             }

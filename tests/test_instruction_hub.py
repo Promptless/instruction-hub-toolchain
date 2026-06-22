@@ -296,24 +296,27 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     assert (hub_root / "dist/cursor/core/skills/review-docs/SKILL.md").exists()
     assert not (hub_root / "dist/cursor/core/rules/review-docs.mdc").exists()
     codex_marketplace = json.loads((hub_root / ".agents/plugins/marketplace.json").read_text())
-    assert codex_marketplace["plugins"][0]["name"] == "core"
+    assert codex_marketplace["plugins"][0]["name"] == "promptless-instruction-hub-core"
     assert codex_marketplace["plugins"][0]["source"]["path"] == "./dist/codex/core"
     assert codex_marketplace["plugins"][0]["policy"]["installation"] == "AVAILABLE"
     assert codex_marketplace["plugins"][0]["policy"]["authentication"] == "ON_INSTALL"
     assert codex_marketplace["plugins"][0]["category"] == "Productivity"
     claude_marketplace = json.loads((hub_root / ".claude-plugin/marketplace.json").read_text())
     assert claude_marketplace["owner"]["name"] == "Promptless"
-    assert claude_marketplace["plugins"][0]["name"] == "core"
+    assert claude_marketplace["plugins"][0]["name"] == "promptless-instruction-hub-core"
+    assert claude_marketplace["plugins"][0]["displayName"] == "Core"
     assert claude_marketplace["plugins"][0]["source"] == "./dist/claude/core"
     cursor_marketplace = json.loads((hub_root / ".cursor-plugin/marketplace.json").read_text())
     assert cursor_marketplace["owner"]["name"] == "Promptless"
-    assert cursor_marketplace["plugins"][0]["name"] == "core"
+    assert cursor_marketplace["plugins"][0]["name"] == "promptless-instruction-hub-core"
     assert cursor_marketplace["plugins"][0]["source"] == "dist/cursor/core"
     claude_manifest = json.loads((hub_root / "dist/claude/core/.claude-plugin/plugin.json").read_text())
+    assert claude_manifest["name"] == "promptless-instruction-hub-core"
+    assert claude_manifest["displayName"] == "Core"
     assert claude_manifest["skills"] == "./skills/"
     assert claude_manifest["mcpServers"] == "./.mcp.json"
     codex_manifest = json.loads((hub_root / "dist/codex/core/.codex-plugin/plugin.json").read_text())
-    assert codex_manifest["name"] == "core"
+    assert codex_manifest["name"] == "promptless-instruction-hub-core"
     assert codex_manifest["skills"] == "./skills/"
     assert codex_manifest["mcpServers"] == "./.mcp.json"
     assert codex_manifest["author"]["name"] == "Promptless"
@@ -324,6 +327,8 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     assert codex_manifest["interface"]["capabilities"] == ["Skills", "MCP servers"]
     assert codex_manifest["interface"]["defaultPrompt"] == ["Use Core instructions for this task."]
     cursor_manifest = json.loads((hub_root / "dist/cursor/core/.cursor-plugin/plugin.json").read_text())
+    assert cursor_manifest["name"] == "promptless-instruction-hub-core"
+    assert cursor_manifest["displayName"] == "Core"
     assert cursor_manifest["skills"] == "./skills/"
     gemini_manifest = json.loads((hub_root / "dist/gemini/core/gemini-extension.json").read_text())
     assert "skills" not in gemini_manifest
@@ -382,18 +387,18 @@ def test_build_renders_stable_packages_as_separate_marketplace_plugins(tmp_path:
 
     codex_marketplace = json.loads((hub_root / ".agents/plugins/marketplace.json").read_text())
     assert [(plugin["name"], plugin["source"]["path"]) for plugin in codex_marketplace["plugins"]] == [
-        ("dev", "./dist/codex/dev"),
-        ("ops", "./dist/codex/ops"),
+        ("promptless-instruction-hub-dev", "./dist/codex/dev"),
+        ("promptless-instruction-hub-ops", "./dist/codex/ops"),
     ]
     claude_marketplace = json.loads((hub_root / ".claude-plugin/marketplace.json").read_text())
-    assert [(plugin["name"], plugin["source"]) for plugin in claude_marketplace["plugins"]] == [
-        ("dev", "./dist/claude/dev"),
-        ("ops", "./dist/claude/ops"),
+    assert [(plugin["name"], plugin["displayName"], plugin["source"]) for plugin in claude_marketplace["plugins"]] == [
+        ("promptless-instruction-hub-dev", "Dev", "./dist/claude/dev"),
+        ("promptless-instruction-hub-ops", "Ops", "./dist/claude/ops"),
     ]
     cursor_marketplace = json.loads((hub_root / ".cursor-plugin/marketplace.json").read_text())
     assert [(plugin["name"], plugin["source"]) for plugin in cursor_marketplace["plugins"]] == [
-        ("dev", "dist/cursor/dev"),
-        ("ops", "dist/cursor/ops"),
+        ("promptless-instruction-hub-dev", "dist/cursor/dev"),
+        ("promptless-instruction-hub-ops", "dist/cursor/ops"),
     ]
     release_manifest = json.loads((hub_root / ".promptless/releases/current.json").read_text())
     assert release_manifest["stable_packages"] == ["dev", "ops"]
@@ -722,8 +727,8 @@ def test_action_publish_writes_release_branch_and_marketplace_pointers_for_stabl
 
     claude_pointer = json.loads((repo / ".claude-plugin/marketplace.json").read_text())
     assert [(plugin["name"], plugin["source"]["path"]) for plugin in claude_pointer["plugins"]] == [
-        ("dev", "dist/claude/dev"),
-        ("ops", "dist/claude/ops"),
+        ("acme-instruction-hub-dev", "dist/claude/dev"),
+        ("acme-instruction-hub-ops", "dist/claude/ops"),
     ]
     assert all(plugin["source"]["source"] == "git-subdir" for plugin in claude_pointer["plugins"])
     assert all(
@@ -735,8 +740,8 @@ def test_action_publish_writes_release_branch_and_marketplace_pointers_for_stabl
 
     codex_pointer = json.loads((repo / ".agents/plugins/marketplace.json").read_text())
     assert [(plugin["name"], plugin["source"]["path"]) for plugin in codex_pointer["plugins"]] == [
-        ("dev", "dist/codex/dev"),
-        ("ops", "dist/codex/ops"),
+        ("acme-instruction-hub-dev", "dist/codex/dev"),
+        ("acme-instruction-hub-ops", "dist/codex/ops"),
     ]
     assert all(plugin["source"]["source"] == "git-subdir" for plugin in codex_pointer["plugins"])
     assert all(
@@ -748,8 +753,8 @@ def test_action_publish_writes_release_branch_and_marketplace_pointers_for_stabl
 
     cursor_pointer = json.loads((repo / ".cursor-plugin/marketplace.json").read_text())
     assert [(plugin["name"], plugin["source"]["path"]) for plugin in cursor_pointer["plugins"]] == [
-        ("dev", "dist/cursor/dev"),
-        ("ops", "dist/cursor/ops"),
+        ("acme-instruction-hub-dev", "dist/cursor/dev"),
+        ("acme-instruction-hub-ops", "dist/cursor/ops"),
     ]
     assert all(plugin["source"]["owner"] == "Promptless" for plugin in cursor_pointer["plugins"])
     assert all(plugin["source"]["repo"] == "instruction-hub-test" for plugin in cursor_pointer["plugins"])
