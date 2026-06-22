@@ -9,7 +9,7 @@ from promptless_instruction_hub.assets import load_assets, validate_no_literal_s
 from promptless_instruction_hub.config import load_hub_config, load_packages
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.mcp_config import read_mcp_servers
-from promptless_instruction_hub.models import HubConfig, LoadedAsset, PackageDefinition
+from promptless_instruction_hub.models import HubConfig, LoadedAsset, PackageDefinition, StablePackage
 
 SUPPORT_MODES_BY_ASSET_TYPE = {
     "skill": {"agent-skill", "native", "projected", "unsupported"},
@@ -28,6 +28,7 @@ class ValidationResult:
     config: HubConfig
     packages: dict[str, PackageDefinition]
     assets: dict[str, LoadedAsset]
+    stable_packages: tuple[StablePackage, ...]
     stable_assets: tuple[LoadedAsset, ...]
 
 
@@ -42,8 +43,15 @@ def validate_hub(hub_root: Path) -> ValidationResult:
     validate_no_literal_secrets(root)
     _validate_target_support(config, assets)
     _validate_mcp_assets(assets)
-    stable_assets = _resolve_stable_assets(config, packages, assets)
-    return ValidationResult(config=config, packages=packages, assets=assets, stable_assets=stable_assets)
+    stable_packages = _resolve_stable_packages(config, packages, assets)
+    stable_assets = _resolve_stable_assets(stable_packages)
+    return ValidationResult(
+        config=config,
+        packages=packages,
+        assets=assets,
+        stable_packages=stable_packages,
+        stable_assets=stable_assets,
+    )
 
 
 def _validate_target_support(config: HubConfig, assets: dict[str, LoadedAsset]) -> None:
@@ -71,20 +79,27 @@ def _validate_mcp_assets(assets: dict[str, LoadedAsset]) -> None:
             read_mcp_servers(asset.path, default_server_name=asset.id)
 
 
-def _resolve_stable_assets(
+def _resolve_stable_packages(
     config: HubConfig,
     packages: dict[str, PackageDefinition],
     assets: dict[str, LoadedAsset],
-) -> tuple[LoadedAsset, ...]:
-    refs: set[str] = set()
+) -> tuple[StablePackage, ...]:
+    stable_packages: list[StablePackage] = []
+    missing_refs: set[str] = set()
     for package_id in config.stable_packages:
         package = packages.get(package_id)
         if package is None:
             msg = f"stable package not found: {package_id}"
             raise InstructionHubError(msg)
-        refs.update(package.includes)
-    missing_refs = sorted(ref for ref in refs if ref not in assets)
+        missing_refs.update(ref for ref in package.includes if ref not in assets)
+        package_assets = tuple(assets[ref] for ref in sorted(package.includes) if ref in assets)
+        stable_packages.append(StablePackage(definition=package, assets=package_assets))
     if missing_refs:
-        msg = f"package includes unknown asset refs: {', '.join(missing_refs)}"
+        msg = f"package includes unknown asset refs: {', '.join(sorted(missing_refs))}"
         raise InstructionHubError(msg)
-    return tuple(assets[ref] for ref in sorted(refs))
+    return tuple(stable_packages)
+
+
+def _resolve_stable_assets(stable_packages: tuple[StablePackage, ...]) -> tuple[LoadedAsset, ...]:
+    assets_by_ref = {asset.ref: asset for stable_package in stable_packages for asset in stable_package.assets}
+    return tuple(assets_by_ref[ref] for ref in sorted(assets_by_ref))

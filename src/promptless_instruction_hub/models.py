@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -180,6 +181,14 @@ class LoadedAsset(BaseModel):
         """Ensure loaded asset IDs remain safe path segments."""
 
         return validate_identifier(value, "asset id")
+
+
+@dataclass(frozen=True)
+class StablePackage:
+    """Resolved stable package with the assets rendered into its plugin payload."""
+
+    definition: PackageDefinition
+    assets: tuple[LoadedAsset, ...]
 
 
 def _validate_unique(values: Sequence[str], field_name: str) -> None:

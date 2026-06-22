@@ -32,6 +32,14 @@ inputs:
     description: Commit a default-branch Claude marketplace pointer that targets the release branch in publish mode.
     required: false
     default: "true"
+  update-codex-pointer:
+    description: Commit a default-branch Codex marketplace pointer that targets the release branch in publish mode.
+    required: false
+    default: "true"
+  update-cursor-pointer:
+    description: Commit a default-branch Cursor marketplace pointer that targets the release branch in publish mode.
+    required: false
+    default: "true"
   github-token:
     description: Token used only for publish-mode git pushes when checkout credentials are not persisted.
     required: false
@@ -70,6 +78,8 @@ runs:
         INPUT_SOURCE_BRANCH: ${{ inputs.source-branch }}
         INPUT_GENERATED_PATHS: ${{ inputs.generated-paths }}
         INPUT_UPDATE_CLAUDE_POINTER: ${{ inputs.update-claude-pointer }}
+        INPUT_UPDATE_CODEX_POINTER: ${{ inputs.update-codex-pointer }}
+        INPUT_UPDATE_CURSOR_POINTER: ${{ inputs.update-cursor-pointer }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
         INPUT_COMMIT_USER_NAME: ${{ inputs.commit-user-name }}
         INPUT_COMMIT_USER_EMAIL: ${{ inputs.commit-user-email }}
