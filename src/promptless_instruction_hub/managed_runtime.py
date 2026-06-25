@@ -8,6 +8,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Literal
 
+from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, file_hash, read_json_mapping, write_json
 from promptless_instruction_hub.models import Harness, HubConfig, PackageDefinition
 
@@ -76,7 +77,7 @@ def render_managed_runtimes(
     config: HubConfig,
     package: PackageDefinition,
 ) -> tuple[ManagedRuntimeRecord, ...]:
-    """Inject Promptless-owned runtime artifacts for one generated plugin."""
+    """Write managed-runtime metadata and inject supported runtime artifacts for one generated plugin."""
 
     plugin_id = f"{config.plugin_id}-{package.id}"
     if target not in SUPPORTED_HOST_ENROLLMENT_TARGETS:
@@ -126,12 +127,12 @@ def _write_host_enrollment_hook(target_root: Path, target: Harness) -> None:
     hook_config = _existing_hook_config(hook_path)
     hooks = hook_config.setdefault("hooks", {})
     if not isinstance(hooks, dict):
-        hooks = {}
-        hook_config["hooks"] = hooks
+        msg = f"{hook_path} field hooks must be a JSON object"
+        raise InstructionHubError(msg)
     session_start = hooks.setdefault("SessionStart", [])
     if not isinstance(session_start, list):
-        session_start = []
-        hooks["SessionStart"] = session_start
+        msg = f"{hook_path} field hooks.SessionStart must be a JSON array"
+        raise InstructionHubError(msg)
     session_start.append(_host_enrollment_hook_entry(target))
     write_json(hook_path, hook_config)
 
@@ -141,8 +142,12 @@ def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
         return {}
     try:
         return read_json_mapping(hook_path)
-    except (OSError, ValueError):
-        return {}
+    except OSError as exc:
+        msg = f"failed to read existing hook config at {hook_path}: {exc}"
+        raise InstructionHubError(msg) from exc
+    except ValueError as exc:
+        msg = f"existing hook config at {hook_path} is invalid: {exc}"
+        raise InstructionHubError(msg) from exc
 
 
 def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
@@ -153,7 +158,8 @@ def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
         root_expr = "${PLUGIN_ROOT}"
         host = "codex"
 
-    # Codex and Claude both load plugin-root hooks from hooks/hooks.json and execute command hooks.
+    # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
+    # the user to trust/review plugin hooks before running this startup command.
     # https://developers.openai.com/codex/plugins/build
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     command = f'python3 "{root_expr}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host {host} --quiet'

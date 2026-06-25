@@ -90,31 +90,46 @@
           "target",
           "toolchain_version"
         ],
-        "allOf": [
+        "oneOf": [
           {
-            "if": {
-              "properties": {
-                "status": {
-                  "const": "included"
-                }
-              },
-              "required": ["status"]
+            "properties": {
+              "status": {
+                "const": "included"
+              }
             },
-            "then": {
-              "required": ["channel", "version", "sha256", "executable", "path", "hook"]
+            "required": ["channel", "version", "sha256", "executable", "path", "hook"],
+            "not": {
+              "required": ["reason"]
             }
           },
           {
-            "if": {
-              "properties": {
-                "status": {
-                  "const": "unsupported"
-                }
-              },
-              "required": ["status"]
+            "properties": {
+              "status": {
+                "const": "unsupported"
+              }
             },
-            "then": {
-              "required": ["reason"]
+            "required": ["reason"],
+            "not": {
+              "anyOf": [
+                {
+                  "required": ["channel"]
+                },
+                {
+                  "required": ["version"]
+                },
+                {
+                  "required": ["sha256"]
+                },
+                {
+                  "required": ["executable"]
+                },
+                {
+                  "required": ["path"]
+                },
+                {
+                  "required": ["hook"]
+                }
+              ]
             }
           }
         ],
