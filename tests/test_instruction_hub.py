@@ -454,12 +454,14 @@ def test_build_check_fails_when_generated_output_is_stale(tmp_path: Path) -> Non
 @pytest.mark.parametrize(
     ("generated_path", "expected_stale_path"),
     [
+        (Path("hub.release.json"), "hub.release.json"),
+        (Path("hub.stable.json"), "hub.stable.json"),
         (Path(".agents/plugins/marketplace.json"), ".agents/plugins"),
         (Path(".claude-plugin/marketplace.json"), ".claude-plugin"),
         (Path(".cursor-plugin/marketplace.json"), ".cursor-plugin"),
     ],
 )
-def test_build_check_fails_when_root_marketplace_is_stale(
+def test_build_check_fails_when_root_generated_output_is_stale(
     tmp_path: Path,
     generated_path: Path,
     expected_stale_path: str,
@@ -781,6 +783,55 @@ def test_action_publish_writes_release_branch_and_marketplace_pointers_for_stabl
     assert all(plugin["source"]["type"] == "github" for plugin in cursor_pointer["plugins"])
     assert all("version" not in plugin for plugin in cursor_pointer["plugins"])
     assert output_path.read_text() == "release-branch=release/stable\n"
+
+
+def test_action_publish_bumps_and_rewrites_outputs_when_package_id_changes(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-package-id-rename", targets=("claude", "codex", "cursor"))
+    _configure_split_package_hub(repo, ("claude", "codex", "cursor"))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "split stable packages")
+
+    first = _run_action(repo, tmp_path / "github-output-first.txt")
+    assert first.returncode == 0, first.stdout + first.stderr
+    _git(repo, "fetch", "origin", "release/stable")
+    assert _release_branch_plugin_versions(repo, packages=("dev", "ops"), targets=("claude", "codex", "cursor")) == {
+        "0.1.0"
+    }
+
+    (repo / "hub.yaml").write_text((repo / "hub.yaml").read_text().replace("  - dev\n", "  - developer\n"))
+    (repo / "packages/dev.yaml").rename(repo / "packages/developer.yaml")
+    (repo / "packages/developer.yaml").write_text(
+        "id: developer\nname: Developer\nincludes:\n  - skill:authoring-tools\n"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "rename dev package id")
+
+    second = _run_action(repo, tmp_path / "github-output-second.txt")
+    assert second.returncode == 0, second.stdout + second.stderr
+    _git(repo, "fetch", "origin", "release/stable")
+
+    assert _release_branch_plugin_versions(
+        repo,
+        packages=("developer", "ops"),
+        targets=("claude", "codex", "cursor"),
+    ) == {"0.1.1"}
+    assert _release_branch_path_exists(repo, "dist/claude/developer/.claude-plugin/plugin.json")
+    assert not _release_branch_path_exists(repo, "dist/claude/dev/.claude-plugin/plugin.json")
+    claude_pointer = json.loads((repo / ".claude-plugin/marketplace.json").read_text())
+    assert [(plugin["name"], plugin["source"]["path"]) for plugin in claude_pointer["plugins"]] == [
+        ("acme-instruction-hub-developer", "dist/claude/developer"),
+        ("acme-instruction-hub-ops", "dist/claude/ops"),
+    ]
+    codex_pointer = json.loads((repo / ".agents/plugins/marketplace.json").read_text())
+    assert [(plugin["name"], plugin["source"]["path"]) for plugin in codex_pointer["plugins"]] == [
+        ("acme-instruction-hub-developer", "dist/codex/developer"),
+        ("acme-instruction-hub-ops", "dist/codex/ops"),
+    ]
+    cursor_pointer = json.loads((repo / ".cursor-plugin/marketplace.json").read_text())
+    assert [(plugin["name"], plugin["source"]["path"]) for plugin in cursor_pointer["plugins"]] == [
+        ("acme-instruction-hub-developer", "dist/cursor/developer"),
+        ("acme-instruction-hub-ops", "dist/cursor/ops"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1170,11 +1221,19 @@ def test_publish_version_reports_nested_authoritative_version_basis_path(tmp_pat
         ("schema_version", r"hub\.release\.json: schema_version must be 1"),
         ("assets_object", r"hub\.release\.json: assets must be a list"),
         ("assets_empty", r"hub\.release\.json: assets refs must match version_basis package assets"),
+        (
+            "target_hash_missing",
+            r"hub\.release\.json: version_basis\.target_hashes keys must match version_basis\.targets",
+        ),
+        (
+            "managed_runtime_bad_sha",
+            r"hub\.release\.json: version_basis\.managed_runtimes\[0\]\.sha256 must be a sha256 hex digest",
+        ),
         ("release_id_empty", r"hub\.release\.json: release_id must not be empty"),
         ("release_hash_mismatch", r"hub\.release\.json: release_hash must match manifest content"),
     ],
 )
-def test_publish_version_rejects_authoritative_release_manifest_top_level_tampering(
+def test_publish_version_rejects_authoritative_release_manifest_tampering(
     tmp_path: Path,
     mutation: str,
     message: str,
@@ -1193,6 +1252,10 @@ def test_publish_version_rejects_authoritative_release_manifest_top_level_tamper
         manifest["assets"] = {}
     elif mutation == "assets_empty":
         manifest["assets"] = []
+    elif mutation == "target_hash_missing":
+        del manifest["version_basis"]["target_hashes"]["claude"]
+    elif mutation == "managed_runtime_bad_sha":
+        manifest["version_basis"]["managed_runtimes"][0]["sha256"] = "bad"
     elif mutation == "release_id_empty":
         manifest["release_id"] = ""
     elif mutation == "release_hash_mismatch":
@@ -1218,6 +1281,30 @@ def test_publish_version_rejects_authoritative_release_manifest_unexpected_root_
 
     with pytest.raises(ValueError, match=r"hub\.release\.json: release manifest must contain exactly"):
         resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
+
+
+def test_publish_version_uses_config_when_previous_release_has_no_version_metadata(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, plugin_version="0.2.0")
+    previous_release_root = tmp_path / "previous-release"
+    previous_release_root.mkdir()
+    (previous_release_root / "README.md").write_text("# Previous release\n")
+
+    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.2.0"
+
+
+def test_publish_version_ignores_repo_context_inventory(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    _configure_split_package_hub(hub_root, targets=("claude", "codex"))
+    build_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    shutil.copytree(hub_root, previous_release_root)
+    (hub_root / "hub.repo-context.json").write_text(
+        json.dumps({"schema_version": 1, "files": [{"path": "AGENTS.md", "imported": False}]})
+    )
+
+    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.0"
 
 
 def test_publish_version_rejects_release_manifest_without_version_basis(tmp_path: Path) -> None:
@@ -1901,13 +1988,19 @@ def _release_branch_path_exists(repo: Path, path: str) -> bool:
     return result.returncode == 0
 
 
-def _release_branch_plugin_versions(repo: Path) -> set[str]:
-    manifest_paths = [
-        "dist/claude/core/.claude-plugin/plugin.json",
-        "dist/codex/core/.codex-plugin/plugin.json",
-        "dist/cursor/core/.cursor-plugin/plugin.json",
-        "dist/gemini/core/gemini-extension.json",
-    ]
+def _release_branch_plugin_versions(
+    repo: Path,
+    *,
+    packages: tuple[str, ...] = ("core",),
+    targets: tuple[str, ...] = ("claude", "codex", "cursor", "gemini"),
+) -> set[str]:
+    manifest_names = {
+        "claude": ".claude-plugin/plugin.json",
+        "codex": ".codex-plugin/plugin.json",
+        "cursor": ".cursor-plugin/plugin.json",
+        "gemini": "gemini-extension.json",
+    }
+    manifest_paths = [f"dist/{target}/{package}/{manifest_names[target]}" for target in targets for package in packages]
     return {
         json.loads(_git_output(repo, "show", f"origin/release/stable:{manifest_path}"))["version"]
         for manifest_path in manifest_paths
