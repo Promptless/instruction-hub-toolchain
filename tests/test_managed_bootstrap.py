@@ -526,7 +526,15 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
         server.stop()
 
 
-def test_bootstrap_blocks_inline_codex_otel_config(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        'otel = { environment = "local" }\n',
+        'otel.exporter = "otlp-http"\n',
+        '[otel.exporter.otlp-http]\nendpoint = "http://collector.local"\n',
+    ],
+)
+def test_bootstrap_blocks_top_level_codex_otel_config(tmp_path: Path, config_text: str) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -536,7 +544,7 @@ def test_bootstrap_blocks_inline_codex_otel_config(tmp_path: Path) -> None:
         codex_home = tmp_path / "codex-home"
         codex_config = codex_home / ".codex/config.toml"
         codex_config.parent.mkdir(parents=True)
-        codex_config.write_text('otel = { environment = "local" }\n')
+        codex_config.write_text(config_text)
 
         _run_bootstrap(
             hub_root / "dist/codex/core",
@@ -551,7 +559,7 @@ def test_bootstrap_blocks_inline_codex_otel_config(tmp_path: Path) -> None:
             expected_status="blocked",
         )
 
-        assert codex_config.read_text() == 'otel = { environment = "local" }\n'
+        assert codex_config.read_text() == config_text
         assert server.check_ins[-1]["status"] == "blocked"
     finally:
         server.stop()

@@ -603,9 +603,9 @@ def _codex_managed_block(policy: HostPolicy) -> str:
 
 def _has_unmanaged_codex_otel_config(existing: str) -> bool:
     return (
-        re.search(r"(?m)^\s*\[otel\]\s*$", existing) is not None
+        re.search(r"(?m)^\s*\[otel(?:\]|\.)", existing) is not None
         or re.search(
-            r"(?m)^\s*otel\s*=",
+            r"(?m)^\s*otel(?:\s*=|\.)",
             existing,
         )
         is not None
