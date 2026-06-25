@@ -583,20 +583,16 @@ def _codex_managed_block(policy: HostPolicy) -> str:
             "[otel]",
             'environment = "prod"',
             f"log_user_prompt = {_toml_bool(_capture_enabled(policy, 'user_prompts'))}",
-            (
-                "exporter = { otlp-http = { "
-                f"endpoint = {_toml_string(policy.collector.logs_endpoint)}, "
-                'protocol = "binary", '
-                f"headers = {headers} "
-                "} }"
-            ),
-            (
-                "trace_exporter = { otlp-http = { "
-                f"endpoint = {_toml_string(policy.collector.traces_endpoint)}, "
-                'protocol = "binary", '
-                f"headers = {headers} "
-                "} }"
-            ),
+            "",
+            "[otel.exporter.otlp-http]",
+            f"endpoint = {_toml_string(policy.collector.logs_endpoint)}",
+            'protocol = "binary"',
+            f"headers = {headers}",
+            "",
+            "[otel.trace_exporter.otlp-http]",
+            f"endpoint = {_toml_string(policy.collector.traces_endpoint)}",
+            'protocol = "binary"',
+            f"headers = {headers}",
             MANAGED_END,
             "",
         ]

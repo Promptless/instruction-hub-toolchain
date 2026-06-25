@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import threading
+import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
@@ -276,6 +277,9 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert codex_config.count('protocol = "binary"') == 2
         assert "metrics_exporter" not in codex_config
         assert "plugin-token" not in codex_config
+        codex_otel = tomllib.loads(codex_config)["otel"]
+        assert codex_otel["exporter"]["otlp-http"]["protocol"] == "binary"
+        assert codex_otel["trace_exporter"]["otlp-http"]["protocol"] == "binary"
 
         claude_home = tmp_path / "claude-home"
         _run_bootstrap(
