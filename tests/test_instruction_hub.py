@@ -23,6 +23,10 @@ SCHEMAS = REPO_ROOT / "schemas"
 WORKFLOWS = REPO_ROOT / ".github/workflows"
 
 
+def _assert_no_promptless_directory(root: Path) -> None:
+    assert list(root.rglob(".promptless")) == []
+
+
 def _assert_codex_plugin_ingestion_contract(plugin_root: Path) -> None:
     manifest_path = plugin_root / ".codex-plugin/plugin.json"
     manifest_data: object = json.loads(manifest_path.read_text())
@@ -93,7 +97,8 @@ def test_init_creates_empty_hub_contract(tmp_path: Path) -> None:
     init_hub(hub_root, org="Acme")
     validation = validate_hub(hub_root)
 
-    assert (hub_root / ".promptless/instruction-hub.yaml").exists()
+    assert (hub_root / "hub.yaml").exists()
+    assert not (hub_root / ".promptless").exists()
     assert (hub_root / ".agents/plugins").is_dir()
     assert (hub_root / ".claude-plugin").is_dir()
     assert (hub_root / ".cursor-plugin").is_dir()
@@ -120,9 +125,10 @@ def test_scan_imports_skills_and_inventories_repo_context(tmp_path: Path) -> Non
     assert (hub_root / "assets/mcps/repo-mcp.json").exists()
     assert not (hub_root / "assets/mcps/repo-mcp.asset.yaml").exists()
     assert not (hub_root / "assets/mcps/cursor-mcp.json").exists()
-    inventory = json.loads((hub_root / ".promptless/inventory/repo-context.json").read_text())
+    inventory = json.loads((hub_root / "hub.repo-context.json").read_text())
     assert "source_root" not in inventory
     assert inventory["files"][0]["imported"] is False
+    _assert_no_promptless_directory(hub_root)
 
 
 def test_scan_imports_cursor_only_mcp_config(tmp_path: Path) -> None:
@@ -334,12 +340,13 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     gemini_manifest = json.loads((hub_root / "dist/gemini/core/gemini-extension.json").read_text())
     assert "skills" not in gemini_manifest
     assert gemini_manifest["mcpServers"]["fixture-trace"]["env"]["PROMPTLESS_API_KEY"] == "${PROMPTLESS_API_KEY}"
-    assert (hub_root / "dist/codex/core/.promptless/release.json").exists()
+    assert (hub_root / "dist/codex/core/hub.release.json").exists()
+    _assert_no_promptless_directory(hub_root)
     mcp_config = json.loads((hub_root / "dist/codex/core/.mcp.json").read_text())
     assert mcp_config["mcpServers"]["fixture-trace"]["env"]["PROMPTLESS_API_KEY"] == "${PROMPTLESS_API_KEY}"
     assert mcp_config["mcpServers"]["fixture-docs"]["url"] == "https://example.invalid/mcp"
     assert "promptless-instruction-hub-status" not in mcp_config["mcpServers"]
-    release_manifest = json.loads((hub_root / ".promptless/releases/current.json").read_text())
+    release_manifest = json.loads((hub_root / "hub.release.json").read_text())
     assert "git_commit" not in release_manifest
     assert set(release_manifest["target_hashes"]) == {"claude", "codex", "cursor", "gemini"}
     assert {asset["title"] for asset in release_manifest["assets"]} == {"Repository MCP Servers", "Review Docs"}
@@ -348,7 +355,7 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
 def test_build_renders_stable_packages_as_separate_marketplace_plugins(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
-    (hub_root / ".promptless/instruction-hub.yaml").write_text(
+    (hub_root / "hub.yaml").write_text(
         "\n".join(
             [
                 "org: Promptless",
@@ -401,7 +408,7 @@ def test_build_renders_stable_packages_as_separate_marketplace_plugins(tmp_path:
         ("promptless-instruction-hub-dev", "dist/cursor/dev"),
         ("promptless-instruction-hub-ops", "dist/cursor/ops"),
     ]
-    release_manifest = json.loads((hub_root / ".promptless/releases/current.json").read_text())
+    release_manifest = json.loads((hub_root / "hub.release.json").read_text())
     assert release_manifest["stable_packages"] == ["dev", "ops"]
     assert [asset["ref"] for asset in release_manifest["assets"]] == [
         "skill:authoring-tools",
@@ -474,7 +481,7 @@ def test_build_check_passes_after_generated_output_is_committed(tmp_path: Path) 
 def test_build_renders_projected_rules_native_cursor_rules_and_mcp_assets(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Acme")
-    (hub_root / ".promptless/instruction-hub.yaml").write_text(
+    (hub_root / "hub.yaml").write_text(
         "\n".join(
             [
                 "org: Acme",
@@ -965,6 +972,40 @@ def test_action_publish_second_run_is_noop(tmp_path: Path) -> None:
     assert "No marketplace pointer changes to publish." in second.stdout
 
 
+def test_action_publish_bumps_generated_plugin_version_when_assets_change(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-version-bump", targets=("claude", "codex", "cursor", "gemini"))
+    (repo / "packages/core.yaml").write_text("id: core\nname: Core\nincludes:\n  - skill:review-docs\n")
+    skill_root = repo / "assets/skills/review-docs"
+    skill_root.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Review Docs\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "add review docs")
+
+    first = _run_action(repo, tmp_path / "github-output-first.txt")
+    assert first.returncode == 0, first.stdout + first.stderr
+    _git(repo, "fetch", "origin", "release/stable")
+    assert _release_branch_plugin_versions(repo) == {"0.1.0"}
+
+    (skill_root / "SKILL.md").write_text("# Review Docs\n\nPrefer concise summaries.\n")
+    _git(repo, "add", "assets/skills/review-docs/SKILL.md")
+    _git(repo, "commit", "-m", "update review docs")
+
+    second = _run_action(repo, tmp_path / "github-output-second.txt")
+    assert second.returncode == 0, second.stdout + second.stderr
+    _git(repo, "fetch", "origin", "release/stable")
+
+    assert _release_branch_plugin_versions(repo) == {"0.1.1"}
+    release_manifest = json.loads(_git_output(repo, "show", "origin/release/stable:hub.release.json"))
+    stable_channel = json.loads(_git_output(repo, "show", "origin/release/stable:hub.stable.json"))
+    assert release_manifest["plugin"]["version"] == "0.1.1"
+    assert stable_channel["plugin_version"] == "0.1.1"
+    assert "plugin_version: 0.1.0" in (repo / "hub.yaml").read_text()
+
+    third = _run_action(repo, tmp_path / "github-output-third.txt")
+    assert third.returncode == 0, third.stdout + third.stderr
+    assert "No release branch changes to publish." in third.stdout
+
+
 def test_action_publish_supports_subdirectory_hub_root_and_custom_release_branch(tmp_path: Path) -> None:
     repo = _init_action_repo(tmp_path / "publish-subdir", targets=("claude", "codex", "cursor"), hub_root_name="hub")
 
@@ -1009,7 +1050,7 @@ def test_action_publish_removes_stale_pointer_when_target_is_removed(tmp_path: P
     assert (repo / ".claude-plugin/marketplace.json").exists()
 
     _write_hub_config(repo, ("codex",))
-    _git(repo, "add", ".promptless/instruction-hub.yaml")
+    _git(repo, "add", "hub.yaml")
     _git(repo, "commit", "-m", "remove claude target")
 
     second = _run_action(repo, tmp_path / "github-output-second.txt")
@@ -1026,7 +1067,7 @@ def test_action_publish_removes_stale_pointer_when_target_is_removed(tmp_path: P
 def test_validate_rejects_empty_stable_packages(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
-    (hub_root / ".promptless/instruction-hub.yaml").write_text(
+    (hub_root / "hub.yaml").write_text(
         "\n".join(
             [
                 "org: Acme",
@@ -1107,7 +1148,7 @@ def test_validate_rejects_unsafe_asset_ids(tmp_path: Path) -> None:
 def test_validate_rejects_empty_required_config_strings(tmp_path: Path, config_text: str) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
-    (hub_root / ".promptless/instruction-hub.yaml").write_text(config_text)
+    (hub_root / "hub.yaml").write_text(config_text)
 
     with pytest.raises(InstructionHubError, match="String should have at least 1 character"):
         validate_hub(hub_root)
@@ -1116,7 +1157,7 @@ def test_validate_rejects_empty_required_config_strings(tmp_path: Path, config_t
 def test_validate_rejects_empty_target_list(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
-    (hub_root / ".promptless/instruction-hub.yaml").write_text(
+    (hub_root / "hub.yaml").write_text(
         "\n".join(
             [
                 "org: Acme",
@@ -1334,7 +1375,7 @@ def test_build_rejects_same_priority_duplicate_mcp_servers(tmp_path: Path) -> No
 def test_validate_wraps_malformed_yaml_with_path(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
-    config_path = hub_root / ".promptless/instruction-hub.yaml"
+    config_path = hub_root / "hub.yaml"
     config_path.write_text("org: [\n")
 
     with pytest.raises(InstructionHubError, match=re.escape(str(config_path))):
@@ -1397,7 +1438,7 @@ def test_cli_init_scan_build_validate_and_status(tmp_path: Path, capsys: pytest.
     assert main(["validate", "--hub", str(hub_root)]) == 0
     assert main(["build", "--hub", str(hub_root)]) == 0
     assert main(["build", "--hub", str(hub_root), "--check"]) == 0
-    assert main(["status", "--manifest", str(hub_root / ".promptless/releases/current.json")]) == 0
+    assert main(["status", "--manifest", str(hub_root / "hub.release.json")]) == 0
 
     output = capsys.readouterr().out
     assert "valid Instruction Hub" in output
@@ -1412,7 +1453,7 @@ def test_empty_hub_fixture_bootstraps(tmp_path: Path) -> None:
     result = build_hub(hub_root)
 
     assert result.asset_count == 0
-    assert (hub_root / ".promptless/releases/current.json").exists()
+    assert (hub_root / "hub.release.json").exists()
 
 
 def test_status_mcp_returns_invalid_request_errors(
@@ -1446,7 +1487,7 @@ def test_status_mcp_reports_release_metadata_without_git_commit(
     }
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
 
-    run_status_mcp(hub_root / ".promptless/releases/current.json")
+    run_status_mcp(hub_root / "hub.release.json")
 
     response = json.loads(capsys.readouterr().out)
     status = json.loads(response["result"]["content"][0]["text"])
@@ -1522,6 +1563,19 @@ def _remote_branch_exists(cwd: Path, branch: str) -> bool:
     raise AssertionError(result.stdout + result.stderr)
 
 
+def _release_branch_plugin_versions(repo: Path) -> set[str]:
+    manifest_paths = [
+        "dist/claude/core/.claude-plugin/plugin.json",
+        "dist/codex/core/.codex-plugin/plugin.json",
+        "dist/cursor/core/.cursor-plugin/plugin.json",
+        "dist/gemini/core/gemini-extension.json",
+    ]
+    return {
+        json.loads(_git_output(repo, "show", f"origin/release/stable:{manifest_path}"))["version"]
+        for manifest_path in manifest_paths
+    }
+
+
 def _init_action_repo(root: Path, *, targets: tuple[str, ...], hub_root_name: str = ".") -> Path:
     remote = root / "remote.git"
     repo = root / "repo"
@@ -1543,7 +1597,7 @@ def _init_action_repo(root: Path, *, targets: tuple[str, ...], hub_root_name: st
 
 def _write_hub_config(hub_root: Path, targets: tuple[str, ...]) -> None:
     target_lines = "\n".join(f"  - {target}" for target in targets)
-    (hub_root / ".promptless/instruction-hub.yaml").write_text(
+    (hub_root / "hub.yaml").write_text(
         "\n".join(
             [
                 "org: Acme",
@@ -1562,7 +1616,7 @@ def _write_hub_config(hub_root: Path, targets: tuple[str, ...]) -> None:
 
 def _configure_split_package_hub(hub_root: Path, targets: tuple[str, ...]) -> None:
     target_lines = "\n".join(f"  - {target}" for target in targets)
-    (hub_root / ".promptless/instruction-hub.yaml").write_text(
+    (hub_root / "hub.yaml").write_text(
         "\n".join(
             [
                 "org: Acme",

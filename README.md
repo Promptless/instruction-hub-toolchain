@@ -43,6 +43,24 @@ Customer hubs should usually use `build` for pull requests and `publish` after
 changes merge to the default branch. Use `check` only for repositories that
 intentionally commit generated artifacts on the same branch as source assets.
 
+## Hub File Layout
+
+Instruction Hub source config lives at `hub.yaml` in the hub root. Generated hub
+metadata is also flat at the hub root:
+
+- `hub.release.json`: current release manifest.
+- `hub.stable.json`: stable channel pointer.
+- `hub.repo-context.json`: scanned repository-context inventory.
+
+Generated plugins embed local metadata as root files inside each plugin:
+
+- `hub.release.json`: plugin-local release/status manifest.
+- `hub.managed-runtimes.json`: Promptless-managed runtime metadata.
+
+The old `.promptless/instruction-hub.yaml` and generated `.promptless/...`
+layout is not read or migrated by this toolchain. Existing hubs must rename
+their config to `hub.yaml` and regenerate output with `pi build`.
+
 ## Release Model
 
 Action releases are tagged with immutable versions such as `v0.1.0` and a moving

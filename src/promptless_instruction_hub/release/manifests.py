@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH, STABLE_CHANNEL_PATH
 from promptless_instruction_hub.fs import JsonValue, directory_hash, write_json
 from promptless_instruction_hub.managed_runtime import ManagedRuntimeRecord
 from promptless_instruction_hub.models import LoadedAsset
@@ -19,7 +20,7 @@ def build_release_manifest(
     """Build the deterministic release manifest for generated target output."""
 
     target_hashes = {
-        target: directory_hash(output_root / "dist" / target, skip_names={"release.json"})
+        target: directory_hash(output_root / "dist" / target, skip_names={RELEASE_MANIFEST_PATH.name})
         for target in validation.config.targets
     }
     base_manifest: dict[str, JsonValue] = {
@@ -42,12 +43,27 @@ def build_release_manifest(
     return base_manifest
 
 
+def build_release_source_state(validation: ValidationResult) -> dict[str, JsonValue]:
+    """Return the source-derived manifest fields that should move plugin versions."""
+
+    return {
+        "org": validation.config.org,
+        "plugin": {
+            "id": validation.config.plugin_id,
+            "name": validation.config.plugin_name,
+        },
+        "stable_packages": validation.config.stable_packages,
+        "targets": validation.config.targets,
+        "assets": [_asset_manifest(asset) for asset in validation.stable_assets],
+    }
+
+
 def write_release_files(output_root: Path, release_manifest: dict[str, JsonValue]) -> None:
     """Write generated release and stable-channel manifests."""
 
-    write_json(output_root / ".promptless/releases/current.json", release_manifest)
+    write_json(output_root / RELEASE_MANIFEST_PATH, release_manifest)
     write_json(
-        output_root / ".promptless/channels/stable.json",
+        output_root / STABLE_CHANNEL_PATH,
         {
             "schema_version": 1,
             "channel": "stable",

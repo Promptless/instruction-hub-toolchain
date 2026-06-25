@@ -7,9 +7,11 @@ import json
 import sys
 from pathlib import Path
 
+from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH
 from promptless_instruction_hub.compiler import build_hub, init_hub, validate_hub
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.mcp_status import run_status_mcp
+from promptless_instruction_hub.release.versions import resolve_publish_plugin_version
 from promptless_instruction_hub.scan.hub import scan_hub
 from promptless_instruction_hub.status import summarize_release_manifest
 
@@ -47,9 +49,15 @@ def _build_parser() -> argparse.ArgumentParser:
     build_parser = subcommands.add_parser("build", help="generate target distribution artifacts")
     _add_hub_arg(build_parser)
     build_parser.add_argument("--check", action="store_true", help="fail if generated artifacts are stale")
+    build_parser.add_argument("--plugin-version", help=argparse.SUPPRESS)
 
     status_parser = subcommands.add_parser("status", help="print local release metadata")
-    status_parser.add_argument("--manifest", type=Path, default=Path(".promptless/releases/current.json"))
+    status_parser.add_argument("--manifest", type=Path, default=RELEASE_MANIFEST_PATH)
+
+    publish_version_parser = subcommands.add_parser("publish-version", help=argparse.SUPPRESS)
+    _add_hub_arg(publish_version_parser)
+    publish_version_parser.add_argument("--previous-release-root", type=Path)
+    publish_version_parser.add_argument("--hub-relative-path", default="")
 
     mcp_parser = subcommands.add_parser("mcp-status", help=argparse.SUPPRESS)
     mcp_parser.add_argument("--manifest", type=Path, required=True)
@@ -84,9 +92,18 @@ def _dispatch(args: argparse.Namespace) -> int:
         print(f"valid Instruction Hub: {len(result.stable_assets)} stable asset(s)")
         return 0
     if args.command == "build":
-        result = build_hub(args.hub, check=args.check)
+        result = build_hub(args.hub, check=args.check, plugin_version=args.plugin_version)
         verb = "checked" if result.checked else "built"
         print(f"{verb} release {result.release_id} ({result.release_hash[:12]})")
+        return 0
+    if args.command == "publish-version":
+        print(
+            resolve_publish_plugin_version(
+                args.hub,
+                previous_release_root=args.previous_release_root,
+                hub_relative_path=args.hub_relative_path,
+            )
+        )
         return 0
     if args.command == "status":
         print(json.dumps(summarize_release_manifest(args.manifest), indent=2, sort_keys=True))

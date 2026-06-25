@@ -138,17 +138,27 @@ def file_hash(path: Path) -> str:
 
 
 def replace_tree(source: Path, destination: Path) -> None:
-    """Replace one generated directory tree with another."""
+    """Replace one generated file or directory tree with another."""
 
     if destination.exists():
-        shutil.rmtree(destination)
+        if destination.is_dir():
+            shutil.rmtree(destination)
+        else:
+            destination.unlink()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, destination)
+    if source.is_dir():
+        shutil.copytree(source, destination)
+    else:
+        shutil.copy2(source, destination)
 
 
 def trees_equal(left: Path, right: Path) -> bool:
-    """Compare two directory trees by relative file names and bytes."""
+    """Compare two generated files or directory trees by names and bytes."""
 
+    if not left.exists() or not right.exists():
+        return not left.exists() and not right.exists()
+    if left.is_file() or right.is_file():
+        return left.is_file() and right.is_file() and file_hash(left) == file_hash(right)
     return _tree_fingerprint(left) == _tree_fingerprint(right)
 
 
