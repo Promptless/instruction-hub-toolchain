@@ -169,32 +169,48 @@ def _validate_manifest_version_basis(
         "version_basis.plugin",
     )
 
-    org = _require_string(manifest_path, basis, "org")
+    org = _require_string(manifest_path, basis, "org", display_path="version_basis.org")
     if not org:
         msg = f"{manifest_path}: version_basis.org must not be empty"
         raise ValueError(msg)
 
-    stable_packages = _require_string_list(manifest_path, basis, "stable_packages")
+    stable_packages = _require_string_list(
+        manifest_path,
+        basis,
+        "stable_packages",
+        display_path="version_basis.stable_packages",
+    )
+    if not stable_packages:
+        msg = f"{manifest_path}: version_basis.stable_packages must not be empty"
+        raise ValueError(msg)
     _require_unique(manifest_path, stable_packages, "version_basis.stable_packages")
     for index, package_id in enumerate(stable_packages):
         _validate_identifier(manifest_path, package_id, f"version_basis.stable_packages[{index}]")
 
-    targets = _require_string_list(manifest_path, basis, "targets")
+    targets = _require_string_list(manifest_path, basis, "targets", display_path="version_basis.targets")
+    if not targets:
+        msg = f"{manifest_path}: version_basis.targets must not be empty"
+        raise ValueError(msg)
     _require_unique(manifest_path, targets, "version_basis.targets")
     for index, target in enumerate(targets):
         if target not in SUPPORTED_HARNESSES:
             msg = f"{manifest_path}: version_basis.targets[{index}] must be a supported target"
             raise ValueError(msg)
 
-    target_hashes = _require_mapping(manifest_path, basis, "target_hashes")
+    target_hashes = _require_mapping(
+        manifest_path,
+        basis,
+        "target_hashes",
+        display_path="version_basis.target_hashes",
+    )
     _validate_target_hashes(manifest_path, target_hashes, targets, "version_basis.target_hashes")
     _validate_managed_runtimes(
         manifest_path,
-        _require_list(manifest_path, basis, "managed_runtimes"),
+        _require_list(manifest_path, basis, "managed_runtimes", display_path="version_basis.managed_runtimes"),
         "version_basis.managed_runtimes",
     )
 
-    packages = _require_list(manifest_path, basis, "packages")
+    packages = _require_list(manifest_path, basis, "packages", display_path="version_basis.packages")
     package_ids: list[str] = []
     for index, package_value in enumerate(packages):
         package = _require_mapping_value(manifest_path, package_value, f"version_basis.packages[{index}]")
@@ -212,12 +228,16 @@ def _validate_manifest_version_basis(
 
 def _validate_plugin_object(manifest_path: Path, plugin: dict[str, JsonValue], key_path: str) -> None:
     _require_exact_keys(manifest_path, plugin, key_path, PLUGIN_KEYS)
-    _validate_identifier(manifest_path, _require_string(manifest_path, plugin, "id"), f"{key_path}.id")
-    name = _require_string(manifest_path, plugin, "name")
+    _validate_identifier(
+        manifest_path,
+        _require_string(manifest_path, plugin, "id", display_path=f"{key_path}.id"),
+        f"{key_path}.id",
+    )
+    name = _require_string(manifest_path, plugin, "name", display_path=f"{key_path}.name")
     if not name:
         msg = f"{manifest_path}: {key_path}.name must not be empty"
         raise ValueError(msg)
-    version = _require_string(manifest_path, plugin, "version")
+    version = _require_string(manifest_path, plugin, "version", display_path=f"{key_path}.version")
     if SEMVER_RE.match(version) is None:
         msg = f"{manifest_path}: {key_path}.version must be SemVer, got: {version}"
         raise ValueError(msg)
@@ -225,19 +245,19 @@ def _validate_plugin_object(manifest_path: Path, plugin: dict[str, JsonValue], k
 
 def _validate_package_basis(manifest_path: Path, package: dict[str, JsonValue], key_path: str) -> str:
     _require_exact_keys(manifest_path, package, key_path, PACKAGE_BASIS_KEYS)
-    package_id = _require_string(manifest_path, package, "id")
+    package_id = _require_string(manifest_path, package, "id", display_path=f"{key_path}.id")
     _validate_identifier(manifest_path, package_id, f"{key_path}.id")
-    name = _require_string(manifest_path, package, "name")
+    name = _require_string(manifest_path, package, "name", display_path=f"{key_path}.name")
     if not name:
         msg = f"{manifest_path}: {key_path}.name must not be empty"
         raise ValueError(msg)
 
-    includes = _require_string_list(manifest_path, package, "includes")
+    includes = _require_string_list(manifest_path, package, "includes", display_path=f"{key_path}.includes")
     _require_unique(manifest_path, includes, f"{key_path}.includes")
     for index, asset_ref in enumerate(includes):
         _validate_asset_ref(manifest_path, asset_ref, f"{key_path}.includes[{index}]")
 
-    assets = _require_list(manifest_path, package, "assets")
+    assets = _require_list(manifest_path, package, "assets", display_path=f"{key_path}.assets")
     asset_refs: list[str] = []
     for index, asset_value in enumerate(assets):
         asset = _require_mapping_value(manifest_path, asset_value, f"{key_path}.assets[{index}]")
@@ -250,13 +270,13 @@ def _validate_package_basis(manifest_path: Path, package: dict[str, JsonValue], 
 
 def _validate_asset_manifest(manifest_path: Path, asset: dict[str, JsonValue], key_path: str) -> str:
     _require_exact_keys(manifest_path, asset, key_path, ASSET_MANIFEST_KEYS)
-    asset_ref = _require_string(manifest_path, asset, "ref")
+    asset_ref = _require_string(manifest_path, asset, "ref", display_path=f"{key_path}.ref")
     _validate_asset_ref(manifest_path, asset_ref, f"{key_path}.ref")
     asset_type, _, asset_id = asset_ref.partition(":")
-    if _require_string(manifest_path, asset, "id") != asset_id:
+    if _require_string(manifest_path, asset, "id", display_path=f"{key_path}.id") != asset_id:
         msg = f"{manifest_path}: {key_path}.id must match {key_path}.ref"
         raise ValueError(msg)
-    if _require_string(manifest_path, asset, "type") != asset_type:
+    if _require_string(manifest_path, asset, "type", display_path=f"{key_path}.type") != asset_type:
         msg = f"{manifest_path}: {key_path}.type must match {key_path}.ref"
         raise ValueError(msg)
     title = asset["title"]
@@ -267,8 +287,16 @@ def _validate_asset_manifest(manifest_path: Path, asset: dict[str, JsonValue], k
     if source_path is not None and not isinstance(source_path, str):
         msg = f"{manifest_path}: {key_path}.source_path must be a string or null"
         raise ValueError(msg)
-    _validate_sha256(manifest_path, _require_string(manifest_path, asset, "content_hash"), f"{key_path}.content_hash")
-    _validate_support_mapping(manifest_path, _require_mapping(manifest_path, asset, "support"), f"{key_path}.support")
+    _validate_sha256(
+        manifest_path,
+        _require_string(manifest_path, asset, "content_hash", display_path=f"{key_path}.content_hash"),
+        f"{key_path}.content_hash",
+    )
+    _validate_support_mapping(
+        manifest_path,
+        _require_mapping(manifest_path, asset, "support", display_path=f"{key_path}.support"),
+        f"{key_path}.support",
+    )
     return asset_ref
 
 
@@ -304,8 +332,12 @@ def _validate_target_hashes(
     if set(target_hashes) != expected_targets:
         msg = f"{manifest_path}: {key_path} keys must match version_basis.targets"
         raise ValueError(msg)
-    for target, digest in target_hashes.items():
-        _validate_sha256(manifest_path, _require_string(manifest_path, target_hashes, target), f"{key_path}.{target}")
+    for target in target_hashes:
+        _validate_sha256(
+            manifest_path,
+            _require_string(manifest_path, target_hashes, target, display_path=f"{key_path}.{target}"),
+            f"{key_path}.{target}",
+        )
 
 
 def _validate_managed_runtimes(manifest_path: Path, runtimes: list[JsonValue], key_path: str) -> None:
@@ -328,43 +360,68 @@ def _validate_managed_runtimes(manifest_path: Path, runtimes: list[JsonValue], k
             if not isinstance(value, str) or not value:
                 msg = f"{manifest_path}: {runtime_path}.{string_key} must be a non-empty string"
                 raise ValueError(msg)
-        _validate_sha256(manifest_path, _require_string(manifest_path, runtime, "sha256"), f"{runtime_path}.sha256")
+        _validate_sha256(
+            manifest_path,
+            _require_string(manifest_path, runtime, "sha256", display_path=f"{runtime_path}.sha256"),
+            f"{runtime_path}.sha256",
+        )
 
 
 def _require_mapping(
     manifest_path: Path,
     data: dict[str, JsonValue],
     key_path: str,
+    *,
+    display_path: str | None = None,
 ) -> dict[str, JsonValue]:
-    value = _lookup_path(manifest_path, data, key_path)
+    value = _lookup_path(manifest_path, data, key_path, display_path=display_path)
     if isinstance(value, dict):
         return value
-    msg = f"{manifest_path}: {key_path} must be a JSON object"
+    msg = f"{manifest_path}: {display_path or key_path} must be a JSON object"
     raise ValueError(msg)
 
 
-def _require_string(manifest_path: Path, data: dict[str, JsonValue], key_path: str) -> str:
-    value = _lookup_path(manifest_path, data, key_path)
+def _require_string(
+    manifest_path: Path,
+    data: dict[str, JsonValue],
+    key_path: str,
+    *,
+    display_path: str | None = None,
+) -> str:
+    value = _lookup_path(manifest_path, data, key_path, display_path=display_path)
     if isinstance(value, str):
         return value
-    msg = f"{manifest_path}: {key_path} must be a string"
+    msg = f"{manifest_path}: {display_path or key_path} must be a string"
     raise ValueError(msg)
 
 
-def _require_list(manifest_path: Path, data: dict[str, JsonValue], key_path: str) -> list[JsonValue]:
-    value = _lookup_path(manifest_path, data, key_path)
+def _require_list(
+    manifest_path: Path,
+    data: dict[str, JsonValue],
+    key_path: str,
+    *,
+    display_path: str | None = None,
+) -> list[JsonValue]:
+    value = _lookup_path(manifest_path, data, key_path, display_path=display_path)
     if isinstance(value, list):
         return value
-    msg = f"{manifest_path}: {key_path} must be a list"
+    msg = f"{manifest_path}: {display_path or key_path} must be a list"
     raise ValueError(msg)
 
 
-def _require_string_list(manifest_path: Path, data: dict[str, JsonValue], key_path: str) -> list[str]:
-    values = _require_list(manifest_path, data, key_path)
+def _require_string_list(
+    manifest_path: Path,
+    data: dict[str, JsonValue],
+    key_path: str,
+    *,
+    display_path: str | None = None,
+) -> list[str]:
+    values = _require_list(manifest_path, data, key_path, display_path=display_path)
+    item_path = display_path or key_path
     strings: list[str] = []
     for index, value in enumerate(values):
         if not isinstance(value, str) or not value:
-            msg = f"{manifest_path}: {key_path}[{index}] must be a non-empty string"
+            msg = f"{manifest_path}: {item_path}[{index}] must be a non-empty string"
             raise ValueError(msg)
         strings.append(value)
     return strings
@@ -397,11 +454,17 @@ def _require_unique(manifest_path: Path, values: list[str], key_path: str) -> No
     raise ValueError(msg)
 
 
-def _lookup_path(manifest_path: Path, data: dict[str, JsonValue], key_path: str) -> JsonValue:
+def _lookup_path(
+    manifest_path: Path,
+    data: dict[str, JsonValue],
+    key_path: str,
+    *,
+    display_path: str | None = None,
+) -> JsonValue:
     value: JsonValue = data
     for key in key_path.split("."):
         if not isinstance(value, dict) or key not in value:
-            msg = f"{manifest_path}: {key_path} is missing"
+            msg = f"{manifest_path}: {display_path or key_path} is missing"
             raise ValueError(msg)
         value = value[key]
     return value

@@ -78,7 +78,7 @@ def read_json_value(path: Path) -> JsonValue:
 
     try:
         raw_data = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         msg = f"{path} contains malformed JSON: {exc}"
         raise ValueError(msg) from exc
     return validate_json_value(raw_data, path)

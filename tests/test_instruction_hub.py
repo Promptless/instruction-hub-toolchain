@@ -1130,6 +1130,40 @@ def test_publish_version_rejects_malformed_authoritative_version_basis(tmp_path:
         resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
 
 
+@pytest.mark.parametrize("field", ["stable_packages", "targets"])
+def test_publish_version_rejects_empty_authoritative_version_basis_required_lists(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    shutil.copytree(hub_root, previous_release_root)
+    manifest_path = previous_release_root / "hub.release.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["version_basis"][field] = []
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match=rf"hub\.release\.json: version_basis\.{field} must not be empty"):
+        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
+
+
+def test_publish_version_reports_nested_authoritative_version_basis_path(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    shutil.copytree(hub_root, previous_release_root)
+    manifest_path = previous_release_root / "hub.release.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["version_basis"]["plugin"]["id"] = None
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match=r"hub\.release\.json: version_basis\.plugin\.id must be a string"):
+        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
+
+
 def test_publish_version_rejects_release_manifest_without_version_basis(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -1153,6 +1187,17 @@ def test_publish_version_reports_malformed_previous_release_json_path(tmp_path: 
     previous_release_root = tmp_path / "previous-release"
     previous_release_root.mkdir()
     (previous_release_root / "hub.release.json").write_text("{")
+
+    with pytest.raises(ValueError, match=r"hub\.release\.json contains malformed JSON"):
+        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
+
+
+def test_publish_version_reports_malformed_previous_release_json_encoding_path(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    previous_release_root.mkdir()
+    (previous_release_root / "hub.release.json").write_bytes(b"\xff")
 
     with pytest.raises(ValueError, match=r"hub\.release\.json contains malformed JSON"):
         resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
@@ -1709,9 +1754,12 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
     assert schema["additionalProperties"] is False
     assert "target_hashes" in schema["required"]
     assert "version_basis" in schema["required"]
-    assert "managed_runtimes" not in schema["required"]
+    assert "managed_runtimes" in schema["required"]
     assert "git_commit" not in schema["properties"]
-    assert schema["properties"]["managed_runtimes"]["default"] == []
+    assert schema["properties"]["stable_packages"]["minItems"] == 1
+    assert schema["properties"]["targets"]["minItems"] == 1
+    assert schema["properties"]["target_hashes"]["minProperties"] == 1
+    assert "default" not in schema["properties"]["managed_runtimes"]
     version_basis_schema = schema["properties"]["version_basis"]
     assert version_basis_schema["required"] == [
         "org",
@@ -1722,6 +1770,9 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
         "target_hashes",
         "managed_runtimes",
     ]
+    assert version_basis_schema["properties"]["stable_packages"]["minItems"] == 1
+    assert version_basis_schema["properties"]["targets"]["minItems"] == 1
+    assert version_basis_schema["properties"]["packages"]["minItems"] == 1
     assert version_basis_schema["properties"]["target_hashes"] == {"$ref": "#/properties/target_hashes"}
     assert version_basis_schema["properties"]["managed_runtimes"] == {"$ref": "#/properties/managed_runtimes"}
     managed_runtime_schema = schema["properties"]["managed_runtimes"]["items"]
