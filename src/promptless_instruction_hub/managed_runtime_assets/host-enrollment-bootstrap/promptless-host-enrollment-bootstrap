@@ -248,7 +248,8 @@ def _worker_url(env_name: str, worker_base_url: str, default_path: str) -> str:
     override = os.environ.get(env_name)
     if override is None or override.strip() == "":
         return f"{worker_base_url}{default_path}"
-    _validate_http_url(override, env_name)
+    parsed_override = _validate_http_url(override, env_name)
+    _validate_worker_transport(parsed_override, env_name)
     if _same_origin(override, worker_base_url):
         return override
     if _test_url_overrides_enabled() and _is_loopback_url(override):
@@ -919,10 +920,12 @@ def _json_value(value: object) -> JsonValue:
 
 
 def _normalize_base_url(value: str) -> str:
-    parsed = _validate_http_url(value.rstrip("/"), "worker base URL")
+    normalized = value.rstrip("/")
+    parsed = _validate_http_url(normalized, "worker base URL")
+    _validate_worker_transport(parsed, "worker base URL")
     if parsed.path not in {"", "/"}:
         raise BootstrapError("worker base URL must not include a path")
-    return value.rstrip("/")
+    return normalized
 
 
 def _same_origin(url: str, base_url: str) -> bool:
@@ -937,8 +940,22 @@ def _test_url_overrides_enabled() -> bool:
 
 def _is_loopback_url(url: str) -> bool:
     parsed = urlsplit(url)
+    return _is_loopback_parsed_url(parsed)
+
+
+def _is_loopback_parsed_url(parsed: SplitResult) -> bool:
     host = parsed.hostname
     return host in {"localhost", "127.0.0.1", "::1"}
+
+
+def _validate_worker_transport(parsed: SplitResult, field_name: str) -> None:
+    if parsed.scheme == "https":
+        return
+    if _test_url_overrides_enabled() and _is_loopback_parsed_url(parsed):
+        return
+    raise BootstrapError(
+        f"{field_name} must use HTTPS unless {TEST_URL_OVERRIDE_ENV}=1 and the host is loopback"
+    )
 
 
 def _string_value(value: object) -> str | None:

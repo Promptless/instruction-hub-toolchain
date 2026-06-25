@@ -197,6 +197,59 @@ def test_bootstrap_blocks_worker_endpoint_override_to_different_origin(tmp_path:
         server.stop()
 
 
+def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    home = tmp_path / "home"
+
+    payload, result = _run_bootstrap(
+        hub_root / "dist/codex/core",
+        "codex",
+        {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+            "PROMPTLESS_WORKER_BASE_URL": "http://example.com",
+            "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES": "0",
+        },
+        expected_status="error",
+    )
+
+    assert "worker base URL must use HTTPS unless" in str(payload["message"])
+    assert result.stdout == ""
+
+
+def test_bootstrap_rejects_plaintext_non_loopback_worker_endpoint_override(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "INSTRUCTION_HUB_POLICY_URL": "http://example.com/v0/host-enrollment/policy",
+            },
+            expected_status="error",
+        )
+
+        assert "INSTRUCTION_HUB_POLICY_URL must use HTTPS unless" in str(payload["message"])
+        assert result.stdout == ""
+        assert server.check_ins == []
+    finally:
+        server.stop()
+
+
 def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -1140,7 +1193,10 @@ def _run_bootstrap(
 
 
 def _clean_env(**overrides: str) -> dict[str, str]:
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES": "1",
+    }
     env.update(overrides)
     return env
 
