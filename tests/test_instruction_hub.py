@@ -1017,6 +1017,34 @@ def test_action_publish_bumps_generated_plugin_version_when_assets_change(tmp_pa
     assert "No release branch changes to publish." in third.stdout
 
 
+def test_action_publish_removes_legacy_promptless_release_metadata(tmp_path: Path) -> None:
+    repo = _init_action_repo(tmp_path / "publish-cleans-legacy-release-metadata", targets=("claude",))
+    _git(repo, "switch", "--orphan", "release/stable")
+    for path in repo.iterdir():
+        if path.name == ".git":
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    (repo / ".promptless/releases").mkdir(parents=True)
+    (repo / ".promptless/channels").mkdir(parents=True)
+    (repo / ".promptless/releases/current.json").write_text("{}\n")
+    (repo / ".promptless/channels/stable.json").write_text("{}\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "seed legacy release metadata")
+    _git(repo, "push", "-u", "origin", "release/stable")
+    _git(repo, "switch", "main")
+
+    result = _run_action(repo, tmp_path / "github-output.txt")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    _git(repo, "fetch", "origin", "release/stable")
+    assert _release_branch_path_exists(repo, "hub.release.json")
+    assert not _release_branch_path_exists(repo, ".promptless/releases/current.json")
+    assert not _release_branch_path_exists(repo, ".promptless/channels/stable.json")
+
+
 def test_publish_version_bumps_when_package_name_changes(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Acme")
@@ -1046,6 +1074,32 @@ def test_publish_version_bumps_when_package_membership_changes(tmp_path: Path) -
     assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.1"
 
 
+def test_publish_version_prefers_manual_semver_promotion(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, plugin_version="1.0.0-alpha.1")
+    build_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    shutil.copytree(hub_root, previous_release_root)
+    (hub_root / "hub.yaml").write_text(
+        (hub_root / "hub.yaml").read_text().replace("plugin_version: 1.0.0-alpha.1", "plugin_version: 1.0.0")
+    )
+
+    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "1.0.0"
+
+
+def test_publish_version_prefers_higher_configured_version_floor(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, plugin_version="0.1.1")
+    build_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    shutil.copytree(hub_root, previous_release_root)
+    (hub_root / "hub.yaml").write_text(
+        (hub_root / "hub.yaml").read_text().replace("plugin_version: 0.1.1", "plugin_version: 0.2.0")
+    )
+
+    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.2.0"
+
+
 def test_publish_version_rejects_invalid_authoritative_release_manifest(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -1060,6 +1114,19 @@ def test_publish_version_rejects_invalid_authoritative_release_manifest(tmp_path
     )
 
     with pytest.raises(ValueError, match=r"hub\.release\.json: plugin\.version must be SemVer"):
+        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
+
+
+def test_publish_version_rejects_malformed_authoritative_version_basis(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    previous_release_root.mkdir()
+    (previous_release_root / "hub.release.json").write_text(
+        json.dumps({"plugin": {"id": "acme", "name": "Acme", "version": "0.1.0"}, "version_basis": {}})
+    )
+
+    with pytest.raises(ValueError, match=r"hub\.release\.json: version_basis must contain exactly"):
         resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
 
 
@@ -1080,6 +1147,27 @@ def test_publish_version_rejects_release_manifest_without_version_basis(tmp_path
         resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
 
 
+def test_publish_version_reports_malformed_previous_release_json_path(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    previous_release_root.mkdir()
+    (previous_release_root / "hub.release.json").write_text("{")
+
+    with pytest.raises(ValueError, match=r"hub\.release\.json contains malformed JSON"):
+        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
+
+
+def test_publish_version_rejects_missing_previous_hub_path(tmp_path: Path) -> None:
+    hub_root = tmp_path / "repo/hub"
+    init_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    previous_release_root.mkdir()
+
+    with pytest.raises(ValueError, match="previous release is missing hub path: hub"):
+        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root, hub_relative_path="hub")
+
+
 def test_publish_version_bumps_from_legacy_plugin_manifest_without_release_manifest(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -1091,6 +1179,38 @@ def test_publish_version_bumps_from_legacy_plugin_manifest_without_release_manif
     )
 
     assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.1"
+
+
+def test_publish_version_rejects_inconsistent_legacy_plugin_manifest_versions(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    previous_release_root.mkdir()
+    _write_legacy_plugin_manifest(
+        previous_release_root / "dist/claude/core/.claude-plugin/plugin.json",
+        version="0.1.0",
+    )
+    _write_legacy_plugin_manifest(
+        previous_release_root / "dist/codex/core/.codex-plugin/plugin.json",
+        version="0.2.0",
+    )
+
+    with pytest.raises(ValueError, match="legacy plugin manifests disagree on version"):
+        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
+
+
+def test_publish_version_rejects_invalid_legacy_plugin_manifest_version(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    previous_release_root.mkdir()
+    _write_legacy_plugin_manifest(
+        previous_release_root / "dist/claude/core/.claude-plugin/plugin.json",
+        version="bad",
+    )
+
+    with pytest.raises(ValueError, match=r"plugin\.json: version must be SemVer"):
+        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
 
 
 def test_action_publish_supports_subdirectory_hub_root_and_custom_release_branch(tmp_path: Path) -> None:
@@ -1661,6 +1781,17 @@ def _remote_branch_exists(cwd: Path, branch: str) -> bool:
     if result.returncode == 2:
         return False
     raise AssertionError(result.stdout + result.stderr)
+
+
+def _release_branch_path_exists(repo: Path, path: str) -> bool:
+    result = subprocess.run(
+        ["git", "cat-file", "-e", f"origin/release/stable:{path}"],
+        cwd=repo,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def _release_branch_plugin_versions(repo: Path) -> set[str]:

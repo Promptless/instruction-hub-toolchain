@@ -76,7 +76,11 @@ def read_json_mapping(path: Path) -> dict[str, JsonValue]:
 def read_json_value(path: Path) -> JsonValue:
     """Read a JSON file and return JSON-compatible data."""
 
-    raw_data = json.loads(path.read_text())
+    try:
+        raw_data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        msg = f"{path} contains malformed JSON: {exc}"
+        raise ValueError(msg) from exc
     return validate_json_value(raw_data, path)
 
 

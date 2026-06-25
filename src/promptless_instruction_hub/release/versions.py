@@ -2,15 +2,51 @@
 
 from __future__ import annotations
 
+import re
 import tempfile
 from pathlib import Path
 
 from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH
 from promptless_instruction_hub.fs import JsonValue, read_json_mapping
-from promptless_instruction_hub.models import SEMVER_RE, HubConfig
+from promptless_instruction_hub.models import ASSET_KINDS, IDENTIFIER_RE, SEMVER_RE, SUPPORTED_HARNESSES, HubConfig
 from promptless_instruction_hub.release.manifests import build_release_version_basis
 from promptless_instruction_hub.render.plugins import render_target_plugins
 from promptless_instruction_hub.validate.hub import ValidationResult, validate_hub
+
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+VERSION_BASIS_KEYS = frozenset(
+    {
+        "org",
+        "plugin",
+        "stable_packages",
+        "targets",
+        "packages",
+        "target_hashes",
+        "managed_runtimes",
+    }
+)
+PLUGIN_KEYS = frozenset({"id", "name", "version"})
+PACKAGE_BASIS_KEYS = frozenset({"id", "name", "includes", "assets"})
+ASSET_MANIFEST_KEYS = frozenset({"ref", "id", "type", "title", "source_path", "content_hash", "support"})
+MANAGED_RUNTIME_KEYS = frozenset(
+    {
+        "id",
+        "channel",
+        "executable",
+        "hook",
+        "package_id",
+        "path",
+        "plugin_id",
+        "plugin_version",
+        "sha256",
+        "status",
+        "target",
+        "toolchain_version",
+        "version",
+    }
+)
+SUPPORT_KEYS = frozenset({"mode", "reason"})
+SUPPORT_MODES = frozenset({"agent-skill", "native", "projected", "unsupported"})
 
 
 def resolve_publish_plugin_version(
@@ -34,8 +70,8 @@ def resolve_publish_plugin_version(
         previous_basis = _read_manifest_version_basis(previous_manifest_path, previous_manifest)
         current_basis = _build_current_version_basis(validation, plugin_version=previous_version)
         if previous_basis == current_basis:
-            return _max_core_version(config_version, previous_version)
-        return _max_core_version(config_version, _bump_patch(previous_version))
+            return _max_semver(config_version, previous_version)
+        return _max_semver(config_version, _bump_patch(previous_version))
 
     previous_version = _read_legacy_plugin_manifest_version(previous_hub_root)
     if previous_version is None:
@@ -43,15 +79,20 @@ def resolve_publish_plugin_version(
 
     # Legacy release branches have no root version basis, so the first flat-layout publish
     # must assume generated output may have changed.
-    return _max_core_version(config_version, _bump_patch(previous_version))
+    return _max_semver(config_version, _bump_patch(previous_version))
 
 
 def _previous_hub_root(previous_release_root: Path | None, hub_relative_path: str) -> Path | None:
     if previous_release_root is None or not previous_release_root.exists():
         return None
     relative_path = hub_relative_path.strip("/")
-    previous_hub_root = previous_release_root / relative_path if relative_path else previous_release_root
-    return previous_hub_root if previous_hub_root.exists() else None
+    if not relative_path:
+        return previous_release_root
+    previous_hub_root = previous_release_root / relative_path
+    if previous_hub_root.exists():
+        return previous_hub_root
+    msg = f"{previous_release_root}: previous release is missing hub path: {relative_path}"
+    raise ValueError(msg)
 
 
 def _read_manifest_plugin_version(manifest_path: Path, manifest: dict[str, JsonValue]) -> str:
@@ -64,7 +105,9 @@ def _read_manifest_plugin_version(manifest_path: Path, manifest: dict[str, JsonV
 
 
 def _read_manifest_version_basis(manifest_path: Path, manifest: dict[str, JsonValue]) -> dict[str, JsonValue]:
-    return _require_mapping(manifest_path, manifest, "version_basis")
+    basis = _require_mapping(manifest_path, manifest, "version_basis")
+    _validate_manifest_version_basis(manifest_path, manifest, basis)
+    return basis
 
 
 def _read_legacy_plugin_manifest_version(previous_hub_root: Path) -> str | None:
@@ -114,6 +157,180 @@ def _with_plugin_version(validation: ValidationResult, plugin_version: str) -> V
     )
 
 
+def _validate_manifest_version_basis(
+    manifest_path: Path,
+    manifest: dict[str, JsonValue],
+    basis: dict[str, JsonValue],
+) -> None:
+    _require_exact_keys(manifest_path, basis, "version_basis", VERSION_BASIS_KEYS)
+    _validate_plugin_object(
+        manifest_path,
+        _require_mapping_value(manifest_path, basis["plugin"], "version_basis.plugin"),
+        "version_basis.plugin",
+    )
+
+    org = _require_string(manifest_path, basis, "org")
+    if not org:
+        msg = f"{manifest_path}: version_basis.org must not be empty"
+        raise ValueError(msg)
+
+    stable_packages = _require_string_list(manifest_path, basis, "stable_packages")
+    _require_unique(manifest_path, stable_packages, "version_basis.stable_packages")
+    for index, package_id in enumerate(stable_packages):
+        _validate_identifier(manifest_path, package_id, f"version_basis.stable_packages[{index}]")
+
+    targets = _require_string_list(manifest_path, basis, "targets")
+    _require_unique(manifest_path, targets, "version_basis.targets")
+    for index, target in enumerate(targets):
+        if target not in SUPPORTED_HARNESSES:
+            msg = f"{manifest_path}: version_basis.targets[{index}] must be a supported target"
+            raise ValueError(msg)
+
+    target_hashes = _require_mapping(manifest_path, basis, "target_hashes")
+    _validate_target_hashes(manifest_path, target_hashes, targets, "version_basis.target_hashes")
+    _validate_managed_runtimes(
+        manifest_path,
+        _require_list(manifest_path, basis, "managed_runtimes"),
+        "version_basis.managed_runtimes",
+    )
+
+    packages = _require_list(manifest_path, basis, "packages")
+    package_ids: list[str] = []
+    for index, package_value in enumerate(packages):
+        package = _require_mapping_value(manifest_path, package_value, f"version_basis.packages[{index}]")
+        package_ids.append(_validate_package_basis(manifest_path, package, f"version_basis.packages[{index}]"))
+    if package_ids != stable_packages:
+        msg = f"{manifest_path}: version_basis.packages ids must match version_basis.stable_packages"
+        raise ValueError(msg)
+
+    for key in ("org", "plugin", "stable_packages", "targets", "target_hashes", "managed_runtimes"):
+        top_level_value = _lookup_path(manifest_path, manifest, key)
+        if top_level_value != basis[key]:
+            msg = f"{manifest_path}: version_basis.{key} must match {key}"
+            raise ValueError(msg)
+
+
+def _validate_plugin_object(manifest_path: Path, plugin: dict[str, JsonValue], key_path: str) -> None:
+    _require_exact_keys(manifest_path, plugin, key_path, PLUGIN_KEYS)
+    _validate_identifier(manifest_path, _require_string(manifest_path, plugin, "id"), f"{key_path}.id")
+    name = _require_string(manifest_path, plugin, "name")
+    if not name:
+        msg = f"{manifest_path}: {key_path}.name must not be empty"
+        raise ValueError(msg)
+    version = _require_string(manifest_path, plugin, "version")
+    if SEMVER_RE.match(version) is None:
+        msg = f"{manifest_path}: {key_path}.version must be SemVer, got: {version}"
+        raise ValueError(msg)
+
+
+def _validate_package_basis(manifest_path: Path, package: dict[str, JsonValue], key_path: str) -> str:
+    _require_exact_keys(manifest_path, package, key_path, PACKAGE_BASIS_KEYS)
+    package_id = _require_string(manifest_path, package, "id")
+    _validate_identifier(manifest_path, package_id, f"{key_path}.id")
+    name = _require_string(manifest_path, package, "name")
+    if not name:
+        msg = f"{manifest_path}: {key_path}.name must not be empty"
+        raise ValueError(msg)
+
+    includes = _require_string_list(manifest_path, package, "includes")
+    _require_unique(manifest_path, includes, f"{key_path}.includes")
+    for index, asset_ref in enumerate(includes):
+        _validate_asset_ref(manifest_path, asset_ref, f"{key_path}.includes[{index}]")
+
+    assets = _require_list(manifest_path, package, "assets")
+    asset_refs: list[str] = []
+    for index, asset_value in enumerate(assets):
+        asset = _require_mapping_value(manifest_path, asset_value, f"{key_path}.assets[{index}]")
+        asset_refs.append(_validate_asset_manifest(manifest_path, asset, f"{key_path}.assets[{index}]"))
+    if asset_refs != includes:
+        msg = f"{manifest_path}: {key_path}.assets refs must match {key_path}.includes"
+        raise ValueError(msg)
+    return package_id
+
+
+def _validate_asset_manifest(manifest_path: Path, asset: dict[str, JsonValue], key_path: str) -> str:
+    _require_exact_keys(manifest_path, asset, key_path, ASSET_MANIFEST_KEYS)
+    asset_ref = _require_string(manifest_path, asset, "ref")
+    _validate_asset_ref(manifest_path, asset_ref, f"{key_path}.ref")
+    asset_type, _, asset_id = asset_ref.partition(":")
+    if _require_string(manifest_path, asset, "id") != asset_id:
+        msg = f"{manifest_path}: {key_path}.id must match {key_path}.ref"
+        raise ValueError(msg)
+    if _require_string(manifest_path, asset, "type") != asset_type:
+        msg = f"{manifest_path}: {key_path}.type must match {key_path}.ref"
+        raise ValueError(msg)
+    title = asset["title"]
+    if title is not None and not isinstance(title, str):
+        msg = f"{manifest_path}: {key_path}.title must be a string or null"
+        raise ValueError(msg)
+    source_path = asset["source_path"]
+    if source_path is not None and not isinstance(source_path, str):
+        msg = f"{manifest_path}: {key_path}.source_path must be a string or null"
+        raise ValueError(msg)
+    _validate_sha256(manifest_path, _require_string(manifest_path, asset, "content_hash"), f"{key_path}.content_hash")
+    _validate_support_mapping(manifest_path, _require_mapping(manifest_path, asset, "support"), f"{key_path}.support")
+    return asset_ref
+
+
+def _validate_support_mapping(manifest_path: Path, support: dict[str, JsonValue], key_path: str) -> None:
+    for target, support_value in support.items():
+        if target not in SUPPORTED_HARNESSES:
+            msg = f"{manifest_path}: {key_path}.{target} must be a supported target"
+            raise ValueError(msg)
+        support_data = _require_mapping_value(manifest_path, support_value, f"{key_path}.{target}")
+        if not set(support_data) <= SUPPORT_KEYS or "mode" not in support_data:
+            msg = f"{manifest_path}: {key_path}.{target} must contain mode and optional reason"
+            raise ValueError(msg)
+        mode = support_data.get("mode")
+        if not isinstance(mode, str) or mode not in SUPPORT_MODES:
+            msg = f"{manifest_path}: {key_path}.{target}.mode must be a supported mode"
+            raise ValueError(msg)
+        reason = support_data.get("reason")
+        if reason is not None and (not isinstance(reason, str) or not reason):
+            msg = f"{manifest_path}: {key_path}.{target}.reason must be a non-empty string"
+            raise ValueError(msg)
+        if mode == "unsupported" and reason is None:
+            msg = f"{manifest_path}: {key_path}.{target}.reason is required when mode is unsupported"
+            raise ValueError(msg)
+
+
+def _validate_target_hashes(
+    manifest_path: Path,
+    target_hashes: dict[str, JsonValue],
+    targets: list[str],
+    key_path: str,
+) -> None:
+    expected_targets = set(targets)
+    if set(target_hashes) != expected_targets:
+        msg = f"{manifest_path}: {key_path} keys must match version_basis.targets"
+        raise ValueError(msg)
+    for target, digest in target_hashes.items():
+        _validate_sha256(manifest_path, _require_string(manifest_path, target_hashes, target), f"{key_path}.{target}")
+
+
+def _validate_managed_runtimes(manifest_path: Path, runtimes: list[JsonValue], key_path: str) -> None:
+    for index, runtime_value in enumerate(runtimes):
+        runtime = _require_mapping_value(manifest_path, runtime_value, f"{key_path}[{index}]")
+        runtime_path = f"{key_path}[{index}]"
+        _require_exact_keys(manifest_path, runtime, runtime_path, MANAGED_RUNTIME_KEYS)
+        if runtime["id"] != "host-enrollment-bootstrap":
+            msg = f"{manifest_path}: {runtime_path}.id must be host-enrollment-bootstrap"
+            raise ValueError(msg)
+        if runtime["status"] != "included":
+            msg = f"{manifest_path}: {runtime_path}.status must be included"
+            raise ValueError(msg)
+        target = runtime["target"]
+        if target not in {"claude", "codex"}:
+            msg = f"{manifest_path}: {runtime_path}.target must be claude or codex"
+            raise ValueError(msg)
+        for string_key in MANAGED_RUNTIME_KEYS - {"id", "status", "target", "sha256"}:
+            value = runtime[string_key]
+            if not isinstance(value, str) or not value:
+                msg = f"{manifest_path}: {runtime_path}.{string_key} must be a non-empty string"
+                raise ValueError(msg)
+        _validate_sha256(manifest_path, _require_string(manifest_path, runtime, "sha256"), f"{runtime_path}.sha256")
+
+
 def _require_mapping(
     manifest_path: Path,
     data: dict[str, JsonValue],
@@ -134,6 +351,52 @@ def _require_string(manifest_path: Path, data: dict[str, JsonValue], key_path: s
     raise ValueError(msg)
 
 
+def _require_list(manifest_path: Path, data: dict[str, JsonValue], key_path: str) -> list[JsonValue]:
+    value = _lookup_path(manifest_path, data, key_path)
+    if isinstance(value, list):
+        return value
+    msg = f"{manifest_path}: {key_path} must be a list"
+    raise ValueError(msg)
+
+
+def _require_string_list(manifest_path: Path, data: dict[str, JsonValue], key_path: str) -> list[str]:
+    values = _require_list(manifest_path, data, key_path)
+    strings: list[str] = []
+    for index, value in enumerate(values):
+        if not isinstance(value, str) or not value:
+            msg = f"{manifest_path}: {key_path}[{index}] must be a non-empty string"
+            raise ValueError(msg)
+        strings.append(value)
+    return strings
+
+
+def _require_mapping_value(manifest_path: Path, value: JsonValue, key_path: str) -> dict[str, JsonValue]:
+    if isinstance(value, dict):
+        return value
+    msg = f"{manifest_path}: {key_path} must be a JSON object"
+    raise ValueError(msg)
+
+
+def _require_exact_keys(
+    manifest_path: Path,
+    data: dict[str, JsonValue],
+    key_path: str,
+    expected_keys: frozenset[str],
+) -> None:
+    if set(data) == expected_keys:
+        return
+    expected = ", ".join(sorted(expected_keys))
+    msg = f"{manifest_path}: {key_path} must contain exactly these keys: {expected}"
+    raise ValueError(msg)
+
+
+def _require_unique(manifest_path: Path, values: list[str], key_path: str) -> None:
+    if len(set(values)) == len(values):
+        return
+    msg = f"{manifest_path}: {key_path} must not contain duplicates"
+    raise ValueError(msg)
+
+
 def _lookup_path(manifest_path: Path, data: dict[str, JsonValue], key_path: str) -> JsonValue:
     value: JsonValue = data
     for key in key_path.split("."):
@@ -144,10 +407,29 @@ def _lookup_path(manifest_path: Path, data: dict[str, JsonValue], key_path: str)
     return value
 
 
-def _max_core_version(first: str, second: str) -> str:
-    first_core = _core_tuple(first)
-    second_core = _core_tuple(second)
-    return first if first_core > second_core else second
+def _validate_identifier(manifest_path: Path, value: str, key_path: str) -> None:
+    if IDENTIFIER_RE.match(value) is not None:
+        return
+    msg = f"{manifest_path}: {key_path} must be a kebab-case identifier"
+    raise ValueError(msg)
+
+
+def _validate_asset_ref(manifest_path: Path, value: str, key_path: str) -> None:
+    asset_type, separator, asset_id = value.partition(":")
+    if separator != ":" or asset_type not in ASSET_KINDS or IDENTIFIER_RE.match(asset_id) is None:
+        msg = f"{manifest_path}: {key_path} must be a valid asset ref"
+        raise ValueError(msg)
+
+
+def _validate_sha256(manifest_path: Path, value: str, key_path: str) -> None:
+    if SHA256_RE.fullmatch(value) is not None:
+        return
+    msg = f"{manifest_path}: {key_path} must be a sha256 hex digest"
+    raise ValueError(msg)
+
+
+def _max_semver(first: str, second: str) -> str:
+    return first if _compare_semver(first, second) >= 0 else second
 
 
 def _bump_patch(version: str) -> str:
@@ -161,3 +443,47 @@ def _core_tuple(version: str) -> tuple[int, int, int]:
         msg = f"plugin version must be SemVer, got: {version}"
         raise ValueError(msg)
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def _compare_semver(first: str, second: str) -> int:
+    first_match = SEMVER_RE.match(first)
+    second_match = SEMVER_RE.match(second)
+    if first_match is None:
+        msg = f"plugin version must be SemVer, got: {first}"
+        raise ValueError(msg)
+    if second_match is None:
+        msg = f"plugin version must be SemVer, got: {second}"
+        raise ValueError(msg)
+
+    first_core = tuple(int(first_match.group(index)) for index in (1, 2, 3))
+    second_core = tuple(int(second_match.group(index)) for index in (1, 2, 3))
+    if first_core != second_core:
+        return 1 if first_core > second_core else -1
+    return _compare_prerelease(first_match.group(4), second_match.group(4))
+
+
+def _compare_prerelease(first: str | None, second: str | None) -> int:
+    if first is None and second is None:
+        return 0
+    if first is None:
+        return 1
+    if second is None:
+        return -1
+    first_parts = first.split(".")
+    second_parts = second.split(".")
+    for first_part, second_part in zip(first_parts, second_parts, strict=False):
+        first_is_numeric = first_part.isdigit()
+        second_is_numeric = second_part.isdigit()
+        if first_is_numeric and second_is_numeric:
+            first_number = int(first_part)
+            second_number = int(second_part)
+            if first_number != second_number:
+                return 1 if first_number > second_number else -1
+            continue
+        if first_is_numeric != second_is_numeric:
+            return -1 if first_is_numeric else 1
+        if first_part != second_part:
+            return 1 if first_part > second_part else -1
+    if len(first_parts) == len(second_parts):
+        return 0
+    return 1 if len(first_parts) > len(second_parts) else -1
