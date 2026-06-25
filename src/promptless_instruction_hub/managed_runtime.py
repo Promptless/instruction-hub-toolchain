@@ -162,6 +162,8 @@ def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
     # the user to trust/review plugin hooks before running this startup command.
     # https://developers.openai.com/codex/plugins/build
     # https://docs.anthropic.com/en/docs/claude-code/hooks
+    # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
+    # Promptless-built static native binary so customer machines do not need Python or uv.
     command = f'python3 "{root_expr}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host {host} --quiet'
     return {
         "matcher": "startup|resume",

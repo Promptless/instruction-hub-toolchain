@@ -48,3 +48,17 @@ intentionally commit generated artifacts on the same branch as source assets.
 Action releases are tagged with immutable versions such as `v0.1.0` and a moving
 major pointer such as `v0`. Customer workflows can use `@v0` for minor updates or
 pin to an immutable tag for stricter reproducibility.
+
+## Managed Runtime Bootstrap
+
+The toolchain owns Promptless-managed runtime artifacts that must be injected
+into generated customer plugins, including the host enrollment bootstrap used by
+Codex and Claude startup hooks. The current dogfood implementation is a
+stdlib-only Python script, but the customer-grade bootstrap must be a static
+native binary built and versioned by Promptless, then bundled into the toolchain
+release.
+
+Customer Instruction Hub repositories should not need Python, uv, Go, Rust,
+curl, jq, or other runtime/build dependencies installed for the bootstrap hook to
+run. Customer builds should only consume the already-built Promptless artifact
+that the toolchain copies into plugin `bin/`.
