@@ -209,12 +209,19 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
 
         assert len(server.check_ins) == 2
         for check_in in server.check_ins:
+            assert set(check_in) == {
+                "bootstrap_version",
+                "checked_at",
+                "drift_reports",
+                "effective_config",
+                "host",
+                "needs_restart",
+                "plugin_version",
+                "policy_version",
+                "status",
+            }
             assert check_in["bootstrap_version"] == "0.1.0"
-            assert check_in["bootstrap_channel"] == "stable"
-            assert len(_json_string(check_in["bootstrap_sha256"], "bootstrap_sha256")) == 64
-            assert check_in["toolchain_version"]
-            assert check_in["plugin_id"] == "promptless-instruction-hub-core"
-            assert check_in["package_id"] == "core"
+            assert check_in["plugin_version"] == "0.1.0"
             assert check_in["status"] == "needs_restart"
             assert check_in["needs_restart"] is True
             effective_config = _json_mapping(check_in["effective_config"], "effective_config")
@@ -250,8 +257,9 @@ def test_bootstrap_missing_managed_runtime_manifest_uses_default_metadata(tmp_pa
         )
 
         assert (home / ".codex/config.toml").exists()
-        assert server.check_ins[0]["plugin_id"] == "unknown"
-        assert server.check_ins[0]["package_id"] == "unknown"
+        assert server.check_ins[0]["plugin_version"] == "unknown"
+        assert "plugin_id" not in server.check_ins[0]
+        assert "package_id" not in server.check_ins[0]
     finally:
         server.stop()
 

@@ -334,12 +334,6 @@ def _check_in_payload(
         "drift_reports": [_redact_json(report) for report in result.drift_reports],
         "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "bootstrap_version": metadata.bootstrap_version,
-        "bootstrap_channel": metadata.bootstrap_channel,
-        "bootstrap_sha256": metadata.bootstrap_sha256,
-        "toolchain_version": metadata.toolchain_version,
-        "plugin_id": metadata.plugin_id,
-        "package_id": metadata.package_id,
-        "target": metadata.target,
     }
 
 
