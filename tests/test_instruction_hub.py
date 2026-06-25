@@ -15,6 +15,7 @@ from promptless_instruction_hub.cli import main
 from promptless_instruction_hub.compiler import build_hub, init_hub, validate_hub
 from promptless_instruction_hub.errors import BuildCheckFailedError, InstructionHubError
 from promptless_instruction_hub.mcp_status import STATUS_TOOL_NAME, run_status_mcp
+from promptless_instruction_hub.release.versions import resolve_publish_plugin_version
 from promptless_instruction_hub.scan.hub import scan_hub
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -349,6 +350,8 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     release_manifest = json.loads((hub_root / "hub.release.json").read_text())
     assert "git_commit" not in release_manifest
     assert set(release_manifest["target_hashes"]) == {"claude", "codex", "cursor", "gemini"}
+    assert release_manifest["version_basis"]["target_hashes"] == release_manifest["target_hashes"]
+    assert release_manifest["version_basis"]["managed_runtimes"] == release_manifest["managed_runtimes"]
     assert {asset["title"] for asset in release_manifest["assets"]} == {"Repository MCP Servers", "Review Docs"}
 
 
@@ -410,6 +413,14 @@ def test_build_renders_stable_packages_as_separate_marketplace_plugins(tmp_path:
     ]
     release_manifest = json.loads((hub_root / "hub.release.json").read_text())
     assert release_manifest["stable_packages"] == ["dev", "ops"]
+    assert [(package["id"], package["name"]) for package in release_manifest["version_basis"]["packages"]] == [
+        ("dev", "Dev"),
+        ("ops", "Ops"),
+    ]
+    assert [asset["ref"] for asset in release_manifest["version_basis"]["packages"][0]["assets"]] == [
+        "skill:authoring-tools"
+    ]
+    assert [asset["ref"] for asset in release_manifest["version_basis"]["packages"][1]["assets"]] == ["skill:runbooks"]
     assert [asset["ref"] for asset in release_manifest["assets"]] == [
         "skill:authoring-tools",
         "skill:runbooks",
@@ -1006,6 +1017,82 @@ def test_action_publish_bumps_generated_plugin_version_when_assets_change(tmp_pa
     assert "No release branch changes to publish." in third.stdout
 
 
+def test_publish_version_bumps_when_package_name_changes(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Acme")
+    _configure_split_package_hub(hub_root, targets=("claude", "codex"))
+    build_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    shutil.copytree(hub_root, previous_release_root)
+
+    (hub_root / "packages/dev.yaml").write_text(
+        "id: dev\nname: Developer Tools\nincludes:\n  - skill:authoring-tools\n"
+    )
+
+    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.1"
+
+
+def test_publish_version_bumps_when_package_membership_changes(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Acme")
+    _configure_split_package_hub(hub_root, targets=("claude", "codex"))
+    build_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    shutil.copytree(hub_root, previous_release_root)
+
+    (hub_root / "packages/dev.yaml").write_text("id: dev\nname: Dev\nincludes:\n  - skill:runbooks\n")
+    (hub_root / "packages/ops.yaml").write_text("id: ops\nname: Ops\nincludes:\n  - skill:authoring-tools\n")
+
+    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.1"
+
+
+def test_publish_version_rejects_invalid_authoritative_release_manifest(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    previous_release_root.mkdir()
+    (previous_release_root / "hub.release.json").write_text(
+        json.dumps({"plugin": {"id": "acme", "name": "Acme", "version": "not-semver"}, "version_basis": {}})
+    )
+    _write_legacy_plugin_manifest(
+        previous_release_root / "dist/claude/core/.claude-plugin/plugin.json",
+        version="9.9.9",
+    )
+
+    with pytest.raises(ValueError, match=r"hub\.release\.json: plugin\.version must be SemVer"):
+        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
+
+
+def test_publish_version_rejects_release_manifest_without_version_basis(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    previous_release_root.mkdir()
+    (previous_release_root / "hub.release.json").write_text(
+        json.dumps({"plugin": {"id": "acme", "name": "Acme", "version": "0.1.0"}})
+    )
+    _write_legacy_plugin_manifest(
+        previous_release_root / "dist/claude/core/.claude-plugin/plugin.json",
+        version="9.9.9",
+    )
+
+    with pytest.raises(ValueError, match=r"hub\.release\.json: version_basis is missing"):
+        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
+
+
+def test_publish_version_bumps_from_legacy_plugin_manifest_without_release_manifest(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    previous_release_root.mkdir()
+    _write_legacy_plugin_manifest(
+        previous_release_root / "dist/claude/core/.claude-plugin/plugin.json",
+        version="0.1.0",
+    )
+
+    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.1"
+
+
 def test_action_publish_supports_subdirectory_hub_root_and_custom_release_branch(tmp_path: Path) -> None:
     repo = _init_action_repo(tmp_path / "publish-subdir", targets=("claude", "codex", "cursor"), hub_root_name="hub")
 
@@ -1501,9 +1588,22 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
 
     assert schema["additionalProperties"] is False
     assert "target_hashes" in schema["required"]
+    assert "version_basis" in schema["required"]
     assert "managed_runtimes" not in schema["required"]
     assert "git_commit" not in schema["properties"]
     assert schema["properties"]["managed_runtimes"]["default"] == []
+    version_basis_schema = schema["properties"]["version_basis"]
+    assert version_basis_schema["required"] == [
+        "org",
+        "plugin",
+        "stable_packages",
+        "targets",
+        "packages",
+        "target_hashes",
+        "managed_runtimes",
+    ]
+    assert version_basis_schema["properties"]["target_hashes"] == {"$ref": "#/properties/target_hashes"}
+    assert version_basis_schema["properties"]["managed_runtimes"] == {"$ref": "#/properties/managed_runtimes"}
     managed_runtime_schema = schema["properties"]["managed_runtimes"]["items"]
     assert managed_runtime_schema["required"] == [
         "id",
@@ -1574,6 +1674,11 @@ def _release_branch_plugin_versions(repo: Path) -> set[str]:
         json.loads(_git_output(repo, "show", f"origin/release/stable:{manifest_path}"))["version"]
         for manifest_path in manifest_paths
     }
+
+
+def _write_legacy_plugin_manifest(manifest_path: Path, *, version: str) -> None:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps({"version": version}))
 
 
 def _init_action_repo(root: Path, *, targets: tuple[str, ...], hub_root_name: str = ".") -> Path:

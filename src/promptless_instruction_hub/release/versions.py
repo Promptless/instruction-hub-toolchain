@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH
 from promptless_instruction_hub.fs import JsonValue, read_json_mapping
-from promptless_instruction_hub.models import SEMVER_RE
-from promptless_instruction_hub.release.manifests import build_release_source_state
-from promptless_instruction_hub.validate.hub import validate_hub
+from promptless_instruction_hub.models import SEMVER_RE, HubConfig
+from promptless_instruction_hub.release.manifests import build_release_version_basis
+from promptless_instruction_hub.render.plugins import render_target_plugins
+from promptless_instruction_hub.validate.hub import ValidationResult, validate_hub
 
 
 def resolve_publish_plugin_version(
@@ -25,14 +27,22 @@ def resolve_publish_plugin_version(
     if previous_hub_root is None:
         return config_version
 
-    previous_version = _read_previous_version(previous_hub_root)
+    previous_manifest_path = previous_hub_root / RELEASE_MANIFEST_PATH
+    if previous_manifest_path.exists():
+        previous_manifest = read_json_mapping(previous_manifest_path)
+        previous_version = _read_manifest_plugin_version(previous_manifest_path, previous_manifest)
+        previous_basis = _read_manifest_version_basis(previous_manifest_path, previous_manifest)
+        current_basis = _build_current_version_basis(validation, plugin_version=previous_version)
+        if previous_basis == current_basis:
+            return _max_core_version(config_version, previous_version)
+        return _max_core_version(config_version, _bump_patch(previous_version))
+
+    previous_version = _read_legacy_plugin_manifest_version(previous_hub_root)
     if previous_version is None:
         return config_version
 
-    previous_state = _read_previous_source_state(previous_hub_root)
-    current_state = build_release_source_state(validation)
-    if previous_state == current_state:
-        return _max_core_version(config_version, previous_version)
+    # Legacy release branches have no root version basis, so the first flat-layout publish
+    # must assume generated output may have changed.
     return _max_core_version(config_version, _bump_patch(previous_version))
 
 
@@ -44,44 +54,20 @@ def _previous_hub_root(previous_release_root: Path | None, hub_relative_path: st
     return previous_hub_root if previous_hub_root.exists() else None
 
 
-def _read_previous_source_state(previous_hub_root: Path) -> dict[str, JsonValue] | None:
-    manifest = _read_previous_release_manifest(previous_hub_root)
-    if manifest is None:
-        return None
-    plugin = manifest.get("plugin")
-    if not isinstance(plugin, dict):
-        return None
-    return {
-        "org": manifest.get("org"),
-        "plugin": {
-            "id": plugin.get("id"),
-            "name": plugin.get("name"),
-        },
-        "stable_packages": manifest.get("stable_packages"),
-        "targets": manifest.get("targets"),
-        "assets": manifest.get("assets"),
-    }
+def _read_manifest_plugin_version(manifest_path: Path, manifest: dict[str, JsonValue]) -> str:
+    _require_mapping(manifest_path, manifest, "plugin")
+    version = _require_string(manifest_path, manifest, "plugin.version")
+    if SEMVER_RE.match(version) is None:
+        msg = f"{manifest_path}: plugin.version must be SemVer, got: {version}"
+        raise ValueError(msg)
+    return version
 
 
-def _read_previous_version(previous_hub_root: Path) -> str | None:
-    manifest = _read_previous_release_manifest(previous_hub_root)
-    if manifest is not None:
-        plugin = manifest.get("plugin")
-        if isinstance(plugin, dict):
-            version = plugin.get("version")
-            if isinstance(version, str) and SEMVER_RE.match(version):
-                return version
-    return _read_first_plugin_manifest_version(previous_hub_root)
+def _read_manifest_version_basis(manifest_path: Path, manifest: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    return _require_mapping(manifest_path, manifest, "version_basis")
 
 
-def _read_previous_release_manifest(previous_hub_root: Path) -> dict[str, JsonValue] | None:
-    manifest_path = previous_hub_root / RELEASE_MANIFEST_PATH
-    if not manifest_path.exists():
-        return None
-    return read_json_mapping(manifest_path)
-
-
-def _read_first_plugin_manifest_version(previous_hub_root: Path) -> str | None:
+def _read_legacy_plugin_manifest_version(previous_hub_root: Path) -> str | None:
     manifest_paths = sorted(
         [
             *previous_hub_root.glob("dist/*/*/.claude-plugin/plugin.json"),
@@ -90,12 +76,72 @@ def _read_first_plugin_manifest_version(previous_hub_root: Path) -> str | None:
             *previous_hub_root.glob("dist/*/*/gemini-extension.json"),
         ]
     )
+    versions: set[str] = set()
     for manifest_path in manifest_paths:
         manifest = read_json_mapping(manifest_path)
         version = manifest.get("version")
-        if isinstance(version, str) and SEMVER_RE.match(version):
-            return version
-    return None
+        if not isinstance(version, str) or SEMVER_RE.match(version) is None:
+            msg = f"{manifest_path}: version must be SemVer"
+            raise ValueError(msg)
+        versions.add(version)
+    if not versions:
+        return None
+    if len(versions) > 1:
+        msg = f"{previous_hub_root}: legacy plugin manifests disagree on version: {', '.join(sorted(versions))}"
+        raise ValueError(msg)
+    return next(iter(versions))
+
+
+def _build_current_version_basis(validation: ValidationResult, *, plugin_version: str) -> dict[str, JsonValue]:
+    versioned_validation = _with_plugin_version(validation, plugin_version)
+    with tempfile.TemporaryDirectory(prefix="promptless-instruction-hub-version-") as temp_dir:
+        output_root = Path(temp_dir)
+        managed_runtimes = render_target_plugins(
+            output_root,
+            versioned_validation.config,
+            versioned_validation.stable_packages,
+        )
+        return build_release_version_basis(output_root, versioned_validation, managed_runtimes)
+
+
+def _with_plugin_version(validation: ValidationResult, plugin_version: str) -> ValidationResult:
+    config = HubConfig.model_validate({**validation.config.model_dump(), "plugin_version": plugin_version})
+    return ValidationResult(
+        config=config,
+        packages=validation.packages,
+        assets=validation.assets,
+        stable_packages=validation.stable_packages,
+    )
+
+
+def _require_mapping(
+    manifest_path: Path,
+    data: dict[str, JsonValue],
+    key_path: str,
+) -> dict[str, JsonValue]:
+    value = _lookup_path(manifest_path, data, key_path)
+    if isinstance(value, dict):
+        return value
+    msg = f"{manifest_path}: {key_path} must be a JSON object"
+    raise ValueError(msg)
+
+
+def _require_string(manifest_path: Path, data: dict[str, JsonValue], key_path: str) -> str:
+    value = _lookup_path(manifest_path, data, key_path)
+    if isinstance(value, str):
+        return value
+    msg = f"{manifest_path}: {key_path} must be a string"
+    raise ValueError(msg)
+
+
+def _lookup_path(manifest_path: Path, data: dict[str, JsonValue], key_path: str) -> JsonValue:
+    value: JsonValue = data
+    for key in key_path.split("."):
+        if not isinstance(value, dict) or key not in value:
+            msg = f"{manifest_path}: {key_path} is missing"
+            raise ValueError(msg)
+        value = value[key]
+    return value
 
 
 def _max_core_version(first: str, second: str) -> str:
