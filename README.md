@@ -52,10 +52,11 @@ metadata is also flat at the hub root:
 - `hub.stable.json`: stable channel pointer.
 - `hub.repo-context.json`: scanned repository-context inventory.
 
-Generated plugins embed local metadata as root files inside each plugin:
+Every generated plugin embeds local metadata as root files inside each plugin:
 
 - `hub.release.json`: plugin-local release/status manifest.
-- `hub.managed-runtimes.json`: Promptless-managed runtime metadata.
+- `hub.managed-runtimes.json`: Promptless-managed runtime metadata for plugins
+  that include managed-runtime artifacts.
 
 The old `.promptless/instruction-hub.yaml` and generated `.promptless/...`
 layout is not read or migrated by this toolchain. Existing hubs must rename
