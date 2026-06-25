@@ -45,6 +45,9 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert runtime["path"] == f"bin/{BOOTSTRAP_BIN}"
         assert len(runtime["sha256"]) == 64
 
+    codex_manifest = json.loads((hub_root / "dist/codex/core/.codex-plugin/plugin.json").read_text())
+    assert codex_manifest["hooks"] == "./hooks/hooks.json"
+
     for target in ("cursor", "gemini"):
         plugin_root = hub_root / "dist" / target / "core"
         assert not (plugin_root / "bin" / BOOTSTRAP_BIN).exists()
@@ -97,6 +100,38 @@ def test_bootstrap_missing_token_exits_zero_without_config_write(tmp_path: Path)
 
     assert quiet_result.returncode == 0
     assert quiet_result.stdout == ""
+    assert json.loads(quiet_result.stderr)["status"] == "setup_needed"
+
+
+def test_bootstrap_loads_seed_from_plugin_data_file(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        (plugin_data / "host-enrollment-seed.json").write_text(
+            json.dumps({"plugin_enrollment_token": "plugin-token", "worker_base_url": server.base_url})
+        )
+
+        home = tmp_path / "home"
+        _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            },
+        )
+
+        assert len(server.check_ins) == 1
+        assert server.check_ins[0]["host"] == "codex"
+    finally:
+        server.stop()
 
 
 def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Path) -> None:
@@ -159,6 +194,126 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         claude_effective_config = _json_mapping(server.check_ins[1]["effective_config"], "claude effective_config")
         assert codex_effective_config["collector_metrics_endpoint"] is None
         assert claude_effective_config["collector_metrics_endpoint"] == "http://127.0.0.1:4318/v1/metrics"
+    finally:
+        server.stop()
+
+
+def test_bootstrap_applies_capture_policy_disabled_values(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer(
+        policy=_policy_with(
+            capture_policy={
+                "user_prompts": "disabled",
+                "tool_inputs": "disabled",
+                "tool_outputs": "full_local_default",
+                "raw_api_bodies": "disabled",
+            }
+        )
+    )
+    server.start()
+    try:
+        codex_home = tmp_path / "codex-home"
+        _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(codex_home),
+                "CODEX_HOME": str(codex_home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+        )
+        codex_config = (codex_home / ".codex/config.toml").read_text()
+        assert "log_user_prompt = false" in codex_config
+
+        claude_home = tmp_path / "claude-home"
+        _run_bootstrap(
+            hub_root / "dist/claude/core",
+            "claude",
+            {
+                "HOME": str(claude_home),
+                "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+        )
+        claude_settings = json.loads((claude_home / ".claude/settings.json").read_text())
+        assert claude_settings["env"]["OTEL_LOG_USER_PROMPTS"] == "0"
+        assert claude_settings["env"]["OTEL_LOG_TOOL_DETAILS"] == "0"
+        assert claude_settings["env"]["OTEL_LOG_TOOL_CONTENT"] == "1"
+        assert claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"] == "0"
+
+        for check_in in server.check_ins:
+            effective_config = _json_mapping(check_in["effective_config"], "effective_config")
+            assert effective_config["user_prompts_enabled"] is False
+            assert effective_config["tool_inputs_enabled"] is False
+            assert effective_config["tool_outputs_enabled"] is True
+            assert effective_config["raw_api_bodies_enabled"] is False
+    finally:
+        server.stop()
+
+
+def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        codex_home = tmp_path / "codex-home"
+        codex_config = codex_home / ".codex/config.toml"
+        codex_config.parent.mkdir(parents=True)
+        original_codex_config = 'model = "gpt-5"\n[profiles.local]\nmodel = "gpt-5-codex"\n'
+        codex_config.write_text(original_codex_config)
+
+        _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(codex_home),
+                "CODEX_HOME": str(codex_home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+        )
+
+        assert original_codex_config.rstrip() in codex_config.read_text()
+        codex_backups = list(codex_config.parent.glob("config.toml.*.bak"))
+        assert len(codex_backups) == 1
+        assert codex_backups[0].read_text() == original_codex_config
+
+        claude_home = tmp_path / "claude-home"
+        claude_settings = claude_home / ".claude/settings.json"
+        claude_settings.parent.mkdir(parents=True)
+        original_claude_settings = {"env": {"CUSTOM_ENV": "1"}, "theme": "dark"}
+        claude_settings.write_text(json.dumps(original_claude_settings))
+
+        _run_bootstrap(
+            hub_root / "dist/claude/core",
+            "claude",
+            {
+                "HOME": str(claude_home),
+                "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+        )
+
+        updated_claude_settings = json.loads(claude_settings.read_text())
+        assert updated_claude_settings["theme"] == "dark"
+        assert updated_claude_settings["env"]["CUSTOM_ENV"] == "1"
+        assert updated_claude_settings["env"]["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
+        claude_backups = list(claude_settings.parent.glob("settings.json.*.bak"))
+        assert len(claude_backups) == 1
+        assert json.loads(claude_backups[0].read_text()) == original_claude_settings
     finally:
         server.stop()
 
@@ -281,6 +436,41 @@ def test_bootstrap_blocks_inline_codex_otel_config(tmp_path: Path) -> None:
         server.stop()
 
 
+def test_bootstrap_blocks_partial_codex_managed_block(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        codex_home = tmp_path / "codex-home"
+        codex_config = codex_home / ".codex/config.toml"
+        codex_config.parent.mkdir(parents=True)
+        original_config = '# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT\n[otel]\nenvironment = "local"\n'
+        codex_config.write_text(original_config)
+
+        _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(codex_home),
+                "CODEX_HOME": str(codex_home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="blocked",
+        )
+
+        assert codex_config.read_text() == original_config
+        assert list(codex_config.parent.glob("config.toml.*.bak")) == []
+        drift_reports = _json_list(server.check_ins[-1]["drift_reports"], "drift_reports")
+        first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
+        assert first_drift_report["kind"] == "manual_config_required"
+    finally:
+        server.stop()
+
+
 def test_bootstrap_blocks_unmanaged_claude_telemetry_env(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -357,6 +547,8 @@ def test_bootstrap_second_run_reports_configured_without_duplicate_managed_block
         "header-newline",
         "invalid-header-name",
         "unsupported-schema-version",
+        "bool-schema-version",
+        "bool-policy-version",
         "invalid-capture-value",
     ],
 )
@@ -470,6 +662,77 @@ def test_bootstrap_does_not_retry_unrelated_422_check_in(tmp_path: Path) -> None
         server.stop()
 
 
+@pytest.mark.parametrize(
+    ("response_payload", "expected_message"),
+    [
+        ({"accepted": False, "policy_version": 1}, "check-in response was not accepted"),
+        (
+            {"accepted": True, "policy_version": 2},
+            "check-in response policy version did not match the applied policy",
+        ),
+    ],
+)
+def test_bootstrap_rejects_invalid_check_in_success_response(
+    tmp_path: Path,
+    response_payload: dict[str, JsonValue],
+    expected_message: str,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer(post_responses=[(200, response_payload)])
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, _result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert expected_message in str(payload["message"])
+        assert len(server.check_ins) == 1
+    finally:
+        server.stop()
+
+
+def test_bootstrap_rejects_missing_managed_runtime_manifest(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    (plugin_root / ".promptless/managed-runtimes.json").unlink()
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, result = _run_bootstrap(
+            plugin_root,
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(plugin_root),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "managed runtime manifest is missing" in str(payload["message"])
+        assert result.stdout == ""
+        assert server.check_ins == []
+    finally:
+        server.stop()
+
+
 def test_bootstrap_rejects_invalid_managed_runtime_manifest(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -494,6 +757,39 @@ def test_bootstrap_rejects_invalid_managed_runtime_manifest(tmp_path: Path) -> N
         )
 
         assert "managed runtime manifest is invalid JSON" in str(payload["message"])
+        assert result.stdout == ""
+        assert server.check_ins == []
+    finally:
+        server.stop()
+
+
+def test_bootstrap_rejects_manifest_target_mismatch(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    manifest_path = plugin_root / ".promptless/managed-runtimes.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["managed_runtimes"][0]["target"] = "claude"
+    manifest_path.write_text(json.dumps(manifest))
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, result = _run_bootstrap(
+            plugin_root,
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(plugin_root),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "managed runtime manifest target claude does not match resolved host codex" in str(payload["message"])
         assert result.stdout == ""
         assert server.check_ins == []
     finally:
@@ -607,6 +903,10 @@ def _invalid_policy(case: str) -> dict[str, JsonValue]:
         headers["Bad Header"] = "value"
     elif case == "unsupported-schema-version":
         policy["schema_version"] = 2
+    elif case == "bool-schema-version":
+        policy["schema_version"] = True
+    elif case == "bool-policy-version":
+        policy["policy_version"] = True
     elif case == "invalid-capture-value":
         capture_policy["tool_outputs"] = "full"
     else:

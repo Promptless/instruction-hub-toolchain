@@ -29,6 +29,8 @@ def write_manifest(
     manifest["author"] = {"name": config.org}
     if rendered.get("skills"):
         manifest["skills"] = "./skills/"
+    if _has_hooks(target_root, rendered):
+        manifest["hooks"] = "./hooks/hooks.json"
     if mcp_server_names:
         manifest["mcpServers"] = "./.mcp.json"
     manifest["interface"] = {
@@ -37,7 +39,7 @@ def write_manifest(
         "longDescription": f"{package.name} distributes governed agent instructions for {config.org}.",
         "developerName": config.org,
         "category": "Productivity",
-        "capabilities": _capabilities(rendered, mcp_server_names),
+        "capabilities": _capabilities(target_root, rendered, mcp_server_names),
         "defaultPrompt": [f"Use {package.name} instructions for this task."],
     }
     write_json(target_root / ".codex-plugin/plugin.json", manifest)
@@ -62,7 +64,7 @@ def write_marketplace(output_root: Path, config: HubConfig, packages: Sequence[S
     write_json(output_root / ".agents/plugins/marketplace.json", marketplace)
 
 
-def _capabilities(rendered: RenderedAssets, mcp_server_names: list[str]) -> list[str]:
+def _capabilities(target_root: Path, rendered: RenderedAssets, mcp_server_names: list[str]) -> list[str]:
     capabilities: list[str] = []
     if rendered.get("skills"):
         capabilities.append("Skills")
@@ -74,4 +76,10 @@ def _capabilities(rendered: RenderedAssets, mcp_server_names: list[str]) -> list
         capabilities.append("Agents")
     if rendered.get("commands"):
         capabilities.append("Commands")
+    if _has_hooks(target_root, rendered):
+        capabilities.append("Hooks")
     return capabilities or ["Instruction guidance"]
+
+
+def _has_hooks(target_root: Path, rendered: RenderedAssets) -> bool:
+    return bool(rendered.get("hooks")) or (target_root / "hooks/hooks.json").exists()

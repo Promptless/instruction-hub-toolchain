@@ -65,7 +65,7 @@ class EnrollmentSeed:
 
 @dataclass(frozen=True)
 class RuntimeMetadata:
-    """Runtime metadata loaded from the generated plugin manifest."""
+    """Runtime metadata reported in worker check-ins."""
 
     bootstrap_version: str
     bootstrap_channel: str
@@ -74,7 +74,7 @@ class RuntimeMetadata:
     plugin_id: str
     plugin_version: str
     package_id: str
-    target: str
+    target: Host
 
 
 @dataclass(frozen=True)
@@ -128,7 +128,10 @@ def _run(host_arg: str, *, quiet: bool) -> int:
     seed = _load_seed()
     metadata = _load_runtime_metadata(plugin_root, host)
     if seed.plugin_enrollment_token is None:
-        _emit({"status": "setup_needed", "reason": "missing_enrollment_token", "host": host}, quiet=quiet)
+        _emit(
+            {"status": "setup_needed", "reason": "missing_enrollment_token", "host": host},
+            stream=sys.stderr if quiet else None,
+        )
         return 0
 
     policy_url = os.environ.get("INSTRUCTION_HUB_POLICY_URL") or f"{seed.worker_base_url}/v0/host-enrollment/policy"
@@ -138,21 +141,15 @@ def _run(host_arg: str, *, quiet: bool) -> int:
     signed_policy = _get_json(policy_url, seed.plugin_enrollment_token)
     policy = _validate_signed_policy(signed_policy, host)
     if _requires_newer_bootstrap(policy.required_bootstrap_version, metadata.bootstrap_version):
-        result = ConfigResult(
-            status="blocked",
-            needs_restart=False,
-            effective_config=_effective_config(host, policy, configured=False, managed_config_detected=False),
-            drift_reports=[
-                {
-                    "kind": "bootstrap_upgrade_required",
-                    "message": "Worker policy requires a newer Promptless bootstrap runtime",
-                    "repaired": False,
-                    "details": {
-                        "required_bootstrap_version": policy.required_bootstrap_version,
-                        "bootstrap_version": metadata.bootstrap_version,
-                    },
-                }
-            ],
+        result = _blocked_result(
+            host,
+            policy,
+            kind="bootstrap_upgrade_required",
+            message="Worker policy requires a newer Promptless bootstrap runtime",
+            details={
+                "required_bootstrap_version": policy.required_bootstrap_version,
+                "bootstrap_version": metadata.bootstrap_version,
+            },
         )
         _post_check_in(check_in_url, seed.plugin_enrollment_token, host, metadata, policy, result)
         _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
@@ -254,7 +251,7 @@ def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetad
         return defaults
     manifest_path = plugin_root / MANAGED_RUNTIME_MANIFEST
     if not manifest_path.exists():
-        return defaults
+        raise BootstrapError(f"managed runtime manifest is missing at {manifest_path}")
     try:
         manifest = json.loads(manifest_path.read_text())
     except json.JSONDecodeError as exc:
@@ -269,6 +266,9 @@ def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetad
             raise BootstrapError(f"managed runtime manifest entries must be objects at {manifest_path}")
         if runtime.get("id") != "host-enrollment-bootstrap" or runtime.get("status") != "included":
             continue
+        target = _host_value(_string_value(runtime.get("target")) or host, "managed runtime manifest target")
+        if target != host:
+            raise BootstrapError(f"managed runtime manifest target {target} does not match resolved host {host}")
         return RuntimeMetadata(
             bootstrap_version=_string_value(runtime.get("version")) or BOOTSTRAP_VERSION,
             bootstrap_channel=_string_value(runtime.get("channel")) or BOOTSTRAP_CHANNEL,
@@ -277,7 +277,7 @@ def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetad
             plugin_id=_string_value(runtime.get("plugin_id")) or "unknown",
             plugin_version=_string_value(runtime.get("plugin_version")) or "unknown",
             package_id=_string_value(runtime.get("package_id")) or "unknown",
-            target=_string_value(runtime.get("target")) or host,
+            target=target,
         )
     raise BootstrapError(f"managed runtime manifest does not include host-enrollment-bootstrap at {manifest_path}")
 
@@ -488,19 +488,21 @@ def _configure_codex(policy: HostPolicy) -> ConfigResult:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     existing = config_path.read_text() if config_path.exists() else ""
     managed_block = _codex_managed_block(policy)
+    if _has_partial_managed_block(existing):
+        return _blocked_result(
+            "codex",
+            policy,
+            kind="manual_config_required",
+            message="Incomplete Promptless-managed Codex telemetry block was left unchanged",
+            details={"path": str(config_path)},
+        )
     if MANAGED_BEGIN not in existing and _has_unmanaged_codex_otel_config(existing):
-        return ConfigResult(
-            status="blocked",
-            needs_restart=False,
-            effective_config=_effective_config("codex", policy, configured=False, managed_config_detected=False),
-            drift_reports=[
-                {
-                    "kind": "manual_config_required",
-                    "message": "Existing unmanaged Codex otel config was left unchanged",
-                    "repaired": False,
-                    "details": {"path": str(config_path)},
-                }
-            ],
+        return _blocked_result(
+            "codex",
+            policy,
+            kind="manual_config_required",
+            message="Existing unmanaged Codex otel config was left unchanged",
+            details={"path": str(config_path)},
         )
     updated = _replace_managed_block(existing, managed_block)
     changed = updated != existing
@@ -555,40 +557,32 @@ def _has_unmanaged_codex_otel_config(existing: str) -> bool:
     )
 
 
+def _has_partial_managed_block(existing: str) -> bool:
+    return existing.count(MANAGED_BEGIN) != existing.count(MANAGED_END)
+
+
 def _configure_claude(policy: HostPolicy) -> ConfigResult:
     settings_path = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser() / "settings.json"
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings = _read_settings(settings_path)
     env = settings.setdefault("env", {})
     if not isinstance(env, dict):
-        return ConfigResult(
-            status="blocked",
-            needs_restart=False,
-            effective_config=_effective_config("claude", policy, configured=False, managed_config_detected=False),
-            drift_reports=[
-                {
-                    "kind": "manual_config_required",
-                    "message": "Claude settings env is not an object",
-                    "repaired": False,
-                    "details": {"path": str(settings_path)},
-                }
-            ],
+        return _blocked_result(
+            "claude",
+            policy,
+            kind="manual_config_required",
+            message="Claude settings env is not an object",
+            details={"path": str(settings_path)},
         )
     desired_env = _claude_env(policy)
     unmanaged_conflicts = _unmanaged_claude_env_conflicts(env, desired_env)
     if unmanaged_conflicts:
-        return ConfigResult(
-            status="blocked",
-            needs_restart=False,
-            effective_config=_effective_config("claude", policy, configured=False, managed_config_detected=False),
-            drift_reports=[
-                {
-                    "kind": "manual_config_required",
-                    "message": "Existing unmanaged Claude telemetry env was left unchanged",
-                    "repaired": False,
-                    "details": {"path": str(settings_path), "env_keys": unmanaged_conflicts},
-                }
-            ],
+        return _blocked_result(
+            "claude",
+            policy,
+            kind="manual_config_required",
+            message="Existing unmanaged Claude telemetry env was left unchanged",
+            details={"path": str(settings_path), "env_keys": unmanaged_conflicts},
         )
     current_settings = json.dumps(settings, sort_keys=True)
     env.update(desired_env)
@@ -674,6 +668,29 @@ def _effective_config(
     }
     effective_config["config_hash"] = hashlib.sha256(json.dumps(effective_config, sort_keys=True).encode()).hexdigest()
     return effective_config
+
+
+def _blocked_result(
+    host: Host,
+    policy: HostPolicy,
+    *,
+    kind: str,
+    message: str,
+    details: dict[str, JsonValue],
+) -> ConfigResult:
+    return ConfigResult(
+        status="blocked",
+        needs_restart=False,
+        effective_config=_effective_config(host, policy, configured=False, managed_config_detected=False),
+        drift_reports=[
+            {
+                "kind": kind,
+                "message": message,
+                "repaired": False,
+                "details": details,
+            }
+        ],
+    )
 
 
 def _effective_metrics_endpoint(host: Host, policy: HostPolicy, *, configured: bool) -> str | None:
@@ -766,7 +783,7 @@ def _datetime_value(value: JsonValue | None, field_name: str) -> dt.datetime:
 
 
 def _int_value(value: JsonValue | None, field_name: str) -> int:
-    if not isinstance(value, int):
+    if type(value) is not int:
         raise BootstrapError(f"{field_name} must be an integer")
     return value
 
@@ -831,6 +848,12 @@ def _string_value(value: object) -> str | None:
     if isinstance(value, str):
         return value
     return None
+
+
+def _host_value(value: str, field_name: str) -> Host:
+    if value == "codex" or value == "claude":
+        return value
+    raise BootstrapError(f"{field_name} must be codex or claude")
 
 
 def _non_empty(value: str | None) -> str | None:

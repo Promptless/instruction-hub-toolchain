@@ -318,13 +318,14 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     codex_manifest = json.loads((hub_root / "dist/codex/core/.codex-plugin/plugin.json").read_text())
     assert codex_manifest["name"] == "promptless-instruction-hub-core"
     assert codex_manifest["skills"] == "./skills/"
+    assert codex_manifest["hooks"] == "./hooks/hooks.json"
     assert codex_manifest["mcpServers"] == "./.mcp.json"
     assert codex_manifest["author"]["name"] == "Promptless"
     assert codex_manifest["interface"]["displayName"] == "Core"
     assert (
         codex_manifest["interface"]["longDescription"] == "Core distributes governed agent instructions for Promptless."
     )
-    assert codex_manifest["interface"]["capabilities"] == ["Skills", "MCP servers"]
+    assert codex_manifest["interface"]["capabilities"] == ["Skills", "MCP servers", "Hooks"]
     assert codex_manifest["interface"]["defaultPrompt"] == ["Use Core instructions for this task."]
     cursor_manifest = json.loads((hub_root / "dist/cursor/core/.cursor-plugin/plugin.json").read_text())
     assert cursor_manifest["name"] == "promptless-instruction-hub-core"
