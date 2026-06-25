@@ -45,11 +45,14 @@ intentionally commit generated artifacts on the same branch as source assets.
 
 ## Hub File Layout
 
-Instruction Hub source config lives at `hub.yaml` in the hub root. Generated hub
-metadata is also flat at the hub root:
+Instruction Hub source config lives at `hub.yaml` in the hub root. Build-generated
+release metadata is also flat at the hub root:
 
 - `hub.release.json`: current release manifest.
 - `hub.stable.json`: stable channel pointer.
+
+Scan-generated metadata is committed as a root file:
+
 - `hub.repo-context.json`: scanned repository-context inventory.
 
 Every generated plugin embeds local metadata as root files inside each plugin:
