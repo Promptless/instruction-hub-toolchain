@@ -11,6 +11,8 @@ import os
 import re
 import shutil
 import sys
+import tempfile
+import tomllib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -551,6 +553,15 @@ def _configure_codex(policy: HostPolicy) -> ConfigResult:
             message="Incomplete Promptless-managed Codex telemetry block was left unchanged",
             details={"path": str(config_path)},
         )
+    parse_error = _codex_toml_parse_error(existing)
+    if parse_error is not None:
+        return _blocked_result(
+            "codex",
+            policy,
+            kind="manual_config_required",
+            message="Existing Codex config is invalid TOML and was left unchanged",
+            details={"path": str(config_path), "parse_error": parse_error},
+        )
     unmanaged_source = _without_managed_block(existing)
     if _has_unmanaged_codex_otel_config(unmanaged_source):
         return _blocked_result(
@@ -618,6 +629,16 @@ def _has_invalid_managed_block(existing: str) -> bool:
     if begin_count == 0:
         return False
     return _managed_block_pattern().search(existing) is None
+
+
+def _codex_toml_parse_error(existing: str) -> str | None:
+    if not existing.strip():
+        return None
+    try:
+        tomllib.loads(existing)
+    except tomllib.TOMLDecodeError as exc:
+        return str(exc)
+    return None
 
 
 def _without_managed_block(existing: str) -> str:
@@ -805,7 +826,35 @@ def _write_with_backup(path: Path, contents: str) -> None:
     if path.exists():
         timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S%f")
         shutil.copy2(path, path.with_name(f"{path.name}.{timestamp}.bak"))
-    path.write_text(contents)
+    _atomic_write_text(path, contents)
+
+
+def _atomic_write_text(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name != "posix":
+        return
+    directory_descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
 
 
 def _requires_newer_bootstrap(required: str | None, current: str) -> bool:

@@ -470,6 +470,7 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
         codex_backups = list(codex_config.parent.glob("config.toml.*.bak"))
         assert len(codex_backups) == 1
         assert codex_backups[0].read_text() == original_codex_config
+        assert list(codex_config.parent.glob(".config.toml.*.tmp")) == []
 
         claude_home = tmp_path / "claude-home"
         claude_settings = claude_home / ".claude/settings.json"
@@ -497,6 +498,7 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
         claude_backups = list(claude_settings.parent.glob("settings.json.*.bak"))
         assert len(claude_backups) == 1
         assert json.loads(claude_backups[0].read_text()) == original_claude_settings
+        assert list(claude_settings.parent.glob(".settings.json.*.tmp")) == []
     finally:
         server.stop()
 
@@ -584,6 +586,43 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
 
         assert claude_settings.read_text() == '{"env":[]}\n'
         assert server.check_ins[-1]["status"] == "blocked"
+    finally:
+        server.stop()
+
+
+def test_bootstrap_blocks_invalid_codex_toml(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        codex_home = tmp_path / "codex-home"
+        codex_config = codex_home / ".codex/config.toml"
+        codex_config.parent.mkdir(parents=True)
+        original_config = 'model = "gpt-5"\nmodel = "gpt-5-codex"\n'
+        codex_config.write_text(original_config)
+
+        _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(codex_home),
+                "CODEX_HOME": str(codex_home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="blocked",
+        )
+
+        assert codex_config.read_text() == original_config
+        assert list(codex_config.parent.glob("config.toml.*.bak")) == []
+        drift_reports = _json_list(server.check_ins[-1]["drift_reports"], "drift_reports")
+        first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
+        assert first_drift_report["kind"] == "manual_config_required"
+        details = _json_mapping(first_drift_report["details"], "drift_reports[0].details")
+        assert "parse_error" in details
     finally:
         server.stop()
 
