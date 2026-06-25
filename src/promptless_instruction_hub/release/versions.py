@@ -9,11 +9,27 @@ from pathlib import Path
 from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH
 from promptless_instruction_hub.fs import JsonValue, read_json_mapping
 from promptless_instruction_hub.models import ASSET_KINDS, IDENTIFIER_RE, SEMVER_RE, SUPPORTED_HARNESSES, HubConfig
+from promptless_instruction_hub.release.hashing import stable_hash
 from promptless_instruction_hub.release.manifests import build_release_version_basis
 from promptless_instruction_hub.render.plugins import render_target_plugins
 from promptless_instruction_hub.validate.hub import ValidationResult, validate_hub
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RELEASE_MANIFEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "org",
+        "plugin",
+        "stable_packages",
+        "targets",
+        "target_hashes",
+        "managed_runtimes",
+        "assets",
+        "version_basis",
+        "release_id",
+        "release_hash",
+    }
+)
 VERSION_BASIS_KEYS = frozenset(
     {
         "org",
@@ -66,8 +82,10 @@ def resolve_publish_plugin_version(
     previous_manifest_path = previous_hub_root / RELEASE_MANIFEST_PATH
     if previous_manifest_path.exists():
         previous_manifest = read_json_mapping(previous_manifest_path)
-        previous_version = _read_manifest_plugin_version(previous_manifest_path, previous_manifest)
-        previous_basis = _read_manifest_version_basis(previous_manifest_path, previous_manifest)
+        previous_version, previous_basis = _read_authoritative_release_manifest(
+            previous_manifest_path,
+            previous_manifest,
+        )
         current_basis = _build_current_version_basis(validation, plugin_version=previous_version)
         if previous_basis == current_basis:
             return _max_semver(config_version, previous_version)
@@ -95,6 +113,16 @@ def _previous_hub_root(previous_release_root: Path | None, hub_relative_path: st
     raise ValueError(msg)
 
 
+def _read_authoritative_release_manifest(
+    manifest_path: Path,
+    manifest: dict[str, JsonValue],
+) -> tuple[str, dict[str, JsonValue]]:
+    plugin_version = _read_manifest_plugin_version(manifest_path, manifest)
+    version_basis = _read_manifest_version_basis(manifest_path, manifest)
+    _validate_release_manifest(manifest_path, manifest, plugin_version, version_basis)
+    return plugin_version, version_basis
+
+
 def _read_manifest_plugin_version(manifest_path: Path, manifest: dict[str, JsonValue]) -> str:
     _require_mapping(manifest_path, manifest, "plugin")
     version = _require_string(manifest_path, manifest, "plugin.version")
@@ -108,6 +136,104 @@ def _read_manifest_version_basis(manifest_path: Path, manifest: dict[str, JsonVa
     basis = _require_mapping(manifest_path, manifest, "version_basis")
     _validate_manifest_version_basis(manifest_path, manifest, basis)
     return basis
+
+
+def _validate_release_manifest(
+    manifest_path: Path,
+    manifest: dict[str, JsonValue],
+    plugin_version: str,
+    version_basis: dict[str, JsonValue],
+) -> None:
+    _require_exact_keys(manifest_path, manifest, "release manifest", RELEASE_MANIFEST_KEYS)
+    _validate_schema_version(manifest_path, manifest)
+    _validate_release_manifest_assets(manifest_path, manifest, version_basis)
+    _validate_release_identity(manifest_path, manifest, plugin_version)
+
+
+def _validate_schema_version(manifest_path: Path, manifest: dict[str, JsonValue]) -> None:
+    schema_version = _lookup_path(manifest_path, manifest, "schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
+        msg = f"{manifest_path}: schema_version must be 1"
+        raise ValueError(msg)
+
+
+def _validate_release_manifest_assets(
+    manifest_path: Path,
+    manifest: dict[str, JsonValue],
+    version_basis: dict[str, JsonValue],
+) -> None:
+    assets = _require_list(manifest_path, manifest, "assets")
+    asset_refs: list[str] = []
+    assets_by_ref: dict[str, dict[str, JsonValue]] = {}
+    for index, asset_value in enumerate(assets):
+        asset = _require_mapping_value(manifest_path, asset_value, f"assets[{index}]")
+        asset_ref = _validate_asset_manifest(manifest_path, asset, f"assets[{index}]")
+        asset_refs.append(asset_ref)
+        assets_by_ref[asset_ref] = asset
+    _require_unique(manifest_path, asset_refs, "assets.ref")
+
+    expected_assets_by_ref = _version_basis_assets_by_ref(manifest_path, version_basis)
+    expected_asset_refs = sorted(expected_assets_by_ref)
+    if asset_refs != expected_asset_refs:
+        msg = f"{manifest_path}: assets refs must match version_basis package assets"
+        raise ValueError(msg)
+    for index, asset_ref in enumerate(asset_refs):
+        if assets_by_ref[asset_ref] != expected_assets_by_ref[asset_ref]:
+            msg = f"{manifest_path}: assets[{index}] must match version_basis package asset"
+            raise ValueError(msg)
+
+
+def _version_basis_assets_by_ref(
+    manifest_path: Path,
+    version_basis: dict[str, JsonValue],
+) -> dict[str, dict[str, JsonValue]]:
+    assets_by_ref: dict[str, dict[str, JsonValue]] = {}
+    packages = _require_list(
+        manifest_path,
+        version_basis,
+        "packages",
+        display_path="version_basis.packages",
+    )
+    for package_index, package_value in enumerate(packages):
+        package = _require_mapping_value(manifest_path, package_value, f"version_basis.packages[{package_index}]")
+        package_assets = _require_list(
+            manifest_path,
+            package,
+            "assets",
+            display_path=f"version_basis.packages[{package_index}].assets",
+        )
+        for asset_index, asset_value in enumerate(package_assets):
+            asset_path = f"version_basis.packages[{package_index}].assets[{asset_index}]"
+            asset = _require_mapping_value(manifest_path, asset_value, asset_path)
+            asset_ref = _require_string(manifest_path, asset, "ref", display_path=f"{asset_path}.ref")
+            assets_by_ref[asset_ref] = asset
+    return assets_by_ref
+
+
+def _validate_release_identity(
+    manifest_path: Path,
+    manifest: dict[str, JsonValue],
+    plugin_version: str,
+) -> None:
+    release_id = _require_string(manifest_path, manifest, "release_id")
+    if not release_id:
+        msg = f"{manifest_path}: release_id must not be empty"
+        raise ValueError(msg)
+    release_hash = _require_string(manifest_path, manifest, "release_hash")
+    _validate_sha256(manifest_path, release_hash, "release_hash")
+
+    manifest_without_release_data = {
+        key: value for key, value in manifest.items() if key not in {"release_id", "release_hash"}
+    }
+    expected_release_id = f"{plugin_version}+{stable_hash(manifest_without_release_data)[:12]}"
+    if release_id != expected_release_id:
+        msg = f"{manifest_path}: release_id must match manifest content"
+        raise ValueError(msg)
+
+    manifest_without_release_hash = {key: value for key, value in manifest.items() if key != "release_hash"}
+    if release_hash != stable_hash(manifest_without_release_hash):
+        msg = f"{manifest_path}: release_hash must match manifest content"
+        raise ValueError(msg)
 
 
 def _read_legacy_plugin_manifest_version(previous_hub_root: Path) -> str | None:

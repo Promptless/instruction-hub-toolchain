@@ -1164,6 +1164,62 @@ def test_publish_version_reports_nested_authoritative_version_basis_path(tmp_pat
         resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("schema_version", r"hub\.release\.json: schema_version must be 1"),
+        ("assets_object", r"hub\.release\.json: assets must be a list"),
+        ("assets_empty", r"hub\.release\.json: assets refs must match version_basis package assets"),
+        ("release_id_empty", r"hub\.release\.json: release_id must not be empty"),
+        ("release_hash_mismatch", r"hub\.release\.json: release_hash must match manifest content"),
+    ],
+)
+def test_publish_version_rejects_authoritative_release_manifest_top_level_tampering(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    _configure_split_package_hub(hub_root, targets=("claude", "codex"))
+    build_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    shutil.copytree(hub_root, previous_release_root)
+    manifest_path = previous_release_root / "hub.release.json"
+    manifest = json.loads(manifest_path.read_text())
+    if mutation == "schema_version":
+        manifest["schema_version"] = 999
+    elif mutation == "assets_object":
+        manifest["assets"] = {}
+    elif mutation == "assets_empty":
+        manifest["assets"] = []
+    elif mutation == "release_id_empty":
+        manifest["release_id"] = ""
+    elif mutation == "release_hash_mismatch":
+        manifest["release_hash"] = "0" * 64
+    else:
+        raise AssertionError(f"unhandled mutation: {mutation}")
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match=message):
+        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
+
+
+def test_publish_version_rejects_authoritative_release_manifest_unexpected_root_key(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    shutil.copytree(hub_root, previous_release_root)
+    manifest_path = previous_release_root / "hub.release.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["unexpected"] = True
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match=r"hub\.release\.json: release manifest must contain exactly"):
+        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
+
+
 def test_publish_version_rejects_release_manifest_without_version_basis(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
