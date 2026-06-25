@@ -168,27 +168,30 @@ def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
 
 def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
     if target == "claude":
-        root_expr = "${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}"
-        host = "claude"
+        hook_command: dict[str, JsonValue] = {
+            "command": "python3",
+            "args": [f"${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_ENROLLMENT_EXECUTABLE}", "--host", "claude", "--quiet"],
+        }
     else:
-        root_expr = "${PLUGIN_ROOT}"
-        host = "codex"
+        hook_command = {
+            "command": f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host codex --quiet',
+        }
 
     # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
-    # the user to trust/review plugin hooks before running this startup command.
+    # the user to trust/review plugin hooks before running this startup command. Claude uses
+    # exec-form args so the generated hook does not depend on POSIX shell expansion.
     # https://developers.openai.com/codex/plugins/build
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
     # Promptless-built static native binary so customer machines do not need Python or uv.
-    command = f'python3 "{root_expr}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host {host} --quiet'
     return {
         "matcher": "startup|resume",
         "hooks": [
             {
                 "type": "command",
-                "command": command,
                 "timeout": HOST_ENROLLMENT_HOOK_TIMEOUT_SECONDS,
                 "statusMessage": "Checking Promptless host enrollment",
+                **hook_command,
             }
         ],
     }

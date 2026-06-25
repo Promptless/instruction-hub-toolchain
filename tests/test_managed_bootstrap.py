@@ -32,11 +32,14 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert os.access(bootstrap_path, os.X_OK)
         hooks = json.loads((plugin_root / "hooks/hooks.json").read_text())
         hook = hooks["hooks"]["SessionStart"][0]["hooks"][0]
-        hook_command = hook["command"]
-        root_expr = "${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}" if target == "claude" else "${PLUGIN_ROOT}"
-        assert hook_command == f'python3 "{root_expr}/bin/{BOOTSTRAP_BIN}" --host {target} --quiet'
-        assert f"--host {target}" in hook_command
-        assert "--quiet" in hook_command
+        if target == "claude":
+            assert hook["command"] == "python3"
+            assert hook["args"] == [f"${{CLAUDE_PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}", "--host", "claude", "--quiet"]
+        else:
+            hook_command = hook["command"]
+            assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host codex --quiet'
+            assert "--host codex" in hook_command
+            assert "--quiet" in hook_command
         assert hook["timeout"] == 45
         metadata = json.loads((plugin_root / ".promptless/managed-runtimes.json").read_text())
         runtime = metadata["managed_runtimes"][0]
