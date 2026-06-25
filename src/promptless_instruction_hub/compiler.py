@@ -88,8 +88,8 @@ def build_hub(hub_root: Path, *, check: bool = False) -> BuildResult:
     validation = validate_hub(root)
     with tempfile.TemporaryDirectory(prefix="promptless-instruction-hub-") as temp_dir:
         output_root = Path(temp_dir)
-        render_target_plugins(output_root, validation.config, validation.stable_packages)
-        release_manifest = build_release_manifest(output_root, validation)
+        managed_runtimes = render_target_plugins(output_root, validation.config, validation.stable_packages)
+        release_manifest = build_release_manifest(output_root, validation, managed_runtimes)
         write_release_files(output_root, release_manifest)
         embed_release_manifest(output_root, validation.config, validation.stable_packages, release_manifest)
         if check:

@@ -1,0 +1,779 @@
+#!/usr/bin/env python3
+"""Configure local agent-host telemetry from a Promptless worker policy."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit
+
+BOOTSTRAP_VERSION = "0.1.0"
+BOOTSTRAP_CHANNEL = "stable"
+DEFAULT_WORKER_BASE_URL = "https://pig.promptless.ai"
+MANAGED_BEGIN = "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT"
+MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
+MANAGED_RUNTIME_MANIFEST = Path(".promptless/managed-runtimes.json")
+SEED_FILE_NAME = "host-enrollment-seed.json"
+Host = Literal["codex", "claude"]
+
+JsonScalar = str | int | float | bool | None
+JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+
+
+class BootstrapError(RuntimeError):
+    """Expected non-fatal bootstrap failure."""
+
+
+@dataclass(frozen=True)
+class EnrollmentSeed:
+    """Private enrollment seed used to authenticate with the worker."""
+
+    plugin_enrollment_token: str | None
+    worker_base_url: str
+
+
+@dataclass(frozen=True)
+class RuntimeMetadata:
+    """Build-time runtime metadata injected by the toolchain."""
+
+    bootstrap_version: str
+    bootstrap_channel: str
+    bootstrap_sha256: str
+    toolchain_version: str
+    plugin_id: str
+    plugin_version: str
+    package_id: str
+    target: str
+
+
+@dataclass(frozen=True)
+class CollectorPolicy:
+    """Validated OTLP collector policy."""
+
+    logs_endpoint: str
+    traces_endpoint: str
+    metrics_endpoint: str
+    grpc_endpoint: str | None
+    headers: dict[str, str]
+
+
+@dataclass(frozen=True)
+class HostPolicy:
+    """Validated worker policy body used by the bootstrap."""
+
+    policy_version: int
+    collector: CollectorPolicy
+    capture_policy: dict[str, str]
+    required_bootstrap_version: str | None
+
+
+@dataclass(frozen=True)
+class ConfigResult:
+    """Host config write result."""
+
+    status: str
+    needs_restart: bool
+    effective_config: dict[str, JsonValue]
+    drift_reports: list[dict[str, JsonValue]]
+
+
+def main() -> int:
+    """Run host enrollment and return a non-blocking hook exit code."""
+
+    parser = argparse.ArgumentParser(description="Promptless host enrollment bootstrap")
+    parser.add_argument("--host", choices=("auto", "codex", "claude"), default="auto")
+    parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
+    args = parser.parse_args()
+    try:
+        return _run(args.host, quiet=args.quiet)
+    except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
+        _emit({"status": "error", "message": _redact_text(str(exc))}, quiet=args.quiet)
+        return 0
+
+
+def _run(host_arg: str, *, quiet: bool) -> int:
+    host = _resolve_host(host_arg)
+    plugin_root = _plugin_root()
+    seed = _load_seed()
+    metadata = _load_runtime_metadata(plugin_root, host)
+    if seed.plugin_enrollment_token is None:
+        _emit({"status": "setup_needed", "reason": "missing_enrollment_token", "host": host}, quiet=quiet)
+        return 0
+
+    policy_url = os.environ.get("INSTRUCTION_HUB_POLICY_URL") or f"{seed.worker_base_url}/v0/host-enrollment/policy"
+    check_in_url = (
+        os.environ.get("INSTRUCTION_HUB_HOST_CHECKIN_URL")
+        or f"{seed.worker_base_url}/v0/host-enrollment/check-ins"
+    )
+    signed_policy = _get_json(policy_url, seed.plugin_enrollment_token)
+    policy = _validate_signed_policy(signed_policy, host)
+    if _requires_newer_bootstrap(policy.required_bootstrap_version, metadata.bootstrap_version):
+        result = ConfigResult(
+            status="blocked",
+            needs_restart=False,
+            effective_config=_effective_config(host, policy, configured=False, managed_config_detected=False),
+            drift_reports=[
+                {
+                    "kind": "bootstrap_upgrade_required",
+                    "message": "Worker policy requires a newer Promptless bootstrap runtime",
+                    "repaired": False,
+                    "details": {
+                        "required_bootstrap_version": policy.required_bootstrap_version,
+                        "bootstrap_version": metadata.bootstrap_version,
+                    },
+                }
+            ],
+        )
+        _post_check_in(check_in_url, seed.plugin_enrollment_token, host, metadata, policy, result)
+        _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
+        return 0
+
+    result = _configure_host(host, policy)
+    _post_check_in(check_in_url, seed.plugin_enrollment_token, host, metadata, policy, result)
+    _emit({"status": result.status, "host": host, "needs_restart": result.needs_restart}, quiet=quiet)
+    return 0
+
+
+def _resolve_host(host_arg: str) -> Host:
+    if host_arg == "codex" or host_arg == "claude":
+        return host_arg
+    if os.environ.get("CLAUDE_PLUGIN_ROOT"):
+        return "claude"
+    return "codex"
+
+
+def _plugin_root() -> Path | None:
+    raw_root = os.environ.get("PLUGIN_ROOT") or os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if raw_root is None or raw_root.strip() == "":
+        return None
+    return Path(raw_root).expanduser()
+
+
+def _load_seed() -> EnrollmentSeed:
+    env_seed = _seed_from_environment()
+    if env_seed.plugin_enrollment_token is not None:
+        return env_seed
+
+    for path in _seed_paths():
+        seed = _seed_from_file(path)
+        if seed.plugin_enrollment_token is not None:
+            return seed
+    return env_seed
+
+
+def _seed_from_environment() -> EnrollmentSeed:
+    seed_json = os.environ.get("PROMPTLESS_HOST_ENROLLMENT_SEED")
+    if seed_json:
+        seed = _seed_from_mapping(_load_json_string(seed_json), fallback_base_url=DEFAULT_WORKER_BASE_URL)
+        if seed.plugin_enrollment_token is not None:
+            return seed
+
+    token = (
+        os.environ.get("PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN")
+        or os.environ.get("INSTRUCTION_HUB_PLUGIN_ENROLLMENT_TOKEN")
+        or os.environ.get("PLUGIN_ENROLLMENT_TOKEN")
+    )
+    base_url = (
+        os.environ.get("PROMPTLESS_WORKER_BASE_URL")
+        or os.environ.get("INSTRUCTION_HUB_WORKER_BASE_URL")
+        or DEFAULT_WORKER_BASE_URL
+    )
+    return EnrollmentSeed(plugin_enrollment_token=_non_empty(token), worker_base_url=_normalize_base_url(base_url))
+
+
+def _seed_paths() -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for raw_dir in (os.environ.get("PLUGIN_DATA"), os.environ.get("CLAUDE_PLUGIN_DATA")):
+        if raw_dir:
+            paths.append(Path(raw_dir).expanduser() / SEED_FILE_NAME)
+    paths.append(Path.home() / ".promptless/instruction-hub" / SEED_FILE_NAME)
+    paths.append(Path.home() / ".config/promptless/instruction-hub" / SEED_FILE_NAME)
+    return tuple(paths)
+
+
+def _seed_from_file(path: Path) -> EnrollmentSeed:
+    if not path.exists():
+        return EnrollmentSeed(plugin_enrollment_token=None, worker_base_url=DEFAULT_WORKER_BASE_URL)
+    try:
+        raw_value = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise BootstrapError(f"enrollment seed is invalid JSON at {path}: {exc.msg}") from exc
+    return _seed_from_mapping(raw_value, fallback_base_url=DEFAULT_WORKER_BASE_URL)
+
+
+def _seed_from_mapping(raw_value: object, *, fallback_base_url: str) -> EnrollmentSeed:
+    if not isinstance(raw_value, dict):
+        raise BootstrapError("enrollment seed must be a JSON object")
+    token = _string_value(raw_value.get("plugin_enrollment_token"))
+    base_url = _string_value(raw_value.get("worker_base_url")) or fallback_base_url
+    return EnrollmentSeed(plugin_enrollment_token=_non_empty(token), worker_base_url=_normalize_base_url(base_url))
+
+
+def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetadata:
+    defaults = RuntimeMetadata(
+        bootstrap_version=BOOTSTRAP_VERSION,
+        bootstrap_channel=BOOTSTRAP_CHANNEL,
+        bootstrap_sha256=_self_sha256(),
+        toolchain_version="unknown",
+        plugin_id="unknown",
+        plugin_version="unknown",
+        package_id="unknown",
+        target=host,
+    )
+    if plugin_root is None:
+        return defaults
+    manifest_path = plugin_root / MANAGED_RUNTIME_MANIFEST
+    if not manifest_path.exists():
+        return defaults
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except json.JSONDecodeError:
+        return defaults
+    if not isinstance(manifest, dict):
+        return defaults
+    runtimes = manifest.get("managed_runtimes")
+    if not isinstance(runtimes, list):
+        return defaults
+    for runtime in runtimes:
+        if not isinstance(runtime, dict):
+            continue
+        if runtime.get("id") != "host-enrollment-bootstrap" or runtime.get("status") != "included":
+            continue
+        return RuntimeMetadata(
+            bootstrap_version=_string_value(runtime.get("version")) or BOOTSTRAP_VERSION,
+            bootstrap_channel=_string_value(runtime.get("channel")) or BOOTSTRAP_CHANNEL,
+            bootstrap_sha256=_self_sha256(),
+            toolchain_version=_string_value(runtime.get("toolchain_version")) or "unknown",
+            plugin_id=_string_value(runtime.get("plugin_id")) or "unknown",
+            plugin_version=_string_value(runtime.get("plugin_version")) or "unknown",
+            package_id=_string_value(runtime.get("package_id")) or "unknown",
+            target=_string_value(runtime.get("target")) or host,
+        )
+    return defaults
+
+
+def _get_json(url: str, token: str) -> dict[str, JsonValue]:
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"}, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        raise BootstrapError(f"policy request failed with HTTP {exc.code}") from exc
+    return _decode_json_object(body, "policy response")
+
+
+def _post_check_in(
+    url: str,
+    token: str,
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    result: ConfigResult,
+) -> None:
+    payload = _check_in_payload(host, metadata, policy, result, include_bootstrap_fields=True)
+    try:
+        _post_json(url, token, payload)
+    except BootstrapError as exc:
+        if "HTTP 422" not in str(exc):
+            raise
+        _post_json(url, token, _check_in_payload(host, metadata, policy, result, include_bootstrap_fields=False))
+
+
+def _post_json(url: str, token: str, payload: dict[str, JsonValue]) -> None:
+    body = json.dumps(payload, sort_keys=True).encode()
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        raise BootstrapError(f"check-in request failed with HTTP {exc.code}") from exc
+
+
+def _check_in_payload(
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    result: ConfigResult,
+    *,
+    include_bootstrap_fields: bool,
+) -> dict[str, JsonValue]:
+    payload: dict[str, JsonValue] = {
+        "host": host,
+        "plugin_version": metadata.plugin_version,
+        "policy_version": policy.policy_version,
+        "status": result.status,
+        "needs_restart": result.needs_restart,
+        "effective_config": result.effective_config,
+        "drift_reports": [_redact_json(report) for report in result.drift_reports],
+        "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    if include_bootstrap_fields:
+        payload.update(
+            {
+                "bootstrap_version": metadata.bootstrap_version,
+                "bootstrap_channel": metadata.bootstrap_channel,
+                "bootstrap_sha256": metadata.bootstrap_sha256,
+                "toolchain_version": metadata.toolchain_version,
+                "plugin_id": metadata.plugin_id,
+                "package_id": metadata.package_id,
+                "target": metadata.target,
+            }
+        )
+    return payload
+
+
+def _validate_signed_policy(payload: dict[str, JsonValue], host: Host) -> HostPolicy:
+    policy_value = payload.get("policy")
+    if not isinstance(policy_value, dict):
+        raise BootstrapError("policy response missing policy object")
+    signature = _string_value(payload.get("signature"))
+    if signature is None or re.fullmatch(r"[A-Za-z0-9._-]+:.+", signature) is None:
+        raise BootstrapError("policy response has invalid signature shape")
+    # The worker response is authenticated by TLS for the dogfood bootstrap. Hosted policy signing
+    # should move to asymmetric signatures before broader customer rollout.
+    expires_at = _datetime_value(policy_value.get("expires_at"), "policy.expires_at")
+    if expires_at <= dt.datetime.now(dt.timezone.utc):
+        raise BootstrapError("policy has expired")
+    policy_version = _int_value(policy_value.get("policy_version"), "policy.policy_version")
+    enabled_hosts = policy_value.get("enabled_hosts")
+    if not isinstance(enabled_hosts, list) or host not in enabled_hosts:
+        raise BootstrapError(f"policy does not enable {host}")
+    collector = _validate_collector(policy_value.get("collector"))
+    capture_policy = _validate_capture_policy(policy_value.get("capture_policy"))
+    permissions = policy_value.get("plugin_permissions")
+    if not isinstance(permissions, dict) or permissions.get("write_user_config") is not True:
+        raise BootstrapError("policy does not allow user config writes")
+    required_bootstrap_version = _string_value(policy_value.get("required_bootstrap_version"))
+    return HostPolicy(
+        policy_version=policy_version,
+        collector=collector,
+        capture_policy=capture_policy,
+        required_bootstrap_version=required_bootstrap_version,
+    )
+
+
+def _validate_collector(value: JsonValue | None) -> CollectorPolicy:
+    if not isinstance(value, dict):
+        raise BootstrapError("policy.collector must be an object")
+    logs_endpoint = _validate_otlp_http_endpoint(value.get("otlp_http_logs_endpoint"), "collector logs", "/v1/logs")
+    traces_endpoint = _validate_otlp_http_endpoint(value.get("otlp_http_traces_endpoint"), "collector traces", "/v1/traces")
+    metrics_endpoint = _validate_otlp_http_endpoint(
+        value.get("otlp_http_metrics_endpoint"),
+        "collector metrics",
+        "/v1/metrics",
+    )
+    grpc_endpoint = _string_value(value.get("otlp_grpc_endpoint"))
+    if grpc_endpoint is not None:
+        _validate_http_url(grpc_endpoint, "collector grpc")
+    headers = value.get("headers")
+    if not isinstance(headers, dict) or not headers:
+        raise BootstrapError("policy.collector.headers must contain at least one header")
+    header_map: dict[str, str] = {}
+    for raw_name, raw_header_value in headers.items():
+        name = _string_value(raw_name)
+        header_value = _string_value(raw_header_value)
+        if name is None or header_value is None or not name.strip() or not header_value.strip():
+            raise BootstrapError("collector headers must be non-empty strings")
+        if any(char in name + header_value for char in ("\r", "\n", ",")):
+            raise BootstrapError("collector headers must not contain newline or comma characters")
+        header_map[name] = header_value
+    return CollectorPolicy(
+        logs_endpoint=logs_endpoint,
+        traces_endpoint=traces_endpoint,
+        metrics_endpoint=metrics_endpoint,
+        grpc_endpoint=grpc_endpoint,
+        headers=header_map,
+    )
+
+
+def _validate_capture_policy(value: JsonValue | None) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise BootstrapError("policy.capture_policy must be an object")
+    capture_policy: dict[str, str] = {}
+    for key in ("user_prompts", "tool_inputs", "tool_outputs", "raw_api_bodies"):
+        policy_value = _string_value(value.get(key))
+        if policy_value is None:
+            raise BootstrapError(f"policy.capture_policy.{key} must be a string")
+        capture_policy[key] = policy_value
+    return capture_policy
+
+
+def _configure_host(host: Host, policy: HostPolicy) -> ConfigResult:
+    if host == "codex":
+        return _configure_codex(policy)
+    return _configure_claude(policy)
+
+
+def _configure_codex(policy: HostPolicy) -> ConfigResult:
+    config_path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser() / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = config_path.read_text() if config_path.exists() else ""
+    managed_block = _codex_managed_block(policy)
+    if MANAGED_BEGIN not in existing and re.search(r"(?m)^\s*\[otel\]\s*$", existing) is not None:
+        return ConfigResult(
+            status="blocked",
+            needs_restart=False,
+            effective_config=_effective_config("codex", policy, configured=False, managed_config_detected=False),
+            drift_reports=[
+                {
+                    "kind": "manual_config_required",
+                    "message": "Existing unmanaged Codex [otel] config was left unchanged",
+                    "repaired": False,
+                    "details": {"path": str(config_path)},
+                }
+            ],
+        )
+    updated = _replace_managed_block(existing, managed_block)
+    changed = updated != existing
+    if changed:
+        _write_with_backup(config_path, updated)
+    return ConfigResult(
+        status="needs_restart" if changed else "configured",
+        needs_restart=changed,
+        effective_config=_effective_config("codex", policy, configured=True, managed_config_detected=True),
+        drift_reports=_updated_config_reports("codex", config_path, changed),
+    )
+
+
+def _codex_managed_block(policy: HostPolicy) -> str:
+    # Codex reads user-level ~/.codex/config.toml for OTel routing keys.
+    # https://developers.openai.com/codex/config-advanced
+    headers = _toml_inline_headers(policy.collector.headers)
+    return "\n".join(
+        [
+            MANAGED_BEGIN,
+            "[otel]",
+            'environment = "prod"',
+            f"log_user_prompt = {_toml_bool(_capture_enabled(policy, 'user_prompts'))}",
+            (
+                "exporter = { otlp-http = { "
+                f"endpoint = {_toml_string(policy.collector.logs_endpoint)}, "
+                'protocol = "json", '
+                f"headers = {headers} "
+                "} }"
+            ),
+            (
+                "trace_exporter = { otlp-http = { "
+                f"endpoint = {_toml_string(policy.collector.traces_endpoint)}, "
+                'protocol = "json", '
+                f"headers = {headers} "
+                "} }"
+            ),
+            (
+                "metrics_exporter = { otlp-http = { "
+                f"endpoint = {_toml_string(policy.collector.metrics_endpoint)}, "
+                'protocol = "json", '
+                f"headers = {headers} "
+                "} }"
+            ),
+            MANAGED_END,
+            "",
+        ]
+    )
+
+
+def _configure_claude(policy: HostPolicy) -> ConfigResult:
+    settings_path = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser() / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings = _read_settings(settings_path)
+    env = settings.setdefault("env", {})
+    if not isinstance(env, dict):
+        return ConfigResult(
+            status="blocked",
+            needs_restart=False,
+            effective_config=_effective_config("claude", policy, configured=False, managed_config_detected=False),
+            drift_reports=[
+                {
+                    "kind": "manual_config_required",
+                    "message": "Claude settings env is not an object",
+                    "repaired": False,
+                    "details": {"path": str(settings_path)},
+                }
+            ],
+        )
+    current_settings = json.dumps(settings, sort_keys=True)
+    env.update(_claude_env(policy))
+    changed = json.dumps(settings, sort_keys=True) != current_settings
+    updated_settings = json.dumps(settings, indent=2, sort_keys=True) + "\n"
+    if changed:
+        _write_with_backup(settings_path, updated_settings)
+    return ConfigResult(
+        status="needs_restart" if changed else "configured",
+        needs_restart=changed,
+        effective_config=_effective_config("claude", policy, configured=True, managed_config_detected=True),
+        drift_reports=_updated_config_reports("claude", settings_path, changed),
+    )
+
+
+def _read_settings(settings_path: Path) -> dict[str, JsonValue]:
+    if not settings_path.exists():
+        return {}
+    try:
+        value = json.loads(settings_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise BootstrapError(f"Claude settings are invalid JSON at {settings_path}: {exc.msg}") from exc
+    if not isinstance(value, dict):
+        raise BootstrapError(f"Claude settings must be a JSON object at {settings_path}")
+    return value
+
+
+def _claude_env(policy: HostPolicy) -> dict[str, str]:
+    # Claude Code supports OTel through settings.json env keys.
+    # https://docs.anthropic.com/en/docs/claude-code/monitoring-usage
+    return {
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+        "OTEL_LOGS_EXPORTER": "otlp",
+        "OTEL_METRICS_EXPORTER": "otlp",
+        "OTEL_TRACES_EXPORTER": "otlp",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": policy.collector.logs_endpoint,
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": policy.collector.traces_endpoint,
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": policy.collector.metrics_endpoint,
+        "OTEL_EXPORTER_OTLP_HEADERS": _otel_headers(policy.collector.headers),
+        "OTEL_LOG_USER_PROMPTS": _env_bool(_capture_enabled(policy, "user_prompts")),
+        "OTEL_LOG_TOOL_DETAILS": _env_bool(_capture_enabled(policy, "tool_inputs")),
+        "OTEL_LOG_TOOL_CONTENT": _env_bool(_capture_enabled(policy, "tool_outputs")),
+        "OTEL_LOG_RAW_API_BODIES": _env_bool(_capture_enabled(policy, "raw_api_bodies")),
+    }
+
+
+def _effective_config(
+    host: Host,
+    policy: HostPolicy,
+    *,
+    configured: bool,
+    managed_config_detected: bool,
+) -> dict[str, JsonValue]:
+    effective_config: dict[str, JsonValue] = {
+        "host": host,
+        "configured": configured,
+        "collector_logs_endpoint": policy.collector.logs_endpoint if configured else None,
+        "collector_traces_endpoint": policy.collector.traces_endpoint if configured else None,
+        "collector_metrics_endpoint": policy.collector.metrics_endpoint if configured else None,
+        "user_prompts_enabled": _capture_enabled(policy, "user_prompts") if configured else None,
+        "tool_inputs_enabled": _capture_enabled(policy, "tool_inputs") if configured else None,
+        "tool_outputs_enabled": _capture_enabled(policy, "tool_outputs") if configured else None,
+        "raw_api_bodies_enabled": _capture_enabled(policy, "raw_api_bodies") if configured else None,
+        "managed_config_detected": managed_config_detected,
+    }
+    effective_config["config_hash"] = hashlib.sha256(
+        json.dumps(effective_config, sort_keys=True).encode()
+    ).hexdigest()
+    return effective_config
+
+
+def _updated_config_reports(host: Host, path: Path, changed: bool) -> list[dict[str, JsonValue]]:
+    if not changed:
+        return []
+    return [
+        {
+            "kind": "repaired_user_config",
+            "message": f"Updated user-level {host} telemetry config",
+            "repaired": True,
+            "details": {"path": str(path)},
+        }
+    ]
+
+
+def _replace_managed_block(existing: str, managed_block: str) -> str:
+    if MANAGED_BEGIN in existing and MANAGED_END in existing:
+        pattern = re.compile(re.escape(MANAGED_BEGIN) + r".*?" + re.escape(MANAGED_END) + r"\n?", re.DOTALL)
+        return pattern.sub(managed_block, existing)
+    prefix = existing.rstrip()
+    if not prefix:
+        return managed_block
+    return prefix + "\n\n" + managed_block
+
+
+def _write_with_backup(path: Path, contents: str) -> None:
+    if path.exists():
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        shutil.copy2(path, path.with_name(f"{path.name}.{timestamp}.bak"))
+    path.write_text(contents)
+
+
+def _requires_newer_bootstrap(required: str | None, current: str) -> bool:
+    if required is None:
+        return False
+    required_tuple = _semver_tuple(required)
+    current_tuple = _semver_tuple(current)
+    if required_tuple is None or current_tuple is None:
+        return required != current
+    return current_tuple < required_tuple
+
+
+def _semver_tuple(value: str) -> tuple[int, int, int] | None:
+    match = re.match(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", value)
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def _capture_enabled(policy: HostPolicy, key: str) -> bool:
+    return policy.capture_policy.get(key) == "full_local_default"
+
+
+def _validate_otlp_http_endpoint(value: JsonValue | None, field_name: str, expected_path: str) -> str:
+    endpoint = _string_value(value)
+    if endpoint is None:
+        raise BootstrapError(f"{field_name} endpoint must be a string")
+    parsed = _validate_http_url(endpoint, field_name)
+    if parsed.path != expected_path:
+        raise BootstrapError(f"{field_name} endpoint must use path {expected_path}")
+    return endpoint
+
+
+def _validate_http_url(value: str, field_name: str):
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc == "":
+        raise BootstrapError(f"{field_name} endpoint must be an absolute HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise BootstrapError(f"{field_name} endpoint must not include credentials, query, or fragment")
+    return parsed
+
+
+def _datetime_value(value: JsonValue | None, field_name: str) -> dt.datetime:
+    text = _string_value(value)
+    if text is None:
+        raise BootstrapError(f"{field_name} must be an ISO timestamp")
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise BootstrapError(f"{field_name} must be an ISO timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise BootstrapError(f"{field_name} must include a timezone")
+    return parsed
+
+
+def _int_value(value: JsonValue | None, field_name: str) -> int:
+    if not isinstance(value, int):
+        raise BootstrapError(f"{field_name} must be an integer")
+    return value
+
+
+def _decode_json_object(body: bytes, label: str) -> dict[str, JsonValue]:
+    try:
+        value = json.loads(body.decode())
+    except json.JSONDecodeError as exc:
+        raise BootstrapError(f"{label} is invalid JSON: {exc.msg}") from exc
+    if not isinstance(value, dict):
+        raise BootstrapError(f"{label} must be a JSON object")
+    return _json_object(value)
+
+
+def _load_json_string(value: str) -> object:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise BootstrapError(f"enrollment seed env is invalid JSON: {exc.msg}") from exc
+
+
+def _json_object(value: dict[object, object]) -> dict[str, JsonValue]:
+    result: dict[str, JsonValue] = {}
+    for key, child in value.items():
+        if not isinstance(key, str):
+            raise BootstrapError("JSON object contains a non-string key")
+        result[key] = _json_value(child)
+    return result
+
+
+def _json_value(value: object) -> JsonValue:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, list):
+        return [_json_value(child) for child in value]
+    if isinstance(value, dict):
+        return _json_object(value)
+    raise BootstrapError(f"unsupported JSON value: {type(value).__name__}")
+
+
+def _normalize_base_url(value: str) -> str:
+    parsed = _validate_http_url(value.rstrip("/"), "worker base URL")
+    if parsed.path not in {"", "/"}:
+        raise BootstrapError("worker base URL must not include a path")
+    return value.rstrip("/")
+
+
+def _string_value(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _non_empty(value: str | None) -> str | None:
+    if value is None or value.strip() == "":
+        return None
+    return value
+
+
+def _otel_headers(headers: dict[str, str]) -> str:
+    return ",".join(f"{name}={value}" for name, value in sorted(headers.items()))
+
+
+def _toml_inline_headers(headers: dict[str, str]) -> str:
+    values = ", ".join(f"{_toml_string(name)} = {_toml_string(value)}" for name, value in sorted(headers.items()))
+    return "{ " + values + " }"
+
+
+def _toml_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def _toml_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _env_bool(value: bool) -> str:
+    return "1" if value else "0"
+
+
+def _self_sha256() -> str:
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def _emit(payload: dict[str, JsonValue], *, quiet: bool = False) -> None:
+    if quiet:
+        return
+    sys.stdout.write(json.dumps(_redact_json(payload), sort_keys=True) + "\n")
+    sys.stdout.flush()
+
+
+def _redact_json(value: JsonValue) -> JsonValue:
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, list):
+        return [_redact_json(child) for child in value]
+    if isinstance(value, dict):
+        redacted: dict[str, JsonValue] = {}
+        for key, child in value.items():
+            if key.lower() in {"authorization", "plugin_enrollment_token", "token"}:
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = _redact_json(child)
+        return redacted
+    return value
+
+
+def _redact_text(value: str) -> str:
+    redacted = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", value)
+    return re.sub(r"(plugin_enrollment_token=)[^,\s]+", r"\1<redacted>", redacted)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

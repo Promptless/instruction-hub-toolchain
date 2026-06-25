@@ -11,6 +11,7 @@
     "stable_packages",
     "targets",
     "target_hashes",
+    "managed_runtimes",
     "assets",
     "release_id",
     "release_hash"
@@ -72,6 +73,100 @@
         },
         "cursor": {
           "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "managed_runtimes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "package_id",
+          "plugin_id",
+          "plugin_version",
+          "status",
+          "target",
+          "toolchain_version"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "included"
+                }
+              },
+              "required": ["status"]
+            },
+            "then": {
+              "required": ["channel", "version", "sha256", "executable", "path", "hook"]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "unsupported"
+                }
+              },
+              "required": ["status"]
+            },
+            "then": {
+              "required": ["reason"]
+            }
+          }
+        ],
+        "properties": {
+          "id": {
+            "const": "host-enrollment-bootstrap"
+          },
+          "package_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+          },
+          "plugin_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+          },
+          "plugin_version": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "enum": ["included", "unsupported"]
+          },
+          "target": {
+            "enum": ["claude", "codex", "gemini", "cursor"]
+          },
+          "toolchain_version": {
+            "type": "string",
+            "minLength": 1
+          },
+          "channel": {
+            "const": "stable"
+          },
+          "version": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "executable": {
+            "const": "promptless-host-enrollment-bootstrap"
+          },
+          "path": {
+            "const": "bin/promptless-host-enrollment-bootstrap"
+          },
+          "hook": {
+            "const": "hooks/hooks.json"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     },

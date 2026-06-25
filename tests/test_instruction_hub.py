@@ -1459,7 +1459,19 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
 
     assert schema["additionalProperties"] is False
     assert "target_hashes" in schema["required"]
+    assert "managed_runtimes" in schema["required"]
     assert "git_commit" not in schema["properties"]
+    managed_runtime_schema = schema["properties"]["managed_runtimes"]["items"]
+    assert managed_runtime_schema["required"] == [
+        "id",
+        "package_id",
+        "plugin_id",
+        "plugin_version",
+        "status",
+        "target",
+        "toolchain_version",
+    ]
+    assert managed_runtime_schema["properties"]["id"] == {"const": "host-enrollment-bootstrap"}
     asset_schema = schema["properties"]["assets"]["items"]
     assert asset_schema["required"] == ["ref", "id", "type", "title", "source_path", "content_hash", "support"]
     assert "pattern" in schema["properties"]["plugin"]["properties"]["version"]

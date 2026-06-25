@@ -5,12 +5,17 @@ from __future__ import annotations
 from pathlib import Path
 
 from promptless_instruction_hub.fs import JsonValue, directory_hash, write_json
+from promptless_instruction_hub.managed_runtime import ManagedRuntimeRecord
 from promptless_instruction_hub.models import LoadedAsset
 from promptless_instruction_hub.release.hashing import stable_hash
 from promptless_instruction_hub.validate.hub import ValidationResult
 
 
-def build_release_manifest(output_root: Path, validation: ValidationResult) -> dict[str, JsonValue]:
+def build_release_manifest(
+    output_root: Path,
+    validation: ValidationResult,
+    managed_runtimes: tuple[ManagedRuntimeRecord, ...],
+) -> dict[str, JsonValue]:
     """Build the deterministic release manifest for generated target output."""
 
     target_hashes = {
@@ -28,6 +33,7 @@ def build_release_manifest(output_root: Path, validation: ValidationResult) -> d
         "stable_packages": validation.config.stable_packages,
         "targets": validation.config.targets,
         "target_hashes": target_hashes,
+        "managed_runtimes": [runtime.to_manifest() for runtime in managed_runtimes],
         "assets": [_asset_manifest(asset) for asset in validation.stable_assets],
     }
     content_hash = stable_hash(base_manifest)
