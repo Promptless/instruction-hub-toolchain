@@ -16,6 +16,7 @@ from promptless_instruction_hub.models import Harness, HubConfig, PackageDefinit
 RuntimeStatus = Literal["included", "unsupported"]
 
 HOST_ENROLLMENT_BOOTSTRAP_ID = "host-enrollment-bootstrap"
+HOST_ENROLLMENT_ASSET_DIR = "host-enrollment"
 HOST_ENROLLMENT_EXECUTABLE = "promptless-host-enrollment-bootstrap"
 HOST_ENROLLMENT_HOOK_TIMEOUT_SECONDS = 45
 HOST_ENROLLMENT_CHANNEL = "stable"
@@ -23,7 +24,7 @@ HOST_ENROLLMENT_VERSION = "0.1.0"
 MANAGED_RUNTIME_MANIFEST = Path(".promptless/managed-runtimes.json")
 SUPPORTED_HOST_ENROLLMENT_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 
-_ASSET_ROOT = Path(__file__).parent / "managed_runtime_assets" / HOST_ENROLLMENT_BOOTSTRAP_ID
+_ASSET_ROOT = Path(__file__).parent / "managed_runtime_assets" / HOST_ENROLLMENT_ASSET_DIR
 _EXECUTABLE_SOURCE = _ASSET_ROOT / HOST_ENROLLMENT_EXECUTABLE
 
 
