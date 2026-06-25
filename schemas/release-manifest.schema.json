@@ -83,55 +83,18 @@
         "additionalProperties": false,
         "required": [
           "id",
+          "channel",
+          "executable",
+          "hook",
           "package_id",
+          "path",
           "plugin_id",
           "plugin_version",
+          "sha256",
           "status",
           "target",
-          "toolchain_version"
-        ],
-        "oneOf": [
-          {
-            "properties": {
-              "status": {
-                "const": "included"
-              }
-            },
-            "required": ["channel", "version", "sha256", "executable", "path", "hook"],
-            "not": {
-              "required": ["reason"]
-            }
-          },
-          {
-            "properties": {
-              "status": {
-                "const": "unsupported"
-              }
-            },
-            "required": ["reason"],
-            "not": {
-              "anyOf": [
-                {
-                  "required": ["channel"]
-                },
-                {
-                  "required": ["version"]
-                },
-                {
-                  "required": ["sha256"]
-                },
-                {
-                  "required": ["executable"]
-                },
-                {
-                  "required": ["path"]
-                },
-                {
-                  "required": ["hook"]
-                }
-              ]
-            }
-          }
+          "toolchain_version",
+          "version"
         ],
         "properties": {
           "id": {
@@ -150,17 +113,18 @@
             "minLength": 1
           },
           "status": {
-            "enum": ["included", "unsupported"]
+            "const": "included"
           },
           "target": {
-            "enum": ["claude", "codex", "gemini", "cursor"]
+            "enum": ["claude", "codex"]
           },
           "toolchain_version": {
             "type": "string",
             "minLength": 1
           },
           "channel": {
-            "const": "stable"
+            "type": "string",
+            "minLength": 1
           },
           "version": {
             "type": "string",
@@ -170,15 +134,14 @@
             "$ref": "#/$defs/sha256"
           },
           "executable": {
-            "const": "promptless-host-enrollment-bootstrap"
+            "type": "string",
+            "minLength": 1
           },
           "path": {
-            "const": "bin/promptless-host-enrollment-bootstrap"
+            "type": "string",
+            "minLength": 1
           },
           "hook": {
-            "const": "hooks/hooks.json"
-          },
-          "reason": {
             "type": "string",
             "minLength": 1
           }

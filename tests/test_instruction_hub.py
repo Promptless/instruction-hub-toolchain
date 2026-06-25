@@ -1466,15 +1466,23 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
     managed_runtime_schema = schema["properties"]["managed_runtimes"]["items"]
     assert managed_runtime_schema["required"] == [
         "id",
+        "channel",
+        "executable",
+        "hook",
         "package_id",
+        "path",
         "plugin_id",
         "plugin_version",
+        "sha256",
         "status",
         "target",
         "toolchain_version",
+        "version",
     ]
     assert managed_runtime_schema["properties"]["id"] == {"const": "host-enrollment-bootstrap"}
-    assert "oneOf" in managed_runtime_schema
+    assert managed_runtime_schema["properties"]["status"] == {"const": "included"}
+    assert managed_runtime_schema["properties"]["target"] == {"enum": ["claude", "codex"]}
+    assert "oneOf" not in managed_runtime_schema
     asset_schema = schema["properties"]["assets"]["items"]
     assert asset_schema["required"] == ["ref", "id", "type", "title", "source_path", "content_hash", "support"]
     assert "pattern" in schema["properties"]["plugin"]["properties"]["version"]
