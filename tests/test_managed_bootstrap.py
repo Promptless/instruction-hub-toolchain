@@ -34,8 +34,11 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         hooks = json.loads((plugin_root / "hooks/hooks.json").read_text())
         hook = hooks["hooks"]["SessionStart"][0]["hooks"][0]
         if target == "claude":
-            assert hook["command"] == "python3"
-            assert hook["args"] == [f"${{CLAUDE_PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}", "--host", "claude", "--quiet"]
+            hook_command = hook["command"]
+            assert hook_command == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host claude --quiet'
+            assert "args" not in hook
+            assert "--host claude" in hook_command
+            assert "--quiet" in hook_command
         else:
             hook_command = hook["command"]
             assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host codex --quiet'

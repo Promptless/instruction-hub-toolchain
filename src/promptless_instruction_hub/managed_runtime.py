@@ -170,8 +170,7 @@ def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
 def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
     if target == "claude":
         hook_command: dict[str, JsonValue] = {
-            "command": "python3",
-            "args": [f"${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_ENROLLMENT_EXECUTABLE}", "--host", "claude", "--quiet"],
+            "command": f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host claude --quiet',
         }
     else:
         hook_command = {
@@ -179,8 +178,7 @@ def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
         }
 
     # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
-    # the user to trust/review plugin hooks before running this startup command. Claude Code
-    # documents command+args hooks, so the generated hook does not depend on POSIX shell expansion.
+    # the user to trust/review plugin hooks before running this startup command.
     # https://developers.openai.com/codex/plugins/build
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
