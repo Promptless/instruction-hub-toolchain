@@ -272,6 +272,8 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         codex_config = (codex_home / ".codex/config.toml").read_text()
         assert "BEGIN PROMPTLESS MANAGED HOST ENROLLMENT" in codex_config
         assert 'endpoint = "http://127.0.0.1:4318/v1/logs"' in codex_config
+        assert 'endpoint = "http://127.0.0.1:4318/v1/traces"' in codex_config
+        assert codex_config.count('protocol = "binary"') == 2
         assert "metrics_exporter" not in codex_config
         assert "plugin-token" not in codex_config
 

@@ -179,8 +179,8 @@ def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
         }
 
     # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
-    # the user to trust/review plugin hooks before running this startup command. Claude uses
-    # exec-form args so the generated hook does not depend on POSIX shell expansion.
+    # the user to trust/review plugin hooks before running this startup command. Claude Code
+    # documents command+args hooks, so the generated hook does not depend on POSIX shell expansion.
     # https://developers.openai.com/codex/plugins/build
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a

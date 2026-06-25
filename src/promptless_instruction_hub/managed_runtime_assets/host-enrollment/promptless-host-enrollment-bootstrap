@@ -575,6 +575,7 @@ def _configure_codex(policy: HostPolicy) -> ConfigResult:
 def _codex_managed_block(policy: HostPolicy) -> str:
     # Codex reads user-level ~/.codex/config.toml, or CODEX_HOME/config.toml, for OTel routing keys.
     # https://developers.openai.com/codex/config-advanced
+    # https://developers.openai.com/codex/config-reference
     headers = _toml_inline_headers(policy.collector.headers)
     return "\n".join(
         [
@@ -585,14 +586,14 @@ def _codex_managed_block(policy: HostPolicy) -> str:
             (
                 "exporter = { otlp-http = { "
                 f"endpoint = {_toml_string(policy.collector.logs_endpoint)}, "
-                'protocol = "json", '
+                'protocol = "binary", '
                 f"headers = {headers} "
                 "} }"
             ),
             (
                 "trace_exporter = { otlp-http = { "
                 f"endpoint = {_toml_string(policy.collector.traces_endpoint)}, "
-                'protocol = "json", '
+                'protocol = "binary", '
                 f"headers = {headers} "
                 "} }"
             ),
