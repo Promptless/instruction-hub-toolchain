@@ -1460,8 +1460,9 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
 
     assert schema["additionalProperties"] is False
     assert "target_hashes" in schema["required"]
-    assert "managed_runtimes" in schema["required"]
+    assert "managed_runtimes" not in schema["required"]
     assert "git_commit" not in schema["properties"]
+    assert schema["properties"]["managed_runtimes"]["default"] == []
     managed_runtime_schema = schema["properties"]["managed_runtimes"]["items"]
     assert managed_runtime_schema["required"] == [
         "id",
