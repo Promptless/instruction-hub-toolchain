@@ -13,6 +13,7 @@ import pytest
 
 from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.errors import InstructionHubError
+from promptless_instruction_hub.fs import JsonValue, validate_json_value
 
 BOOTSTRAP_BIN = "promptless-host-enrollment-bootstrap"
 
@@ -142,13 +143,14 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         for check_in in server.check_ins:
             assert check_in["bootstrap_version"] == "0.1.0"
             assert check_in["bootstrap_channel"] == "stable"
-            assert len(check_in["bootstrap_sha256"]) == 64
+            assert len(_json_string(check_in["bootstrap_sha256"], "bootstrap_sha256")) == 64
             assert check_in["toolchain_version"]
             assert check_in["plugin_id"] == "promptless-instruction-hub-core"
             assert check_in["package_id"] == "core"
             assert check_in["status"] == "needs_restart"
             assert check_in["needs_restart"] is True
-            assert check_in["effective_config"]["configured"] is True
+            effective_config = _json_mapping(check_in["effective_config"], "effective_config")
+            assert effective_config["configured"] is True
     finally:
         server.stop()
 
@@ -329,7 +331,9 @@ def test_bootstrap_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> 
 
         assert not (home / ".codex/config.toml").exists()
         assert server.check_ins[0]["status"] == "blocked"
-        assert server.check_ins[0]["drift_reports"][0]["kind"] == "bootstrap_upgrade_required"
+        drift_reports = _json_list(server.check_ins[0]["drift_reports"], "drift_reports")
+        first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
+        assert first_drift_report["kind"] == "bootstrap_upgrade_required"
     finally:
         server.stop()
 
@@ -423,7 +427,7 @@ def _run_bootstrap(
     env: dict[str, str],
     *,
     expected_status: str = "needs_restart",
-) -> tuple[dict[str, object], subprocess.CompletedProcess[str]]:
+) -> tuple[dict[str, JsonValue], subprocess.CompletedProcess[str]]:
     result = subprocess.run(
         [str(plugin_root / "bin" / BOOTSTRAP_BIN), "--host", host],
         env=_clean_env(**env),
@@ -435,7 +439,11 @@ def _run_bootstrap(
     assert "plugin-token" not in result.stdout
     assert "plugin-token" not in result.stderr
     payload_text = result.stdout.strip() or result.stderr.strip()
-    payload = json.loads(payload_text) if payload_text else {}
+    payload = (
+        _json_mapping(validate_json_value(json.loads(payload_text), "bootstrap output"), "bootstrap output")
+        if payload_text
+        else {}
+    )
     assert payload["status"] == expected_status
     return payload, result
 
@@ -446,7 +454,22 @@ def _clean_env(**overrides: str) -> dict[str, str]:
     return env
 
 
-def _write_native_hook_asset(hub_root: Path, hooks: dict[str, object]) -> None:
+def _json_mapping(value: JsonValue, field_path: str) -> dict[str, JsonValue]:
+    assert isinstance(value, dict), f"{field_path} must be a JSON object"
+    return value
+
+
+def _json_list(value: JsonValue, field_path: str) -> list[JsonValue]:
+    assert isinstance(value, list), f"{field_path} must be a JSON array"
+    return value
+
+
+def _json_string(value: JsonValue, field_path: str) -> str:
+    assert isinstance(value, str), f"{field_path} must be a JSON string"
+    return value
+
+
+def _write_native_hook_asset(hub_root: Path, hooks: dict[str, JsonValue]) -> None:
     hooks_path = hub_root / "assets/hooks/hooks.json"
     hooks_path.write_text(json.dumps(hooks))
     (hub_root / "assets/hooks/hooks.asset.yaml").write_text(
@@ -472,27 +495,24 @@ def _write_native_hook_asset(hub_root: Path, hooks: dict[str, object]) -> None:
     (hub_root / "packages/core.yaml").write_text("id: core\nname: Core\nincludes:\n  - hook:hooks\n")
 
 
-def _policy_with(**policy_updates: object) -> dict[str, object]:
-    payload = json.loads(json.dumps(_signed_policy()))
-    policy = payload["policy"]
-    assert isinstance(policy, dict)
+def _policy_with(**policy_updates: JsonValue) -> dict[str, JsonValue]:
+    payload = _json_mapping(
+        validate_json_value(json.loads(json.dumps(_signed_policy())), "signed policy fixture"),
+        "signed policy fixture",
+    )
+    policy = _json_mapping(payload["policy"], "policy")
     policy.update(policy_updates)
     return payload
 
 
-def _invalid_policy(case: str) -> dict[str, object]:
+def _invalid_policy(case: str) -> dict[str, JsonValue]:
     now = dt.datetime.now(dt.timezone.utc)
     payload = _policy_with()
-    policy = payload["policy"]
-    assert isinstance(policy, dict)
-    collector = policy["collector"]
-    assert isinstance(collector, dict)
-    headers = collector["headers"]
-    assert isinstance(headers, dict)
-    capture_policy = policy["capture_policy"]
-    assert isinstance(capture_policy, dict)
-    permissions = policy["plugin_permissions"]
-    assert isinstance(permissions, dict)
+    policy = _json_mapping(payload["policy"], "policy")
+    collector = _json_mapping(policy["collector"], "policy.collector")
+    headers = _json_mapping(collector["headers"], "policy.collector.headers")
+    capture_policy = _json_mapping(policy["capture_policy"], "policy.capture_policy")
+    permissions = _json_mapping(policy["plugin_permissions"], "policy.plugin_permissions")
 
     if case == "expired":
         policy["expires_at"] = (now - dt.timedelta(minutes=1)).isoformat()
@@ -519,10 +539,10 @@ class _FakeWorkerServer:
     def __init__(
         self,
         *,
-        policy: dict[str, object] | None = None,
-        post_responses: list[tuple[int, dict[str, object]]] | None = None,
+        policy: dict[str, JsonValue] | None = None,
+        post_responses: list[tuple[int, dict[str, JsonValue]]] | None = None,
     ) -> None:
-        self.check_ins: list[dict[str, object]] = []
+        self.check_ins: list[dict[str, JsonValue]] = []
         _FakeWorkerHandler.check_ins = self.check_ins
         _FakeWorkerHandler.policy_response = policy or _signed_policy()
         _FakeWorkerHandler.post_responses = list(post_responses or [])
@@ -541,9 +561,9 @@ class _FakeWorkerServer:
 
 
 class _FakeWorkerHandler(BaseHTTPRequestHandler):
-    check_ins: ClassVar[list[dict[str, object]]] = []
-    policy_response: ClassVar[dict[str, object]]
-    post_responses: ClassVar[list[tuple[int, dict[str, object]]]]
+    check_ins: ClassVar[list[dict[str, JsonValue]]] = []
+    policy_response: ClassVar[dict[str, JsonValue]]
+    post_responses: ClassVar[list[tuple[int, dict[str, JsonValue]]]]
 
     def do_GET(self) -> None:
         if self.path != "/v0/host-enrollment/policy" or self.headers.get("Authorization") != "Bearer plugin-token":
@@ -558,7 +578,10 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         length = int(self.headers["Content-Length"])
-        payload = json.loads(self.rfile.read(length))
+        payload = _json_mapping(
+            validate_json_value(json.loads(self.rfile.read(length)), "check-in request"),
+            "check-in request",
+        )
         self.check_ins.append(payload)
         if self.post_responses:
             status, response_payload = self.post_responses.pop(0)
@@ -569,7 +592,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
-    def _write_json(self, payload: dict[str, object], *, status: int = 200) -> None:
+    def _write_json(self, payload: dict[str, JsonValue], *, status: int = 200) -> None:
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -578,7 +601,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def _signed_policy() -> dict[str, object]:
+def _signed_policy() -> dict[str, JsonValue]:
     now = dt.datetime.now(dt.timezone.utc)
     return {
         "policy": {

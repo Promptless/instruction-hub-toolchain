@@ -36,9 +36,7 @@ def render_target_plugins(
             mcp_servers = collect_mcp_servers(target, assets)
             if mcp_servers:
                 write_mcp_config(target_root, target, mcp_servers)
-            managed_runtimes.extend(
-                render_managed_runtimes(target_root, target, config, stable_package.definition)
-            )
+            managed_runtimes.extend(render_managed_runtimes(target_root, target, config, stable_package.definition))
             _write_manifest(target_root, target, config, stable_package.definition, rendered, mcp_servers)
     if "codex" in config.targets:
         codex.write_marketplace(output_root, config, packages)
