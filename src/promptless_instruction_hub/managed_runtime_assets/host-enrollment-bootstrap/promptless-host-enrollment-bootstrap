@@ -20,6 +20,10 @@ from urllib.parse import SplitResult, urlsplit
 
 BOOTSTRAP_VERSION = "0.1.0"
 BOOTSTRAP_CHANNEL = "stable"
+BOOTSTRAP_EXECUTABLE = "promptless-host-enrollment-bootstrap"
+MANAGED_RUNTIME_ID = "host-enrollment-bootstrap"
+MANAGED_RUNTIME_PATH = f"bin/{BOOTSTRAP_EXECUTABLE}"
+MANAGED_RUNTIME_HOOK = "hooks/hooks.json"
 DEFAULT_WORKER_BASE_URL = "https://pig.promptless.ai"
 MANAGED_BEGIN = "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
@@ -27,6 +31,7 @@ MANAGED_RUNTIME_MANIFEST = Path(".promptless/managed-runtimes.json")
 SEED_FILE_NAME = "host-enrollment-seed.json"
 HTTP_TIMEOUT_SECONDS = 10
 CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
+TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
 
@@ -34,6 +39,7 @@ JsonScalar = str | int | float | bool | None
 JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 CAPTURE_POLICY_VALUES = frozenset({"disabled", "full_local_default"})
 HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class BootstrapError(RuntimeError):
@@ -118,7 +124,7 @@ def main() -> int:
     try:
         return _run(args.host, quiet=args.quiet)
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
-        _emit({"status": "error", "message": _redact_text(str(exc))}, stream=sys.stderr)
+        _emit({"status": "error", "message": _redact_text(str(exc))}, quiet=args.quiet, stream=sys.stderr)
         return 0
 
 
@@ -134,13 +140,15 @@ def _run(host_arg: str, *, quiet: bool) -> int:
         )
         return 0
 
-    policy_url = os.environ.get("INSTRUCTION_HUB_POLICY_URL") or f"{seed.worker_base_url}/v0/host-enrollment/policy"
-    check_in_url = (
-        os.environ.get("INSTRUCTION_HUB_HOST_CHECKIN_URL") or f"{seed.worker_base_url}/v0/host-enrollment/check-ins"
+    policy_url = _worker_url("INSTRUCTION_HUB_POLICY_URL", seed.worker_base_url, "/v0/host-enrollment/policy")
+    check_in_url = _worker_url(
+        "INSTRUCTION_HUB_HOST_CHECKIN_URL",
+        seed.worker_base_url,
+        "/v0/host-enrollment/check-ins",
     )
     signed_policy = _get_json(policy_url, seed.plugin_enrollment_token)
     policy = _validate_signed_policy(signed_policy, host)
-    if _requires_newer_bootstrap(policy.required_bootstrap_version, metadata.bootstrap_version):
+    if _requires_newer_bootstrap(policy.required_bootstrap_version, BOOTSTRAP_VERSION):
         result = _blocked_result(
             host,
             policy,
@@ -148,7 +156,7 @@ def _run(host_arg: str, *, quiet: bool) -> int:
             message="Worker policy requires a newer Promptless bootstrap runtime",
             details={
                 "required_bootstrap_version": policy.required_bootstrap_version,
-                "bootstrap_version": metadata.bootstrap_version,
+                "bootstrap_version": BOOTSTRAP_VERSION,
             },
         )
         _post_check_in(check_in_url, seed.plugin_enrollment_token, host, metadata, policy, result)
@@ -236,6 +244,18 @@ def _seed_from_mapping(raw_value: object, *, fallback_base_url: str) -> Enrollme
     return EnrollmentSeed(plugin_enrollment_token=_non_empty(token), worker_base_url=_normalize_base_url(base_url))
 
 
+def _worker_url(env_name: str, worker_base_url: str, default_path: str) -> str:
+    override = os.environ.get(env_name)
+    if override is None or override.strip() == "":
+        return f"{worker_base_url}{default_path}"
+    _validate_http_url(override, env_name)
+    if _same_origin(override, worker_base_url):
+        return override
+    if _test_url_overrides_enabled() and _is_loopback_url(override):
+        return override
+    raise BootstrapError(f"{env_name} must use the configured worker origin")
+
+
 def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetadata:
     defaults = RuntimeMetadata(
         bootstrap_version=BOOTSTRAP_VERSION,
@@ -258,25 +278,49 @@ def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetad
         raise BootstrapError(f"managed runtime manifest is invalid JSON at {manifest_path}: {exc.msg}") from exc
     if not isinstance(manifest, dict):
         raise BootstrapError(f"managed runtime manifest must be a JSON object at {manifest_path}")
+    schema_version = _int_value(manifest.get("schema_version"), "managed runtime manifest schema_version")
+    if schema_version != 1:
+        raise BootstrapError("managed runtime manifest schema_version must be 1")
     runtimes = manifest.get("managed_runtimes")
     if not isinstance(runtimes, list):
         raise BootstrapError(f"managed runtime manifest field managed_runtimes must be an array at {manifest_path}")
     for runtime in runtimes:
         if not isinstance(runtime, dict):
             raise BootstrapError(f"managed runtime manifest entries must be objects at {manifest_path}")
-        if runtime.get("id") != "host-enrollment-bootstrap" or runtime.get("status") != "included":
+        runtime_id = _manifest_string(runtime, "id")
+        runtime_status = _manifest_string(runtime, "status")
+        if runtime_id != MANAGED_RUNTIME_ID or runtime_status != "included":
             continue
-        target = _host_value(_string_value(runtime.get("target")) or host, "managed runtime manifest target")
+        target = _host_value(_manifest_string(runtime, "target"), "managed runtime manifest target")
         if target != host:
             raise BootstrapError(f"managed runtime manifest target {target} does not match resolved host {host}")
+        version = _manifest_string(runtime, "version")
+        if version != BOOTSTRAP_VERSION:
+            raise BootstrapError("managed runtime manifest version does not match bootstrap executable version")
+        channel = _manifest_string(runtime, "channel")
+        if channel != BOOTSTRAP_CHANNEL:
+            raise BootstrapError(f"managed runtime manifest channel must be {BOOTSTRAP_CHANNEL}")
+        executable = _manifest_string(runtime, "executable")
+        if executable != BOOTSTRAP_EXECUTABLE:
+            raise BootstrapError(f"managed runtime manifest executable must be {BOOTSTRAP_EXECUTABLE}")
+        runtime_path = _manifest_string(runtime, "path")
+        if runtime_path != MANAGED_RUNTIME_PATH:
+            raise BootstrapError(f"managed runtime manifest path must be {MANAGED_RUNTIME_PATH}")
+        hook = _manifest_string(runtime, "hook")
+        if hook != MANAGED_RUNTIME_HOOK:
+            raise BootstrapError(f"managed runtime manifest hook must be {MANAGED_RUNTIME_HOOK}")
+        manifest_sha256 = _manifest_sha256(runtime.get("sha256"))
+        self_sha256 = _self_sha256()
+        if manifest_sha256 != self_sha256:
+            raise BootstrapError("managed runtime manifest sha256 does not match bootstrap executable")
         return RuntimeMetadata(
-            bootstrap_version=_string_value(runtime.get("version")) or BOOTSTRAP_VERSION,
-            bootstrap_channel=_string_value(runtime.get("channel")) or BOOTSTRAP_CHANNEL,
-            bootstrap_sha256=_self_sha256(),
-            toolchain_version=_string_value(runtime.get("toolchain_version")) or "unknown",
-            plugin_id=_string_value(runtime.get("plugin_id")) or "unknown",
-            plugin_version=_string_value(runtime.get("plugin_version")) or "unknown",
-            package_id=_string_value(runtime.get("package_id")) or "unknown",
+            bootstrap_version=version,
+            bootstrap_channel=channel,
+            bootstrap_sha256=self_sha256,
+            toolchain_version=_manifest_string(runtime, "toolchain_version"),
+            plugin_id=_manifest_string(runtime, "plugin_id"),
+            plugin_version=_manifest_string(runtime, "plugin_version"),
+            package_id=_manifest_string(runtime, "package_id"),
             target=target,
         )
     raise BootstrapError(f"managed runtime manifest does not include host-enrollment-bootstrap at {manifest_path}")
@@ -340,7 +384,8 @@ def _post_json(
         ) from exc
     if response_payload.get("accepted") is not True:
         raise BootstrapError("check-in response was not accepted")
-    if response_payload.get("policy_version") != expected_policy_version:
+    response_policy_version = response_payload.get("policy_version")
+    if type(response_policy_version) is not int or response_policy_version != expected_policy_version:
         raise BootstrapError("check-in response policy version did not match the applied policy")
 
 
@@ -398,9 +443,9 @@ def _validate_signed_policy(payload: dict[str, JsonValue], host: Host) -> HostPo
     signature = _string_value(payload.get("signature"))
     if signature is None or re.fullmatch(r"[A-Za-z0-9._-]+:.+", signature) is None:
         raise BootstrapError("policy response has invalid signature shape")
-    # The default dogfood endpoint relies on HTTPS transport authentication; this bootstrap only
-    # shape-checks the hosted policy signature. Local tests and overrides may use HTTP. Before
-    # broader customer rollout, hosted policies should use asymmetric signatures verified here.
+    # The dogfood endpoint relies on HTTPS transport authentication; this bootstrap only
+    # shape-checks the hosted policy signature. Before broader customer rollout, hosted
+    # policies should use asymmetric signatures verified here by the static native binary.
     schema_version = _int_value(policy_value.get("schema_version"), "policy.schema_version")
     if schema_version != 1:
         raise BootstrapError("policy.schema_version must be 1")
@@ -488,7 +533,16 @@ def _configure_codex(policy: HostPolicy) -> ConfigResult:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     existing = config_path.read_text() if config_path.exists() else ""
     managed_block = _codex_managed_block(policy)
-    if _has_partial_managed_block(existing):
+    unsupported_capture_fields = _unsupported_codex_capture_fields(policy)
+    if unsupported_capture_fields:
+        return _blocked_result(
+            "codex",
+            policy,
+            kind="manual_config_required",
+            message="Codex policy requires capture controls this bootstrap cannot enforce",
+            details={"path": str(config_path), "capture_policy_keys": unsupported_capture_fields},
+        )
+    if _has_invalid_managed_block(existing):
         return _blocked_result(
             "codex",
             policy,
@@ -496,7 +550,8 @@ def _configure_codex(policy: HostPolicy) -> ConfigResult:
             message="Incomplete Promptless-managed Codex telemetry block was left unchanged",
             details={"path": str(config_path)},
         )
-    if MANAGED_BEGIN not in existing and _has_unmanaged_codex_otel_config(existing):
+    unmanaged_source = _without_managed_block(existing)
+    if _has_unmanaged_codex_otel_config(unmanaged_source):
         return _blocked_result(
             "codex",
             policy,
@@ -557,8 +612,24 @@ def _has_unmanaged_codex_otel_config(existing: str) -> bool:
     )
 
 
-def _has_partial_managed_block(existing: str) -> bool:
-    return existing.count(MANAGED_BEGIN) != existing.count(MANAGED_END)
+def _has_invalid_managed_block(existing: str) -> bool:
+    begin_count = existing.count(MANAGED_BEGIN)
+    end_count = existing.count(MANAGED_END)
+    if begin_count != end_count or begin_count > 1:
+        return True
+    if begin_count == 0:
+        return False
+    return _managed_block_pattern().search(existing) is None
+
+
+def _without_managed_block(existing: str) -> str:
+    if MANAGED_BEGIN not in existing:
+        return existing
+    return _managed_block_pattern().sub("", existing, count=1)
+
+
+def _managed_block_pattern() -> re.Pattern[str]:
+    return re.compile(re.escape(MANAGED_BEGIN) + r".*?" + re.escape(MANAGED_END) + r"\n?", re.DOTALL)
 
 
 def _configure_claude(policy: HostPolicy) -> ConfigResult:
@@ -615,6 +686,7 @@ def _claude_env(policy: HostPolicy) -> dict[str, str]:
     # https://docs.anthropic.com/en/docs/claude-code/monitoring-usage
     return {
         CLAUDE_MANAGED_ENV_MARKER: "1",
+        "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
         "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
         "OTEL_LOGS_EXPORTER": "otlp",
         "OTEL_METRICS_EXPORTER": "otlp",
@@ -699,6 +771,16 @@ def _effective_metrics_endpoint(host: Host, policy: HostPolicy, *, configured: b
     return policy.collector.metrics_endpoint
 
 
+def _unsupported_codex_capture_fields(policy: HostPolicy) -> list[str]:
+    unsupported_fields: list[str] = []
+    for key in ("tool_inputs", "tool_outputs"):
+        if policy.capture_policy.get(key) != "full_local_default":
+            unsupported_fields.append(key)
+    if policy.capture_policy.get("raw_api_bodies") != "disabled":
+        unsupported_fields.append("raw_api_bodies")
+    return unsupported_fields
+
+
 def _updated_config_reports(host: Host, path: Path, changed: bool) -> list[dict[str, JsonValue]]:
     if not changed:
         return []
@@ -714,8 +796,7 @@ def _updated_config_reports(host: Host, path: Path, changed: bool) -> list[dict[
 
 def _replace_managed_block(existing: str, managed_block: str) -> str:
     if MANAGED_BEGIN in existing and MANAGED_END in existing:
-        pattern = re.compile(re.escape(MANAGED_BEGIN) + r".*?" + re.escape(MANAGED_END) + r"\n?", re.DOTALL)
-        return pattern.sub(managed_block, existing)
+        return _managed_block_pattern().sub(managed_block, existing, count=1)
     prefix = existing.rstrip()
     if not prefix:
         return managed_block
@@ -844,10 +925,40 @@ def _normalize_base_url(value: str) -> str:
     return value.rstrip("/")
 
 
+def _same_origin(url: str, base_url: str) -> bool:
+    parsed_url = urlsplit(url)
+    parsed_base = urlsplit(base_url)
+    return (parsed_url.scheme, parsed_url.netloc) == (parsed_base.scheme, parsed_base.netloc)
+
+
+def _test_url_overrides_enabled() -> bool:
+    return os.environ.get(TEST_URL_OVERRIDE_ENV) == "1"
+
+
+def _is_loopback_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    host = parsed.hostname
+    return host in {"localhost", "127.0.0.1", "::1"}
+
+
 def _string_value(value: object) -> str | None:
     if isinstance(value, str):
         return value
     return None
+
+
+def _manifest_string(value: dict[object, object], field_name: str) -> str:
+    field_value = _string_value(value.get(field_name))
+    if field_value is None or field_value.strip() == "":
+        raise BootstrapError(f"managed runtime manifest {field_name} must be a non-empty string")
+    return field_value
+
+
+def _manifest_sha256(value: object) -> str:
+    field_value = _string_value(value)
+    if field_value is None or SHA256_RE.fullmatch(field_value) is None:
+        raise BootstrapError("managed runtime manifest sha256 must be a lowercase hex SHA-256 digest")
+    return field_value
 
 
 def _host_value(value: str, field_name: str) -> Host:

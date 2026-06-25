@@ -62,3 +62,8 @@ release. Customer Instruction Hub repositories should not need Python, uv, Go,
 Rust, curl, jq, or other runtime/build dependencies installed for the bootstrap
 hook to run. Customer builds should only consume the already-built Promptless
 artifact that the toolchain copies into plugin `bin/`.
+
+The dogfood bootstrap trusts the authenticated TLS worker response and validates
+only the hosted policy shape. The customer-grade static binary must verify an
+asymmetric hosted-policy signature with a pinned Promptless public key before it
+writes local host telemetry config.

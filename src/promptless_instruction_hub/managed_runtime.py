@@ -6,6 +6,7 @@ import shutil
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from re import fullmatch
 from typing import Literal
 
 from promptless_instruction_hub.errors import InstructionHubError
@@ -44,6 +45,20 @@ class ManagedRuntimeRecord:
     path: str | None = None
     hook: str | None = None
     reason: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate included and unsupported managed runtime record shapes."""
+
+        if self.id != HOST_ENROLLMENT_BOOTSTRAP_ID:
+            msg = f"managed runtime id must be {HOST_ENROLLMENT_BOOTSTRAP_ID}"
+            raise InstructionHubError(msg)
+        if self.status == "included":
+            _validate_included_runtime_record(self)
+            return
+        if self.status != "unsupported":
+            msg = "managed runtime status must be included or unsupported"
+            raise InstructionHubError(msg)
+        _validate_unsupported_runtime_record(self)
 
     def to_manifest(self) -> dict[str, JsonValue]:
         """Return a deterministic JSON record for manifests and check-in context."""
@@ -187,6 +202,60 @@ def _write_plugin_manifest(target_root: Path, records: tuple[ManagedRuntimeRecor
             "managed_runtimes": [record.to_manifest() for record in records],
         },
     )
+
+
+def _validate_included_runtime_record(record: ManagedRuntimeRecord) -> None:
+    if record.target not in SUPPORTED_HOST_ENROLLMENT_TARGETS:
+        msg = "included managed runtime target must support host enrollment"
+        raise InstructionHubError(msg)
+    _require_runtime_value(record.package_id, "package_id")
+    _require_runtime_value(record.plugin_id, "plugin_id")
+    _require_runtime_value(record.plugin_version, "plugin_version")
+    _require_runtime_value(record.toolchain_version, "toolchain_version")
+    _require_runtime_field(record.channel, "channel", HOST_ENROLLMENT_CHANNEL)
+    _require_runtime_value(record.version, "version")
+    sha256 = _require_runtime_value(record.sha256, "sha256")
+    if fullmatch(r"[0-9a-f]{64}", sha256) is None:
+        msg = "included managed runtime sha256 must be a lowercase hex SHA-256 digest"
+        raise InstructionHubError(msg)
+    _require_runtime_field(record.executable, "executable", HOST_ENROLLMENT_EXECUTABLE)
+    _require_runtime_field(record.path, "path", f"bin/{HOST_ENROLLMENT_EXECUTABLE}")
+    _require_runtime_field(record.hook, "hook", "hooks/hooks.json")
+    if record.reason is not None:
+        msg = "included managed runtime must not set reason"
+        raise InstructionHubError(msg)
+
+
+def _validate_unsupported_runtime_record(record: ManagedRuntimeRecord) -> None:
+    if record.reason is None or record.reason.strip() == "":
+        msg = "unsupported managed runtime reason must be a non-empty string"
+        raise InstructionHubError(msg)
+    unsupported_fields = {
+        "channel": record.channel,
+        "version": record.version,
+        "sha256": record.sha256,
+        "executable": record.executable,
+        "path": record.path,
+        "hook": record.hook,
+    }
+    for field_name, field_value in unsupported_fields.items():
+        if field_value is not None:
+            msg = f"unsupported managed runtime must not set {field_name}"
+            raise InstructionHubError(msg)
+
+
+def _require_runtime_field(value: str | None, field_name: str, expected: str) -> None:
+    actual = _require_runtime_value(value, field_name)
+    if actual != expected:
+        msg = f"included managed runtime {field_name} must be {expected}"
+        raise InstructionHubError(msg)
+
+
+def _require_runtime_value(value: str | None, field_name: str) -> str:
+    if value is None or value.strip() == "":
+        msg = f"included managed runtime {field_name} must be a non-empty string"
+        raise InstructionHubError(msg)
+    return value
 
 
 def _toolchain_version() -> str:
