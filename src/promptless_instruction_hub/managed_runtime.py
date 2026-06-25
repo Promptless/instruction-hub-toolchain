@@ -16,6 +16,7 @@ RuntimeStatus = Literal["included", "unsupported"]
 
 HOST_ENROLLMENT_BOOTSTRAP_ID = "host-enrollment-bootstrap"
 HOST_ENROLLMENT_EXECUTABLE = "promptless-host-enrollment-bootstrap"
+HOST_ENROLLMENT_HOOK_TIMEOUT_SECONDS = 45
 HOST_ENROLLMENT_CHANNEL = "stable"
 HOST_ENROLLMENT_VERSION = "0.1.0"
 MANAGED_RUNTIME_MANIFEST = Path(".promptless/managed-runtimes.json")
@@ -171,7 +172,7 @@ def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
             {
                 "type": "command",
                 "command": command,
-                "timeout": 20,
+                "timeout": HOST_ENROLLMENT_HOOK_TIMEOUT_SECONDS,
                 "statusMessage": "Checking Promptless host enrollment",
             }
         ],

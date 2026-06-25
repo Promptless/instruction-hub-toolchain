@@ -25,6 +25,8 @@ MANAGED_BEGIN = "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_RUNTIME_MANIFEST = Path(".promptless/managed-runtimes.json")
 SEED_FILE_NAME = "host-enrollment-seed.json"
+HTTP_TIMEOUT_SECONDS = 10
+CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
 
@@ -131,8 +133,7 @@ def _run(host_arg: str, *, quiet: bool) -> int:
 
     policy_url = os.environ.get("INSTRUCTION_HUB_POLICY_URL") or f"{seed.worker_base_url}/v0/host-enrollment/policy"
     check_in_url = (
-        os.environ.get("INSTRUCTION_HUB_HOST_CHECKIN_URL")
-        or f"{seed.worker_base_url}/v0/host-enrollment/check-ins"
+        os.environ.get("INSTRUCTION_HUB_HOST_CHECKIN_URL") or f"{seed.worker_base_url}/v0/host-enrollment/check-ins"
     )
     signed_policy = _get_json(policy_url, seed.plugin_enrollment_token)
     policy = _validate_signed_policy(signed_policy, host)
@@ -284,7 +285,7 @@ def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetad
 def _get_json(url: str, token: str) -> dict[str, JsonValue]:
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"}, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             body = response.read()
     except urllib.error.HTTPError as exc:
         raise BootstrapError(f"policy request failed with HTTP {exc.code}") from exc
@@ -328,7 +329,7 @@ def _post_json(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             response_payload = _decode_json_object(response.read(), "check-in response")
     except urllib.error.HTTPError as exc:
         response_payload = _decode_json_response(exc)
@@ -428,7 +429,9 @@ def _validate_collector(value: JsonValue | None) -> CollectorPolicy:
     if not isinstance(value, dict):
         raise BootstrapError("policy.collector must be an object")
     logs_endpoint = _validate_otlp_http_endpoint(value.get("otlp_http_logs_endpoint"), "collector logs", "/v1/logs")
-    traces_endpoint = _validate_otlp_http_endpoint(value.get("otlp_http_traces_endpoint"), "collector traces", "/v1/traces")
+    traces_endpoint = _validate_otlp_http_endpoint(
+        value.get("otlp_http_traces_endpoint"), "collector traces", "/v1/traces"
+    )
     metrics_endpoint = _validate_otlp_http_endpoint(
         value.get("otlp_http_metrics_endpoint"),
         "collector metrics",
@@ -469,9 +472,7 @@ def _validate_capture_policy(value: JsonValue | None) -> dict[str, str]:
         if policy_value is None:
             raise BootstrapError(f"policy.capture_policy.{key} must be a string")
         if policy_value not in CAPTURE_POLICY_VALUES:
-            raise BootstrapError(
-                f"policy.capture_policy.{key} must be one of {sorted(CAPTURE_POLICY_VALUES)}"
-            )
+            raise BootstrapError(f"policy.capture_policy.{key} must be one of {sorted(CAPTURE_POLICY_VALUES)}")
         capture_policy[key] = policy_value
     return capture_policy
 
@@ -487,7 +488,7 @@ def _configure_codex(policy: HostPolicy) -> ConfigResult:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     existing = config_path.read_text() if config_path.exists() else ""
     managed_block = _codex_managed_block(policy)
-    if MANAGED_BEGIN not in existing and re.search(r"(?m)^\s*\[otel\]\s*$", existing) is not None:
+    if MANAGED_BEGIN not in existing and _has_unmanaged_codex_otel_config(existing):
         return ConfigResult(
             status="blocked",
             needs_restart=False,
@@ -495,7 +496,7 @@ def _configure_codex(policy: HostPolicy) -> ConfigResult:
             drift_reports=[
                 {
                     "kind": "manual_config_required",
-                    "message": "Existing unmanaged Codex [otel] config was left unchanged",
+                    "message": "Existing unmanaged Codex otel config was left unchanged",
                     "repaired": False,
                     "details": {"path": str(config_path)},
                 }
@@ -537,16 +538,20 @@ def _codex_managed_block(policy: HostPolicy) -> str:
                 f"headers = {headers} "
                 "} }"
             ),
-            (
-                "metrics_exporter = { otlp-http = { "
-                f"endpoint = {_toml_string(policy.collector.metrics_endpoint)}, "
-                'protocol = "json", '
-                f"headers = {headers} "
-                "} }"
-            ),
             MANAGED_END,
             "",
         ]
+    )
+
+
+def _has_unmanaged_codex_otel_config(existing: str) -> bool:
+    return (
+        re.search(r"(?m)^\s*\[otel\]\s*$", existing) is not None
+        or re.search(
+            r"(?m)^\s*otel\s*=",
+            existing,
+        )
+        is not None
     )
 
 
@@ -569,8 +574,24 @@ def _configure_claude(policy: HostPolicy) -> ConfigResult:
                 }
             ],
         )
+    desired_env = _claude_env(policy)
+    unmanaged_conflicts = _unmanaged_claude_env_conflicts(env, desired_env)
+    if unmanaged_conflicts:
+        return ConfigResult(
+            status="blocked",
+            needs_restart=False,
+            effective_config=_effective_config("claude", policy, configured=False, managed_config_detected=False),
+            drift_reports=[
+                {
+                    "kind": "manual_config_required",
+                    "message": "Existing unmanaged Claude telemetry env was left unchanged",
+                    "repaired": False,
+                    "details": {"path": str(settings_path), "env_keys": unmanaged_conflicts},
+                }
+            ],
+        )
     current_settings = json.dumps(settings, sort_keys=True)
-    env.update(_claude_env(policy))
+    env.update(desired_env)
     changed = json.dumps(settings, sort_keys=True) != current_settings
     updated_settings = json.dumps(settings, indent=2, sort_keys=True) + "\n"
     if changed:
@@ -599,6 +620,7 @@ def _claude_env(policy: HostPolicy) -> dict[str, str]:
     # Claude Code supports OTel through settings.json env keys.
     # https://docs.anthropic.com/en/docs/claude-code/monitoring-usage
     return {
+        CLAUDE_MANAGED_ENV_MARKER: "1",
         "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
         "OTEL_LOGS_EXPORTER": "otlp",
         "OTEL_METRICS_EXPORTER": "otlp",
@@ -615,6 +637,22 @@ def _claude_env(policy: HostPolicy) -> dict[str, str]:
     }
 
 
+def _unmanaged_claude_env_conflicts(env: dict[object, object], desired_env: dict[str, str]) -> list[str]:
+    if _string_value(env.get(CLAUDE_MANAGED_ENV_MARKER)) == "1":
+        return []
+    conflicts: list[str] = []
+    for key in sorted(desired_env):
+        if key == CLAUDE_MANAGED_ENV_MARKER:
+            continue
+        existing = env.get(key)
+        if existing is None:
+            continue
+        if isinstance(existing, str) and existing == "":
+            continue
+        conflicts.append(key)
+    return conflicts
+
+
 def _effective_config(
     host: Host,
     policy: HostPolicy,
@@ -627,17 +665,21 @@ def _effective_config(
         "configured": configured,
         "collector_logs_endpoint": policy.collector.logs_endpoint if configured else None,
         "collector_traces_endpoint": policy.collector.traces_endpoint if configured else None,
-        "collector_metrics_endpoint": policy.collector.metrics_endpoint if configured else None,
+        "collector_metrics_endpoint": _effective_metrics_endpoint(host, policy, configured=configured),
         "user_prompts_enabled": _capture_enabled(policy, "user_prompts") if configured else None,
         "tool_inputs_enabled": _capture_enabled(policy, "tool_inputs") if configured else None,
         "tool_outputs_enabled": _capture_enabled(policy, "tool_outputs") if configured else None,
         "raw_api_bodies_enabled": _capture_enabled(policy, "raw_api_bodies") if configured else None,
         "managed_config_detected": managed_config_detected,
     }
-    effective_config["config_hash"] = hashlib.sha256(
-        json.dumps(effective_config, sort_keys=True).encode()
-    ).hexdigest()
+    effective_config["config_hash"] = hashlib.sha256(json.dumps(effective_config, sort_keys=True).encode()).hexdigest()
     return effective_config
+
+
+def _effective_metrics_endpoint(host: Host, policy: HostPolicy, *, configured: bool) -> str | None:
+    if not configured or host == "codex":
+        return None
+    return policy.collector.metrics_endpoint
 
 
 def _updated_config_reports(host: Host, path: Path, changed: bool) -> list[dict[str, JsonValue]]:

@@ -30,9 +30,11 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert bootstrap_path.exists()
         assert os.access(bootstrap_path, os.X_OK)
         hooks = json.loads((plugin_root / "hooks/hooks.json").read_text())
-        hook_command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        hook = hooks["hooks"]["SessionStart"][0]["hooks"][0]
+        hook_command = hook["command"]
         assert f"--host {target}" in hook_command
         assert "--quiet" in hook_command
+        assert hook["timeout"] == 45
         metadata = json.loads((plugin_root / ".promptless/managed-runtimes.json").read_text())
         runtime = metadata["managed_runtimes"][0]
         assert runtime["id"] == "host-enrollment-bootstrap"
@@ -119,6 +121,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         codex_config = (codex_home / ".codex/config.toml").read_text()
         assert "BEGIN PROMPTLESS MANAGED HOST ENROLLMENT" in codex_config
         assert 'endpoint = "http://127.0.0.1:4318/v1/logs"' in codex_config
+        assert "metrics_exporter" not in codex_config
         assert "plugin-token" not in codex_config
 
         claude_home = tmp_path / "claude-home"
@@ -136,6 +139,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         )
         claude_settings = json.loads((claude_home / ".claude/settings.json").read_text())
         assert claude_settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
+        assert claude_settings["env"]["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"
 
@@ -151,6 +155,10 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
             assert check_in["needs_restart"] is True
             effective_config = _json_mapping(check_in["effective_config"], "effective_config")
             assert effective_config["configured"] is True
+        codex_effective_config = _json_mapping(server.check_ins[0]["effective_config"], "codex effective_config")
+        claude_effective_config = _json_mapping(server.check_ins[1]["effective_config"], "claude effective_config")
+        assert codex_effective_config["collector_metrics_endpoint"] is None
+        assert claude_effective_config["collector_metrics_endpoint"] == "http://127.0.0.1:4318/v1/metrics"
     finally:
         server.stop()
 
@@ -238,6 +246,77 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
 
         assert claude_settings.read_text() == '{"env":[]}\n'
         assert server.check_ins[-1]["status"] == "blocked"
+    finally:
+        server.stop()
+
+
+def test_bootstrap_blocks_inline_codex_otel_config(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        codex_home = tmp_path / "codex-home"
+        codex_config = codex_home / ".codex/config.toml"
+        codex_config.parent.mkdir(parents=True)
+        codex_config.write_text('otel = { environment = "local" }\n')
+
+        _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(codex_home),
+                "CODEX_HOME": str(codex_home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="blocked",
+        )
+
+        assert codex_config.read_text() == 'otel = { environment = "local" }\n'
+        assert server.check_ins[-1]["status"] == "blocked"
+    finally:
+        server.stop()
+
+
+def test_bootstrap_blocks_unmanaged_claude_telemetry_env(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        claude_home = tmp_path / "claude-home"
+        claude_settings = claude_home / ".claude/settings.json"
+        claude_settings.parent.mkdir(parents=True)
+        claude_settings.write_text('{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"Authorization=Bearer customer-token"}}\n')
+
+        _run_bootstrap(
+            hub_root / "dist/claude/core",
+            "claude",
+            {
+                "HOME": str(claude_home),
+                "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="blocked",
+        )
+
+        assert (
+            claude_settings.read_text()
+            == '{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"Authorization=Bearer customer-token"}}\n'
+        )
+        assert server.check_ins[-1]["status"] == "blocked"
+        drift_reports = _json_list(server.check_ins[-1]["drift_reports"], "drift_reports")
+        first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
+        assert first_drift_report["kind"] == "manual_config_required"
+        details = _json_mapping(first_drift_report["details"], "drift_reports[0].details")
+        assert details["env_keys"] == ["OTEL_EXPORTER_OTLP_HEADERS"]
     finally:
         server.stop()
 
