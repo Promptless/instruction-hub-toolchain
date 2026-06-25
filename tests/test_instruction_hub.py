@@ -318,13 +318,14 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     codex_manifest = json.loads((hub_root / "dist/codex/core/.codex-plugin/plugin.json").read_text())
     assert codex_manifest["name"] == "promptless-instruction-hub-core"
     assert codex_manifest["skills"] == "./skills/"
+    assert codex_manifest["hooks"] == "./hooks/hooks.json"
     assert codex_manifest["mcpServers"] == "./.mcp.json"
     assert codex_manifest["author"]["name"] == "Promptless"
     assert codex_manifest["interface"]["displayName"] == "Core"
     assert (
         codex_manifest["interface"]["longDescription"] == "Core distributes governed agent instructions for Promptless."
     )
-    assert codex_manifest["interface"]["capabilities"] == ["Skills", "MCP servers"]
+    assert codex_manifest["interface"]["capabilities"] == ["Skills", "MCP servers", "Hooks"]
     assert codex_manifest["interface"]["defaultPrompt"] == ["Use Core instructions for this task."]
     cursor_manifest = json.loads((hub_root / "dist/cursor/core/.cursor-plugin/plugin.json").read_text())
     assert cursor_manifest["name"] == "promptless-instruction-hub-core"
@@ -1459,7 +1460,29 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
 
     assert schema["additionalProperties"] is False
     assert "target_hashes" in schema["required"]
+    assert "managed_runtimes" not in schema["required"]
     assert "git_commit" not in schema["properties"]
+    assert schema["properties"]["managed_runtimes"]["default"] == []
+    managed_runtime_schema = schema["properties"]["managed_runtimes"]["items"]
+    assert managed_runtime_schema["required"] == [
+        "id",
+        "channel",
+        "executable",
+        "hook",
+        "package_id",
+        "path",
+        "plugin_id",
+        "plugin_version",
+        "sha256",
+        "status",
+        "target",
+        "toolchain_version",
+        "version",
+    ]
+    assert managed_runtime_schema["properties"]["id"] == {"const": "host-enrollment-bootstrap"}
+    assert managed_runtime_schema["properties"]["status"] == {"const": "included"}
+    assert managed_runtime_schema["properties"]["target"] == {"enum": ["claude", "codex"]}
+    assert "oneOf" not in managed_runtime_schema
     asset_schema = schema["properties"]["assets"]["items"]
     assert asset_schema["required"] == ["ref", "id", "type", "title", "source_path", "content_hash", "support"]
     assert "pattern" in schema["properties"]["plugin"]["properties"]["version"]

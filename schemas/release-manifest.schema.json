@@ -75,6 +75,79 @@
         }
       }
     },
+    "managed_runtimes": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "channel",
+          "executable",
+          "hook",
+          "package_id",
+          "path",
+          "plugin_id",
+          "plugin_version",
+          "sha256",
+          "status",
+          "target",
+          "toolchain_version",
+          "version"
+        ],
+        "properties": {
+          "id": {
+            "const": "host-enrollment-bootstrap"
+          },
+          "package_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+          },
+          "plugin_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+          },
+          "plugin_version": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "const": "included"
+          },
+          "target": {
+            "enum": ["claude", "codex"]
+          },
+          "toolchain_version": {
+            "type": "string",
+            "minLength": 1
+          },
+          "channel": {
+            "type": "string",
+            "minLength": 1
+          },
+          "version": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "executable": {
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "hook": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
     "assets": {
       "type": "array",
       "items": {

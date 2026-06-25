@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from promptless_instruction_hub.fs import JsonValue, write_json
+from promptless_instruction_hub.managed_runtime import ManagedRuntimeRecord, render_managed_runtimes
 from promptless_instruction_hub.models import Harness, HubConfig, PackageDefinition, StablePackage
 import promptless_instruction_hub.render.claude as claude
 import promptless_instruction_hub.render.codex as codex
@@ -15,9 +16,14 @@ from promptless_instruction_hub.render.common import RenderedAssets
 from promptless_instruction_hub.render.mcp import collect_mcp_servers, write_mcp_config
 
 
-def render_target_plugins(output_root: Path, config: HubConfig, packages: tuple[StablePackage, ...]) -> None:
+def render_target_plugins(
+    output_root: Path,
+    config: HubConfig,
+    packages: tuple[StablePackage, ...],
+) -> tuple[ManagedRuntimeRecord, ...]:
     """Render per-package target plugin directories and target marketplace manifests."""
 
+    managed_runtimes: list[ManagedRuntimeRecord] = []
     for marketplace_root in (".agents/plugins", ".claude-plugin", ".cursor-plugin"):
         (output_root / marketplace_root).mkdir(parents=True, exist_ok=True)
 
@@ -30,6 +36,7 @@ def render_target_plugins(output_root: Path, config: HubConfig, packages: tuple[
             mcp_servers = collect_mcp_servers(target, assets)
             if mcp_servers:
                 write_mcp_config(target_root, target, mcp_servers)
+            managed_runtimes.extend(render_managed_runtimes(target_root, target, config, stable_package.definition))
             _write_manifest(target_root, target, config, stable_package.definition, rendered, mcp_servers)
     if "codex" in config.targets:
         codex.write_marketplace(output_root, config, packages)
@@ -37,6 +44,7 @@ def render_target_plugins(output_root: Path, config: HubConfig, packages: tuple[
         claude.write_marketplace(output_root, config, packages)
     if "cursor" in config.targets:
         cursor.write_marketplace(output_root, config, packages)
+    return tuple(managed_runtimes)
 
 
 def embed_release_manifest(
