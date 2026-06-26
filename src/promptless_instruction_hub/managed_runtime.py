@@ -15,17 +15,17 @@ from promptless_instruction_hub.models import Harness, HubConfig, PackageDefinit
 
 RuntimeStatus = Literal["included"]
 
-HOST_ENROLLMENT_BOOTSTRAP_ID = "host-enrollment-bootstrap"
-HOST_ENROLLMENT_ASSET_DIR = "host-enrollment"
-HOST_ENROLLMENT_EXECUTABLE = "promptless-host-enrollment-bootstrap"
-HOST_ENROLLMENT_HOOK_TIMEOUT_SECONDS = 45
-HOST_ENROLLMENT_CHANNEL = "stable"
-HOST_ENROLLMENT_VERSION = "0.1.0"
+TRACE_COLLECTOR_RUNTIME_ID = "native-trace-collector"
+TRACE_COLLECTOR_ASSET_DIR = "trace-collector"
+TRACE_COLLECTOR_EXECUTABLE = "promptless-trace-collector"
+TRACE_COLLECTOR_HOOK_TIMEOUT_SECONDS = 45
+TRACE_COLLECTOR_CHANNEL = "stable"
+TRACE_COLLECTOR_VERSION = "0.1.0"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
-SUPPORTED_HOST_ENROLLMENT_TARGETS: tuple[Harness, ...] = ("claude", "codex")
+SUPPORTED_TRACE_COLLECTOR_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 
-_ASSET_ROOT = Path(__file__).parent / "managed_runtime_assets" / HOST_ENROLLMENT_ASSET_DIR
-_EXECUTABLE_SOURCE = _ASSET_ROOT / HOST_ENROLLMENT_EXECUTABLE
+_ASSET_ROOT = Path(__file__).parent / "managed_runtime_assets" / TRACE_COLLECTOR_ASSET_DIR
+_EXECUTABLE_SOURCE = _ASSET_ROOT / TRACE_COLLECTOR_EXECUTABLE
 
 
 @dataclass(frozen=True)
@@ -81,49 +81,52 @@ def render_managed_runtimes(
     """Write managed-runtime metadata and inject supported runtime artifacts for one generated plugin."""
 
     plugin_id = f"{config.plugin_id}-{package.id}"
-    if target not in SUPPORTED_HOST_ENROLLMENT_TARGETS:
+    if target not in SUPPORTED_TRACE_COLLECTOR_TARGETS:
         return ()
 
-    _copy_bootstrap_executable(target_root)
-    _write_host_enrollment_hook(target_root, target)
+    _copy_trace_collector_executable(target_root)
+    _write_trace_collector_hooks(target_root, target)
     record = ManagedRuntimeRecord(
-        id=HOST_ENROLLMENT_BOOTSTRAP_ID,
+        id=TRACE_COLLECTOR_RUNTIME_ID,
         status="included",
         target=target,
         package_id=package.id,
         plugin_id=plugin_id,
         plugin_version=config.plugin_version,
         toolchain_version=_toolchain_version(),
-        channel=HOST_ENROLLMENT_CHANNEL,
-        version=HOST_ENROLLMENT_VERSION,
+        channel=TRACE_COLLECTOR_CHANNEL,
+        version=TRACE_COLLECTOR_VERSION,
         sha256=file_hash(_EXECUTABLE_SOURCE),
-        executable=HOST_ENROLLMENT_EXECUTABLE,
-        path=f"bin/{HOST_ENROLLMENT_EXECUTABLE}",
+        executable=TRACE_COLLECTOR_EXECUTABLE,
+        path=f"bin/{TRACE_COLLECTOR_EXECUTABLE}",
         hook="hooks/hooks.json",
     )
     _write_plugin_manifest(target_root, (record,))
     return (record,)
 
 
-def _copy_bootstrap_executable(target_root: Path) -> None:
-    destination = target_root / "bin" / HOST_ENROLLMENT_EXECUTABLE
+def _copy_trace_collector_executable(target_root: Path) -> None:
+    destination = target_root / "bin" / TRACE_COLLECTOR_EXECUTABLE
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(_EXECUTABLE_SOURCE, destination)
     destination.chmod(0o755)
 
 
-def _write_host_enrollment_hook(target_root: Path, target: Harness) -> None:
+def _write_trace_collector_hooks(target_root: Path, target: Harness) -> None:
     hook_path = target_root / "hooks/hooks.json"
     hook_config = _existing_hook_config(hook_path)
     hooks = hook_config.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         msg = f"{hook_path} field hooks must be a JSON object"
         raise InstructionHubError(msg)
-    session_start = hooks.setdefault("SessionStart", [])
-    if not isinstance(session_start, list):
-        msg = f"{hook_path} field hooks.SessionStart must be a JSON array"
-        raise InstructionHubError(msg)
-    session_start.append(_host_enrollment_hook_entry(target))
+
+    for event_name in ("SessionStart", "Stop", "SessionEnd"):
+        event_hooks = hooks.setdefault(event_name, [])
+        if not isinstance(event_hooks, list):
+            msg = f"{hook_path} field hooks.{event_name} must be a JSON array"
+            raise InstructionHubError(msg)
+        event_hooks.append(_trace_collector_hook_entry(target, event_name))
+
     write_json(hook_path, hook_config)
 
 
@@ -140,33 +143,35 @@ def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
         raise InstructionHubError(msg) from exc
 
 
-def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
+def _trace_collector_hook_entry(target: Harness, event_name: str) -> dict[str, JsonValue]:
     if target == "claude":
         hook_command: dict[str, JsonValue] = {
-            "command": f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host claude --quiet',
+            "command": f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" --host claude --quiet',
         }
     else:
         hook_command = {
-            "command": f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host codex --quiet',
+            "command": f'python3 "${{PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" --host codex --quiet',
         }
 
     # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
-    # the user to trust/review plugin hooks before running this startup command.
+    # the user to trust/review plugin hooks before running trace upload commands.
     # https://developers.openai.com/codex/plugins/build
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
     # Promptless-built static native binary so customer machines do not need Python or uv.
-    return {
-        "matcher": "startup|resume",
+    entry: dict[str, JsonValue] = {
         "hooks": [
             {
                 "type": "command",
-                "timeout": HOST_ENROLLMENT_HOOK_TIMEOUT_SECONDS,
-                "statusMessage": "Checking Promptless host enrollment",
+                "timeout": TRACE_COLLECTOR_HOOK_TIMEOUT_SECONDS,
+                "statusMessage": "Uploading Promptless traces",
                 **hook_command,
             }
         ],
     }
+    if event_name == "SessionStart":
+        entry["matcher"] = "startup|resume"
+    return entry
 
 
 def _write_plugin_manifest(target_root: Path, records: tuple[ManagedRuntimeRecord, ...]) -> None:

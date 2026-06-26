@@ -1,29 +1,27 @@
 from __future__ import annotations
 
-import datetime as dt
+import base64
+import gzip
 import json
 import os
 import subprocess
 import threading
-import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
 
-import pytest
-
 from promptless_instruction_hub.compiler import build_hub, init_hub
-from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, validate_json_value
 
-BOOTSTRAP_BIN = "promptless-host-enrollment-bootstrap"
+COLLECTOR_BIN = "promptless-trace-collector"
+TRACE_COLLECTOR_ID = "native-trace-collector"
 
 
 def _assert_no_promptless_directory(root: Path) -> None:
     assert list(root.rglob(".promptless")) == []
 
 
-def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
+def test_build_injects_managed_trace_collector_runtime(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
 
@@ -31,55 +29,67 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
 
     for target in ("codex", "claude"):
         plugin_root = hub_root / "dist" / target / "core"
-        bootstrap_path = plugin_root / "bin" / BOOTSTRAP_BIN
-        assert bootstrap_path.exists()
-        assert os.access(bootstrap_path, os.X_OK)
-        hooks = json.loads((plugin_root / "hooks/hooks.json").read_text())
-        hook = hooks["hooks"]["SessionStart"][0]["hooks"][0]
-        if target == "claude":
-            hook_command = hook["command"]
-            assert hook_command == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host claude --quiet'
-        else:
-            hook_command = hook["command"]
-            assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host codex --quiet'
-        assert "--quiet" in hook_command
-        assert hook["timeout"] == 45
-        metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
+        collector_path = plugin_root / "bin" / COLLECTOR_BIN
+        assert collector_path.exists()
+        assert os.access(collector_path, os.X_OK)
+
+        hooks = _json_mapping(json.loads((plugin_root / "hooks/hooks.json").read_text()), "hooks")
+        hook_events = _json_mapping(hooks["hooks"], "hooks.hooks")
+        expected_command = _collector_command(target)
+        for event_name in ("SessionStart", "Stop", "SessionEnd"):
+            entries = _json_array(hook_events[event_name], f"hooks.{event_name}")
+            entry = _json_mapping(entries[0], f"hooks.{event_name}[0]")
+            command_hooks = _json_array(entry["hooks"], f"hooks.{event_name}[0].hooks")
+            hook = _json_mapping(command_hooks[0], f"hooks.{event_name}[0].hooks[0]")
+            assert hook["command"] == expected_command
+            assert hook["timeout"] == 45
+            assert hook["statusMessage"] == "Uploading Promptless traces"
+            if event_name == "SessionStart":
+                assert entry["matcher"] == "startup|resume"
+            else:
+                assert "matcher" not in entry
+
+        metadata = _json_mapping(json.loads((plugin_root / "hub.managed-runtimes.json").read_text()), "metadata")
         assert not (plugin_root / ".promptless").exists()
-        runtime = metadata["managed_runtimes"][0]
-        assert runtime["id"] == "host-enrollment-bootstrap"
+        runtimes = _json_array(metadata["managed_runtimes"], "metadata.managed_runtimes")
+        runtime = _json_mapping(runtimes[0], "metadata.managed_runtimes[0]")
+        assert runtime["id"] == TRACE_COLLECTOR_ID
         assert runtime["status"] == "included"
         assert runtime["target"] == target
         assert runtime["version"] == "0.1.0"
         assert runtime["channel"] == "stable"
-        assert runtime["path"] == f"bin/{BOOTSTRAP_BIN}"
-        assert len(runtime["sha256"]) == 64
+        assert runtime["path"] == f"bin/{COLLECTOR_BIN}"
+        assert runtime["executable"] == COLLECTOR_BIN
+        assert len(str(runtime["sha256"])) == 64
 
     codex_manifest = json.loads((hub_root / "dist/codex/core/.codex-plugin/plugin.json").read_text())
     assert codex_manifest["hooks"] == "./hooks/hooks.json"
 
     for target in ("cursor", "gemini"):
         plugin_root = hub_root / "dist" / target / "core"
-        assert not (plugin_root / "bin" / BOOTSTRAP_BIN).exists()
+        assert not (plugin_root / "bin" / COLLECTOR_BIN).exists()
         assert not (plugin_root / "hub.managed-runtimes.json").exists()
 
-    release_manifest = json.loads((hub_root / "hub.release.json").read_text())
-    assert {runtime["target"] for runtime in release_manifest["managed_runtimes"]} == {"codex", "claude"}
+    release_manifest = _json_mapping(json.loads((hub_root / "hub.release.json").read_text()), "release manifest")
+    managed_runtimes = _json_array(release_manifest["managed_runtimes"], "managed_runtimes")
+    assert {_json_mapping(runtime, "runtime")["target"] for runtime in managed_runtimes} == {"codex", "claude"}
     _assert_no_promptless_directory(hub_root)
 
 
-def test_bootstrap_missing_token_exits_zero_without_config_write(tmp_path: Path) -> None:
+def test_collector_missing_token_exits_zero_without_ledger_write(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
     home = tmp_path / "home"
+    plugin_data = tmp_path / "plugin-data"
 
     result = subprocess.run(
-        [str(hub_root / "dist/codex/core/bin" / BOOTSTRAP_BIN), "--host", "codex"],
+        [str(hub_root / "dist/codex/core/bin" / COLLECTOR_BIN), "--host", "codex"],
         env=_clean_env(
             HOME=str(home),
             CODEX_HOME=str(home / ".codex"),
             PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+            PLUGIN_DATA=str(plugin_data),
         ),
         text=True,
         capture_output=True,
@@ -88,15 +98,16 @@ def test_bootstrap_missing_token_exits_zero_without_config_write(tmp_path: Path)
 
     assert result.returncode == 0
     assert json.loads(result.stdout)["status"] == "setup_needed"
-    assert not (home / ".codex/config.toml").exists()
+    assert not (plugin_data / "trace-collector-ledger.json").exists()
     assert "plugin-token" not in result.stdout
 
     quiet_result = subprocess.run(
-        [str(hub_root / "dist/codex/core/bin" / BOOTSTRAP_BIN), "--host", "codex", "--quiet"],
+        [str(hub_root / "dist/codex/core/bin" / COLLECTOR_BIN), "--host", "codex", "--quiet"],
         env=_clean_env(
             HOME=str(home),
             CODEX_HOME=str(home / ".codex"),
             PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+            PLUGIN_DATA=str(plugin_data),
         ),
         text=True,
         capture_output=True,
@@ -105,10 +116,10 @@ def test_bootstrap_missing_token_exits_zero_without_config_write(tmp_path: Path)
 
     assert quiet_result.returncode == 0
     assert quiet_result.stdout == ""
-    assert json.loads(quiet_result.stderr)["status"] == "setup_needed"
+    assert quiet_result.stderr == ""
 
 
-def test_bootstrap_loads_seed_from_plugin_data_file(tmp_path: Path) -> None:
+def test_collector_loads_seed_from_plugin_data_file_and_checkins(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
@@ -117,12 +128,12 @@ def test_bootstrap_loads_seed_from_plugin_data_file(tmp_path: Path) -> None:
     try:
         plugin_data = tmp_path / "plugin-data"
         plugin_data.mkdir()
-        (plugin_data / "host-enrollment-seed.json").write_text(
+        (plugin_data / "trace-collector-seed.json").write_text(
             json.dumps({"plugin_enrollment_token": "plugin-token", "worker_base_url": server.base_url})
         )
 
         home = tmp_path / "home"
-        _run_bootstrap(
+        _run_collector(
             hub_root / "dist/codex/core",
             "codex",
             {
@@ -134,18 +145,128 @@ def test_bootstrap_loads_seed_from_plugin_data_file(tmp_path: Path) -> None:
         )
 
         assert len(server.check_ins) == 1
-        assert server.check_ins[0]["host"] == "codex"
+        check_in = server.check_ins[0]
+        assert check_in["host"] == "codex"
+        assert check_in["status"] == "configured"
+        assert check_in["needs_restart"] is False
+        effective_config = _json_mapping(check_in["effective_config"], "effective_config")
+        assert effective_config["trace_upload_endpoint"] == f"{server.base_url}/v0/traces/batches"
+        assert effective_config["native_root_count"] == 1
+        assert effective_config["source_ledger_path"] == str(plugin_data / "trace-collector-ledger.json")
+        assert effective_config["raw_native_artifacts_enabled"] is True
     finally:
         server.stop()
 
 
-def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path) -> None:
+def test_collector_baselines_first_run_and_uploads_new_complete_lines(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        existing_line = b'{"type":"session_meta","id":"old"}\n'
+        rollout_path.write_bytes(existing_line)
+
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_DATA": str(plugin_data),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+        payload, _result = _run_collector(hub_root / "dist/codex/core", "codex", env, lifecycle="session_start")
+        assert payload["baseline_only"] is True
+        assert payload["uploaded_chunks"] == 0
+        assert server.uploads == []
+        ledger = _json_mapping(json.loads((plugin_data / "trace-collector-ledger.json").read_text()), "ledger")
+        ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert ledger_sources[str(rollout_path)] == len(existing_line)
+
+        new_line = b'{"type":"turn","id":"new"}\n'
+        partial_line = b'{"type":"turn","id":"partial"}'
+        with rollout_path.open("ab") as file:
+            file.write(new_line)
+            file.write(partial_line)
+
+        payload, _result = _run_collector(hub_root / "dist/codex/core", "codex", env, lifecycle="stop")
+
+        assert payload["baseline_only"] is False
+        assert payload["uploaded_chunks"] == 1
+        assert len(server.uploads) == 1
+        upload = server.uploads[0]
+        assert upload["source"] == "codex"
+        assert upload["host"] == "codex"
+        assert upload["collector_version"] == "0.1.0"
+        assert upload["plugin_version"] == "0.1.0"
+        chunks = _json_array(upload["chunks"], "chunks")
+        chunk = _json_mapping(chunks[0], "chunks[0]")
+        assert chunk["start_offset"] == len(existing_line)
+        assert chunk["end_offset"] == len(existing_line) + len(new_line)
+        assert chunk["line_count"] == 1
+        assert chunk["lifecycle_event"] == "stop"
+        assert _decode_chunk(chunk) == new_line
+
+        ledger = _json_mapping(json.loads((plugin_data / "trace-collector-ledger.json").read_text()), "ledger")
+        ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert ledger_sources[str(rollout_path)] == len(existing_line) + len(new_line)
+        assert len(server.check_ins) == 2
+    finally:
+        server.stop()
+
+
+def test_collector_does_not_advance_ledger_when_upload_fails(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(upload_status=503)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        rollout_path.write_text('{"type":"turn","id":"retry"}\n')
+
+        payload, result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert result.returncode == 0
+        assert "HTTP 503" in str(payload["message"])
+        assert len(server.uploads) == 1
+        ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
+        assert _json_mapping(ledger["sources"], "ledger.sources") == {}
+    finally:
+        server.stop()
+
+
+def test_collector_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
     home = tmp_path / "home"
 
-    payload, result = _run_bootstrap(
+    payload, result = _run_collector(
         hub_root / "dist/codex/core",
         "codex",
         {
@@ -154,7 +275,7 @@ def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path
             "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
             "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
             "PROMPTLESS_WORKER_BASE_URL": "http://example.com",
-            "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES": "0",
+            "PROMPTLESS_TRACE_COLLECTOR_ALLOW_TEST_URL_OVERRIDES": "0",
         },
         expected_status="error",
     )
@@ -163,393 +284,90 @@ def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path
     assert result.stdout == ""
 
 
-def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Path) -> None:
+def test_build_appends_collector_hooks_to_existing_hook_asset(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    build_hub(hub_root)
-    server = _FakeWorkerServer()
-    server.start()
-    try:
-        codex_home = tmp_path / "codex-home"
-        _run_bootstrap(
-            hub_root / "dist/codex/core",
-            "codex",
+    init_hub(hub_root)
+    existing_hook_path = hub_root / "assets/hooks/hooks.json"
+    existing_hook_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_hook_path.write_text(
+        json.dumps(
             {
-                "HOME": str(codex_home),
-                "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
-        )
-        codex_config = (codex_home / ".codex/config.toml").read_text()
-        assert "BEGIN PROMPTLESS MANAGED HOST ENROLLMENT" in codex_config
-        assert 'endpoint = "http://127.0.0.1:4318/v1/logs"' in codex_config
-        assert 'endpoint = "http://127.0.0.1:4318/v1/traces"' in codex_config
-        assert codex_config.count('protocol = "binary"') == 2
-        assert "metrics_exporter" not in codex_config
-        assert "plugin-token" not in codex_config
-        codex_otel = tomllib.loads(codex_config)["otel"]
-        assert codex_otel["exporter"]["otlp-http"]["protocol"] == "binary"
-        assert codex_otel["trace_exporter"]["otlp-http"]["protocol"] == "binary"
-
-        claude_home = tmp_path / "claude-home"
-        _run_bootstrap(
-            hub_root / "dist/claude/core",
-            "claude",
-            {
-                "HOME": str(claude_home),
-                "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
-                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
-        )
-        claude_settings = json.loads((claude_home / ".claude/settings.json").read_text())
-        assert claude_settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
-        assert claude_settings["env"]["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] == "1"
-        assert claude_settings["env"]["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
-        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
-        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"
-
-        assert len(server.check_ins) == 2
-        for check_in in server.check_ins:
-            assert set(check_in) == {
-                "bootstrap_version",
-                "checked_at",
-                "drift_reports",
-                "effective_config",
-                "host",
-                "needs_restart",
-                "plugin_version",
-                "policy_version",
-                "status",
-            }
-            assert check_in["bootstrap_version"] == "0.1.0"
-            assert check_in["plugin_version"] == "0.1.0"
-            assert check_in["status"] == "needs_restart"
-            assert check_in["needs_restart"] is True
-            effective_config = _json_mapping(check_in["effective_config"], "effective_config")
-            assert effective_config["configured"] is True
-        codex_effective_config = _json_mapping(server.check_ins[0]["effective_config"], "codex effective_config")
-        claude_effective_config = _json_mapping(server.check_ins[1]["effective_config"], "claude effective_config")
-        assert codex_effective_config["collector_metrics_endpoint"] is None
-        assert claude_effective_config["collector_metrics_endpoint"] == "http://127.0.0.1:4318/v1/metrics"
-    finally:
-        server.stop()
-
-
-def test_bootstrap_missing_managed_runtime_manifest_uses_default_metadata(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
-    (plugin_root / "hub.managed-runtimes.json").unlink()
-    server = _FakeWorkerServer()
-    server.start()
-    try:
-        home = tmp_path / "home"
-        _run_bootstrap(
-            plugin_root,
-            "codex",
-            {
-                "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(plugin_root),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
-        )
-
-        assert (home / ".codex/config.toml").exists()
-        assert server.check_ins[0]["plugin_version"] == "unknown"
-        assert "plugin_id" not in server.check_ins[0]
-        assert "package_id" not in server.check_ins[0]
-    finally:
-        server.stop()
-
-
-def test_bootstrap_blocks_unsupported_codex_capture_policy_values(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    build_hub(hub_root)
-    server = _FakeWorkerServer(
-        policy=_policy_with(
-            capture_policy={
-                "user_prompts": "full_local_default",
-                "tool_inputs": "disabled",
-                "tool_outputs": "full_local_default",
-                "raw_api_bodies": "disabled",
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup",
+                            "hooks": [{"type": "command", "command": "echo existing", "timeout": 1}],
+                        }
+                    ]
+                }
             }
         )
     )
-    server.start()
-    try:
-        codex_home = tmp_path / "codex-home"
-        _run_bootstrap(
-            hub_root / "dist/codex/core",
-            "codex",
-            {
-                "HOME": str(codex_home),
-                "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
-            expected_status="blocked",
+    (hub_root / "assets/hooks/hooks.asset.yaml").write_text(
+        "\n".join(
+            [
+                "title: Existing Hooks",
+                "support:",
+                "  codex:",
+                "    mode: native",
+                "  claude:",
+                "    mode: unsupported",
+                "    reason: test fixture is codex-only",
+                "  gemini:",
+                "    mode: unsupported",
+                "    reason: test fixture is codex-only",
+                "  cursor:",
+                "    mode: unsupported",
+                "    reason: test fixture is codex-only",
+                "",
+            ]
         )
-
-        assert not (codex_home / ".codex/config.toml").exists()
-        drift_reports = _json_list(server.check_ins[0]["drift_reports"], "drift_reports")
-        first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
-        details = _json_mapping(first_drift_report["details"], "drift_reports[0].details")
-        assert details["capture_policy_keys"] == ["tool_inputs"]
-    finally:
-        server.stop()
-
-
-def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    build_hub(hub_root)
-    server = _FakeWorkerServer()
-    server.start()
-    try:
-        codex_home = tmp_path / "codex-home"
-        codex_config = codex_home / ".codex/config.toml"
-        codex_config.parent.mkdir(parents=True)
-        original_codex_config = 'model = "gpt-5"\n[profiles.local]\nmodel = "gpt-5-codex"\n'
-        codex_config.write_text(original_codex_config)
-
-        _run_bootstrap(
-            hub_root / "dist/codex/core",
-            "codex",
-            {
-                "HOME": str(codex_home),
-                "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
+    )
+    (hub_root / "packages/core.yaml").write_text(
+        "\n".join(
+            [
+                "id: core",
+                "name: Core",
+                "owners: []",
+                "includes:",
+                "  - hook:hooks",
+                "",
+            ]
         )
-
-        assert original_codex_config.rstrip() in codex_config.read_text()
-        codex_backups = list(codex_config.parent.glob("config.toml.*.bak"))
-        assert len(codex_backups) == 1
-        assert codex_backups[0].read_text() == original_codex_config
-        assert list(codex_config.parent.glob(".config.toml.*.tmp")) == []
-
-        claude_home = tmp_path / "claude-home"
-        claude_settings = claude_home / ".claude/settings.json"
-        claude_settings.parent.mkdir(parents=True)
-        original_claude_settings = {"env": {"CUSTOM_ENV": "1"}, "theme": "dark"}
-        claude_settings.write_text(json.dumps(original_claude_settings))
-
-        _run_bootstrap(
-            hub_root / "dist/claude/core",
-            "claude",
-            {
-                "HOME": str(claude_home),
-                "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
-                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
-        )
-
-        updated_claude_settings = json.loads(claude_settings.read_text())
-        assert updated_claude_settings["theme"] == "dark"
-        assert updated_claude_settings["env"]["CUSTOM_ENV"] == "1"
-        assert updated_claude_settings["env"]["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
-        claude_backups = list(claude_settings.parent.glob("settings.json.*.bak"))
-        assert len(claude_backups) == 1
-        assert json.loads(claude_backups[0].read_text()) == original_claude_settings
-        assert list(claude_settings.parent.glob(".settings.json.*.tmp")) == []
-    finally:
-        server.stop()
-
-
-def test_build_appends_bootstrap_hook_to_existing_hook_asset(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    _write_native_hook_asset(
-        hub_root,
-        {
-            "hooks": {
-                "SessionStart": [
-                    {
-                        "matcher": "startup",
-                        "hooks": [{"type": "command", "command": "existing-hook"}],
-                    }
-                ]
-            }
-        },
     )
 
     build_hub(hub_root)
 
-    hooks = json.loads((hub_root / "dist/codex/core/hooks/hooks.json").read_text())
-    session_start = hooks["hooks"]["SessionStart"]
-    assert session_start[0]["hooks"][0]["command"] == "existing-hook"
-    assert f"bin/{BOOTSTRAP_BIN}" in session_start[1]["hooks"][0]["command"]
+    hooks = _json_mapping(json.loads((hub_root / "dist/codex/core/hooks/hooks.json").read_text()), "hooks")
+    hook_events = _json_mapping(hooks["hooks"], "hooks.hooks")
+    session_start = _json_array(hook_events["SessionStart"], "SessionStart")
+    stop_hooks = _json_array(hook_events["Stop"], "Stop")
+    session_end_hooks = _json_array(hook_events["SessionEnd"], "SessionEnd")
+    assert _json_mapping(_json_array(_json_mapping(session_start[0], "existing")["hooks"], "existing.hooks")[0], "hook")[
+        "command"
+    ] == "echo existing"
+    collector_entry = _json_mapping(session_start[1], "collector")
+    collector_hook = _json_mapping(_json_array(collector_entry["hooks"], "collector.hooks")[0], "collector hook")
+    assert collector_entry["matcher"] == "startup|resume"
+    assert collector_hook["command"] == _collector_command("codex")
+    assert _json_mapping(_json_array(_json_mapping(stop_hooks[0], "stop")["hooks"], "stop.hooks")[0], "stop hook")[
+        "command"
+    ] == _collector_command("codex")
+    assert _json_mapping(
+        _json_array(_json_mapping(session_end_hooks[0], "session_end")["hooks"], "session_end.hooks")[0],
+        "session_end hook",
+    )["command"] == _collector_command("codex")
 
 
-def test_build_rejects_malformed_existing_hook_asset(tmp_path: Path) -> None:
+def test_collector_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    _write_native_hook_asset(hub_root, {"hooks": []})
-
-    with pytest.raises(InstructionHubError, match="field hooks must be a JSON object"):
-        build_hub(hub_root)
-
-
-def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
+    init_hub(hub_root)
     build_hub(hub_root)
-    server = _FakeWorkerServer()
-    server.start()
-    try:
-        codex_home = tmp_path / "codex-home"
-        codex_config = codex_home / ".codex/config.toml"
-        codex_config.parent.mkdir(parents=True)
-        codex_config.write_text('[otel]\nenvironment = "local"\n')
-
-        _run_bootstrap(
-            hub_root / "dist/codex/core",
-            "codex",
-            {
-                "HOME": str(codex_home),
-                "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
-            expected_status="blocked",
-        )
-
-        assert codex_config.read_text() == '[otel]\nenvironment = "local"\n'
-        assert server.check_ins[-1]["status"] == "blocked"
-
-        claude_home = tmp_path / "claude-home"
-        claude_settings = claude_home / ".claude/settings.json"
-        claude_settings.parent.mkdir(parents=True)
-        claude_settings.write_text('{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"Authorization=Bearer customer-token"}}\n')
-
-        _run_bootstrap(
-            hub_root / "dist/claude/core",
-            "claude",
-            {
-                "HOME": str(claude_home),
-                "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
-                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
-            expected_status="blocked",
-        )
-
-        assert (
-            claude_settings.read_text()
-            == '{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"Authorization=Bearer customer-token"}}\n'
-        )
-        assert server.check_ins[-1]["status"] == "blocked"
-    finally:
-        server.stop()
-
-
-def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    build_hub(hub_root)
-    server = _FakeWorkerServer()
-    server.start()
-    try:
-        codex_home = tmp_path / "codex-home"
-        codex_env = {
-            "HOME": str(codex_home),
-            "CODEX_HOME": str(codex_home / ".codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-            "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
-            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-        }
-        _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
-        _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env, expected_status="configured")
-        codex_config = (codex_home / ".codex/config.toml").read_text()
-        assert codex_config.count("BEGIN PROMPTLESS MANAGED HOST ENROLLMENT") == 1
-
-        claude_home = tmp_path / "claude-home"
-        claude_env = {
-            "HOME": str(claude_home),
-            "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
-            "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-            "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-            "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
-            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-        }
-        _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
-        settings_path = claude_home / ".claude/settings.json"
-        first_settings = settings_path.read_text()
-        _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env, expected_status="configured")
-        assert settings_path.read_text() == first_settings
-        assert [check_in["status"] for check_in in server.check_ins] == [
-            "needs_restart",
-            "configured",
-            "needs_restart",
-            "configured",
-        ]
-    finally:
-        server.stop()
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "expired",
-        "missing-write-permission",
-        "wrong-logs-path",
-        "invalid-capture-value",
-    ],
-)
-def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    build_hub(hub_root)
-    server = _FakeWorkerServer(policy=_invalid_policy(case))
+    server = _FakeWorkerServer(required_bootstrap_version="0.2.0")
     server.start()
     try:
         home = tmp_path / "home"
-        _run_bootstrap(
-            hub_root / "dist/codex/core",
-            "codex",
-            {
-                "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
-            expected_status="error",
-        )
-
-        assert not (home / ".codex/config.toml").exists()
-        assert server.check_ins == []
-    finally:
-        server.stop()
-
-
-def test_bootstrap_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    build_hub(hub_root)
-    server = _FakeWorkerServer(policy=_policy_with(required_bootstrap_version="0.2.0"))
-    server.start()
-    try:
-        home = tmp_path / "home"
-        _run_bootstrap(
+        payload, _result = _run_collector(
             hub_root / "dist/codex/core",
             "codex",
             {
@@ -562,205 +380,182 @@ def test_bootstrap_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> 
             expected_status="blocked",
         )
 
-        assert not (home / ".codex/config.toml").exists()
-        assert server.check_ins[0]["status"] == "blocked"
-        drift_reports = _json_list(server.check_ins[0]["drift_reports"], "drift_reports")
-        first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
-        assert first_drift_report["kind"] == "bootstrap_upgrade_required"
-    finally:
-        server.stop()
-
-
-def test_bootstrap_rejects_invalid_check_in_success_response(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    build_hub(hub_root)
-    server = _FakeWorkerServer(post_response={"accepted": False, "policy_version": 1})
-    server.start()
-    try:
-        home = tmp_path / "home"
-        payload, _result = _run_bootstrap(
-            hub_root / "dist/codex/core",
-            "codex",
-            {
-                "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
-            expected_status="error",
-        )
-
-        assert "check-in response was not accepted" in str(payload["message"])
+        assert payload["reason"] == "collector_upgrade_required"
+        assert server.uploads == []
         assert len(server.check_ins) == 1
+        check_in = server.check_ins[0]
+        assert check_in["status"] == "blocked"
+        drift_reports = _json_array(check_in["drift_reports"], "drift_reports")
+        first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
+        assert first_drift_report["kind"] == "collector_upgrade_required"
     finally:
         server.stop()
 
 
-def _run_bootstrap(
+def _run_collector(
     plugin_root: Path,
     host: str,
     env: dict[str, str],
     *,
-    expected_status: str = "needs_restart",
+    expected_status: str = "configured",
+    lifecycle: str | None = None,
+    input_payload: dict[str, JsonValue] | None = None,
 ) -> tuple[dict[str, JsonValue], subprocess.CompletedProcess[str]]:
+    command = [str(plugin_root / "bin" / COLLECTOR_BIN), "--host", host]
+    if lifecycle is not None:
+        command.extend(["--lifecycle", lifecycle])
     result = subprocess.run(
-        [str(plugin_root / "bin" / BOOTSTRAP_BIN), "--host", host],
+        command,
         env=_clean_env(**env),
+        input=json.dumps(input_payload) if input_payload is not None else "",
         text=True,
         capture_output=True,
         check=False,
     )
     assert result.returncode == 0
-    assert "plugin-token" not in result.stdout
-    assert "plugin-token" not in result.stderr
     payload_text = result.stdout.strip() or result.stderr.strip()
-    payload = (
-        _json_mapping(validate_json_value(json.loads(payload_text), "bootstrap output"), "bootstrap output")
-        if payload_text
-        else {}
-    )
+    assert payload_text
+    payload = _json_mapping(validate_json_value(json.loads(payload_text), "collector output"), "collector output")
     assert payload["status"] == expected_status
     return payload, result
 
 
 def _clean_env(**overrides: str) -> dict[str, str]:
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES": "1",
+    clean_env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONIOENCODING": "utf-8",
     }
-    env.update(overrides)
-    return env
+    for key in ("SystemRoot", "SYSTEMROOT", "WINDIR"):
+        if key in os.environ:
+            clean_env[key] = os.environ[key]
+    clean_env.update(overrides)
+    return clean_env
 
 
-def _json_mapping(value: JsonValue, field_path: str) -> dict[str, JsonValue]:
-    assert isinstance(value, dict), f"{field_path} must be a JSON object"
-    return value
+def _collector_command(target: str) -> str:
+    if target == "claude":
+        return f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{COLLECTOR_BIN}" --host claude --quiet'
+    return f'python3 "${{PLUGIN_ROOT}}/bin/{COLLECTOR_BIN}" --host codex --quiet'
 
 
-def _json_list(value: JsonValue, field_path: str) -> list[JsonValue]:
-    assert isinstance(value, list), f"{field_path} must be a JSON array"
-    return value
+def _decode_chunk(chunk: dict[str, JsonValue]) -> bytes:
+    encoded = chunk["content_gzip_base64"]
+    assert isinstance(encoded, str)
+    return gzip.decompress(base64.b64decode(encoded))
 
 
-def _json_string(value: JsonValue, field_path: str) -> str:
-    assert isinstance(value, str), f"{field_path} must be a JSON string"
-    return value
-
-
-def _write_native_hook_asset(hub_root: Path, hooks: dict[str, JsonValue]) -> None:
-    hooks_path = hub_root / "assets/hooks/hooks.json"
-    hooks_path.write_text(json.dumps(hooks))
-    (hub_root / "assets/hooks/hooks.asset.yaml").write_text(
-        "\n".join(
-            [
-                "id: hooks",
-                "type: hook",
-                "support:",
-                "  codex:",
-                "    mode: native",
-                "  claude:",
-                "    mode: native",
-                "  cursor:",
-                "    mode: unsupported",
-                "    reason: hooks are only native for Codex and Claude",
-                "  gemini:",
-                "    mode: unsupported",
-                "    reason: hooks are only native for Codex and Claude",
-                "",
-            ]
-        )
-    )
-    (hub_root / "packages/core.yaml").write_text("id: core\nname: Core\nincludes:\n  - hook:hooks\n")
-
-
-def _policy_with(**policy_updates: JsonValue) -> dict[str, JsonValue]:
-    payload = _json_mapping(
-        validate_json_value(json.loads(json.dumps(_signed_policy())), "signed policy fixture"),
-        "signed policy fixture",
-    )
-    policy = _json_mapping(payload["policy"], "policy")
-    policy.update(policy_updates)
-    return payload
-
-
-def _invalid_policy(case: str) -> dict[str, JsonValue]:
-    now = dt.datetime.now(dt.timezone.utc)
-    payload = _policy_with()
-    policy = _json_mapping(payload["policy"], "policy")
-    collector = _json_mapping(policy["collector"], "policy.collector")
-    capture_policy = _json_mapping(policy["capture_policy"], "policy.capture_policy")
-    permissions = _json_mapping(policy["plugin_permissions"], "policy.plugin_permissions")
-
-    if case == "expired":
-        policy["expires_at"] = (now - dt.timedelta(minutes=1)).isoformat()
-    elif case == "missing-write-permission":
-        permissions["write_user_config"] = False
-    elif case == "wrong-logs-path":
-        collector["otlp_http_logs_endpoint"] = "http://127.0.0.1:4318/not-logs"
-    elif case == "invalid-capture-value":
-        capture_policy["tool_outputs"] = "full"
-    else:
-        raise AssertionError(f"unhandled invalid policy case: {case}")
-    return payload
+def _policy_with(
+    base_url: str,
+    *,
+    required_bootstrap_version: str = "0.1.0",
+    forward_only_first_install: bool = True,
+) -> dict[str, JsonValue]:
+    return {
+        "policy": {
+            "schema_version": 2,
+            "policy_version": 7,
+            "enabled_hosts": ["codex", "claude"],
+            "required_bootstrap_version": required_bootstrap_version,
+            "trace_collection": {
+                "enabled_sources": ["codex", "claude"],
+                "upload_endpoint": f"{base_url}/v0/traces/batches",
+                "native_roots": [
+                    {"source": "codex", "glob": "~/.codex/**/*.jsonl"},
+                    {"source": "claude", "glob": "~/.claude/projects/**/*.jsonl"},
+                ],
+                "forward_only_first_install": forward_only_first_install,
+                "include_in_progress_traces": True,
+                "max_batch_bytes": 1048576,
+            },
+            "capture_policy": {
+                "user_prompts": "full_local_default",
+                "assistant_messages": "full_local_default",
+                "reasoning": "full_local_default",
+                "tool_inputs": "full_local_default",
+                "tool_outputs": "full_local_default",
+                "raw_native_artifacts": "full_local_default",
+            },
+            "plugin_permissions": {
+                "allow_network": True,
+                "allowed_hosts": ["127.0.0.1"],
+                "allow_local_file_read": True,
+                "allowed_read_roots": ["~/.codex", "~/.claude"],
+            },
+            "created_at": "2026-06-26T00:00:00Z",
+        },
+        "signature": "test-signature",
+        "signed_at": "2026-06-26T00:00:00Z",
+        "key_id": "test-key",
+    }
 
 
 class _FakeWorkerServer:
-    def __init__(
-        self,
-        *,
-        policy: dict[str, JsonValue] | None = None,
-        post_response: dict[str, JsonValue] | None = None,
-    ) -> None:
-        self.check_ins: list[dict[str, JsonValue]] = []
-        _FakeWorkerHandler.check_ins = self.check_ins
-        _FakeWorkerHandler.policy_response = policy or _signed_policy()
-        _FakeWorkerHandler.post_response = post_response
+    def __init__(self, *, required_bootstrap_version: str = "0.1.0", upload_status: int = 200) -> None:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
-        self._thread = threading.Thread(target=self._server.serve_forever)
+        self.check_ins: list[dict[str, JsonValue]] = []
+        self.uploads: list[dict[str, JsonValue]] = []
+        self._thread: threading.Thread | None = None
+
+        _FakeWorkerHandler.policy_response = _policy_with(
+            self.base_url,
+            required_bootstrap_version=required_bootstrap_version,
+        )
+        _FakeWorkerHandler.upload_status = upload_status
+        _FakeWorkerHandler.check_ins = self.check_ins
+        _FakeWorkerHandler.uploads = self.uploads
 
     def start(self) -> None:
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._server.shutdown()
         self._server.server_close()
-        self._thread.join(timeout=5)
+        if self._thread is not None:
+            self._thread.join(timeout=5)
 
 
 class _FakeWorkerHandler(BaseHTTPRequestHandler):
-    check_ins: ClassVar[list[dict[str, JsonValue]]] = []
     policy_response: ClassVar[dict[str, JsonValue]]
-    post_response: ClassVar[dict[str, JsonValue] | None]
+    upload_status: ClassVar[int]
+    check_ins: ClassVar[list[dict[str, JsonValue]]]
+    uploads: ClassVar[list[dict[str, JsonValue]]]
 
     def do_GET(self) -> None:
-        if self.path != "/v0/host-enrollment/policy" or self.headers.get("Authorization") != "Bearer plugin-token":
-            self.send_response(401)
-            self.end_headers()
+        if self.path == "/v0/host-enrollment/policy":
+            self._assert_authorized()
+            self._send_json(200, self.policy_response)
             return
-        self._write_json(self.policy_response)
+        self._send_json(404, {"accepted": False})
 
     def do_POST(self) -> None:
-        if self.path != "/v0/host-enrollment/check-ins" or self.headers.get("Authorization") != "Bearer plugin-token":
-            self.send_response(401)
-            self.end_headers()
+        self._assert_authorized()
+        payload = self._read_json_body()
+        if self.path == "/v0/host-enrollment/check-ins":
+            self.check_ins.append(payload)
+            self._send_json(200, {"accepted": True})
             return
-        length = int(self.headers["Content-Length"])
-        payload = _json_mapping(
-            validate_json_value(json.loads(self.rfile.read(length)), "check-in request"),
-            "check-in request",
-        )
-        self.check_ins.append(payload)
-        self._write_json(self.post_response or {"accepted": True, "policy_version": 1})
+        if self.path == "/v0/traces/batches":
+            self.uploads.append(payload)
+            self._send_json(self.upload_status, {"accepted": self.upload_status < 400})
+            return
+        self._send_json(404, {"accepted": False})
 
-    def log_message(self, format: str, *args: object) -> None:
+    def log_message(self, _format: str, *_args: object) -> None:
         return
 
-    def _write_json(self, payload: dict[str, JsonValue], *, status: int = 200) -> None:
-        body = json.dumps(payload).encode()
+    def _assert_authorized(self) -> None:
+        assert self.headers.get("Authorization") == "Bearer plugin-token"
+
+    def _read_json_body(self) -> dict[str, JsonValue]:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(content_length)
+        return _json_mapping(validate_json_value(json.loads(body.decode("utf-8")), "request body"), "request body")
+
+    def _send_json(self, status: int, payload: dict[str, JsonValue]) -> None:
+        body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -768,37 +563,11 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def _signed_policy() -> dict[str, JsonValue]:
-    now = dt.datetime.now(dt.timezone.utc)
-    return {
-        "policy": {
-            "schema_version": 1,
-            "org_id": "org_test",
-            "deployment_id": "worker-local-1",
-            "policy_version": 1,
-            "issued_at": now.isoformat(),
-            "expires_at": (now + dt.timedelta(days=7)).isoformat(),
-            "collector": {
-                "otlp_http_logs_endpoint": "http://127.0.0.1:4318/v1/logs",
-                "otlp_http_traces_endpoint": "http://127.0.0.1:4318/v1/traces",
-                "otlp_http_metrics_endpoint": "http://127.0.0.1:4318/v1/metrics",
-                "otlp_grpc_endpoint": "http://127.0.0.1:4317",
-                "headers": {"Authorization": "Bearer otlp-token"},
-                "tls": None,
-            },
-            "enabled_hosts": ["codex", "claude"],
-            "capture_policy": {
-                "user_prompts": "full_local_default",
-                "tool_inputs": "full_local_default",
-                "tool_outputs": "full_local_default",
-                "raw_api_bodies": "disabled",
-            },
-            "plugin_permissions": {
-                "write_user_config": True,
-                "repair_user_config": True,
-            },
-            "required_bootstrap_version": "0.1.0",
-        },
-        "signature": "hmac-sha256-v1:test",
-        "signed_at": now.isoformat(),
-    }
+def _json_mapping(value: JsonValue, path: str) -> dict[str, JsonValue]:
+    assert isinstance(value, dict), f"{path} must be a JSON object"
+    return value
+
+
+def _json_array(value: JsonValue, path: str) -> list[JsonValue]:
+    assert isinstance(value, list), f"{path} must be a JSON array"
+    return value

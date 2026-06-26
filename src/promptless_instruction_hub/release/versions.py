@@ -471,8 +471,8 @@ def _validate_managed_runtimes(manifest_path: Path, runtimes: list[JsonValue], k
         runtime = _require_mapping_value(manifest_path, runtime_value, f"{key_path}[{index}]")
         runtime_path = f"{key_path}[{index}]"
         _require_exact_keys(manifest_path, runtime, runtime_path, MANAGED_RUNTIME_KEYS)
-        if runtime["id"] != "host-enrollment-bootstrap":
-            msg = f"{manifest_path}: {runtime_path}.id must be host-enrollment-bootstrap"
+        if runtime["id"] != "native-trace-collector":
+            msg = f"{manifest_path}: {runtime_path}.id must be native-trace-collector"
             raise ValueError(msg)
         if runtime["status"] != "included":
             msg = f"{manifest_path}: {runtime_path}.status must be included"

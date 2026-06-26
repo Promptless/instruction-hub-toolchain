@@ -102,7 +102,7 @@
         ],
         "properties": {
           "id": {
-            "const": "host-enrollment-bootstrap"
+            "const": "native-trace-collector"
           },
           "package_id": {
             "type": "string",

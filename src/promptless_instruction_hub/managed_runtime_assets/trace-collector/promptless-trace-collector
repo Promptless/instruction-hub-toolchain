@@ -1,0 +1,892 @@
+#!/usr/bin/env python3
+"""Upload native Claude and Codex trace JSONL ranges to a Promptless worker."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import glob
+import gzip
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit
+
+COLLECTOR_VERSION = "0.1.0"
+COLLECTOR_CHANNEL = "stable"
+COLLECTOR_EXECUTABLE = "promptless-trace-collector"
+MANAGED_RUNTIME_ID = "native-trace-collector"
+DEFAULT_WORKER_BASE_URL = "https://pig.promptless.ai"
+MANAGED_RUNTIME_MANIFEST = Path("hub.managed-runtimes.json")
+SEED_FILE_NAME = "trace-collector-seed.json"
+LEDGER_FILE_NAME = "trace-collector-ledger.json"
+HTTP_TIMEOUT_SECONDS = 10
+MAX_STDIN_BYTES = 1024 * 1024
+TEST_URL_OVERRIDE_ENV = "PROMPTLESS_TRACE_COLLECTOR_ALLOW_TEST_URL_OVERRIDES"
+Host = Literal["codex", "claude"]
+LifecycleEvent = Literal["session_start", "stop", "session_end"]
+CollectorStatus = Literal["blocked", "configured", "error"]
+
+JsonScalar = str | int | float | bool | None
+JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+
+
+class CollectorError(RuntimeError):
+    """Expected non-fatal collector failure."""
+
+
+@dataclass(frozen=True)
+class EnrollmentSeed:
+    """Private seed used to authenticate with the customer worker."""
+
+    plugin_enrollment_token: str | None
+    worker_base_url: str
+
+
+@dataclass(frozen=True)
+class RuntimeMetadata:
+    """Managed runtime metadata reported to the customer worker."""
+
+    collector_version: str
+    collector_channel: str
+    collector_sha256: str
+    toolchain_version: str
+    plugin_id: str
+    plugin_version: str
+    package_id: str
+    target: Host
+
+
+@dataclass(frozen=True)
+class NativeRoot:
+    """Native JSONL glob the collector scans for one host."""
+
+    source: Host
+    glob_pattern: str
+
+
+@dataclass(frozen=True)
+class TraceCollectionPolicy:
+    """Validated native trace collection policy from the worker."""
+
+    upload_endpoint: str
+    enabled_sources: tuple[Host, ...]
+    forward_only_first_install: bool
+    include_in_progress_traces: bool
+    max_batch_bytes: int
+    native_roots: tuple[NativeRoot, ...]
+
+
+@dataclass(frozen=True)
+class HostPolicy:
+    """Validated signed worker policy body."""
+
+    policy_version: int
+    trace_collection: TraceCollectionPolicy
+    enabled_hosts: tuple[Host, ...]
+    capture_policy: dict[str, str]
+    required_bootstrap_version: str | None
+
+
+@dataclass(frozen=True)
+class SourceRange:
+    """One complete-line byte range ready to upload from a native JSONL file."""
+
+    path: Path
+    path_hash: str
+    start_offset: int
+    end_offset: int
+    content: bytes
+
+
+@dataclass
+class SourceLedger:
+    """Durable retry cursor for native JSONL source files."""
+
+    path: Path
+    is_new: bool
+    sources: dict[str, int]
+
+
+def main() -> int:
+    """Run trace collection and return a non-blocking hook exit code."""
+
+    parser = argparse.ArgumentParser(description="Promptless native trace collector")
+    parser.add_argument("--host", choices=("auto", "codex", "claude"), default="auto")
+    parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
+    parser.add_argument("--lifecycle", choices=("session_start", "stop", "session_end"), default=None)
+    args = parser.parse_args()
+    try:
+        context = _read_hook_context()
+        return _run(args.host, quiet=args.quiet, explicit_lifecycle=args.lifecycle, hook_context=context)
+    except (CollectorError, OSError, ValueError, urllib.error.URLError) as exc:
+        _emit({"status": "error", "message": _redact_text(str(exc))}, quiet=args.quiet, stream=sys.stderr)
+        return 0
+
+
+def _run(
+    host_arg: str,
+    *,
+    quiet: bool,
+    explicit_lifecycle: str | None,
+    hook_context: dict[str, JsonValue],
+) -> int:
+    host = _resolve_host(host_arg)
+    lifecycle_event = _resolve_lifecycle_event(explicit_lifecycle, hook_context)
+    plugin_root = _plugin_root()
+    seed = _load_seed()
+    metadata = _load_runtime_metadata(plugin_root, host)
+    if seed.plugin_enrollment_token is None:
+        _emit({"status": "setup_needed", "reason": "missing_enrollment_token", "host": host}, quiet=quiet)
+        return 0
+
+    policy_url = _worker_url(seed.worker_base_url, "/v0/host-enrollment/policy")
+    signed_policy = _get_json(policy_url, seed.plugin_enrollment_token)
+    policy = _validate_signed_policy(signed_policy, host)
+    if _requires_newer_runtime(policy.required_bootstrap_version, metadata.collector_version):
+        _post_check_in(
+            _worker_url(seed.worker_base_url, "/v0/host-enrollment/check-ins"),
+            seed.plugin_enrollment_token,
+            host,
+            metadata,
+            policy,
+            status="blocked",
+            needs_restart=False,
+            ledger_path=_ledger_path(),
+            root_count=0,
+            drift_reports=[
+                {
+                    "kind": "collector_upgrade_required",
+                    "message": "Worker policy requires a newer Promptless trace collector",
+                    "repaired": False,
+                    "details": {
+                        "required_bootstrap_version": policy.required_bootstrap_version,
+                        "collector_version": metadata.collector_version,
+                    },
+                }
+            ],
+        )
+        _emit({"status": "blocked", "reason": "collector_upgrade_required", "host": host}, quiet=quiet)
+        return 0
+
+    roots = _native_roots_for_host(host, policy.trace_collection)
+    ledger = _load_ledger(_ledger_path())
+    check_in_url = _worker_url(seed.worker_base_url, "/v0/host-enrollment/check-ins")
+    _post_check_in(
+        check_in_url,
+        seed.plugin_enrollment_token,
+        host,
+        metadata,
+        policy,
+        status="configured",
+        needs_restart=False,
+        ledger_path=ledger.path,
+        root_count=len(roots),
+        drift_reports=[],
+    )
+
+    source_paths = _expand_native_paths(roots)
+    if ledger.is_new and policy.trace_collection.forward_only_first_install:
+        _baseline_sources(ledger, source_paths)
+        _save_ledger(ledger)
+        _emit({"status": "configured", "host": host, "baseline_only": True, "uploaded_chunks": 0}, quiet=quiet)
+        return 0
+
+    ranges = _collect_source_ranges(
+        source_paths,
+        ledger,
+        max_chunk_bytes=max(1, policy.trace_collection.max_batch_bytes // 2),
+    )
+    if ranges:
+        upload_request = _build_upload_request(
+            host=host,
+            metadata=metadata,
+            policy=policy,
+            ranges=ranges,
+            lifecycle_event=lifecycle_event,
+        )
+        _post_json(policy.trace_collection.upload_endpoint, seed.plugin_enrollment_token, upload_request)
+        _advance_ledger(ledger, ranges)
+        _save_ledger(ledger)
+
+    _emit({"status": "configured", "host": host, "baseline_only": False, "uploaded_chunks": len(ranges)}, quiet=quiet)
+    return 0
+
+
+def _read_hook_context() -> dict[str, JsonValue]:
+    if sys.stdin is None or sys.stdin.isatty():
+        return {}
+    raw = sys.stdin.buffer.read(MAX_STDIN_BYTES + 1)
+    if not raw:
+        return {}
+    if len(raw) > MAX_STDIN_BYTES:
+        raise CollectorError("hook context exceeds maximum size")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return _json_mapping(value) or {}
+
+
+def _resolve_host(host_arg: str) -> Host:
+    if host_arg == "codex" or host_arg == "claude":
+        return host_arg
+    if os.environ.get("CLAUDE_PLUGIN_ROOT"):
+        return "claude"
+    return "codex"
+
+
+def _resolve_lifecycle_event(explicit_lifecycle: str | None, hook_context: dict[str, JsonValue]) -> LifecycleEvent | None:
+    if explicit_lifecycle in {"session_start", "stop", "session_end"}:
+        return explicit_lifecycle
+    for key in ("hook_event_name", "event_name", "event", "hook", "type"):
+        value = _string_value(hook_context.get(key))
+        if value is None:
+            continue
+        normalized = value.lower().replace("-", "_")
+        if normalized in {"sessionstart", "session_start", "startup", "resume"}:
+            return "session_start"
+        if normalized == "stop":
+            return "stop"
+        if normalized in {"sessionend", "session_end"}:
+            return "session_end"
+    return None
+
+
+def _plugin_root() -> Path | None:
+    raw_root = os.environ.get("PLUGIN_ROOT") or os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if raw_root is None or raw_root.strip() == "":
+        return None
+    return Path(raw_root).expanduser()
+
+
+def _load_seed() -> EnrollmentSeed:
+    env_seed = _seed_from_environment()
+    if env_seed.plugin_enrollment_token is not None:
+        return env_seed
+
+    for path in _seed_paths():
+        seed = _seed_from_file(path)
+        if seed.plugin_enrollment_token is not None:
+            return seed
+    return env_seed
+
+
+def _seed_from_environment() -> EnrollmentSeed:
+    seed_json = os.environ.get("PROMPTLESS_TRACE_COLLECTOR_SEED")
+    if seed_json:
+        seed = _seed_from_mapping(_load_json_string(seed_json), fallback_base_url=DEFAULT_WORKER_BASE_URL)
+        if seed.plugin_enrollment_token is not None:
+            return seed
+
+    token = (
+        os.environ.get("PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN")
+        or os.environ.get("INSTRUCTION_HUB_PLUGIN_ENROLLMENT_TOKEN")
+        or os.environ.get("PLUGIN_ENROLLMENT_TOKEN")
+    )
+    base_url = (
+        os.environ.get("PROMPTLESS_WORKER_BASE_URL")
+        or os.environ.get("INSTRUCTION_HUB_WORKER_BASE_URL")
+        or DEFAULT_WORKER_BASE_URL
+    )
+    return EnrollmentSeed(plugin_enrollment_token=_non_empty(token), worker_base_url=_normalize_base_url(base_url))
+
+
+def _seed_paths() -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for raw_dir in (os.environ.get("PLUGIN_DATA"), os.environ.get("CLAUDE_PLUGIN_DATA")):
+        if raw_dir:
+            paths.append(Path(raw_dir).expanduser() / SEED_FILE_NAME)
+    paths.append(Path.home() / ".promptless/instruction-hub" / SEED_FILE_NAME)
+    paths.append(Path.home() / ".config/promptless/instruction-hub" / SEED_FILE_NAME)
+    return tuple(paths)
+
+
+def _seed_from_file(path: Path) -> EnrollmentSeed:
+    if not path.exists():
+        return EnrollmentSeed(plugin_enrollment_token=None, worker_base_url=DEFAULT_WORKER_BASE_URL)
+    try:
+        raw_value = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise CollectorError(f"enrollment seed is invalid JSON at {path}: {exc.msg}") from exc
+    return _seed_from_mapping(raw_value, fallback_base_url=DEFAULT_WORKER_BASE_URL)
+
+
+def _seed_from_mapping(raw_value: object, *, fallback_base_url: str) -> EnrollmentSeed:
+    mapping = _json_mapping(raw_value)
+    if mapping is None:
+        raise CollectorError("enrollment seed must be a JSON object")
+    token = _string_value(mapping.get("plugin_enrollment_token"))
+    base_url = _string_value(mapping.get("worker_base_url")) or fallback_base_url
+    return EnrollmentSeed(plugin_enrollment_token=_non_empty(token), worker_base_url=_normalize_base_url(base_url))
+
+
+def _worker_url(worker_base_url: str, path: str) -> str:
+    return f"{worker_base_url}{path}"
+
+
+def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetadata:
+    defaults = RuntimeMetadata(
+        collector_version=COLLECTOR_VERSION,
+        collector_channel=COLLECTOR_CHANNEL,
+        collector_sha256=_self_sha256(),
+        toolchain_version="unknown",
+        plugin_id="unknown",
+        plugin_version="unknown",
+        package_id="unknown",
+        target=host,
+    )
+    if plugin_root is None:
+        return defaults
+    manifest_path = plugin_root / MANAGED_RUNTIME_MANIFEST
+    if not manifest_path.exists():
+        return defaults
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return defaults
+    mapping = _json_mapping(manifest)
+    if mapping is None:
+        return defaults
+    runtimes = mapping.get("managed_runtimes")
+    if not isinstance(runtimes, list):
+        return defaults
+    for runtime_value in runtimes:
+        runtime = _json_mapping(runtime_value)
+        if runtime is None:
+            continue
+        if runtime.get("id") != MANAGED_RUNTIME_ID or runtime.get("status") != "included":
+            continue
+        return RuntimeMetadata(
+            collector_version=_string_value(runtime.get("version")) or COLLECTOR_VERSION,
+            collector_channel=_string_value(runtime.get("channel")) or COLLECTOR_CHANNEL,
+            collector_sha256=_string_value(runtime.get("sha256")) or _self_sha256(),
+            toolchain_version=_string_value(runtime.get("toolchain_version")) or "unknown",
+            plugin_id=_string_value(runtime.get("plugin_id")) or "unknown",
+            plugin_version=_string_value(runtime.get("plugin_version")) or "unknown",
+            package_id=_string_value(runtime.get("package_id")) or "unknown",
+            target=host,
+        )
+    return defaults
+
+
+def _validate_signed_policy(value: object, host: Host) -> HostPolicy:
+    signed_policy = _json_mapping(value)
+    if signed_policy is None:
+        raise CollectorError("worker policy response must be a JSON object")
+    policy_value = _json_mapping(signed_policy.get("policy"))
+    if policy_value is None:
+        raise CollectorError("worker policy response is missing policy")
+    schema_version = _int_value(policy_value.get("schema_version"))
+    if schema_version is None or schema_version < 2:
+        raise CollectorError("worker policy schema_version must be 2 or newer")
+    policy_version = _int_value(policy_value.get("policy_version"))
+    if policy_version is None or policy_version < 1:
+        raise CollectorError("worker policy policy_version must be a positive integer")
+
+    enabled_hosts = _host_tuple(policy_value.get("enabled_hosts"), "enabled_hosts")
+    if host not in enabled_hosts:
+        raise CollectorError(f"worker policy does not enable host {host}")
+
+    trace_collection_value = _json_mapping(policy_value.get("trace_collection"))
+    if trace_collection_value is None:
+        raise CollectorError("worker policy is missing trace_collection")
+    trace_collection = _validate_trace_collection(trace_collection_value, host)
+
+    capture_policy = _string_mapping(policy_value.get("capture_policy"), "capture_policy")
+    required_bootstrap_version = _string_value(policy_value.get("required_bootstrap_version"))
+    return HostPolicy(
+        policy_version=policy_version,
+        trace_collection=trace_collection,
+        enabled_hosts=enabled_hosts,
+        capture_policy=capture_policy,
+        required_bootstrap_version=required_bootstrap_version,
+    )
+
+
+def _validate_trace_collection(value: dict[str, JsonValue], host: Host) -> TraceCollectionPolicy:
+    upload_endpoint = _string_value(value.get("upload_endpoint"))
+    if upload_endpoint is None:
+        raise CollectorError("trace_collection.upload_endpoint must be a string")
+    _validate_upload_endpoint(upload_endpoint)
+    enabled_sources = _host_tuple(value.get("enabled_sources"), "trace_collection.enabled_sources")
+    if host not in enabled_sources:
+        raise CollectorError(f"worker policy does not enable source {host}")
+    max_batch_bytes = _int_value(value.get("max_batch_bytes")) or 10 * 1024 * 1024
+    if max_batch_bytes <= 0:
+        raise CollectorError("trace_collection.max_batch_bytes must be positive")
+    return TraceCollectionPolicy(
+        upload_endpoint=upload_endpoint,
+        enabled_sources=enabled_sources,
+        forward_only_first_install=_bool_value(value.get("forward_only_first_install"), default=True),
+        include_in_progress_traces=_bool_value(value.get("include_in_progress_traces"), default=True),
+        max_batch_bytes=max_batch_bytes,
+        native_roots=_native_root_tuple(value.get("native_roots")),
+    )
+
+
+def _host_tuple(value: JsonValue | None, field_name: str) -> tuple[Host, ...]:
+    if not isinstance(value, list) or not value:
+        raise CollectorError(f"{field_name} must be a non-empty array")
+    hosts: list[Host] = []
+    for item in value:
+        host = _host_value(item)
+        if host is None:
+            raise CollectorError(f"{field_name} must contain only codex or claude")
+        if host not in hosts:
+            hosts.append(host)
+    return tuple(hosts)
+
+
+def _native_root_tuple(value: JsonValue | None) -> tuple[NativeRoot, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise CollectorError("trace_collection.native_roots must be an array")
+    roots: list[NativeRoot] = []
+    for item in value:
+        mapping = _json_mapping(item)
+        if mapping is None:
+            raise CollectorError("trace_collection.native_roots entries must be objects")
+        source = _host_value(mapping.get("source"))
+        glob_pattern = _string_value(mapping.get("glob"))
+        if source is None or glob_pattern is None:
+            raise CollectorError("trace_collection.native_roots entries require source and glob")
+        roots.append(NativeRoot(source=source, glob_pattern=glob_pattern))
+    return tuple(roots)
+
+
+def _native_roots_for_host(host: Host, policy: TraceCollectionPolicy) -> tuple[NativeRoot, ...]:
+    configured = tuple(root for root in policy.native_roots if root.source == host)
+    if configured:
+        return configured
+    if host == "claude":
+        return (NativeRoot(source=host, glob_pattern="~/.claude/projects/**/*.jsonl"),)
+    return (NativeRoot(source=host, glob_pattern="~/.codex/**/*.jsonl"),)
+
+
+def _expand_native_paths(roots: tuple[NativeRoot, ...]) -> tuple[Path, ...]:
+    paths: dict[str, Path] = {}
+    for root in roots:
+        expanded_pattern = os.path.expandvars(os.path.expanduser(root.glob_pattern))
+        for candidate in glob.glob(expanded_pattern, recursive=True):
+            path = Path(candidate).expanduser()
+            if path.is_file():
+                paths[str(path)] = path
+    return tuple(paths[key] for key in sorted(paths))
+
+
+def _ledger_path() -> Path:
+    raw_path = os.environ.get("PROMPTLESS_TRACE_COLLECTOR_LEDGER")
+    if raw_path:
+        return Path(raw_path).expanduser()
+    for raw_dir in (os.environ.get("PLUGIN_DATA"), os.environ.get("CLAUDE_PLUGIN_DATA")):
+        if raw_dir:
+            return Path(raw_dir).expanduser() / LEDGER_FILE_NAME
+    return Path.home() / ".promptless/instruction-hub" / LEDGER_FILE_NAME
+
+
+def _load_ledger(path: Path) -> SourceLedger:
+    if not path.exists():
+        return SourceLedger(path=path, is_new=True, sources={})
+    try:
+        value = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise CollectorError(f"trace collector ledger is invalid JSON at {path}: {exc.msg}") from exc
+    mapping = _json_mapping(value)
+    if mapping is None:
+        raise CollectorError("trace collector ledger must be a JSON object")
+    raw_sources = mapping.get("sources")
+    sources: dict[str, int] = {}
+    if isinstance(raw_sources, dict):
+        for key, offset_value in raw_sources.items():
+            if not isinstance(key, str):
+                continue
+            offset = _int_value(offset_value)
+            if offset is not None and offset >= 0:
+                sources[key] = offset
+    return SourceLedger(path=path, is_new=False, sources=sources)
+
+
+def _save_ledger(ledger: SourceLedger) -> None:
+    ledger.path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"schema_version": 1, "sources": {key: ledger.sources[key] for key in sorted(ledger.sources)}}
+    ledger.path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    ledger.is_new = False
+
+
+def _baseline_sources(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> None:
+    for path in source_paths:
+        complete_end = _complete_end_offset(path)
+        ledger.sources[str(path)] = complete_end
+
+
+def _collect_source_ranges(
+    source_paths: tuple[Path, ...],
+    ledger: SourceLedger,
+    *,
+    max_chunk_bytes: int,
+) -> list[SourceRange]:
+    ranges: list[SourceRange] = []
+    for path in source_paths:
+        path_key = str(path)
+        start_offset = ledger.sources.get(path_key, 0)
+        content = path.read_bytes()
+        if start_offset > len(content):
+            start_offset = 0
+        complete_end = _complete_end_from_bytes(content)
+        if complete_end <= start_offset:
+            continue
+        new_content = content[start_offset:complete_end]
+        offset = start_offset
+        for segment in _split_complete_lines(new_content, max_chunk_bytes=max_chunk_bytes):
+            end_offset = offset + len(segment)
+            ranges.append(
+                SourceRange(
+                    path=path,
+                    path_hash=_path_hash(path),
+                    start_offset=offset,
+                    end_offset=end_offset,
+                    content=segment,
+                )
+            )
+            offset = end_offset
+    return ranges
+
+
+def _complete_end_offset(path: Path) -> int:
+    return _complete_end_from_bytes(path.read_bytes())
+
+
+def _complete_end_from_bytes(content: bytes) -> int:
+    if not content:
+        return 0
+    if content.endswith(b"\n"):
+        return len(content)
+    last_newline = content.rfind(b"\n")
+    if last_newline == -1:
+        return 0
+    return last_newline + 1
+
+
+def _split_complete_lines(content: bytes, *, max_chunk_bytes: int) -> list[bytes]:
+    chunks: list[bytes] = []
+    current = bytearray()
+    for line in content.splitlines(keepends=True):
+        if current and len(current) + len(line) > max_chunk_bytes:
+            chunks.append(bytes(current))
+            current = bytearray()
+        current.extend(line)
+    if current:
+        chunks.append(bytes(current))
+    return chunks
+
+
+def _advance_ledger(ledger: SourceLedger, ranges: list[SourceRange]) -> None:
+    for source_range in ranges:
+        path_key = str(source_range.path)
+        ledger.sources[path_key] = max(ledger.sources.get(path_key, 0), source_range.end_offset)
+
+
+def _build_upload_request(
+    *,
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    ranges: list[SourceRange],
+    lifecycle_event: LifecycleEvent | None,
+) -> dict[str, JsonValue]:
+    chunks: list[JsonValue] = []
+    for source_range in ranges:
+        compressed = gzip.compress(source_range.content)
+        chunks.append(
+            {
+                "source_path_hash": source_range.path_hash,
+                "start_offset": source_range.start_offset,
+                "end_offset": source_range.end_offset,
+                "line_count": len(source_range.content.splitlines()),
+                "content_sha256": hashlib.sha256(source_range.content).hexdigest(),
+                "content_gzip_base64": base64.b64encode(compressed).decode("ascii"),
+                "lifecycle_event": lifecycle_event,
+            }
+        )
+    return {
+        "batch_id": f"{host}-{int(time.time() * 1000)}-{os.getpid()}",
+        "source": host,
+        "host": host,
+        "policy_version": policy.policy_version,
+        "collector_version": metadata.collector_version,
+        "plugin_version": metadata.plugin_version,
+        "uploaded_at": _utc_now_iso(),
+        "chunks": chunks,
+    }
+
+
+def _post_check_in(
+    url: str,
+    token: str,
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    *,
+    status: CollectorStatus,
+    needs_restart: bool,
+    ledger_path: Path,
+    root_count: int,
+    drift_reports: list[dict[str, JsonValue]],
+) -> None:
+    capture_policy = policy.capture_policy
+    payload = {
+        "host": host,
+        "plugin_version": metadata.plugin_version,
+        "policy_version": policy.policy_version,
+        "status": status,
+        "needs_restart": needs_restart,
+        "effective_config": {
+            "host": host,
+            "configured": status == "configured",
+            "trace_upload_endpoint": policy.trace_collection.upload_endpoint,
+            "native_root_count": root_count,
+            "source_ledger_path": str(ledger_path),
+            "user_prompts_enabled": _capture_enabled(capture_policy, "user_prompts"),
+            "assistant_messages_enabled": _capture_enabled(capture_policy, "assistant_messages"),
+            "reasoning_enabled": _capture_enabled(capture_policy, "reasoning"),
+            "tool_inputs_enabled": _capture_enabled(capture_policy, "tool_inputs"),
+            "tool_outputs_enabled": _capture_enabled(capture_policy, "tool_outputs"),
+            "raw_native_artifacts_enabled": _capture_enabled(capture_policy, "raw_native_artifacts"),
+            "managed_config_detected": True,
+        },
+        "drift_reports": drift_reports,
+        "checked_at": _utc_now_iso(),
+        "bootstrap_version": metadata.collector_version,
+    }
+    _post_json(url, token, payload)
+
+
+def _capture_enabled(capture_policy: dict[str, str], key: str) -> bool | None:
+    value = capture_policy.get(key)
+    if value is None:
+        return None
+    return value != "disabled"
+
+
+def _get_json(url: str, token: str) -> JsonValue:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": f"promptless-trace-collector/{COLLECTOR_VERSION}",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            return _load_json_bytes(response.read())
+    except urllib.error.HTTPError as exc:
+        raise CollectorError(f"worker returned HTTP {exc.code} for {urlsplit(url).path}") from exc
+
+
+def _post_json(url: str, token: str, payload: dict[str, JsonValue]) -> JsonValue:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": f"promptless-trace-collector/{COLLECTOR_VERSION}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            response_body = _load_json_bytes(response.read())
+    except urllib.error.HTTPError as exc:
+        raise CollectorError(f"worker returned HTTP {exc.code} for {urlsplit(url).path}") from exc
+    response_mapping = _json_mapping(response_body)
+    if response_mapping is not None and response_mapping.get("accepted") is False:
+        raise CollectorError(f"worker rejected request for {urlsplit(url).path}")
+    return response_body
+
+
+def _validate_upload_endpoint(value: str) -> None:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc == "":
+        raise CollectorError("trace_collection.upload_endpoint must be an absolute HTTP(S) URL")
+    if parsed.path != "/v0/traces/batches":
+        raise CollectorError("trace_collection.upload_endpoint must use path /v0/traces/batches")
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise CollectorError("trace_collection.upload_endpoint must not include credentials, query, or fragment")
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+        raise CollectorError("trace_collection.upload_endpoint must use HTTPS unless the host is loopback")
+
+
+def _normalize_base_url(value: str) -> str:
+    stripped = value.strip().rstrip("/")
+    parsed = urlsplit(stripped)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc == "":
+        raise CollectorError("worker base URL must be an absolute HTTP(S) URL")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.username is not None or parsed.password is not None:
+        raise CollectorError("worker base URL must not include credentials, path, query, or fragment")
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+        override = os.environ.get(TEST_URL_OVERRIDE_ENV)
+        if override not in {"1", "true", "TRUE"}:
+            raise CollectorError("worker base URL must use HTTPS unless the host is loopback")
+    return stripped
+
+
+def _is_loopback_host(hostname: str | None) -> bool:
+    return hostname in {"127.0.0.1", "::1", "localhost"}
+
+
+def _requires_newer_runtime(required: str | None, current: str) -> bool:
+    return required is not None and required != current
+
+
+def _load_json_string(value: str) -> JsonValue:
+    try:
+        return _load_json_value(json.loads(value))
+    except json.JSONDecodeError as exc:
+        raise CollectorError(f"seed JSON is invalid: {exc.msg}") from exc
+
+
+def _load_json_bytes(value: bytes) -> JsonValue:
+    try:
+        return _load_json_value(json.loads(value.decode("utf-8")))
+    except json.JSONDecodeError as exc:
+        raise CollectorError(f"worker returned invalid JSON: {exc.msg}") from exc
+
+
+def _load_json_value(value: object) -> JsonValue:
+    converted = _json_value(value)
+    if converted is _INVALID_JSON:
+        raise CollectorError("JSON contains unsupported values")
+    return converted
+
+
+def _json_mapping(value: object) -> dict[str, JsonValue] | None:
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, JsonValue] = {}
+    for key, child in value.items():
+        if not isinstance(key, str):
+            continue
+        json_child = _json_value(child)
+        if json_child is not _INVALID_JSON:
+            result[key] = json_child
+    return result
+
+
+def _json_value(value: object) -> JsonValue | _InvalidJson:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, list):
+        result: list[JsonValue] = []
+        for item in value:
+            child = _json_value(item)
+            if child is not _INVALID_JSON:
+                result.append(child)
+        return result
+    if isinstance(value, dict):
+        result: dict[str, JsonValue] = {}
+        for key, child in value.items():
+            if not isinstance(key, str):
+                continue
+            json_child = _json_value(child)
+            if json_child is not _INVALID_JSON:
+                result[key] = json_child
+        return result
+    return _INVALID_JSON
+
+
+def _string_mapping(value: JsonValue | None, field_name: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise CollectorError(f"{field_name} must be an object")
+    result: dict[str, str] = {}
+    for key, child in value.items():
+        if isinstance(key, str) and isinstance(child, str):
+            result[key] = child
+    return result
+
+
+def _host_value(value: JsonValue | None) -> Host | None:
+    if value == "codex" or value == "claude":
+        return value
+    return None
+
+
+def _string_value(value: JsonValue | None) -> str | None:
+    if isinstance(value, str) and value != "":
+        return value
+    return None
+
+
+def _int_value(value: JsonValue | None) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _bool_value(value: JsonValue | None, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    return default
+
+
+def _non_empty(value: str | None) -> str | None:
+    if value is None or value.strip() == "":
+        return None
+    return value
+
+
+def _path_hash(path: Path) -> str:
+    return hashlib.sha256(str(path).encode("utf-8")).hexdigest()
+
+
+def _self_sha256() -> str:
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def _utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _emit(payload: dict[str, JsonValue], *, quiet: bool, stream: object | None = None) -> None:
+    if quiet:
+        return
+    output = stream if stream is not None else sys.stdout
+    print(json.dumps(payload, sort_keys=True), file=output)
+
+
+def _redact_text(value: str) -> str:
+    for raw_secret in (
+        os.environ.get("PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN"),
+        os.environ.get("INSTRUCTION_HUB_PLUGIN_ENROLLMENT_TOKEN"),
+        os.environ.get("PLUGIN_ENROLLMENT_TOKEN"),
+    ):
+        if raw_secret:
+            value = value.replace(raw_secret, "<redacted>")
+    return value
+
+
+class _InvalidJson:
+    """Sentinel for values that cannot be represented as JSON."""
+
+
+_INVALID_JSON = _InvalidJson()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
