@@ -343,9 +343,12 @@ def test_build_appends_collector_hooks_to_existing_hook_asset(tmp_path: Path) ->
     session_start = _json_array(hook_events["SessionStart"], "SessionStart")
     stop_hooks = _json_array(hook_events["Stop"], "Stop")
     session_end_hooks = _json_array(hook_events["SessionEnd"], "SessionEnd")
-    assert _json_mapping(_json_array(_json_mapping(session_start[0], "existing")["hooks"], "existing.hooks")[0], "hook")[
-        "command"
-    ] == "echo existing"
+    assert (
+        _json_mapping(_json_array(_json_mapping(session_start[0], "existing")["hooks"], "existing.hooks")[0], "hook")[
+            "command"
+        ]
+        == "echo existing"
+    )
     collector_entry = _json_mapping(session_start[1], "collector")
     collector_hook = _json_mapping(_json_array(collector_entry["hooks"], "collector.hooks")[0], "collector hook")
     assert collector_entry["matcher"] == "startup|resume"
