@@ -14,7 +14,9 @@ import pytest
 from promptless_instruction_hub.cli import main
 from promptless_instruction_hub.compiler import build_hub, init_hub, validate_hub
 from promptless_instruction_hub.errors import BuildCheckFailedError, InstructionHubError
+from promptless_instruction_hub.fs import JsonValue, validate_json_value
 from promptless_instruction_hub.mcp_status import STATUS_TOOL_NAME, run_status_mcp
+from promptless_instruction_hub.release.hashing import stable_hash
 from promptless_instruction_hub.release.versions import resolve_publish_plugin_version
 from promptless_instruction_hub.scan.hub import scan_hub
 
@@ -1125,6 +1127,30 @@ def test_publish_version_bumps_when_package_membership_changes(tmp_path: Path) -
     assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.1"
 
 
+def test_publish_version_accepts_historical_host_enrollment_managed_runtime_id(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Acme")
+    build_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    shutil.copytree(hub_root, previous_release_root)
+    manifest_path = previous_release_root / "hub.release.json"
+    manifest = _json_mapping(
+        validate_json_value(json.loads(manifest_path.read_text()), "previous release manifest"),
+        "previous release manifest",
+    )
+    managed_runtimes = _json_array(manifest["managed_runtimes"], "managed_runtimes")
+    for runtime_value in managed_runtimes:
+        _json_mapping(runtime_value, "managed_runtime")["id"] = "host-enrollment-bootstrap"
+    version_basis = _json_mapping(manifest["version_basis"], "version_basis")
+    basis_runtimes = _json_array(version_basis["managed_runtimes"], "version_basis.managed_runtimes")
+    for runtime_value in basis_runtimes:
+        _json_mapping(runtime_value, "version_basis.managed_runtime")["id"] = "host-enrollment-bootstrap"
+    _rewrite_release_identity(manifest)
+    manifest_path.write_text(json.dumps(manifest))
+
+    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.1"
+
+
 def test_publish_version_prefers_manual_semver_promotion(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, plugin_version="1.0.0-alpha.1")
@@ -2010,6 +2036,28 @@ def _release_branch_plugin_versions(
 def _write_legacy_plugin_manifest(manifest_path: Path, *, version: str) -> None:
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps({"version": version}))
+
+
+def _rewrite_release_identity(manifest: dict[str, JsonValue]) -> None:
+    plugin = _json_mapping(manifest["plugin"], "plugin")
+    plugin_version = plugin["version"]
+    assert isinstance(plugin_version, str)
+    manifest_without_release_data = {
+        key: value for key, value in manifest.items() if key not in {"release_id", "release_hash"}
+    }
+    manifest["release_id"] = f"{plugin_version}+{stable_hash(manifest_without_release_data)[:12]}"
+    manifest_without_release_hash = {key: value for key, value in manifest.items() if key != "release_hash"}
+    manifest["release_hash"] = stable_hash(manifest_without_release_hash)
+
+
+def _json_mapping(value: JsonValue, path: str) -> dict[str, JsonValue]:
+    assert isinstance(value, dict), f"{path} must be a JSON object"
+    return value
+
+
+def _json_array(value: JsonValue, path: str) -> list[JsonValue]:
+    assert isinstance(value, list), f"{path} must be a JSON array"
+    return value
 
 
 def _init_action_repo(root: Path, *, targets: tuple[str, ...], hub_root_name: str = ".") -> Path:

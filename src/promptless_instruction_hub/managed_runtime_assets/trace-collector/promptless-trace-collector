@@ -30,6 +30,7 @@ SEED_FILE_NAME = "trace-collector-seed.json"
 LEDGER_FILE_NAME = "trace-collector-ledger.json"
 HTTP_TIMEOUT_SECONDS = 10
 MAX_STDIN_BYTES = 1024 * 1024
+MAX_UPLOAD_CHUNKS_PER_BATCH = 200
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_TRACE_COLLECTOR_ALLOW_TEST_URL_OVERRIDES"
 Host = Literal["codex", "claude"]
 LifecycleEvent = Literal["session_start", "stop", "session_end"]
@@ -107,6 +108,23 @@ class SourceRange:
     content: bytes
 
 
+@dataclass(frozen=True)
+class UploadBatch:
+    """One worker trace upload request and the source ranges it commits."""
+
+    request: dict[str, JsonValue]
+    ranges: list[SourceRange]
+
+
+@dataclass(frozen=True)
+class UploadSuppression:
+    """Policy reason that prevents native trace upload for this hook run."""
+
+    reason: str
+    drift_report: dict[str, JsonValue]
+    advance_ledger_to_current_end: bool
+
+
 @dataclass
 class SourceLedger:
     """Durable retry cursor for native JSONL source files."""
@@ -179,6 +197,7 @@ def _run(
 
     roots = _native_roots_for_host(host, policy.trace_collection)
     ledger = _load_ledger(_ledger_path())
+    upload_suppression = _trace_upload_suppression(policy, lifecycle_event)
     check_in_url = _worker_url(seed.worker_base_url, "/v0/host-enrollment/check-ins")
     _post_check_in(
         check_in_url,
@@ -190,7 +209,7 @@ def _run(
         needs_restart=False,
         ledger_path=ledger.path,
         root_count=len(roots),
-        drift_reports=[],
+        drift_reports=[upload_suppression.drift_report] if upload_suppression is not None else [],
     )
 
     source_paths = _expand_native_paths(roots)
@@ -200,24 +219,44 @@ def _run(
         _emit({"status": "configured", "host": host, "baseline_only": True, "uploaded_chunks": 0}, quiet=quiet)
         return 0
 
+    if upload_suppression is not None:
+        if upload_suppression.advance_ledger_to_current_end:
+            _baseline_sources(ledger, source_paths)
+            _save_ledger(ledger)
+        _emit(
+            {
+                "status": "configured",
+                "host": host,
+                "baseline_only": False,
+                "uploaded_chunks": 0,
+                "trace_upload_suppressed": True,
+                "suppression_reason": upload_suppression.reason,
+            },
+            quiet=quiet,
+        )
+        return 0
+
     ranges = _collect_source_ranges(
         source_paths,
         ledger,
         max_chunk_bytes=max(1, policy.trace_collection.max_batch_bytes // 2),
     )
+    uploaded_chunks = 0
     if ranges:
-        upload_request = _build_upload_request(
+        upload_batches = _build_upload_batches(
             host=host,
             metadata=metadata,
             policy=policy,
             ranges=ranges,
             lifecycle_event=lifecycle_event,
         )
-        _post_json(policy.trace_collection.upload_endpoint, seed.plugin_enrollment_token, upload_request)
-        _advance_ledger(ledger, ranges)
-        _save_ledger(ledger)
+        for upload_batch in upload_batches:
+            _post_json(policy.trace_collection.upload_endpoint, seed.plugin_enrollment_token, upload_batch.request)
+            _advance_ledger(ledger, upload_batch.ranges)
+            _save_ledger(ledger)
+            uploaded_chunks += len(upload_batch.ranges)
 
-    _emit({"status": "configured", "host": host, "baseline_only": False, "uploaded_chunks": len(ranges)}, quiet=quiet)
+    _emit({"status": "configured", "host": host, "baseline_only": False, "uploaded_chunks": uploaded_chunks}, quiet=quiet)
     return 0
 
 
@@ -539,13 +578,16 @@ def _collect_source_ranges(
     for path in source_paths:
         path_key = str(path)
         start_offset = ledger.sources.get(path_key, 0)
-        content = path.read_bytes()
-        if start_offset > len(content):
+        file_size = path.stat().st_size
+        if start_offset > file_size:
             start_offset = 0
-        complete_end = _complete_end_from_bytes(content)
+        with path.open("rb") as file:
+            file.seek(start_offset)
+            unread_content = file.read()
+        complete_end = start_offset + _complete_end_from_bytes(unread_content)
         if complete_end <= start_offset:
             continue
-        new_content = content[start_offset:complete_end]
+        new_content = unread_content[: complete_end - start_offset]
         offset = start_offset
         for segment in _split_complete_lines(new_content, max_chunk_bytes=max_chunk_bytes):
             end_offset = offset + len(segment)
@@ -581,6 +623,8 @@ def _split_complete_lines(content: bytes, *, max_chunk_bytes: int) -> list[bytes
     chunks: list[bytes] = []
     current = bytearray()
     for line in content.splitlines(keepends=True):
+        if len(line) > max_chunk_bytes:
+            raise CollectorError(f"native trace line exceeds {max_chunk_bytes} byte upload chunk limit")
         if current and len(current) + len(line) > max_chunk_bytes:
             chunks.append(bytes(current))
             current = bytearray()
@@ -596,30 +640,94 @@ def _advance_ledger(ledger: SourceLedger, ranges: list[SourceRange]) -> None:
         ledger.sources[path_key] = max(ledger.sources.get(path_key, 0), source_range.end_offset)
 
 
-def _build_upload_request(
+def _build_upload_batches(
     *,
     host: Host,
     metadata: RuntimeMetadata,
     policy: HostPolicy,
     ranges: list[SourceRange],
     lifecycle_event: LifecycleEvent | None,
-) -> dict[str, JsonValue]:
-    chunks: list[JsonValue] = []
+) -> list[UploadBatch]:
+    batches: list[UploadBatch] = []
+    current_chunks: list[JsonValue] = []
+    current_ranges: list[SourceRange] = []
+    current_encoded_bytes = 0
+    batch_started_at_ms = int(time.time() * 1000)
+
     for source_range in ranges:
-        compressed = gzip.compress(source_range.content)
-        chunks.append(
-            {
-                "source_path_hash": source_range.path_hash,
-                "start_offset": source_range.start_offset,
-                "end_offset": source_range.end_offset,
-                "line_count": len(source_range.content.splitlines()),
-                "content_sha256": hashlib.sha256(source_range.content).hexdigest(),
-                "content_gzip_base64": base64.b64encode(compressed).decode("ascii"),
-                "lifecycle_event": lifecycle_event,
-            }
+        chunk = _upload_chunk_payload(source_range, lifecycle_event)
+        encoded = _string_value(chunk.get("content_gzip_base64"))
+        if encoded is None:
+            raise CollectorError("trace upload chunk payload is missing encoded content")
+        encoded_size = len(encoded.encode("utf-8"))
+        if encoded_size > policy.trace_collection.max_batch_bytes:
+            raise CollectorError("native trace chunk exceeds trace_collection.max_batch_bytes")
+        batch_is_full = (
+            current_chunks
+            and (
+                current_encoded_bytes + encoded_size > policy.trace_collection.max_batch_bytes
+                or len(current_chunks) >= MAX_UPLOAD_CHUNKS_PER_BATCH
+            )
         )
+        if batch_is_full:
+            batches.append(
+                _upload_batch(
+                    host=host,
+                    metadata=metadata,
+                    policy=policy,
+                    chunks=current_chunks,
+                    ranges=current_ranges,
+                    batch_started_at_ms=batch_started_at_ms,
+                    batch_index=len(batches),
+                )
+            )
+            current_chunks = []
+            current_ranges = []
+            current_encoded_bytes = 0
+        current_chunks.append(chunk)
+        current_ranges.append(source_range)
+        current_encoded_bytes += encoded_size
+
+    if current_chunks:
+        batches.append(
+            _upload_batch(
+                host=host,
+                metadata=metadata,
+                policy=policy,
+                chunks=current_chunks,
+                ranges=current_ranges,
+                batch_started_at_ms=batch_started_at_ms,
+                batch_index=len(batches),
+            )
+        )
+    return batches
+
+
+def _upload_chunk_payload(source_range: SourceRange, lifecycle_event: LifecycleEvent | None) -> dict[str, JsonValue]:
+    compressed = gzip.compress(source_range.content)
     return {
-        "batch_id": f"{host}-{int(time.time() * 1000)}-{os.getpid()}",
+        "source_path_hash": source_range.path_hash,
+        "start_offset": source_range.start_offset,
+        "end_offset": source_range.end_offset,
+        "line_count": len(source_range.content.splitlines()),
+        "content_sha256": hashlib.sha256(source_range.content).hexdigest(),
+        "content_gzip_base64": base64.b64encode(compressed).decode("ascii"),
+        "lifecycle_event": lifecycle_event,
+    }
+
+
+def _upload_batch(
+    *,
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    chunks: list[JsonValue],
+    ranges: list[SourceRange],
+    batch_started_at_ms: int,
+    batch_index: int,
+) -> UploadBatch:
+    request: dict[str, JsonValue] = {
+        "batch_id": f"{host}-{batch_started_at_ms}-{os.getpid()}-{batch_index}",
         "source": host,
         "host": host,
         "policy_version": policy.policy_version,
@@ -628,6 +736,7 @@ def _build_upload_request(
         "uploaded_at": _utc_now_iso(),
         "chunks": chunks,
     }
+    return UploadBatch(request=request, ranges=list(ranges))
 
 
 def _post_check_in(
@@ -678,6 +787,45 @@ def _capture_enabled(capture_policy: dict[str, str], key: str) -> bool | None:
     return value != "disabled"
 
 
+def _trace_upload_suppression(policy: HostPolicy, lifecycle_event: LifecycleEvent | None) -> UploadSuppression | None:
+    disabled_capture_keys = _native_upload_disabled_capture_keys(policy.capture_policy)
+    if disabled_capture_keys:
+        return UploadSuppression(
+            reason="capture_policy",
+            advance_ledger_to_current_end=True,
+            drift_report={
+                "kind": "trace_upload_suppressed_by_capture_policy",
+                "message": "Native trace upload is suppressed because policy does not allow full raw JSONL capture",
+                "repaired": False,
+                "details": {"capture_keys": disabled_capture_keys},
+            },
+        )
+    if not policy.trace_collection.include_in_progress_traces and lifecycle_event != "session_end":
+        return UploadSuppression(
+            reason="in_progress_trace",
+            advance_ledger_to_current_end=False,
+            drift_report={
+                "kind": "trace_upload_waiting_for_session_end",
+                "message": "Native trace upload is waiting for a session-end hook per policy",
+                "repaired": False,
+                "details": {"lifecycle_event": lifecycle_event},
+            },
+        )
+    return None
+
+
+def _native_upload_disabled_capture_keys(capture_policy: dict[str, str]) -> list[str]:
+    required_keys = (
+        "user_prompts",
+        "assistant_messages",
+        "reasoning",
+        "tool_inputs",
+        "tool_outputs",
+        "raw_native_artifacts",
+    )
+    return sorted(key for key in required_keys if capture_policy.get(key) != "full_local_default")
+
+
 def _get_json(url: str, token: str) -> JsonValue:
     request = urllib.request.Request(
         url,
@@ -714,8 +862,8 @@ def _post_json(url: str, token: str, payload: dict[str, JsonValue]) -> JsonValue
     except urllib.error.HTTPError as exc:
         raise CollectorError(f"worker returned HTTP {exc.code} for {urlsplit(url).path}") from exc
     response_mapping = _json_mapping(response_body)
-    if response_mapping is not None and response_mapping.get("accepted") is False:
-        raise CollectorError(f"worker rejected request for {urlsplit(url).path}")
+    if response_mapping is None or response_mapping.get("accepted") is not True:
+        raise CollectorError(f"worker did not accept request for {urlsplit(url).path}")
     return response_body
 
 

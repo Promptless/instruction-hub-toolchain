@@ -120,7 +120,7 @@ def _write_trace_collector_hooks(target_root: Path, target: Harness) -> None:
         msg = f"{hook_path} field hooks must be a JSON object"
         raise InstructionHubError(msg)
 
-    for event_name in ("SessionStart", "Stop", "SessionEnd"):
+    for event_name in _trace_collector_hook_events(target):
         event_hooks = hooks.setdefault(event_name, [])
         if not isinstance(event_hooks, list):
             msg = f"{hook_path} field hooks.{event_name} must be a JSON array"
@@ -128,6 +128,12 @@ def _write_trace_collector_hooks(target_root: Path, target: Harness) -> None:
         event_hooks.append(_trace_collector_hook_entry(target, event_name))
 
     write_json(hook_path, hook_config)
+
+
+def _trace_collector_hook_events(target: Harness) -> tuple[str, ...]:
+    if target == "codex":
+        return ("SessionStart", "Stop")
+    return ("SessionStart", "Stop", "SessionEnd")
 
 
 def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
@@ -144,13 +150,20 @@ def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
 
 
 def _trace_collector_hook_entry(target: Harness, event_name: str) -> dict[str, JsonValue]:
+    lifecycle = _trace_collector_lifecycle_arg(event_name)
     if target == "claude":
         hook_command: dict[str, JsonValue] = {
-            "command": f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" --host claude --quiet',
+            "command": (
+                f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" '
+                f"--host claude --lifecycle {lifecycle} --quiet"
+            ),
         }
     else:
         hook_command = {
-            "command": f'python3 "${{PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" --host codex --quiet',
+            "command": (
+                f'python3 "${{PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" '
+                f"--host codex --lifecycle {lifecycle} --quiet"
+            ),
         }
 
     # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
@@ -172,6 +185,17 @@ def _trace_collector_hook_entry(target: Harness, event_name: str) -> dict[str, J
     if event_name == "SessionStart":
         entry["matcher"] = "startup|resume"
     return entry
+
+
+def _trace_collector_lifecycle_arg(event_name: str) -> str:
+    if event_name == "SessionStart":
+        return "session_start"
+    if event_name == "Stop":
+        return "stop"
+    if event_name == "SessionEnd":
+        return "session_end"
+    msg = f"unsupported trace collector hook event: {event_name}"
+    raise InstructionHubError(msg)
 
 
 def _write_plugin_manifest(target_root: Path, records: tuple[ManagedRuntimeRecord, ...]) -> None:

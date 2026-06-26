@@ -63,6 +63,7 @@ MANAGED_RUNTIME_KEYS = frozenset(
 )
 SUPPORT_KEYS = frozenset({"mode", "reason"})
 SUPPORT_MODES = frozenset({"agent-skill", "native", "projected", "unsupported"})
+MANAGED_RUNTIME_IDS = frozenset({"native-trace-collector", "host-enrollment-bootstrap"})
 
 
 def resolve_publish_plugin_version(
@@ -471,8 +472,8 @@ def _validate_managed_runtimes(manifest_path: Path, runtimes: list[JsonValue], k
         runtime = _require_mapping_value(manifest_path, runtime_value, f"{key_path}[{index}]")
         runtime_path = f"{key_path}[{index}]"
         _require_exact_keys(manifest_path, runtime, runtime_path, MANAGED_RUNTIME_KEYS)
-        if runtime["id"] != "native-trace-collector":
-            msg = f"{manifest_path}: {runtime_path}.id must be native-trace-collector"
+        if runtime["id"] not in MANAGED_RUNTIME_IDS:
+            msg = f"{manifest_path}: {runtime_path}.id must be a supported managed runtime id"
             raise ValueError(msg)
         if runtime["status"] != "included":
             msg = f"{manifest_path}: {runtime_path}.status must be included"
