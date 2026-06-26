@@ -10,8 +10,12 @@ from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import read_yaml_mapping
 from promptless_instruction_hub.models import HubConfig, PackageDefinition
 
-CONFIG_PATH = Path(".promptless/instruction-hub.yaml")
+CONFIG_PATH = Path("hub.yaml")
 PACKAGE_DIR = Path("packages")
+RELEASE_MANIFEST_PATH = Path("hub.release.json")
+STABLE_CHANNEL_PATH = Path("hub.stable.json")
+REPO_CONTEXT_PATH = Path("hub.repo-context.json")
+MANAGED_RUNTIME_MANIFEST_PATH = Path("hub.managed-runtimes.json")
 
 
 def load_hub_config(hub_root: Path) -> HubConfig:

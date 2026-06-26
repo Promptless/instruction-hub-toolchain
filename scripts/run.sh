@@ -5,7 +5,7 @@ mode="${INPUT_MODE:-build}"
 hub_root_input="${INPUT_HUB_ROOT:-.}"
 release_branch="${INPUT_RELEASE_BRANCH:-release/stable}"
 source_branch="${INPUT_SOURCE_BRANCH:-main}"
-generated_paths_input="${INPUT_GENERATED_PATHS:-dist .agents/plugins .claude-plugin .cursor-plugin .promptless/releases .promptless/channels}"
+generated_paths_input="${INPUT_GENERATED_PATHS:-dist .agents/plugins .claude-plugin .cursor-plugin hub.release.json hub.stable.json}"
 update_claude_pointer="${INPUT_UPDATE_CLAUDE_POINTER:-true}"
 update_codex_pointer="${INPUT_UPDATE_CODEX_POINTER:-true}"
 update_cursor_pointer="${INPUT_UPDATE_CURSOR_POINTER:-true}"
@@ -24,12 +24,14 @@ fi
 hub_root="$(cd "$hub_root" && pwd)"
 
 declare -a generated_paths=()
+declare -a legacy_generated_paths=(".promptless/releases" ".promptless/channels")
 declare -a release_worktrees=()
 declare -a marketplace_pointer_paths=()
 declare -a temp_paths=()
 original_origin_url=""
 
 cleanup_temp_paths() {
+  set +u
   for worktree_path in "${release_worktrees[@]}"; do
     if [[ -d "$worktree_path" ]]; then
       git -C "$repo_root" worktree remove "$worktree_path" --force >/dev/null 2>&1 || rm -rf "$worktree_path"
@@ -251,6 +253,34 @@ fetch_release_branch() {
   fi
 }
 
+copy_previous_release_branch() {
+  local destination_root="$1"
+
+  if remote_release_branch_exists; then
+    fetch_release_branch
+    git -C "$repo_root" archive "origin/$release_branch" | tar -x -C "$destination_root"
+    return 0
+  fi
+  return 1
+}
+
+resolve_publish_plugin_version() {
+  local previous_release_root="$1"
+  local hub_rel="$2"
+  local previous_release_exists="$3"
+
+  local args=(
+    publish-version
+    --hub "$hub_root"
+    --hub-relative-path "$hub_rel"
+  )
+  if [[ "$previous_release_exists" == "true" ]]; then
+    args+=(--previous-release-root "$previous_release_root")
+  fi
+
+  pi "${args[@]}"
+}
+
 copy_generated_paths() {
   local destination_root="$1"
   local hub_rel="$2"
@@ -293,6 +323,21 @@ copy_payload_generated_paths() {
       mkdir -p "$(dirname "$destination_path")"
       cp -R "$source_path" "$destination_path"
     fi
+  done
+}
+
+cleanup_legacy_generated_paths() {
+  local destination_root="$1"
+  local hub_rel="$2"
+
+  for legacy_generated_path in "${legacy_generated_paths[@]}"; do
+    local destination_path
+    if [[ -n "$hub_rel" ]]; then
+      destination_path="$destination_root/$hub_rel/$legacy_generated_path"
+    else
+      destination_path="$destination_root/$legacy_generated_path"
+    fi
+    rm -rf "$destination_path"
   done
 }
 
@@ -342,6 +387,7 @@ publish_release_branch() {
     fi
   fi
 
+  cleanup_legacy_generated_paths "$worktree" "$hub_rel"
   copy_payload_generated_paths "$payload_root" "$worktree" "$hub_rel"
   if [[ -n "$hub_rel" ]]; then
     git -C "$worktree" add -A "$hub_rel"
@@ -550,11 +596,18 @@ case "$mode" in
   publish)
     require_publish_source_ref
     hub_rel="$(hub_relative_path)"
+    previous_release_root="$(mktemp -d)"
     payload_root="$(mktemp -d)"
     pointer_root="$(mktemp -d)"
-    temp_paths+=("$payload_root" "$pointer_root")
+    temp_paths+=("$previous_release_root" "$payload_root" "$pointer_root")
     pi validate --hub "$hub_root"
-    pi build --hub "$hub_root"
+    if copy_previous_release_branch "$previous_release_root"; then
+      previous_release_exists=true
+    else
+      previous_release_exists=false
+    fi
+    publish_plugin_version="$(resolve_publish_plugin_version "$previous_release_root" "$hub_rel" "$previous_release_exists")"
+    pi build --hub "$hub_root" --plugin-version "$publish_plugin_version"
     copy_generated_paths "$payload_root" "$hub_rel"
     restore_generated_paths_on_default_branch "$hub_rel"
     marketplace_pointer_paths=()

@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from promptless_instruction_hub.config import CONFIG_PATH, PACKAGE_DIR
+from promptless_instruction_hub.config import CONFIG_PATH, PACKAGE_DIR, RELEASE_MANIFEST_PATH, STABLE_CHANNEL_PATH
 from promptless_instruction_hub.errors import BuildCheckFailedError
 from promptless_instruction_hub.fs import JsonValue, replace_tree, trees_equal, write_yaml
 from promptless_instruction_hub.models import HubConfig
@@ -20,8 +20,8 @@ GENERATED_PATHS = (
     Path(".agents/plugins"),
     Path(".claude-plugin"),
     Path(".cursor-plugin"),
-    Path(".promptless/releases"),
-    Path(".promptless/channels"),
+    RELEASE_MANIFEST_PATH,
+    STABLE_CHANNEL_PATH,
 )
 
 __all__ = ["BuildResult", "ValidationResult", "build_hub", "init_hub", "validate_hub"]
@@ -74,18 +74,18 @@ def init_hub(
         ".agents/plugins",
         ".claude-plugin",
         ".cursor-plugin",
-        ".promptless/releases",
-        ".promptless/channels",
     ):
         (root / relative_dir).mkdir(parents=True, exist_ok=True)
     return root
 
 
-def build_hub(hub_root: Path, *, check: bool = False) -> BuildResult:
+def build_hub(hub_root: Path, *, check: bool = False, plugin_version: str | None = None) -> BuildResult:
     """Build generated target artifacts and manifests, or check that they are current."""
 
     root = hub_root.resolve()
     validation = validate_hub(root)
+    if plugin_version is not None:
+        validation = _with_plugin_version(validation, plugin_version)
     with tempfile.TemporaryDirectory(prefix="promptless-instruction-hub-") as temp_dir:
         output_root = Path(temp_dir)
         managed_runtimes = render_target_plugins(output_root, validation.config, validation.stable_packages)
@@ -121,6 +121,16 @@ def _check_generated_output(hub_root: Path, output_root: Path) -> None:
 def _replace_generated_output(hub_root: Path, output_root: Path) -> None:
     for relative_path in GENERATED_PATHS:
         replace_tree(output_root / relative_path, hub_root / relative_path)
+
+
+def _with_plugin_version(validation: ValidationResult, plugin_version: str) -> ValidationResult:
+    config = HubConfig.model_validate({**validation.config.model_dump(), "plugin_version": plugin_version})
+    return ValidationResult(
+        config=config,
+        packages=validation.packages,
+        assets=validation.assets,
+        stable_packages=validation.stable_packages,
+    )
 
 
 def _slugify(value: str) -> str:

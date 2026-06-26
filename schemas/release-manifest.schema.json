@@ -11,7 +11,9 @@
     "stable_packages",
     "targets",
     "target_hashes",
+    "managed_runtimes",
     "assets",
+    "version_basis",
     "release_id",
     "release_hash"
   ],
@@ -44,6 +46,7 @@
     },
     "stable_packages": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "type": "string",
         "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
@@ -52,6 +55,7 @@
     },
     "targets": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "enum": ["claude", "codex", "gemini", "cursor"]
       },
@@ -60,6 +64,7 @@
     "target_hashes": {
       "type": "object",
       "additionalProperties": false,
+      "minProperties": 1,
       "properties": {
         "claude": {
           "$ref": "#/$defs/sha256"
@@ -77,7 +82,6 @@
     },
     "managed_runtimes": {
       "type": "array",
-      "default": [],
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -193,6 +197,100 @@
               }
             }
           }
+        }
+      }
+    },
+    "version_basis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "org",
+        "plugin",
+        "stable_packages",
+        "targets",
+        "packages",
+        "target_hashes",
+        "managed_runtimes"
+      ],
+      "properties": {
+        "org": {
+          "type": "string",
+          "minLength": 1
+        },
+        "plugin": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "name", "version"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "version": {
+              "type": "string",
+              "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9]\\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?$"
+            }
+          }
+        },
+        "stable_packages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+          },
+          "uniqueItems": true
+        },
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": ["claude", "codex", "gemini", "cursor"]
+          },
+          "uniqueItems": true
+        },
+        "packages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "name", "includes", "assets"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "includes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^(skill|rule|agent|command|hook|mcp):[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+                },
+                "uniqueItems": true
+              },
+              "assets": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/properties/assets/items"
+                }
+              }
+            }
+          }
+        },
+        "target_hashes": {
+          "$ref": "#/properties/target_hashes"
+        },
+        "managed_runtimes": {
+          "$ref": "#/properties/managed_runtimes"
         }
       }
     },

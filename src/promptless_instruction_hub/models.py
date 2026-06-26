@@ -68,7 +68,7 @@ class TargetSupport(BaseModel):
 
 
 class HubConfig(BaseModel):
-    """Root `.promptless/instruction-hub.yaml` configuration."""
+    """Root `hub.yaml` configuration."""
 
     model_config = ConfigDict(extra="forbid")
 

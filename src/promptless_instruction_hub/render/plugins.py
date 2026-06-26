@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH
 from promptless_instruction_hub.fs import JsonValue, write_json
 from promptless_instruction_hub.managed_runtime import ManagedRuntimeRecord, render_managed_runtimes
 from promptless_instruction_hub.models import Harness, HubConfig, PackageDefinition, StablePackage
@@ -58,7 +59,7 @@ def embed_release_manifest(
     for target in config.targets:
         for stable_package in packages:
             write_json(
-                output_root / "dist" / target / stable_package.definition.id / ".promptless/release.json",
+                output_root / "dist" / target / stable_package.definition.id / RELEASE_MANIFEST_PATH,
                 release_manifest,
             )
 

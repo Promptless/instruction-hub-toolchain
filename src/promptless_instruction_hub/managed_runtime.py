@@ -8,6 +8,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Literal
 
+from promptless_instruction_hub.config import MANAGED_RUNTIME_MANIFEST_PATH
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, file_hash, read_json_mapping, write_json
 from promptless_instruction_hub.models import Harness, HubConfig, PackageDefinition
@@ -20,7 +21,7 @@ HOST_ENROLLMENT_EXECUTABLE = "promptless-host-enrollment-bootstrap"
 HOST_ENROLLMENT_HOOK_TIMEOUT_SECONDS = 45
 HOST_ENROLLMENT_CHANNEL = "stable"
 HOST_ENROLLMENT_VERSION = "0.1.0"
-MANAGED_RUNTIME_MANIFEST = Path(".promptless/managed-runtimes.json")
+MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
 SUPPORTED_HOST_ENROLLMENT_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 
 _ASSET_ROOT = Path(__file__).parent / "managed_runtime_assets" / HOST_ENROLLMENT_ASSET_DIR

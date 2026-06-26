@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from promptless_instruction_hub.assets import unsupported_support
-from promptless_instruction_hub.config import PACKAGE_DIR
+from promptless_instruction_hub.config import PACKAGE_DIR, REPO_CONTEXT_PATH
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import (
     JsonValue,
@@ -154,7 +154,7 @@ def _inventory_repo_context(hub_root: Path, source_root: Path) -> list[str]:
             }
         )
     write_json(
-        hub_root / ".promptless/inventory/repo-context.json",
+        hub_root / REPO_CONTEXT_PATH,
         {
             "schema_version": 1,
             "files": files,

@@ -19,6 +19,10 @@ from promptless_instruction_hub.fs import JsonValue, validate_json_value
 BOOTSTRAP_BIN = "promptless-host-enrollment-bootstrap"
 
 
+def _assert_no_promptless_directory(root: Path) -> None:
+    assert list(root.rglob(".promptless")) == []
+
+
 def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -40,7 +44,8 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host codex --quiet'
         assert "--quiet" in hook_command
         assert hook["timeout"] == 45
-        metadata = json.loads((plugin_root / ".promptless/managed-runtimes.json").read_text())
+        metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
+        assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
         assert runtime["id"] == "host-enrollment-bootstrap"
         assert runtime["status"] == "included"
@@ -56,10 +61,11 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
     for target in ("cursor", "gemini"):
         plugin_root = hub_root / "dist" / target / "core"
         assert not (plugin_root / "bin" / BOOTSTRAP_BIN).exists()
-        assert not (plugin_root / ".promptless/managed-runtimes.json").exists()
+        assert not (plugin_root / "hub.managed-runtimes.json").exists()
 
-    release_manifest = json.loads((hub_root / ".promptless/releases/current.json").read_text())
+    release_manifest = json.loads((hub_root / "hub.release.json").read_text())
     assert {runtime["target"] for runtime in release_manifest["managed_runtimes"]} == {"codex", "claude"}
+    _assert_no_promptless_directory(hub_root)
 
 
 def test_bootstrap_missing_token_exits_zero_without_config_write(tmp_path: Path) -> None:
@@ -239,7 +245,7 @@ def test_bootstrap_missing_managed_runtime_manifest_uses_default_metadata(tmp_pa
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
     plugin_root = hub_root / "dist/codex/core"
-    (plugin_root / ".promptless/managed-runtimes.json").unlink()
+    (plugin_root / "hub.managed-runtimes.json").unlink()
     server = _FakeWorkerServer()
     server.start()
     try:

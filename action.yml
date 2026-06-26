@@ -26,8 +26,8 @@ inputs:
       .agents/plugins
       .claude-plugin
       .cursor-plugin
-      .promptless/releases
-      .promptless/channels
+      hub.release.json
+      hub.stable.json
   update-claude-pointer:
     description: Commit a default-branch Claude marketplace pointer that targets the release branch in publish mode.
     required: false
