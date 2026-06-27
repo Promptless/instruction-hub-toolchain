@@ -71,21 +71,32 @@ Action releases are tagged with immutable versions such as `v0.1.0` and a moving
 major pointer such as `v0`. Customer workflows can use `@v0` for minor updates or
 pin to an immutable tag for stricter reproducibility.
 
-## Managed Runtime Bootstrap
+## Managed Runtime Trace Collector
 
-The toolchain owns Promptless-managed runtime artifacts that must be injected
-into generated customer plugins, including the host enrollment bootstrap used by
-Codex and Claude startup hooks. During dogfood, generated hooks invoke the
-bundled stdlib-only Python script with `python3`.
+The toolchain owns Promptless-managed runtime artifacts that are injected into
+generated customer plugins. The current managed runtime is the native trace
+collector used by Codex and Claude lifecycle hooks. During dogfood, generated
+hooks invoke the bundled stdlib-only Python script with `python3`.
 
-Before the customer-grade release, replace that script with a static native
-binary built and versioned by Promptless, then bundled into the toolchain
-release. Customer Instruction Hub repositories should not need Python, uv, Go,
-Rust, curl, jq, or other runtime/build dependencies installed for the bootstrap
+The collector reads the private enrollment seed, fetches the signed hosted
+policy through the customer worker, validates the signed-policy envelope and
+native trace upload policy, then uploads new complete JSONL ranges from the
+configured native trace roots. It maintains a per-user ledger in plugin data so
+successful uploads advance monotonically and failed uploads are retried. First
+install defaults to forward-only baselining so historical local traces are not
+uploaded unless policy explicitly opts into backfill.
+
+Codex hooks run on `SessionStart` and `Stop`; Claude hooks run on
+`SessionStart`, `Stop`, and `SessionEnd`. When policy disables in-progress
+trace uploads, Codex `Stop` and Claude `SessionEnd` are treated as terminal
+events. Upload responses must echo the batch and policy version and confirm all
+raw chunks before the ledger advances.
+
+Before the customer-grade release, replace the Python dogfood script with a
+static native binary built and versioned by Promptless, then bundled into the
+toolchain release. Customer Instruction Hub repositories should not need Python,
+uv, Go, Rust, curl, jq, or other runtime/build dependencies installed for the
 hook to run. Customer builds should only consume the already-built Promptless
-artifact that the toolchain copies into plugin `bin/`.
-
-The dogfood bootstrap trusts the authenticated TLS worker response and validates
-only the hosted policy shape. The customer-grade static binary must verify an
-asymmetric hosted-policy signature with a pinned Promptless public key before it
-writes local host telemetry config.
+artifact that the toolchain copies into plugin `bin/`. The customer-grade
+binary must verify the asymmetric hosted-policy signature with a pinned
+Promptless public key before trusting the policy body.

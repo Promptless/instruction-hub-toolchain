@@ -12,6 +12,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -36,6 +37,12 @@ HTTP_TIMEOUT_SECONDS = 10
 MAX_STDIN_BYTES = 1024 * 1024
 MAX_UPLOAD_CHUNKS_PER_BATCH = 200
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_TRACE_COLLECTOR_ALLOW_TEST_URL_OVERRIDES"
+SEMVER_RE = re.compile(
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-((?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?"
+    r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
 Host = Literal["codex", "claude"]
 LifecycleEvent = Literal["session_start", "stop", "session_end"]
 CollectorStatus = Literal["blocked", "configured", "error"]
@@ -173,16 +180,18 @@ def _run(
     policy_url = _worker_url(seed.worker_base_url, "/v0/host-enrollment/policy")
     signed_policy = _get_json(policy_url, seed.plugin_enrollment_token)
     policy = _validate_signed_policy(signed_policy, host)
+    check_in_url = _worker_url(seed.worker_base_url, "/v0/host-enrollment/check-ins")
+    ledger_path = _ledger_path()
     if _requires_newer_runtime(policy.required_bootstrap_version, metadata.collector_version):
         _post_check_in(
-            _worker_url(seed.worker_base_url, "/v0/host-enrollment/check-ins"),
+            check_in_url,
             seed.plugin_enrollment_token,
             host,
             metadata,
             policy,
             status="blocked",
             needs_restart=False,
-            ledger_path=_ledger_path(),
+            ledger_path=ledger_path,
             root_count=0,
             drift_reports=[
                 {
@@ -199,79 +208,128 @@ def _run(
         _emit({"status": "blocked", "reason": "collector_upgrade_required", "host": host}, quiet=quiet)
         return 0
 
-    ledger_path = _ledger_path()
-    with _ledger_lock(ledger_path):
-        roots = _native_roots_for_host(host, policy.trace_collection)
-        ledger = _load_ledger(ledger_path)
-        upload_suppression = _trace_upload_suppression(policy, host, lifecycle_event)
-        check_in_url = _worker_url(seed.worker_base_url, "/v0/host-enrollment/check-ins")
-        _post_check_in(
-            check_in_url,
-            seed.plugin_enrollment_token,
-            host,
-            metadata,
-            policy,
-            status="configured",
-            needs_restart=False,
-            ledger_path=ledger.path,
-            root_count=len(roots),
-            drift_reports=[upload_suppression.drift_report] if upload_suppression is not None else [],
-        )
+    configured_check_in_accepted = False
+    try:
+        with _ledger_lock(ledger_path):
+            roots = _native_roots_for_host(host, policy.trace_collection)
+            ledger = _load_ledger(ledger_path)
+            upload_suppression = _trace_upload_suppression(policy, host, lifecycle_event)
+            _post_check_in(
+                check_in_url,
+                seed.plugin_enrollment_token,
+                host,
+                metadata,
+                policy,
+                status="configured",
+                needs_restart=False,
+                ledger_path=ledger.path,
+                root_count=len(roots),
+                drift_reports=[upload_suppression.drift_report] if upload_suppression is not None else [],
+            )
+            configured_check_in_accepted = True
 
-        source_paths = _expand_native_paths(roots)
-        if ledger.is_new and policy.trace_collection.forward_only_first_install:
-            _baseline_sources(ledger, source_paths)
-            _save_ledger(ledger)
-            _emit({"status": "configured", "host": host, "baseline_only": True, "uploaded_chunks": 0}, quiet=quiet)
-            return 0
-
-        if upload_suppression is not None:
-            if upload_suppression.advance_ledger_to_current_end:
+            source_paths = _expand_native_paths(roots)
+            if ledger.is_new and policy.trace_collection.forward_only_first_install:
                 _baseline_sources(ledger, source_paths)
                 _save_ledger(ledger)
+                _emit({"status": "configured", "host": host, "baseline_only": True, "uploaded_chunks": 0}, quiet=quiet)
+                return 0
+
+            if upload_suppression is not None:
+                if upload_suppression.advance_ledger_to_current_end:
+                    _baseline_sources(ledger, source_paths)
+                    _save_ledger(ledger)
+                _emit(
+                    {
+                        "status": "configured",
+                        "host": host,
+                        "baseline_only": False,
+                        "uploaded_chunks": 0,
+                        "trace_upload_suppressed": True,
+                        "suppression_reason": upload_suppression.reason,
+                    },
+                    quiet=quiet,
+                )
+                return 0
+
+            ranges = _collect_source_ranges(
+                source_paths,
+                ledger,
+                max_chunk_bytes=max(1, policy.trace_collection.max_batch_bytes // 2),
+            )
+            uploaded_chunks = 0
+            if ranges:
+                upload_batches = _build_upload_batches(
+                    host=host,
+                    metadata=metadata,
+                    policy=policy,
+                    ranges=ranges,
+                    lifecycle_event=lifecycle_event,
+                )
+                for upload_batch in upload_batches:
+                    _post_upload_batch(
+                        policy.trace_collection.upload_endpoint,
+                        seed.plugin_enrollment_token,
+                        policy,
+                        upload_batch,
+                    )
+                    _advance_ledger(ledger, upload_batch.ranges)
+                    _save_ledger(ledger)
+                    uploaded_chunks += len(upload_batch.ranges)
+
             _emit(
-                {
-                    "status": "configured",
-                    "host": host,
-                    "baseline_only": False,
-                    "uploaded_chunks": 0,
-                    "trace_upload_suppressed": True,
-                    "suppression_reason": upload_suppression.reason,
-                },
+                {"status": "configured", "host": host, "baseline_only": False, "uploaded_chunks": uploaded_chunks},
                 quiet=quiet,
             )
-            return 0
-
-        ranges = _collect_source_ranges(
-            source_paths,
-            ledger,
-            max_chunk_bytes=max(1, policy.trace_collection.max_batch_bytes // 2),
-        )
-        uploaded_chunks = 0
-        if ranges:
-            upload_batches = _build_upload_batches(
+    except (CollectorError, OSError, ValueError, urllib.error.URLError) as exc:
+        if configured_check_in_accepted:
+            _post_error_check_in(
+                check_in_url=check_in_url,
+                token=seed.plugin_enrollment_token,
                 host=host,
                 metadata=metadata,
                 policy=policy,
-                ranges=ranges,
-                lifecycle_event=lifecycle_event,
+                ledger_path=ledger_path,
+                root_count=len(_native_roots_for_host(host, policy.trace_collection)),
+                error_message=str(exc),
             )
-            for upload_batch in upload_batches:
-                _post_upload_batch(
-                    policy.trace_collection.upload_endpoint,
-                    seed.plugin_enrollment_token,
-                    policy,
-                    upload_batch,
-                )
-                _advance_ledger(ledger, upload_batch.ranges)
-                _save_ledger(ledger)
-                uploaded_chunks += len(upload_batch.ranges)
-
-        _emit(
-            {"status": "configured", "host": host, "baseline_only": False, "uploaded_chunks": uploaded_chunks},
-            quiet=quiet,
-        )
+        raise
     return 0
+
+
+def _post_error_check_in(
+    *,
+    check_in_url: str,
+    token: str,
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    ledger_path: Path,
+    root_count: int,
+    error_message: str,
+) -> None:
+    try:
+        _post_check_in(
+            check_in_url,
+            token,
+            host,
+            metadata,
+            policy,
+            status="error",
+            needs_restart=False,
+            ledger_path=ledger_path,
+            root_count=root_count,
+            drift_reports=[
+                {
+                    "kind": "trace_collector_error",
+                    "message": "Native trace collector failed after loading hosted policy",
+                    "repaired": False,
+                    "details": {"error": _redact_text(error_message)[:400]},
+                }
+            ],
+        )
+    except (CollectorError, OSError, ValueError, urllib.error.URLError):
+        return
 
 
 def _read_hook_context() -> dict[str, JsonValue]:
@@ -437,6 +495,9 @@ def _validate_signed_policy(value: object, host: Host) -> HostPolicy:
     signed_policy = _json_mapping(value)
     if signed_policy is None:
         raise CollectorError("worker policy response must be a JSON object")
+    for field_name in ("signature", "signed_at", "key_id"):
+        if _string_value(signed_policy.get(field_name)) is None:
+            raise CollectorError(f"worker signed policy response is missing {field_name}")
     policy_value = _json_mapping(signed_policy.get("policy"))
     if policy_value is None:
         raise CollectorError("worker policy response is missing policy")
@@ -621,11 +682,20 @@ def _save_ledger(ledger: SourceLedger) -> None:
             temp_file.flush()
             os.fsync(temp_file.fileno())
         os.replace(temp_path, ledger.path)
+        _fsync_directory(ledger.path.parent)
     finally:
         if temp_path is not None and temp_path.exists():
             temp_path.unlink()
     ledger.sources = merged_sources
     ledger.is_new = False
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _baseline_sources(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> None:
@@ -717,19 +787,18 @@ def _build_upload_batches(
     batches: list[UploadBatch] = []
     current_chunks: list[JsonValue] = []
     current_ranges: list[SourceRange] = []
-    current_encoded_bytes = 0
+    current_decoded_bytes = 0
     batch_started_at_ms = int(time.time() * 1000)
 
     for source_range in ranges:
         chunk = _upload_chunk_payload(source_range, lifecycle_event)
-        encoded = _string_value(chunk.get("content_gzip_base64"))
-        if encoded is None:
+        if _string_value(chunk.get("content_gzip_base64")) is None:
             raise CollectorError("trace upload chunk payload is missing encoded content")
-        encoded_size = len(encoded.encode("utf-8"))
-        if encoded_size > policy.trace_collection.max_batch_bytes:
+        decoded_size = len(source_range.content)
+        if decoded_size > policy.trace_collection.max_batch_bytes:
             raise CollectorError("native trace chunk exceeds trace_collection.max_batch_bytes")
         batch_is_full = current_chunks and (
-            current_encoded_bytes + encoded_size > policy.trace_collection.max_batch_bytes
+            current_decoded_bytes + decoded_size > policy.trace_collection.max_batch_bytes
             or len(current_chunks) >= MAX_UPLOAD_CHUNKS_PER_BATCH
         )
         if batch_is_full:
@@ -746,10 +815,10 @@ def _build_upload_batches(
             )
             current_chunks = []
             current_ranges = []
-            current_encoded_bytes = 0
+            current_decoded_bytes = 0
         current_chunks.append(chunk)
         current_ranges.append(source_range)
-        current_encoded_bytes += encoded_size
+        current_decoded_bytes += decoded_size
 
     if current_chunks:
         batches.append(
@@ -874,6 +943,11 @@ def _validate_upload_response(
     policy_version = _int_value(response.get("policy_version"))
     if policy_version != expected_policy_version:
         raise CollectorError(f"worker response policy_version did not match request for {urlsplit(url).path}")
+    request_chunks = request.get("chunks")
+    expected_raw_artifacts = len(request_chunks) if isinstance(request_chunks, list) else 0
+    raw_artifact_count = _int_value(response.get("raw_artifact_count"))
+    if raw_artifact_count != expected_raw_artifacts:
+        raise CollectorError(f"worker response raw_artifact_count did not match request for {urlsplit(url).path}")
     for field in ("raw_artifact_count", "trace_count", "event_count", "unparsed_record_count"):
         value = _int_value(response.get(field))
         if value is None or value < 0:
@@ -1021,7 +1095,58 @@ def _is_loopback_host(hostname: str | None) -> bool:
 
 
 def _requires_newer_runtime(required: str | None, current: str) -> bool:
-    return required is not None and required != current
+    if required is None:
+        return False
+    comparison = _compare_semver(current, required)
+    if comparison is None:
+        return required != current
+    return comparison < 0
+
+
+def _compare_semver(first: str, second: str) -> int | None:
+    first_match = SEMVER_RE.match(first)
+    second_match = SEMVER_RE.match(second)
+    if first_match is None or second_match is None:
+        return None
+    first_core = tuple(int(first_match.group(index)) for index in (1, 2, 3))
+    second_core = tuple(int(second_match.group(index)) for index in (1, 2, 3))
+    if first_core != second_core:
+        return 1 if first_core > second_core else -1
+    return _compare_prerelease(first_match.group(4), second_match.group(4))
+
+
+def _compare_prerelease(first: str | None, second: str | None) -> int:
+    if first == second:
+        return 0
+    if first is None:
+        return 1
+    if second is None:
+        return -1
+    first_identifiers = first.split(".")
+    second_identifiers = second.split(".")
+    for first_part, second_part in zip(first_identifiers, second_identifiers, strict=False):
+        comparison = _compare_prerelease_identifier(first_part, second_part)
+        if comparison != 0:
+            return comparison
+    if len(first_identifiers) == len(second_identifiers):
+        return 0
+    return 1 if len(first_identifiers) > len(second_identifiers) else -1
+
+
+def _compare_prerelease_identifier(first: str, second: str) -> int:
+    if first == second:
+        return 0
+    first_numeric = first.isdigit()
+    second_numeric = second.isdigit()
+    if first_numeric and second_numeric:
+        first_number = int(first)
+        second_number = int(second)
+        return 1 if first_number > second_number else -1
+    if first_numeric:
+        return -1
+    if second_numeric:
+        return 1
+    return 1 if first > second else -1
 
 
 def _load_json_string(value: str) -> JsonValue:

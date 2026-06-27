@@ -448,6 +448,18 @@ def test_collector_does_not_advance_ledger_when_upload_response_lacks_acceptance
                 "accepted": True,
                 "batch_id": "filled-by-test",
                 "policy_version": 7,
+                "raw_artifact_count": 0,
+                "trace_count": 1,
+                "event_count": 1,
+                "unparsed_record_count": 0,
+            },
+            "raw_artifact_count did not match request",
+        ),
+        (
+            {
+                "accepted": True,
+                "batch_id": "filled-by-test",
+                "policy_version": 7,
                 "raw_artifact_count": 1,
                 "trace_count": 1,
                 "unparsed_record_count": 0,
@@ -504,6 +516,68 @@ def test_collector_does_not_advance_ledger_when_upload_ack_is_invalid(
         assert len(server.uploads) == 1
         ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
         assert _json_mapping(ledger["sources"], "ledger.sources") == {}
+    finally:
+        server.stop()
+
+
+def test_collector_quiet_failure_reports_error_check_in(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    upload_response: dict[str, JsonValue] = {
+        "accepted": True,
+        "batch_id": "filled-by-test",
+        "policy_version": 7,
+        "raw_artifact_count": 0,
+        "trace_count": 1,
+        "event_count": 1,
+        "unparsed_record_count": 0,
+    }
+
+    def fill_batch_id(payload: dict[str, JsonValue]) -> None:
+        upload_response["batch_id"] = payload["batch_id"]
+
+    server = _FakeWorkerServer(
+        upload_response=upload_response,
+        before_upload_response=fill_batch_id,
+        forward_only_first_install=False,
+    )
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        rollout_path.write_text('{"type":"turn","id":"quiet-error"}\n')
+
+        result = subprocess.run(
+            [str(hub_root / "dist/codex/core/bin" / COLLECTOR_BIN), "--host", "codex", "--quiet"],
+            env=_clean_env(
+                HOME=str(home),
+                CODEX_HOME=str(home / ".codex"),
+                PLUGIN_DATA=str(plugin_data),
+                PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+                PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN="plugin-token",
+                PROMPTLESS_WORKER_BASE_URL=server.base_url,
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0
+        assert result.stdout == ""
+        assert result.stderr == ""
+        assert [check_in["status"] for check_in in server.check_ins] == ["configured", "error"]
+        error_check_in = server.check_ins[1]
+        drift_reports = _json_array(error_check_in["drift_reports"], "drift_reports")
+        first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
+        assert first_drift_report["kind"] == "trace_collector_error"
+        assert "raw_artifact_count" in str(_json_mapping(first_drift_report["details"], "details")["error"])
     finally:
         server.stop()
 
@@ -765,8 +839,8 @@ def test_collector_splits_uploads_by_policy_batch_limit(tmp_path: Path) -> None:
         assert [_decode_chunk(chunk) for chunk in uploaded_chunks] == lines
         for upload in server.uploads:
             chunks = [_json_mapping(chunk, "chunk") for chunk in _json_array(upload["chunks"], "chunks")]
-            encoded_size = sum(len(str(chunk["content_gzip_base64"]).encode("utf-8")) for chunk in chunks)
-            assert encoded_size <= 200
+            decoded_size = sum(len(_decode_chunk(chunk)) for chunk in chunks)
+            assert decoded_size <= 200
         ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
         ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
         assert ledger_sources[str(rollout_path)] == sum(len(line) for line in lines)
@@ -999,6 +1073,68 @@ def test_collector_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> 
         drift_reports = _json_array(check_in["drift_reports"], "drift_reports")
         first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
         assert first_drift_report["kind"] == "collector_upgrade_required"
+    finally:
+        server.stop()
+
+
+def test_collector_allows_worker_required_runtime_older_than_current(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(required_bootstrap_version="0.0.1")
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+        )
+
+        assert payload["status"] == "configured"
+        assert server.uploads == []
+        assert [check_in["status"] for check_in in server.check_ins] == ["configured"]
+    finally:
+        server.stop()
+
+
+def test_collector_rejects_policy_without_signed_envelope_fields(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    del _FakeWorkerHandler.policy_response["signature"]
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "missing signature" in str(payload["message"])
+        assert server.check_ins == []
+        assert server.uploads == []
     finally:
         server.stop()
 
