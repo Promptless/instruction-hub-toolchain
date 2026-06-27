@@ -31,6 +31,8 @@ SEED_FILE_NAME = "host-enrollment-seed.json"
 HTTP_TIMEOUT_SECONDS = 10
 CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
+BOOTSTRAP_AUTH_FLAG_ENV = "PIGS_FLY"
+BOOTSTRAP_AUTH_FLAG_ENABLED_VALUE = "True"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
 
@@ -113,6 +115,10 @@ def main() -> int:
 
 def _run(host_arg: str, *, quiet: bool) -> int:
     host = _resolve_host(host_arg)
+    if not _bootstrap_auth_flow_enabled():
+        _emit({"status": "disabled", "reason": "pigs_fly_not_enabled", "host": host}, quiet=quiet)
+        return 0
+
     plugin_root = _plugin_root()
     seed = _load_seed()
     metadata = _load_runtime_metadata(plugin_root, host)
@@ -154,6 +160,12 @@ def _resolve_host(host_arg: str) -> Host:
     if os.environ.get("CLAUDE_PLUGIN_ROOT"):
         return "claude"
     return "codex"
+
+
+def _bootstrap_auth_flow_enabled() -> bool:
+    """Return whether the end-user device has enabled bootstrap auth testing."""
+
+    return os.environ.get(BOOTSTRAP_AUTH_FLAG_ENV) == BOOTSTRAP_AUTH_FLAG_ENABLED_VALUE
 
 
 def _plugin_root() -> Path | None:
