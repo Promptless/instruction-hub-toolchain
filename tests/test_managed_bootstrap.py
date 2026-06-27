@@ -102,6 +102,37 @@ def test_bootstrap_missing_token_exits_zero_without_config_write(tmp_path: Path)
     assert json.loads(quiet_result.stderr)["status"] == "setup_needed"
 
 
+def test_bootstrap_requires_local_pigs_fly_flag_before_auth_flow(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="disabled",
+            enable_bootstrap=False,
+        )
+
+        assert payload["reason"] == "pigs_fly_not_enabled"
+        assert result.stderr == ""
+        assert not (home / ".codex/config.toml").exists()
+        assert server.policy_requests == []
+        assert server.check_ins == []
+    finally:
+        server.stop()
+
+
 def test_bootstrap_loads_seed_from_plugin_data_file(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -590,10 +621,11 @@ def _run_bootstrap(
     env: dict[str, str],
     *,
     expected_status: str = "needs_restart",
+    enable_bootstrap: bool = True,
 ) -> tuple[dict[str, JsonValue], subprocess.CompletedProcess[str]]:
     result = subprocess.run(
         [str(plugin_root / "bin" / BOOTSTRAP_BIN), "--host", host],
-        env=_clean_env(**env),
+        env=_clean_env(enable_bootstrap=enable_bootstrap, **env),
         text=True,
         capture_output=True,
         check=False,
@@ -611,11 +643,13 @@ def _run_bootstrap(
     return payload, result
 
 
-def _clean_env(**overrides: str) -> dict[str, str]:
+def _clean_env(*, enable_bootstrap: bool = True, **overrides: str) -> dict[str, str]:
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES": "1",
     }
+    if enable_bootstrap:
+        env["PIGS_FLY"] = "True"
     env.update(overrides)
     return env
 
@@ -700,7 +734,9 @@ class _FakeWorkerServer:
         post_response: dict[str, JsonValue] | None = None,
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
+        self.policy_requests: list[str] = []
         _FakeWorkerHandler.check_ins = self.check_ins
+        _FakeWorkerHandler.policy_requests = self.policy_requests
         _FakeWorkerHandler.policy_response = policy or _signed_policy()
         _FakeWorkerHandler.post_response = post_response
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
@@ -719,6 +755,7 @@ class _FakeWorkerServer:
 
 class _FakeWorkerHandler(BaseHTTPRequestHandler):
     check_ins: ClassVar[list[dict[str, JsonValue]]] = []
+    policy_requests: ClassVar[list[str]] = []
     policy_response: ClassVar[dict[str, JsonValue]]
     post_response: ClassVar[dict[str, JsonValue] | None]
 
@@ -727,6 +764,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             self.send_response(401)
             self.end_headers()
             return
+        self.policy_requests.append(self.path)
         self._write_json(self.policy_response)
 
     def do_POST(self) -> None:
