@@ -244,6 +244,8 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert claude_settings["env"]["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"
+        assert claude_settings["env"]["OTEL_LOG_USER_PROMPTS"] == "1"
+        assert claude_settings["env"]["OTEL_LOG_ASSISTANT_RESPONSES"] == "0"
 
         assert len(server.session_requests) == 2
         assert server.session_requests[0]["deployment_instance_id"] == "worker-local-1"

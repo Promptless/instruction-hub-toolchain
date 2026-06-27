@@ -935,6 +935,9 @@ def _claude_env(policy: HostPolicy) -> dict[str, str]:
         "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": policy.collector.metrics_endpoint,
         "OTEL_EXPORTER_OTLP_HEADERS": _otel_headers(policy.collector.headers),
         "OTEL_LOG_USER_PROMPTS": _env_bool(_capture_enabled(policy, "user_prompts")),
+        # Claude Code falls back to OTEL_LOG_USER_PROMPTS for assistant responses
+        # when unset. Keep responses off until policy exposes an explicit field.
+        "OTEL_LOG_ASSISTANT_RESPONSES": "0",
         "OTEL_LOG_TOOL_DETAILS": _env_bool(_capture_enabled(policy, "tool_inputs")),
         "OTEL_LOG_TOOL_CONTENT": _env_bool(_capture_enabled(policy, "tool_outputs")),
         "OTEL_LOG_RAW_API_BODIES": _env_bool(_capture_enabled(policy, "raw_api_bodies")),
