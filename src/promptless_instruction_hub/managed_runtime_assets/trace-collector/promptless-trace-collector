@@ -6,15 +6,19 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import fcntl
 import glob
 import gzip
 import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -195,68 +199,78 @@ def _run(
         _emit({"status": "blocked", "reason": "collector_upgrade_required", "host": host}, quiet=quiet)
         return 0
 
-    roots = _native_roots_for_host(host, policy.trace_collection)
-    ledger = _load_ledger(_ledger_path())
-    upload_suppression = _trace_upload_suppression(policy, lifecycle_event)
-    check_in_url = _worker_url(seed.worker_base_url, "/v0/host-enrollment/check-ins")
-    _post_check_in(
-        check_in_url,
-        seed.plugin_enrollment_token,
-        host,
-        metadata,
-        policy,
-        status="configured",
-        needs_restart=False,
-        ledger_path=ledger.path,
-        root_count=len(roots),
-        drift_reports=[upload_suppression.drift_report] if upload_suppression is not None else [],
-    )
+    ledger_path = _ledger_path()
+    with _ledger_lock(ledger_path):
+        roots = _native_roots_for_host(host, policy.trace_collection)
+        ledger = _load_ledger(ledger_path)
+        upload_suppression = _trace_upload_suppression(policy, host, lifecycle_event)
+        check_in_url = _worker_url(seed.worker_base_url, "/v0/host-enrollment/check-ins")
+        _post_check_in(
+            check_in_url,
+            seed.plugin_enrollment_token,
+            host,
+            metadata,
+            policy,
+            status="configured",
+            needs_restart=False,
+            ledger_path=ledger.path,
+            root_count=len(roots),
+            drift_reports=[upload_suppression.drift_report] if upload_suppression is not None else [],
+        )
 
-    source_paths = _expand_native_paths(roots)
-    if ledger.is_new and policy.trace_collection.forward_only_first_install:
-        _baseline_sources(ledger, source_paths)
-        _save_ledger(ledger)
-        _emit({"status": "configured", "host": host, "baseline_only": True, "uploaded_chunks": 0}, quiet=quiet)
-        return 0
-
-    if upload_suppression is not None:
-        if upload_suppression.advance_ledger_to_current_end:
+        source_paths = _expand_native_paths(roots)
+        if ledger.is_new and policy.trace_collection.forward_only_first_install:
             _baseline_sources(ledger, source_paths)
             _save_ledger(ledger)
+            _emit({"status": "configured", "host": host, "baseline_only": True, "uploaded_chunks": 0}, quiet=quiet)
+            return 0
+
+        if upload_suppression is not None:
+            if upload_suppression.advance_ledger_to_current_end:
+                _baseline_sources(ledger, source_paths)
+                _save_ledger(ledger)
+            _emit(
+                {
+                    "status": "configured",
+                    "host": host,
+                    "baseline_only": False,
+                    "uploaded_chunks": 0,
+                    "trace_upload_suppressed": True,
+                    "suppression_reason": upload_suppression.reason,
+                },
+                quiet=quiet,
+            )
+            return 0
+
+        ranges = _collect_source_ranges(
+            source_paths,
+            ledger,
+            max_chunk_bytes=max(1, policy.trace_collection.max_batch_bytes // 2),
+        )
+        uploaded_chunks = 0
+        if ranges:
+            upload_batches = _build_upload_batches(
+                host=host,
+                metadata=metadata,
+                policy=policy,
+                ranges=ranges,
+                lifecycle_event=lifecycle_event,
+            )
+            for upload_batch in upload_batches:
+                _post_upload_batch(
+                    policy.trace_collection.upload_endpoint,
+                    seed.plugin_enrollment_token,
+                    policy,
+                    upload_batch,
+                )
+                _advance_ledger(ledger, upload_batch.ranges)
+                _save_ledger(ledger)
+                uploaded_chunks += len(upload_batch.ranges)
+
         _emit(
-            {
-                "status": "configured",
-                "host": host,
-                "baseline_only": False,
-                "uploaded_chunks": 0,
-                "trace_upload_suppressed": True,
-                "suppression_reason": upload_suppression.reason,
-            },
+            {"status": "configured", "host": host, "baseline_only": False, "uploaded_chunks": uploaded_chunks},
             quiet=quiet,
         )
-        return 0
-
-    ranges = _collect_source_ranges(
-        source_paths,
-        ledger,
-        max_chunk_bytes=max(1, policy.trace_collection.max_batch_bytes // 2),
-    )
-    uploaded_chunks = 0
-    if ranges:
-        upload_batches = _build_upload_batches(
-            host=host,
-            metadata=metadata,
-            policy=policy,
-            ranges=ranges,
-            lifecycle_event=lifecycle_event,
-        )
-        for upload_batch in upload_batches:
-            _post_json(policy.trace_collection.upload_endpoint, seed.plugin_enrollment_token, upload_batch.request)
-            _advance_ledger(ledger, upload_batch.ranges)
-            _save_ledger(ledger)
-            uploaded_chunks += len(upload_batch.ranges)
-
-    _emit({"status": "configured", "host": host, "baseline_only": False, "uploaded_chunks": uploaded_chunks}, quiet=quiet)
     return 0
 
 
@@ -283,7 +297,9 @@ def _resolve_host(host_arg: str) -> Host:
     return "codex"
 
 
-def _resolve_lifecycle_event(explicit_lifecycle: str | None, hook_context: dict[str, JsonValue]) -> LifecycleEvent | None:
+def _resolve_lifecycle_event(
+    explicit_lifecycle: str | None, hook_context: dict[str, JsonValue]
+) -> LifecycleEvent | None:
     if explicit_lifecycle in {"session_start", "stop", "session_end"}:
         return explicit_lifecycle
     for key in ("hook_event_name", "event_name", "event", "hook", "type"):
@@ -533,16 +549,45 @@ def _ledger_path() -> Path:
     return Path.home() / ".promptless/instruction-hub" / LEDGER_FILE_NAME
 
 
+@contextmanager
+def _ledger_lock(path: Path) -> Iterator[None]:
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _load_ledger(path: Path) -> SourceLedger:
     if not path.exists():
         return SourceLedger(path=path, is_new=True, sources={})
     try:
         value = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
-        raise CollectorError(f"trace collector ledger is invalid JSON at {path}: {exc.msg}") from exc
+    except json.JSONDecodeError:
+        return SourceLedger(path=path, is_new=False, sources={})
     mapping = _json_mapping(value)
     if mapping is None:
         raise CollectorError("trace collector ledger must be a JSON object")
+    return SourceLedger(path=path, is_new=False, sources=_ledger_sources_from_mapping(mapping))
+
+
+def _ledger_sources_from_disk(path: Path) -> dict[str, int]:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    mapping = _json_mapping(value)
+    if mapping is None:
+        return {}
+    return _ledger_sources_from_mapping(mapping)
+
+
+def _ledger_sources_from_mapping(mapping: dict[str, JsonValue]) -> dict[str, int]:
     raw_sources = mapping.get("sources")
     sources: dict[str, int] = {}
     if isinstance(raw_sources, dict):
@@ -552,13 +597,34 @@ def _load_ledger(path: Path) -> SourceLedger:
             offset = _int_value(offset_value)
             if offset is not None and offset >= 0:
                 sources[key] = offset
-    return SourceLedger(path=path, is_new=False, sources=sources)
+    return sources
 
 
 def _save_ledger(ledger: SourceLedger) -> None:
     ledger.path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"schema_version": 1, "sources": {key: ledger.sources[key] for key in sorted(ledger.sources)}}
-    ledger.path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    merged_sources = _ledger_sources_from_disk(ledger.path)
+    for key, offset in ledger.sources.items():
+        merged_sources[key] = max(merged_sources.get(key, 0), offset)
+    payload = {"schema_version": 1, "sources": {key: merged_sources[key] for key in sorted(merged_sources)}}
+    content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=ledger.path.parent,
+            prefix=f".{ledger.path.name}.",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(content)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, ledger.path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+    ledger.sources = merged_sources
     ledger.is_new = False
 
 
@@ -662,12 +728,9 @@ def _build_upload_batches(
         encoded_size = len(encoded.encode("utf-8"))
         if encoded_size > policy.trace_collection.max_batch_bytes:
             raise CollectorError("native trace chunk exceeds trace_collection.max_batch_bytes")
-        batch_is_full = (
-            current_chunks
-            and (
-                current_encoded_bytes + encoded_size > policy.trace_collection.max_batch_bytes
-                or len(current_chunks) >= MAX_UPLOAD_CHUNKS_PER_BATCH
-            )
+        batch_is_full = current_chunks and (
+            current_encoded_bytes + encoded_size > policy.trace_collection.max_batch_bytes
+            or len(current_chunks) >= MAX_UPLOAD_CHUNKS_PER_BATCH
         )
         if batch_is_full:
             batches.append(
@@ -739,6 +802,16 @@ def _upload_batch(
     return UploadBatch(request=request, ranges=list(ranges))
 
 
+def _post_upload_batch(
+    url: str,
+    token: str,
+    policy: HostPolicy,
+    upload_batch: UploadBatch,
+) -> None:
+    response = _post_json(url, token, upload_batch.request)
+    _validate_upload_response(response, upload_batch.request, policy.policy_version, url)
+
+
 def _post_check_in(
     url: str,
     token: str,
@@ -777,7 +850,39 @@ def _post_check_in(
         "checked_at": _utc_now_iso(),
         "bootstrap_version": metadata.collector_version,
     }
-    _post_json(url, token, payload)
+    response = _post_json(url, token, payload)
+    _validate_check_in_response(response, policy.policy_version, url)
+
+
+def _validate_check_in_response(response: dict[str, JsonValue], expected_policy_version: int, url: str) -> None:
+    _require_accepted_response(response, url)
+    policy_version = _int_value(response.get("policy_version"))
+    if policy_version != expected_policy_version:
+        raise CollectorError(f"worker response policy_version did not match request for {urlsplit(url).path}")
+
+
+def _validate_upload_response(
+    response: dict[str, JsonValue],
+    request: dict[str, JsonValue],
+    expected_policy_version: int,
+    url: str,
+) -> None:
+    _require_accepted_response(response, url)
+    request_batch_id = _string_value(request.get("batch_id"))
+    if _string_value(response.get("batch_id")) != request_batch_id:
+        raise CollectorError(f"worker response batch_id did not match request for {urlsplit(url).path}")
+    policy_version = _int_value(response.get("policy_version"))
+    if policy_version != expected_policy_version:
+        raise CollectorError(f"worker response policy_version did not match request for {urlsplit(url).path}")
+    for field in ("raw_artifact_count", "trace_count", "event_count", "unparsed_record_count"):
+        value = _int_value(response.get(field))
+        if value is None or value < 0:
+            raise CollectorError(f"worker response {field} must be a non-negative integer")
+
+
+def _require_accepted_response(response: dict[str, JsonValue], url: str) -> None:
+    if response.get("accepted") is not True:
+        raise CollectorError(f"worker did not accept request for {urlsplit(url).path}")
 
 
 def _capture_enabled(capture_policy: dict[str, str], key: str) -> bool | None:
@@ -787,7 +892,11 @@ def _capture_enabled(capture_policy: dict[str, str], key: str) -> bool | None:
     return value != "disabled"
 
 
-def _trace_upload_suppression(policy: HostPolicy, lifecycle_event: LifecycleEvent | None) -> UploadSuppression | None:
+def _trace_upload_suppression(
+    policy: HostPolicy,
+    host: Host,
+    lifecycle_event: LifecycleEvent | None,
+) -> UploadSuppression | None:
     disabled_capture_keys = _native_upload_disabled_capture_keys(policy.capture_policy)
     if disabled_capture_keys:
         return UploadSuppression(
@@ -800,7 +909,9 @@ def _trace_upload_suppression(policy: HostPolicy, lifecycle_event: LifecycleEven
                 "details": {"capture_keys": disabled_capture_keys},
             },
         )
-    if not policy.trace_collection.include_in_progress_traces and lifecycle_event != "session_end":
+    if not policy.trace_collection.include_in_progress_traces and not _is_terminal_lifecycle_event(
+        host, lifecycle_event
+    ):
         return UploadSuppression(
             reason="in_progress_trace",
             advance_ledger_to_current_end=False,
@@ -808,10 +919,16 @@ def _trace_upload_suppression(policy: HostPolicy, lifecycle_event: LifecycleEven
                 "kind": "trace_upload_waiting_for_session_end",
                 "message": "Native trace upload is waiting for a session-end hook per policy",
                 "repaired": False,
-                "details": {"lifecycle_event": lifecycle_event},
+                "details": {"host": host, "lifecycle_event": lifecycle_event},
             },
         )
     return None
+
+
+def _is_terminal_lifecycle_event(host: Host, lifecycle_event: LifecycleEvent | None) -> bool:
+    if host == "codex":
+        return lifecycle_event == "stop"
+    return lifecycle_event == "session_end"
 
 
 def _native_upload_disabled_capture_keys(capture_policy: dict[str, str]) -> list[str]:
@@ -843,7 +960,7 @@ def _get_json(url: str, token: str) -> JsonValue:
         raise CollectorError(f"worker returned HTTP {exc.code} for {urlsplit(url).path}") from exc
 
 
-def _post_json(url: str, token: str, payload: dict[str, JsonValue]) -> JsonValue:
+def _post_json(url: str, token: str, payload: dict[str, JsonValue]) -> dict[str, JsonValue]:
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -862,9 +979,9 @@ def _post_json(url: str, token: str, payload: dict[str, JsonValue]) -> JsonValue
     except urllib.error.HTTPError as exc:
         raise CollectorError(f"worker returned HTTP {exc.code} for {urlsplit(url).path}") from exc
     response_mapping = _json_mapping(response_body)
-    if response_mapping is None or response_mapping.get("accepted") is not True:
-        raise CollectorError(f"worker did not accept request for {urlsplit(url).path}")
-    return response_body
+    if response_mapping is None:
+        raise CollectorError(f"worker response for {urlsplit(url).path} must be a JSON object")
+    return response_mapping
 
 
 def _validate_upload_endpoint(value: str) -> None:
@@ -884,7 +1001,13 @@ def _normalize_base_url(value: str) -> str:
     parsed = urlsplit(stripped)
     if parsed.scheme not in {"http", "https"} or parsed.netloc == "":
         raise CollectorError("worker base URL must be an absolute HTTP(S) URL")
-    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.username is not None or parsed.password is not None:
+    if (
+        parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         raise CollectorError("worker base URL must not include credentials, path, query, or fragment")
     if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
         override = os.environ.get(TEST_URL_OVERRIDE_ENV)
