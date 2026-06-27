@@ -9,6 +9,7 @@ import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -68,7 +69,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
     _assert_no_promptless_directory(hub_root)
 
 
-def test_bootstrap_missing_token_exits_zero_without_config_write(tmp_path: Path) -> None:
+def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
@@ -80,6 +81,7 @@ def test_bootstrap_missing_token_exits_zero_without_config_write(tmp_path: Path)
             HOME=str(home),
             CODEX_HOME=str(home / ".codex"),
             PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+            PROMPTLESS_WORKER_BASE_URL="http://127.0.0.1:9",
         ),
         text=True,
         capture_output=True,
@@ -87,9 +89,8 @@ def test_bootstrap_missing_token_exits_zero_without_config_write(tmp_path: Path)
     )
 
     assert result.returncode == 0
-    assert json.loads(result.stdout)["status"] == "setup_needed"
+    assert json.loads(result.stderr)["status"] == "error"
     assert not (home / ".codex/config.toml").exists()
-    assert "plugin-token" not in result.stdout
 
     quiet_result = subprocess.run(
         [str(hub_root / "dist/codex/core/bin" / BOOTSTRAP_BIN), "--host", "codex", "--quiet"],
@@ -97,6 +98,7 @@ def test_bootstrap_missing_token_exits_zero_without_config_write(tmp_path: Path)
             HOME=str(home),
             CODEX_HOME=str(home / ".codex"),
             PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+            PROMPTLESS_WORKER_BASE_URL="http://127.0.0.1:9",
         ),
         text=True,
         capture_output=True,
@@ -105,7 +107,7 @@ def test_bootstrap_missing_token_exits_zero_without_config_write(tmp_path: Path)
 
     assert quiet_result.returncode == 0
     assert quiet_result.stdout == ""
-    assert json.loads(quiet_result.stderr)["status"] == "setup_needed"
+    assert quiet_result.stderr == ""
 
 
 def test_bootstrap_requires_local_pigs_fly_flag_before_auth_flow(tmp_path: Path) -> None:
@@ -123,7 +125,6 @@ def test_bootstrap_requires_local_pigs_fly_flag_before_auth_flow(tmp_path: Path)
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="disabled",
@@ -133,6 +134,7 @@ def test_bootstrap_requires_local_pigs_fly_flag_before_auth_flow(tmp_path: Path)
         assert payload["reason"] == "pigs_fly_not_enabled"
         assert result.stderr == ""
         assert not (home / ".codex/config.toml").exists()
+        assert server.session_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
     finally:
@@ -149,7 +151,7 @@ def test_bootstrap_loads_seed_from_plugin_data_file(tmp_path: Path) -> None:
         plugin_data = tmp_path / "plugin-data"
         plugin_data.mkdir()
         (plugin_data / "host-enrollment-seed.json").write_text(
-            json.dumps({"plugin_enrollment_token": "plugin-token", "worker_base_url": server.base_url})
+            json.dumps({"worker_base_url": server.base_url})
         )
 
         home = tmp_path / "home"
@@ -166,6 +168,8 @@ def test_bootstrap_loads_seed_from_plugin_data_file(tmp_path: Path) -> None:
 
         assert len(server.check_ins) == 1
         assert server.check_ins[0]["host"] == "codex"
+        assert len(server.session_requests) == 1
+        assert (plugin_data / "host-enrollment-state.json").exists()
     finally:
         server.stop()
 
@@ -183,7 +187,6 @@ def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path
             "HOME": str(home),
             "CODEX_HOME": str(home / ".codex"),
             "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-            "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
             "PROMPTLESS_WORKER_BASE_URL": "http://example.com",
             "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES": "0",
         },
@@ -209,7 +212,6 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -219,7 +221,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert 'endpoint = "http://127.0.0.1:4318/v1/traces"' in codex_config
         assert codex_config.count('protocol = "binary"') == 2
         assert "metrics_exporter" not in codex_config
-        assert "plugin-token" not in codex_config
+        assert "plihost_localcredential" not in codex_config
         codex_otel = tomllib.loads(codex_config)["otel"]
         assert codex_otel["exporter"]["otlp-http"]["protocol"] == "binary"
         assert codex_otel["trace_exporter"]["otlp-http"]["protocol"] == "binary"
@@ -233,7 +235,6 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
                 "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -244,6 +245,19 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"
 
+        assert len(server.session_requests) == 2
+        assert server.session_requests[0]["deployment_instance_id"] == "worker-local-1"
+        assert server.session_requests[0]["target"] == "codex"
+        assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
+        assert server.session_requests[0]["plugin_version"] == "0.1.0"
+        assert server.session_requests[0]["package_id"] == "core"
+        assert server.session_requests[0]["bootstrap_version"] == "0.1.0"
+        assert server.session_requests[0]["toolchain_version"] != "unknown"
+        assert server.session_requests[1]["target"] == "claude"
+        assert server.policy_requests == [
+            "/v0/host-enrollment/policy?target=codex",
+            "/v0/host-enrollment/policy?target=claude",
+        ]
         assert len(server.check_ins) == 2
         for check_in in server.check_ins:
             assert set(check_in) == {
@@ -288,7 +302,6 @@ def test_bootstrap_missing_managed_runtime_manifest_uses_default_metadata(tmp_pa
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(plugin_root),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -325,7 +338,6 @@ def test_bootstrap_blocks_unsupported_codex_capture_policy_values(tmp_path: Path
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="blocked",
@@ -360,7 +372,6 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -385,7 +396,6 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
                 "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -455,7 +465,6 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="blocked",
@@ -477,7 +486,6 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
                 "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="blocked",
@@ -504,7 +512,6 @@ def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_pa
             "HOME": str(codex_home),
             "CODEX_HOME": str(codex_home / ".codex"),
             "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-            "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
         _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
@@ -518,7 +525,6 @@ def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_pa
             "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
             "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
             "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-            "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
         _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
@@ -532,6 +538,7 @@ def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_pa
             "needs_restart",
             "configured",
         ]
+        assert [request["target"] for request in server.session_requests] == ["codex", "claude"]
     finally:
         server.stop()
 
@@ -560,7 +567,6 @@ def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> N
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="error",
@@ -587,7 +593,6 @@ def test_bootstrap_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> 
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="blocked",
@@ -617,7 +622,6 @@ def test_bootstrap_rejects_invalid_check_in_success_response(tmp_path: Path) -> 
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="error",
@@ -645,8 +649,10 @@ def _run_bootstrap(
         check=False,
     )
     assert result.returncode == 0
-    assert "plugin-token" not in result.stdout
-    assert "plugin-token" not in result.stderr
+    assert "plihost_localcredential" not in result.stdout
+    assert "plihost_localcredential" not in result.stderr
+    assert "plihenroll_devicecode" not in result.stdout
+    assert "plihenroll_devicecode" not in result.stderr
     payload_text = result.stdout.strip() or result.stderr.strip()
     payload = (
         _json_mapping(validate_json_value(json.loads(payload_text), "bootstrap output"), "bootstrap output")
@@ -661,6 +667,7 @@ def _clean_env(*, enable_bootstrap: bool = True, **overrides: str) -> dict[str, 
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES": "1",
+        "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER": "0",
     }
     if enable_bootstrap:
         env["PIGS_FLY"] = "True"
@@ -749,8 +756,12 @@ class _FakeWorkerServer:
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
         self.policy_requests: list[str] = []
+        self.poll_requests: list[dict[str, JsonValue]] = []
+        self.session_requests: list[dict[str, JsonValue]] = []
         _FakeWorkerHandler.check_ins = self.check_ins
         _FakeWorkerHandler.policy_requests = self.policy_requests
+        _FakeWorkerHandler.poll_requests = self.poll_requests
+        _FakeWorkerHandler.session_requests = self.session_requests
         _FakeWorkerHandler.policy_response = policy or _signed_policy()
         _FakeWorkerHandler.post_response = post_response
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
@@ -770,11 +781,28 @@ class _FakeWorkerServer:
 class _FakeWorkerHandler(BaseHTTPRequestHandler):
     check_ins: ClassVar[list[dict[str, JsonValue]]] = []
     policy_requests: ClassVar[list[str]] = []
+    poll_requests: ClassVar[list[dict[str, JsonValue]]] = []
     policy_response: ClassVar[dict[str, JsonValue]]
     post_response: ClassVar[dict[str, JsonValue] | None]
+    session_requests: ClassVar[list[dict[str, JsonValue]]] = []
 
     def do_GET(self) -> None:
-        if self.path != "/v0/host-enrollment/policy" or self.headers.get("Authorization") != "Bearer plugin-token":
+        if self.path == "/healthz":
+            self._write_json(
+                {
+                    "status": "ok",
+                    "deployment_instance_id": "worker-local-1",
+                    "worker_version": "test",
+                }
+            )
+            return
+        parsed = urlsplit(self.path)
+        target = parse_qs(parsed.query).get("target")
+        if (
+            parsed.path != "/v0/host-enrollment/policy"
+            or target not in (["codex"], ["claude"])
+            or self.headers.get("Authorization") != "Bearer plihost_localcredential"
+        ):
             self.send_response(401)
             self.end_headers()
             return
@@ -782,15 +810,43 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self._write_json(self.policy_response)
 
     def do_POST(self) -> None:
-        if self.path != "/v0/host-enrollment/check-ins" or self.headers.get("Authorization") != "Bearer plugin-token":
+        if self.path == "/v0/host-enrollment/sessions":
+            payload = self._read_json_request("session create request")
+            self.session_requests.append(payload)
+            self._write_json(
+                {
+                    "session_id": "11111111-1111-4111-8111-111111111111",
+                    "device_code": "plihenroll_devicecode",
+                    "approval_url": "https://app.promptless.ai/instruction-hub/enroll?token=approval-token",
+                    "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
+                    "poll_interval_seconds": 1,
+                }
+            )
+            return
+        if self.path == "/v0/host-enrollment/sessions/11111111-1111-4111-8111-111111111111/poll":
+            payload = self._read_json_request("session poll request")
+            if payload.get("device_code") != "plihenroll_devicecode":
+                self.send_response(401)
+                self.end_headers()
+                return
+            self.poll_requests.append(payload)
+            self._write_json(
+                {
+                    "status": "approved",
+                    "host_credential": "plihost_localcredential",
+                    "credential_id": "22222222-2222-4222-8222-222222222222",
+                    "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
+                }
+            )
+            return
+        if (
+            self.path != "/v0/host-enrollment/check-ins"
+            or self.headers.get("Authorization") != "Bearer plihost_localcredential"
+        ):
             self.send_response(401)
             self.end_headers()
             return
-        length = int(self.headers["Content-Length"])
-        payload = _json_mapping(
-            validate_json_value(json.loads(self.rfile.read(length)), "check-in request"),
-            "check-in request",
-        )
+        payload = self._read_json_request("check-in request")
         self.check_ins.append(payload)
         self._write_json(self.post_response or {"accepted": True, "policy_version": 1})
 
@@ -804,6 +860,13 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_json_request(self, label: str) -> dict[str, JsonValue]:
+        length = int(self.headers["Content-Length"])
+        return _json_mapping(
+            validate_json_value(json.loads(self.rfile.read(length)), label),
+            label,
+        )
 
 
 def _signed_policy() -> dict[str, JsonValue]:

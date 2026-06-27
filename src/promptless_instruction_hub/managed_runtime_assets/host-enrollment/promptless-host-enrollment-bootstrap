@@ -5,19 +5,24 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import getpass
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
+import uuid
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TextIO
-from urllib.parse import SplitResult, urlsplit
+from urllib.parse import SplitResult, urlencode, urlsplit
 
 BOOTSTRAP_VERSION = "0.1.0"
 BOOTSTRAP_CHANNEL = "stable"
@@ -28,11 +33,14 @@ MANAGED_BEGIN = "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_RUNTIME_MANIFEST = Path("hub.managed-runtimes.json")
 SEED_FILE_NAME = "host-enrollment-seed.json"
+STATE_FILE_NAME = "host-enrollment-state.json"
 HTTP_TIMEOUT_SECONDS = 10
+ENROLLMENT_POLL_DEADLINE_SECONDS = 35
 CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
 BOOTSTRAP_AUTH_FLAG_ENV = "PIGS_FLY"
 BOOTSTRAP_AUTH_FLAG_ENABLED_VALUE = "True"
+OPEN_BROWSER_ENV = "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
 
@@ -46,12 +54,22 @@ class BootstrapError(RuntimeError):
     """Expected non-fatal bootstrap failure."""
 
 
+class BootstrapAuthError(BootstrapError):
+    """Host credential was rejected by the worker."""
+
+
 @dataclass(frozen=True)
 class EnrollmentSeed:
-    """Private enrollment seed used to authenticate with the worker."""
+    """Local worker discovery settings for browser-approved enrollment."""
 
-    plugin_enrollment_token: str | None
     worker_base_url: str
+
+
+@dataclass(frozen=True)
+class WorkerHealth:
+    """Worker metadata needed to bind a local host credential."""
+
+    deployment_instance_id: str
 
 
 @dataclass(frozen=True)
@@ -90,6 +108,46 @@ class HostPolicy:
 
 
 @dataclass(frozen=True)
+class EnrollmentContext:
+    """Host identity and plugin metadata sent to the worker enrollment bridge."""
+
+    worker_base_url: str
+    deployment_instance_id: str
+    metadata: RuntimeMetadata
+    host_instance_id: str
+    host_label: str
+    host_platform: str
+
+
+@dataclass(frozen=True)
+class HostCredential:
+    """Local per-host credential approved through the browser flow."""
+
+    value: str
+    credential_id: str | None
+
+
+@dataclass(frozen=True)
+class EnrollmentSession:
+    """Pending browser approval session created by the worker."""
+
+    session_id: str
+    device_code: str
+    approval_url: str
+    expires_at: dt.datetime
+    poll_interval_seconds: int
+
+
+@dataclass(frozen=True)
+class CredentialLookup:
+    """Credential lookup result from local state."""
+
+    credential: HostCredential | None
+    state: dict[str, JsonValue]
+    state_path: Path
+
+
+@dataclass(frozen=True)
 class ConfigResult:
     """Host config write result."""
 
@@ -122,16 +180,24 @@ def _run(host_arg: str, *, quiet: bool) -> int:
     plugin_root = _plugin_root()
     seed = _load_seed()
     metadata = _load_runtime_metadata(plugin_root, host)
-    if seed.plugin_enrollment_token is None:
-        _emit(
-            {"status": "setup_needed", "reason": "missing_enrollment_token", "host": host},
-            stream=sys.stderr if quiet else None,
-        )
+    health = _get_worker_health(seed.worker_base_url)
+    context = _enrollment_context(seed.worker_base_url, health, metadata)
+    credential = _obtain_host_credential(context)
+    if credential is None:
+        _emit({"status": "setup_pending", "reason": "approval_pending", "host": host}, quiet=quiet)
         return 0
 
-    policy_url = _worker_url(seed.worker_base_url, "/v0/host-enrollment/policy")
+    policy_url = _worker_url(seed.worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
     check_in_url = _worker_url(seed.worker_base_url, "/v0/host-enrollment/check-ins")
-    signed_policy = _get_json(policy_url, seed.plugin_enrollment_token)
+    try:
+        signed_policy = _get_json(policy_url, credential.value, label="policy response")
+    except BootstrapAuthError:
+        _forget_cached_host_credential(context)
+        credential = _enroll_host_credential(context)
+        if credential is None:
+            _emit({"status": "setup_pending", "reason": "approval_pending", "host": host}, quiet=quiet)
+            return 0
+        signed_policy = _get_json(policy_url, credential.value, label="policy response")
     policy = _validate_signed_policy(signed_policy, host)
     if _requires_newer_bootstrap(policy.required_bootstrap_version, BOOTSTRAP_VERSION):
         result = _blocked_result(
@@ -144,12 +210,12 @@ def _run(host_arg: str, *, quiet: bool) -> int:
                 "bootstrap_version": BOOTSTRAP_VERSION,
             },
         )
-        _post_check_in(check_in_url, seed.plugin_enrollment_token, host, metadata, policy, result)
+        _post_check_in(check_in_url, credential, host, metadata, policy, result)
         _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
         return 0
 
     result = _configure_host(host, policy)
-    _post_check_in(check_in_url, seed.plugin_enrollment_token, host, metadata, policy, result)
+    _post_check_in(check_in_url, credential, host, metadata, policy, result)
     _emit({"status": result.status, "host": host, "needs_restart": result.needs_restart}, quiet=quiet)
     return 0
 
@@ -176,35 +242,63 @@ def _plugin_root() -> Path | None:
 
 
 def _load_seed() -> EnrollmentSeed:
-    env_seed = _seed_from_environment()
-    if env_seed.plugin_enrollment_token is not None:
-        return env_seed
+    env_base_url = _base_url_from_environment()
+    if env_base_url is not None:
+        return EnrollmentSeed(worker_base_url=_normalize_base_url(env_base_url))
 
     for path in _seed_paths():
-        seed = _seed_from_file(path)
-        if seed.plugin_enrollment_token is not None:
-            return seed
-    return env_seed
+        base_url = _base_url_from_file(path)
+        if base_url is not None:
+            return EnrollmentSeed(worker_base_url=_normalize_base_url(base_url))
+    return EnrollmentSeed(worker_base_url=DEFAULT_WORKER_BASE_URL)
 
 
-def _seed_from_environment() -> EnrollmentSeed:
+def _base_url_from_environment() -> str | None:
     seed_json = os.environ.get("PROMPTLESS_HOST_ENROLLMENT_SEED")
     if seed_json:
-        seed = _seed_from_mapping(_load_json_string(seed_json), fallback_base_url=DEFAULT_WORKER_BASE_URL)
-        if seed.plugin_enrollment_token is not None:
-            return seed
+        return _base_url_from_mapping(_load_json_string(seed_json))
+    return os.environ.get("PROMPTLESS_WORKER_BASE_URL") or os.environ.get("INSTRUCTION_HUB_WORKER_BASE_URL")
 
-    token = (
-        os.environ.get("PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN")
-        or os.environ.get("INSTRUCTION_HUB_PLUGIN_ENROLLMENT_TOKEN")
-        or os.environ.get("PLUGIN_ENROLLMENT_TOKEN")
+
+def _base_url_from_file(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        raw_value = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise BootstrapError(f"enrollment seed is invalid JSON at {path}: {exc.msg}") from exc
+    return _base_url_from_mapping(raw_value)
+
+
+def _base_url_from_mapping(raw_value: object) -> str | None:
+    if not isinstance(raw_value, dict):
+        raise BootstrapError("enrollment seed must be a JSON object")
+    return _non_empty(_string_value(raw_value.get("worker_base_url")))
+
+
+def _get_worker_health(worker_base_url: str) -> WorkerHealth:
+    payload = _get_json(_worker_url(worker_base_url, "/healthz"), None, label="worker health response")
+    deployment_instance_id = _non_empty(_string_value(payload.get("deployment_instance_id")))
+    if deployment_instance_id is None:
+        raise BootstrapError("worker health response missing deployment_instance_id")
+    return WorkerHealth(deployment_instance_id=deployment_instance_id)
+
+
+def _enrollment_context(worker_base_url: str, health: WorkerHealth, metadata: RuntimeMetadata) -> EnrollmentContext:
+    state_path = _state_path()
+    state = _load_state(state_path)
+    host_instance_id = _host_instance_id(state)
+    if state.get("host_instance_id") != host_instance_id:
+        state["host_instance_id"] = host_instance_id
+        _write_state(state_path, state)
+    return EnrollmentContext(
+        worker_base_url=worker_base_url,
+        deployment_instance_id=health.deployment_instance_id,
+        metadata=metadata,
+        host_instance_id=host_instance_id,
+        host_label=_host_label(),
+        host_platform=_host_platform(),
     )
-    base_url = (
-        os.environ.get("PROMPTLESS_WORKER_BASE_URL")
-        or os.environ.get("INSTRUCTION_HUB_WORKER_BASE_URL")
-        or DEFAULT_WORKER_BASE_URL
-    )
-    return EnrollmentSeed(plugin_enrollment_token=_non_empty(token), worker_base_url=_normalize_base_url(base_url))
 
 
 def _seed_paths() -> tuple[Path, ...]:
@@ -217,22 +311,263 @@ def _seed_paths() -> tuple[Path, ...]:
     return tuple(paths)
 
 
-def _seed_from_file(path: Path) -> EnrollmentSeed:
+def _state_path() -> Path:
+    for raw_dir in (os.environ.get("PLUGIN_DATA"), os.environ.get("CLAUDE_PLUGIN_DATA")):
+        if raw_dir:
+            return Path(raw_dir).expanduser() / STATE_FILE_NAME
+    return Path.home() / ".promptless/instruction-hub" / STATE_FILE_NAME
+
+
+def _load_state(path: Path) -> dict[str, JsonValue]:
     if not path.exists():
-        return EnrollmentSeed(plugin_enrollment_token=None, worker_base_url=DEFAULT_WORKER_BASE_URL)
+        return {}
     try:
-        raw_value = json.loads(path.read_text())
+        value = json.loads(path.read_text())
     except json.JSONDecodeError as exc:
-        raise BootstrapError(f"enrollment seed is invalid JSON at {path}: {exc.msg}") from exc
-    return _seed_from_mapping(raw_value, fallback_base_url=DEFAULT_WORKER_BASE_URL)
+        raise BootstrapError(f"host enrollment state is invalid JSON at {path}: {exc.msg}") from exc
+    if not isinstance(value, dict):
+        raise BootstrapError(f"host enrollment state must be a JSON object at {path}")
+    return _json_object(value)
 
 
-def _seed_from_mapping(raw_value: object, *, fallback_base_url: str) -> EnrollmentSeed:
-    if not isinstance(raw_value, dict):
-        raise BootstrapError("enrollment seed must be a JSON object")
-    token = _string_value(raw_value.get("plugin_enrollment_token"))
-    base_url = _string_value(raw_value.get("worker_base_url")) or fallback_base_url
-    return EnrollmentSeed(plugin_enrollment_token=_non_empty(token), worker_base_url=_normalize_base_url(base_url))
+def _write_state(path: Path, state: dict[str, JsonValue]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    _atomic_write_text(path, body)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _host_instance_id(state: dict[str, JsonValue]) -> str:
+    existing = _non_empty(_string_value(state.get("host_instance_id")))
+    if existing is not None:
+        return existing
+    return f"host-{uuid.uuid4().hex}"
+
+
+def _host_label() -> str:
+    username = _non_empty(getpass.getuser()) or "unknown-user"
+    node = _non_empty(platform.node()) or "unknown-host"
+    return _truncate(f"{username}@{node}", 240)
+
+
+def _host_platform() -> str:
+    return _truncate(platform.platform(), 120)
+
+
+def _truncate(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return value[:max_length]
+
+
+def _obtain_host_credential(context: EnrollmentContext) -> HostCredential | None:
+    lookup = _cached_host_credential(context)
+    if lookup.credential is not None:
+        return lookup.credential
+    return _enroll_host_credential(context, state=lookup.state, state_path=lookup.state_path)
+
+
+def _cached_host_credential(context: EnrollmentContext) -> CredentialLookup:
+    state_path = _state_path()
+    state = _load_state(state_path)
+    credentials = _json_mapping_or_empty(state.get("credentials"))
+    cached_credential = _json_mapping_or_empty(credentials.get(_credential_cache_key(context)))
+    credential_value = _string_value(cached_credential.get("value"))
+    credential_id = _string_value(cached_credential.get("credential_id"))
+    credential = HostCredential(value=credential_value, credential_id=credential_id) if credential_value else None
+    return CredentialLookup(credential=credential, state=state, state_path=state_path)
+
+
+def _forget_cached_host_credential(context: EnrollmentContext) -> None:
+    state_path = _state_path()
+    state = _load_state(state_path)
+    credentials = _json_mapping_or_empty(state.get("credentials"))
+    key = _credential_cache_key(context)
+    if key in credentials:
+        del credentials[key]
+        state["credentials"] = credentials
+        _write_state(state_path, state)
+
+
+def _enroll_host_credential(
+    context: EnrollmentContext,
+    *,
+    state: dict[str, JsonValue] | None = None,
+    state_path: Path | None = None,
+) -> HostCredential | None:
+    state_path = state_path or _state_path()
+    if state is None:
+        state = _load_state(state_path)
+    session = _pending_enrollment_session(context, state)
+    if session is None:
+        session = _create_enrollment_session(context)
+        _store_pending_enrollment(context, state_path, state, session)
+        _open_approval_url(session.approval_url)
+    credential = _poll_enrollment_session(context, session)
+    if credential is None:
+        return None
+    _store_host_credential(context, state_path, state, credential)
+    return credential
+
+
+def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, JsonValue]) -> EnrollmentSession | None:
+    pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+    session_value = _json_mapping_or_empty(pending_enrollments.get(_credential_cache_key(context)))
+    if not session_value:
+        return None
+    expires_at = _optional_datetime_value(session_value.get("expires_at"), "pending enrollment expires_at")
+    if expires_at is None or expires_at <= dt.datetime.now(dt.timezone.utc):
+        return None
+    session_id = _string_value(session_value.get("session_id"))
+    device_code = _string_value(session_value.get("device_code"))
+    approval_url = _string_value(session_value.get("approval_url"))
+    poll_interval_seconds = _optional_int_value(session_value.get("poll_interval_seconds"))
+    if session_id is None or device_code is None or approval_url is None or poll_interval_seconds is None:
+        return None
+    return EnrollmentSession(
+        session_id=session_id,
+        device_code=device_code,
+        approval_url=approval_url,
+        expires_at=expires_at,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+
+
+def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSession:
+    payload: dict[str, JsonValue] = {
+        "deployment_instance_id": context.deployment_instance_id,
+        "target": context.metadata.target,
+        "plugin_id": context.metadata.plugin_id,
+        "plugin_version": context.metadata.plugin_version,
+        "package_id": context.metadata.package_id,
+        "bootstrap_version": context.metadata.bootstrap_version,
+        "toolchain_version": context.metadata.toolchain_version,
+        "host_instance_id": context.host_instance_id,
+        "host_label": context.host_label,
+        "host_platform": context.host_platform,
+    }
+    response = _post_json_response(
+        _worker_url(context.worker_base_url, "/v0/host-enrollment/sessions"),
+        None,
+        payload,
+        label="host enrollment session response",
+    )
+    session_id = _string_value(response.get("session_id"))
+    device_code = _string_value(response.get("device_code"))
+    approval_url = _string_value(response.get("approval_url"))
+    expires_at = _datetime_value(response.get("expires_at"), "host enrollment session expires_at")
+    poll_interval_seconds = _int_value(response.get("poll_interval_seconds"), "host enrollment poll interval")
+    if session_id is None or device_code is None or approval_url is None:
+        raise BootstrapError("host enrollment session response missing required fields")
+    if poll_interval_seconds < 1 or poll_interval_seconds > 30:
+        raise BootstrapError("host enrollment poll interval must be between 1 and 30 seconds")
+    return EnrollmentSession(
+        session_id=session_id,
+        device_code=device_code,
+        approval_url=approval_url,
+        expires_at=expires_at,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+
+
+def _store_pending_enrollment(
+    context: EnrollmentContext,
+    state_path: Path,
+    state: dict[str, JsonValue],
+    session: EnrollmentSession,
+) -> None:
+    pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+    pending_enrollments[_credential_cache_key(context)] = {
+        "session_id": session.session_id,
+        "device_code": session.device_code,
+        "approval_url": session.approval_url,
+        "expires_at": session.expires_at.isoformat(),
+        "poll_interval_seconds": session.poll_interval_seconds,
+    }
+    state["pending_enrollments"] = pending_enrollments
+    _write_state(state_path, state)
+
+
+def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSession) -> HostCredential | None:
+    deadline = time.monotonic() + ENROLLMENT_POLL_DEADLINE_SECONDS
+    while True:
+        response = _post_json_response(
+            _worker_url(context.worker_base_url, f"/v0/host-enrollment/sessions/{session.session_id}/poll"),
+            None,
+            {"device_code": session.device_code},
+            label="host enrollment poll response",
+        )
+        status = _string_value(response.get("status"))
+        if status == "approved":
+            host_credential = _string_value(response.get("host_credential"))
+            if host_credential is None:
+                raise BootstrapError("approved host enrollment poll response missing host_credential")
+            return HostCredential(value=host_credential, credential_id=_string_value(response.get("credential_id")))
+        if status in {"expired", "consumed"}:
+            _forget_pending_enrollment(context)
+            return None
+        if status != "pending":
+            raise BootstrapError("host enrollment poll response has invalid status")
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            return None
+        time.sleep(min(float(session.poll_interval_seconds), remaining_seconds))
+
+
+def _store_host_credential(
+    context: EnrollmentContext,
+    state_path: Path,
+    state: dict[str, JsonValue],
+    credential: HostCredential,
+) -> None:
+    credentials = _json_mapping_or_empty(state.get("credentials"))
+    credentials[_credential_cache_key(context)] = {
+        "value": credential.value,
+        "credential_id": credential.credential_id,
+        "worker_base_url": context.worker_base_url,
+        "deployment_instance_id": context.deployment_instance_id,
+        "target": context.metadata.target,
+        "plugin_id": context.metadata.plugin_id,
+        "package_id": context.metadata.package_id,
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    state["credentials"] = credentials
+    pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+    pending_enrollments.pop(_credential_cache_key(context), None)
+    state["pending_enrollments"] = pending_enrollments
+    _write_state(state_path, state)
+
+
+def _forget_pending_enrollment(context: EnrollmentContext) -> None:
+    state_path = _state_path()
+    state = _load_state(state_path)
+    pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+    if pending_enrollments.pop(_credential_cache_key(context), None) is not None:
+        state["pending_enrollments"] = pending_enrollments
+        _write_state(state_path, state)
+
+
+def _credential_cache_key(context: EnrollmentContext) -> str:
+    cache_material = {
+        "deployment_instance_id": context.deployment_instance_id,
+        "package_id": context.metadata.package_id,
+        "plugin_id": context.metadata.plugin_id,
+        "target": context.metadata.target,
+        "worker_base_url": context.worker_base_url,
+    }
+    return hashlib.sha256(json.dumps(cache_material, sort_keys=True).encode()).hexdigest()
+
+
+def _open_approval_url(approval_url: str) -> None:
+    if os.environ.get(OPEN_BROWSER_ENV) == "0":
+        return
+    try:
+        webbrowser.open(approval_url, new=2, autoraise=True)
+    except webbrowser.Error:
+        return
 
 
 def _worker_url(worker_base_url: str, path: str) -> str:
@@ -282,52 +617,63 @@ def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetad
     return defaults
 
 
-def _get_json(url: str, token: str) -> dict[str, JsonValue]:
-    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"}, method="GET")
+def _get_json(url: str, token: str | None, *, label: str) -> dict[str, JsonValue]:
+    headers = _auth_headers(token)
+    request = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             body = response.read()
     except urllib.error.HTTPError as exc:
-        raise BootstrapError(f"policy request failed with HTTP {exc.code}") from exc
-    return _decode_json_object(body, "policy response")
+        if exc.code in {401, 403}:
+            raise BootstrapAuthError(f"{label} request failed with HTTP {exc.code}") from exc
+        raise BootstrapError(f"{label} request failed with HTTP {exc.code}") from exc
+    return _decode_json_object(body, label)
 
 
 def _post_check_in(
     url: str,
-    token: str,
+    credential: HostCredential,
     host: Host,
     metadata: RuntimeMetadata,
     policy: HostPolicy,
     result: ConfigResult,
 ) -> None:
     payload = _check_in_payload(host, metadata, policy, result)
-    _post_json(url, token, payload, expected_policy_version=policy.policy_version)
+    response_payload = _post_json_response(url, credential.value, payload, label="check-in response")
+    if response_payload.get("accepted") is not True:
+        raise BootstrapError("check-in response was not accepted")
+    response_policy_version = response_payload.get("policy_version")
+    if type(response_policy_version) is not int or response_policy_version != policy.policy_version:
+        raise BootstrapError("check-in response policy version did not match the applied policy")
 
 
-def _post_json(
+def _post_json_response(
     url: str,
-    token: str,
+    token: str | None,
     payload: dict[str, JsonValue],
     *,
-    expected_policy_version: int,
-) -> None:
+    label: str,
+) -> dict[str, JsonValue]:
     body = json.dumps(payload, sort_keys=True).encode()
     request = urllib.request.Request(
         url,
         data=body,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={**_auth_headers(token), "Content-Type": "application/json"},
         method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-            response_payload = _decode_json_object(response.read(), "check-in response")
+            return _decode_json_object(response.read(), label)
     except urllib.error.HTTPError as exc:
-        raise BootstrapError(f"check-in request failed with HTTP {exc.code}") from exc
-    if response_payload.get("accepted") is not True:
-        raise BootstrapError("check-in response was not accepted")
-    response_policy_version = response_payload.get("policy_version")
-    if type(response_policy_version) is not int or response_policy_version != expected_policy_version:
-        raise BootstrapError("check-in response policy version did not match the applied policy")
+        if exc.code in {401, 403}:
+            raise BootstrapAuthError(f"{label} request failed with HTTP {exc.code}") from exc
+        raise BootstrapError(f"{label} request failed with HTTP {exc.code}") from exc
+
+
+def _auth_headers(token: str | None) -> dict[str, str]:
+    if token is None:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _check_in_payload(
@@ -783,9 +1129,21 @@ def _datetime_value(value: JsonValue | None, field_name: str) -> dt.datetime:
     return parsed
 
 
+def _optional_datetime_value(value: JsonValue | None, field_name: str) -> dt.datetime | None:
+    if value is None:
+        return None
+    return _datetime_value(value, field_name)
+
+
 def _int_value(value: JsonValue | None, field_name: str) -> int:
     if type(value) is not int:
         raise BootstrapError(f"{field_name} must be an integer")
+    return value
+
+
+def _optional_int_value(value: JsonValue | None) -> int | None:
+    if type(value) is not int:
+        return None
     return value
 
 
@@ -823,6 +1181,12 @@ def _json_value(value: object) -> JsonValue:
     if isinstance(value, dict):
         return _json_object(value)
     raise BootstrapError(f"unsupported JSON value: {type(value).__name__}")
+
+
+def _json_mapping_or_empty(value: JsonValue | None) -> dict[str, JsonValue]:
+    if not isinstance(value, dict):
+        return {}
+    return value
 
 
 def _normalize_base_url(value: str) -> str:
@@ -917,7 +1281,7 @@ def _redact_json(value: JsonValue) -> JsonValue:
     if isinstance(value, dict):
         redacted: dict[str, JsonValue] = {}
         for key, child in value.items():
-            if key.lower() in {"authorization", "plugin_enrollment_token", "token"}:
+            if key.lower() in {"authorization", "device_code", "host_credential", "token"}:
                 redacted[key] = "<redacted>"
             else:
                 redacted[key] = _redact_json(child)
@@ -927,7 +1291,8 @@ def _redact_json(value: JsonValue) -> JsonValue:
 
 def _redact_text(value: str) -> str:
     redacted = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", value)
-    return re.sub(r"(plugin_enrollment_token=)[^,\s]+", r"\1<redacted>", redacted)
+    redacted = re.sub(r"plihost_[A-Za-z0-9._~+/=-]+", "plihost_<redacted>", redacted)
+    return re.sub(r"plihenroll_[A-Za-z0-9._~+/=-]+", "plihenroll_<redacted>", redacted)
 
 
 if __name__ == "__main__":
