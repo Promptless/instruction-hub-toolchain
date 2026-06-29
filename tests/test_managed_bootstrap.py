@@ -150,9 +150,7 @@ def test_bootstrap_loads_seed_from_plugin_data_file(tmp_path: Path) -> None:
     try:
         plugin_data = tmp_path / "plugin-data"
         plugin_data.mkdir()
-        (plugin_data / "host-enrollment-seed.json").write_text(
-            json.dumps({"worker_base_url": server.base_url})
-        )
+        (plugin_data / "host-enrollment-seed.json").write_text(json.dumps({"worker_base_url": server.base_url}))
 
         home = tmp_path / "home"
         _run_bootstrap(
