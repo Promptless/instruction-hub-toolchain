@@ -78,10 +78,9 @@ into generated customer plugins, including the host enrollment bootstrap used by
 Codex and Claude startup hooks. During dogfood, generated hooks invoke the
 bundled stdlib-only Python script with `python3`.
 
-When local `PIGS_FLY=True` is set, the dogfood bootstrap discovers the worker
-base URL from `PROMPTLESS_HOST_ENROLLMENT_SEED`, `PROMPTLESS_WORKER_BASE_URL`,
-`INSTRUCTION_HUB_WORKER_BASE_URL`, plugin data, or the default production worker.
-It creates a browser-approved host enrollment session through the worker-local
+When local `PIGS_FLY=True` is set, the dogfood bootstrap uses
+`PROMPTLESS_WORKER_BASE_URL` or the default production worker. It creates a
+browser-approved host enrollment session through the worker-local
 `/v0/host-enrollment/sessions` bridge, polls the matching session endpoint for a
 one-time per-host credential, caches that credential in plugin/user data, and
 then uses the host credential to fetch `/v0/host-enrollment/policy?target=...`

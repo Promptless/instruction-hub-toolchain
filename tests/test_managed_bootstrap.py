@@ -141,7 +141,7 @@ def test_bootstrap_requires_local_pigs_fly_flag_before_auth_flow(tmp_path: Path)
         server.stop()
 
 
-def test_bootstrap_loads_seed_from_plugin_data_file(tmp_path: Path) -> None:
+def test_bootstrap_uses_plugin_data_for_state_file(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
@@ -150,7 +150,6 @@ def test_bootstrap_loads_seed_from_plugin_data_file(tmp_path: Path) -> None:
     try:
         plugin_data = tmp_path / "plugin-data"
         plugin_data.mkdir()
-        (plugin_data / "host-enrollment-seed.json").write_text(json.dumps({"worker_base_url": server.base_url}))
 
         home = tmp_path / "home"
         _run_bootstrap(
@@ -161,6 +160,7 @@ def test_bootstrap_loads_seed_from_plugin_data_file(tmp_path: Path) -> None:
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
 

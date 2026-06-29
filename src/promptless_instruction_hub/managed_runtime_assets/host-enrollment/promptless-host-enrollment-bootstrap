@@ -32,7 +32,6 @@ DEFAULT_WORKER_BASE_URL = "https://pig.promptless.ai"
 MANAGED_BEGIN = "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_RUNTIME_MANIFEST = Path("hub.managed-runtimes.json")
-SEED_FILE_NAME = "host-enrollment-seed.json"
 STATE_FILE_NAME = "host-enrollment-state.json"
 HTTP_TIMEOUT_SECONDS = 10
 ENROLLMENT_POLL_DEADLINE_SECONDS = 35
@@ -55,13 +54,6 @@ class BootstrapError(RuntimeError):
 
 class BootstrapAuthError(BootstrapError):
     """Host credential was rejected by the worker."""
-
-
-@dataclass(frozen=True)
-class EnrollmentSeed:
-    """Local worker discovery settings for browser-approved enrollment."""
-
-    worker_base_url: str
 
 
 @dataclass(frozen=True)
@@ -177,17 +169,17 @@ def _run(host_arg: str, *, quiet: bool) -> int:
         return 0
 
     plugin_root = _plugin_root()
-    seed = _load_seed()
+    worker_base_url = _worker_base_url()
     metadata = _load_runtime_metadata(plugin_root, host)
-    health = _get_worker_health(seed.worker_base_url)
-    context = _enrollment_context(seed.worker_base_url, health, metadata)
+    health = _get_worker_health(worker_base_url)
+    context = _enrollment_context(worker_base_url, health, metadata)
     credential = _obtain_host_credential(context)
     if credential is None:
         _emit({"status": "setup_pending", "reason": "approval_pending", "host": host}, quiet=quiet)
         return 0
 
-    policy_url = _worker_url(seed.worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
-    check_in_url = _worker_url(seed.worker_base_url, "/v0/host-enrollment/check-ins")
+    policy_url = _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
+    check_in_url = _worker_url(worker_base_url, "/v0/host-enrollment/check-ins")
     try:
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
     except BootstrapAuthError:
@@ -240,39 +232,8 @@ def _plugin_root() -> Path | None:
     return Path(raw_root).expanduser()
 
 
-def _load_seed() -> EnrollmentSeed:
-    env_base_url = _base_url_from_environment()
-    if env_base_url is not None:
-        return EnrollmentSeed(worker_base_url=_normalize_base_url(env_base_url))
-
-    for path in _seed_paths():
-        base_url = _base_url_from_file(path)
-        if base_url is not None:
-            return EnrollmentSeed(worker_base_url=_normalize_base_url(base_url))
-    return EnrollmentSeed(worker_base_url=DEFAULT_WORKER_BASE_URL)
-
-
-def _base_url_from_environment() -> str | None:
-    seed_json = os.environ.get("PROMPTLESS_HOST_ENROLLMENT_SEED")
-    if seed_json:
-        return _base_url_from_mapping(_load_json_string(seed_json))
-    return os.environ.get("PROMPTLESS_WORKER_BASE_URL") or os.environ.get("INSTRUCTION_HUB_WORKER_BASE_URL")
-
-
-def _base_url_from_file(path: Path) -> str | None:
-    if not path.exists():
-        return None
-    try:
-        raw_value = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
-        raise BootstrapError(f"enrollment seed is invalid JSON at {path}: {exc.msg}") from exc
-    return _base_url_from_mapping(raw_value)
-
-
-def _base_url_from_mapping(raw_value: object) -> str | None:
-    if not isinstance(raw_value, dict):
-        raise BootstrapError("enrollment seed must be a JSON object")
-    return _non_empty(_string_value(raw_value.get("worker_base_url")))
+def _worker_base_url() -> str:
+    return _normalize_base_url(os.environ.get("PROMPTLESS_WORKER_BASE_URL") or DEFAULT_WORKER_BASE_URL)
 
 
 def _get_worker_health(worker_base_url: str) -> WorkerHealth:
@@ -298,16 +259,6 @@ def _enrollment_context(worker_base_url: str, health: WorkerHealth, metadata: Ru
         host_label=_host_label(),
         host_platform=_host_platform(),
     )
-
-
-def _seed_paths() -> tuple[Path, ...]:
-    paths: list[Path] = []
-    for raw_dir in (os.environ.get("PLUGIN_DATA"), os.environ.get("CLAUDE_PLUGIN_DATA")):
-        if raw_dir:
-            paths.append(Path(raw_dir).expanduser() / SEED_FILE_NAME)
-    paths.append(Path.home() / ".promptless/instruction-hub" / SEED_FILE_NAME)
-    paths.append(Path.home() / ".config/promptless/instruction-hub" / SEED_FILE_NAME)
-    return tuple(paths)
 
 
 def _state_path() -> Path:
@@ -1159,13 +1110,6 @@ def _decode_json_object(body: bytes, label: str) -> dict[str, JsonValue]:
     return _json_object(value)
 
 
-def _load_json_string(value: str) -> object:
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise BootstrapError(f"enrollment seed env is invalid JSON: {exc.msg}") from exc
-
-
 def _json_object(value: dict[object, object]) -> dict[str, JsonValue]:
     result: dict[str, JsonValue] = {}
     for key, child in value.items():
@@ -1214,9 +1158,7 @@ def _validate_worker_transport(parsed: SplitResult, field_name: str) -> None:
         return
     if _test_url_overrides_enabled() and _is_loopback_parsed_url(parsed):
         return
-    raise BootstrapError(
-        f"{field_name} must use HTTPS unless {TEST_URL_OVERRIDE_ENV}=1 and the host is loopback"
-    )
+    raise BootstrapError(f"{field_name} must use HTTPS unless {TEST_URL_OVERRIDE_ENV}=1 and the host is loopback")
 
 
 def _string_value(value: object) -> str | None:
