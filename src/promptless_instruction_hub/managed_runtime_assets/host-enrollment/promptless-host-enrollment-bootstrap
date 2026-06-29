@@ -39,7 +39,6 @@ ENROLLMENT_POLL_DEADLINE_SECONDS = 35
 CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
 BOOTSTRAP_AUTH_FLAG_ENV = "PIGS_FLY"
-BOOTSTRAP_AUTH_FLAG_ENABLED_VALUE = "True"
 OPEN_BROWSER_ENV = "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
@@ -231,7 +230,7 @@ def _resolve_host(host_arg: str) -> Host:
 def _bootstrap_auth_flow_enabled() -> bool:
     """Return whether the end-user device has enabled bootstrap auth testing."""
 
-    return os.environ.get(BOOTSTRAP_AUTH_FLAG_ENV) == BOOTSTRAP_AUTH_FLAG_ENABLED_VALUE
+    return os.environ.get(BOOTSTRAP_AUTH_FLAG_ENV) == "True"
 
 
 def _plugin_root() -> Path | None:
