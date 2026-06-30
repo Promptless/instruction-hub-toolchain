@@ -25,7 +25,7 @@ import uuid
 import webbrowser
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO, Literal, Optional, Union
@@ -142,7 +142,7 @@ class TraceCollectionPolicy:
 
 @dataclass(frozen=True)
 class HostPolicy:
-    """Validated signed worker policy body."""
+    """Shape-validated worker policy body from a signed-policy response."""
 
     policy_version: int
     trace_collection: TraceCollectionPolicy
@@ -152,22 +152,28 @@ class HostPolicy:
 
 
 @dataclass(frozen=True)
-class SourceRange:
-    """One complete-line byte range ready to upload from a native JSONL file."""
+class SourceEvent:
+    """One complete native JSONL source event that can advance the ledger."""
 
+    kind: Literal["jsonl_range", "oversized_record"]
     path: Path
     path_hash: str
     start_offset: int
     end_offset: int
-    content: bytes
+    byte_count: int
+    content_sha256: str
+    content: Optional[bytes]
+    oversized_reason: Optional[str]
 
 
 @dataclass(frozen=True)
 class UploadBatch:
-    """One worker trace upload request and the source ranges it commits."""
+    """One worker trace upload request and the source events it commits."""
 
     request: dict[str, JsonValue]
-    ranges: list[SourceRange]
+    events: list[SourceEvent]
+    raw_artifact_count: int
+    skipped_record_count: int
 
 
 @dataclass(frozen=True)
@@ -186,6 +192,10 @@ class SourceLedger:
     path: Path
     is_new: bool
     sources: dict[str, int]
+    reset_sources: set[str] = field(default_factory=set)
+    drift_reports: list[dict[str, JsonValue]] = field(default_factory=list)
+    legacy_ledger_imports: set[str] = field(default_factory=set)
+    recover_to_current_end: bool = False
 
 
 def main() -> int:
@@ -272,6 +282,9 @@ def _run(
             roots = _native_roots_for_host(host, policy.trace_collection)
             ledger = _load_ledger(ledger_path)
             upload_suppression = _trace_upload_suppression(policy, host, lifecycle_event)
+            drift_reports = list(ledger.drift_reports)
+            if upload_suppression is not None:
+                drift_reports.append(upload_suppression.drift_report)
             _post_check_in(
                 check_in_url,
                 credential.value,
@@ -282,11 +295,26 @@ def _run(
                 needs_restart=False,
                 ledger_path=ledger.path,
                 root_count=len(roots),
-                drift_reports=[upload_suppression.drift_report] if upload_suppression is not None else [],
+                drift_reports=drift_reports,
             )
             configured_check_in_accepted = True
 
             source_paths = _expand_native_paths(roots)
+            if ledger.recover_to_current_end:
+                _baseline_sources(ledger, source_paths)
+                _save_ledger(ledger)
+                _emit(
+                    {
+                        "status": "configured",
+                        "host": host,
+                        "baseline_only": True,
+                        "uploaded_chunks": 0,
+                        "ledger_recovered": True,
+                    },
+                    quiet=quiet,
+                )
+                return 0
+
             if ledger.is_new and policy.trace_collection.forward_only_first_install:
                 _baseline_sources(ledger, source_paths)
                 _save_ledger(ledger)
@@ -311,7 +339,8 @@ def _run(
                 return 0
 
             uploaded_chunks = 0
-            ranges = _iter_source_ranges(
+            skipped_records = 0
+            events = _iter_source_events(
                 source_paths,
                 ledger,
                 max_chunk_bytes=policy.trace_collection.max_batch_bytes,
@@ -320,7 +349,7 @@ def _run(
                 host=host,
                 metadata=metadata,
                 policy=policy,
-                ranges=ranges,
+                events=events,
                 lifecycle_event=lifecycle_event,
             )
             for upload_batch in upload_batches:
@@ -330,14 +359,23 @@ def _run(
                     policy,
                     upload_batch,
                 )
-                _advance_ledger(ledger, upload_batch.ranges)
+                _advance_ledger(ledger, upload_batch.events)
                 _save_ledger(ledger)
-                uploaded_chunks += len(upload_batch.ranges)
+                uploaded_chunks += upload_batch.raw_artifact_count
+                skipped_records += upload_batch.skipped_record_count
 
-            _emit(
-                {"status": "configured", "host": host, "baseline_only": False, "uploaded_chunks": uploaded_chunks},
-                quiet=quiet,
-            )
+            if ledger.reset_sources:
+                _save_ledger(ledger)
+
+            result_payload: dict[str, JsonValue] = {
+                "status": "configured",
+                "host": host,
+                "baseline_only": False,
+                "uploaded_chunks": uploaded_chunks,
+            }
+            if skipped_records:
+                result_payload["skipped_records"] = skipped_records
+            _emit(result_payload, quiet=quiet)
     except (CollectorError, OSError, ValueError, urllib.error.URLError) as exc:
         if configured_check_in_accepted:
             _post_error_check_in(
@@ -1071,16 +1109,21 @@ def _validate_trace_collection(value: dict[str, JsonValue], host: Host) -> Trace
     enabled_sources = _host_tuple(value.get("enabled_sources"), "trace_collection.enabled_sources")
     if host not in enabled_sources:
         raise CollectorError(f"worker policy does not enable source {host}")
-    max_batch_bytes = _int_value(value.get("max_batch_bytes")) or 10 * 1024 * 1024
+    raw_max_batch_bytes = _int_value(value.get("max_batch_bytes"))
+    max_batch_bytes = raw_max_batch_bytes if raw_max_batch_bytes is not None else 10 * 1024 * 1024
     if max_batch_bytes <= 0:
         raise CollectorError("trace_collection.max_batch_bytes must be positive")
+    native_roots = _native_root_tuple(value.get("native_roots"))
+    invalid_root_sources = sorted({root.source for root in native_roots if root.source not in enabled_sources})
+    if invalid_root_sources:
+        raise CollectorError("trace_collection.native_roots source must be enabled by trace_collection.enabled_sources")
     return TraceCollectionPolicy(
         upload_endpoint=upload_endpoint,
         enabled_sources=enabled_sources,
         forward_only_first_install=_bool_value(value.get("forward_only_first_install"), default=True),
         include_in_progress_traces=_bool_value(value.get("include_in_progress_traces"), default=True),
         max_batch_bytes=max_batch_bytes,
-        native_roots=_native_root_tuple(value.get("native_roots")),
+        native_roots=native_roots,
     )
 
 
@@ -1139,10 +1182,25 @@ def _ledger_path() -> Path:
     raw_path = os.environ.get("PROMPTLESS_TRACE_COLLECTOR_LEDGER")
     if raw_path:
         return Path(raw_path).expanduser()
-    for raw_dir in (os.environ.get("PLUGIN_DATA"), os.environ.get("CLAUDE_PLUGIN_DATA")):
-        if raw_dir:
-            return Path(raw_dir).expanduser() / LEDGER_FILE_NAME
     return Path.home() / ".promptless/instruction-hub" / LEDGER_FILE_NAME
+
+
+def _legacy_ledger_paths(global_path: Path) -> tuple[Path, ...]:
+    if os.environ.get("PROMPTLESS_TRACE_COLLECTOR_LEDGER"):
+        return ()
+
+    paths: list[Path] = []
+    seen = {str(global_path)}
+    for raw_dir in (os.environ.get("PLUGIN_DATA"), os.environ.get("CLAUDE_PLUGIN_DATA")):
+        if not raw_dir:
+            continue
+        legacy_path = Path(raw_dir).expanduser() / LEDGER_FILE_NAME
+        legacy_key = str(legacy_path)
+        if legacy_key in seen:
+            continue
+        seen.add(legacy_key)
+        paths.append(legacy_path)
+    return tuple(paths)
 
 
 @contextmanager
@@ -1155,50 +1213,133 @@ def _ledger_lock(path: Path) -> Iterator[None]:
 
 
 def _load_ledger(path: Path) -> SourceLedger:
-    if not path.exists():
-        return SourceLedger(path=path, is_new=True, sources={})
-    try:
-        value = json.loads(path.read_text())
-    except json.JSONDecodeError:
-        return SourceLedger(path=path, is_new=False, sources={})
-    mapping = _json_mapping(value)
-    if mapping is None:
-        raise CollectorError("trace collector ledger must be a JSON object")
-    return SourceLedger(path=path, is_new=False, sources=_ledger_sources_from_mapping(mapping))
+    disk_state = _ledger_state_from_disk(path)
+    if disk_state is None:
+        return _recover_corrupt_ledger(path)
+
+    sources, legacy_ledger_imports = disk_state
+    ledger = SourceLedger(
+        path=path,
+        is_new=not path.exists(),
+        sources=sources,
+        legacy_ledger_imports=legacy_ledger_imports,
+    )
+    _import_legacy_ledgers(ledger)
+    return ledger
+
+
+def _import_legacy_ledgers(ledger: SourceLedger) -> None:
+    imported_sources = False
+    for legacy_path in _legacy_ledger_paths(ledger.path):
+        legacy_key = str(legacy_path)
+        if legacy_key in ledger.legacy_ledger_imports:
+            continue
+        legacy_state = _ledger_state_from_disk(legacy_path)
+        if legacy_state is None:
+            continue
+        legacy_sources, _legacy_imports = legacy_state
+        if not legacy_sources:
+            continue
+        for source_key, offset in legacy_sources.items():
+            ledger.sources[source_key] = max(ledger.sources.get(source_key, 0), offset)
+        ledger.legacy_ledger_imports.add(legacy_key)
+        imported_sources = True
+
+    if imported_sources:
+        _save_ledger(ledger)
+
+
+def _recover_corrupt_ledger(path: Path) -> SourceLedger:
+    backup_path = _corrupt_ledger_backup_path(path)
+    path.rename(backup_path)
+    return SourceLedger(
+        path=path,
+        is_new=False,
+        sources={},
+        drift_reports=[
+            {
+                "kind": "trace_ledger_corrupt",
+                "message": "Local trace ledger was corrupt and has been moved aside",
+                "repaired": True,
+                "details": {"backup_path": str(backup_path)},
+            }
+        ],
+        recover_to_current_end=True,
+    )
+
+
+def _corrupt_ledger_backup_path(path: Path) -> Path:
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    suffix = secrets.token_hex(4)
+    return path.with_name(f"{path.name}.corrupt-{timestamp}-{suffix}")
 
 
 def _ledger_sources_from_disk(path: Path) -> dict[str, int]:
-    if not path.exists():
+    disk_state = _ledger_state_from_disk(path)
+    if disk_state is None:
         return {}
+    sources, _legacy_ledger_imports = disk_state
+    return sources
+
+
+def _ledger_state_from_disk(path: Path) -> Optional[tuple[dict[str, int], set[str]]]:
+    if not path.exists():
+        return {}, set()
     try:
         value = json.loads(path.read_text())
     except json.JSONDecodeError:
-        return {}
+        return None
     mapping = _json_mapping(value)
     if mapping is None:
-        return {}
-    return _ledger_sources_from_mapping(mapping)
+        return None
+    sources = _ledger_sources_from_mapping(mapping)
+    if sources is None:
+        return None
+    return sources, _legacy_ledger_imports_from_mapping(mapping)
 
 
-def _ledger_sources_from_mapping(mapping: dict[str, JsonValue]) -> dict[str, int]:
+def _ledger_sources_from_mapping(mapping: dict[str, JsonValue]) -> Optional[dict[str, int]]:
     raw_sources = mapping.get("sources")
+    if not isinstance(raw_sources, dict):
+        return None
     sources: dict[str, int] = {}
-    if isinstance(raw_sources, dict):
-        for key, offset_value in raw_sources.items():
-            if not isinstance(key, str):
-                continue
-            offset = _int_value(offset_value)
-            if offset is not None and offset >= 0:
-                sources[key] = offset
+    for key, offset_value in raw_sources.items():
+        if not isinstance(key, str):
+            return None
+        offset = _int_value(offset_value)
+        if offset is None or offset < 0:
+            return None
+        sources[key] = offset
     return sources
+
+
+def _legacy_ledger_imports_from_mapping(mapping: dict[str, JsonValue]) -> set[str]:
+    raw_imports = mapping.get("legacy_ledger_imports")
+    if not isinstance(raw_imports, list):
+        return set()
+    return {value for value in raw_imports if isinstance(value, str)}
 
 
 def _save_ledger(ledger: SourceLedger) -> None:
     ledger.path.parent.mkdir(parents=True, exist_ok=True)
-    merged_sources = _ledger_sources_from_disk(ledger.path)
+    disk_state = _ledger_state_from_disk(ledger.path)
+    if disk_state is None:
+        merged_sources: dict[str, int] = {}
+        legacy_ledger_imports: set[str] = set()
+    else:
+        merged_sources, legacy_ledger_imports = disk_state
     for key, offset in ledger.sources.items():
-        merged_sources[key] = max(merged_sources.get(key, 0), offset)
-    payload = {"schema_version": 1, "sources": {key: merged_sources[key] for key in sorted(merged_sources)}}
+        if key in ledger.reset_sources:
+            merged_sources[key] = offset
+        else:
+            merged_sources[key] = max(merged_sources.get(key, 0), offset)
+    legacy_ledger_imports.update(ledger.legacy_ledger_imports)
+    payload: dict[str, JsonValue] = {
+        "schema_version": 1,
+        "sources": {key: merged_sources[key] for key in sorted(merged_sources)},
+    }
+    if legacy_ledger_imports:
+        payload["legacy_ledger_imports"] = sorted(legacy_ledger_imports)
     content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     temp_path: Optional[Path] = None
     try:
@@ -1219,10 +1360,15 @@ def _save_ledger(ledger: SourceLedger) -> None:
         if temp_path is not None and temp_path.exists():
             temp_path.unlink()
     ledger.sources = merged_sources
+    ledger.reset_sources.clear()
+    ledger.legacy_ledger_imports = legacy_ledger_imports
+    ledger.recover_to_current_end = False
     ledger.is_new = False
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
     directory_fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(directory_fd)
@@ -1236,12 +1382,12 @@ def _baseline_sources(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> N
         ledger.sources[str(path)] = complete_end
 
 
-def _iter_source_ranges(
+def _iter_source_events(
     source_paths: tuple[Path, ...],
     ledger: SourceLedger,
     *,
     max_chunk_bytes: int,
-) -> Iterator[SourceRange]:
+) -> Iterator[SourceEvent]:
     if max_chunk_bytes <= 0:
         raise CollectorError("native trace upload chunk limit must be positive")
 
@@ -1251,10 +1397,21 @@ def _iter_source_ranges(
         file_size = path.stat().st_size
         if start_offset > file_size:
             start_offset = 0
+            ledger.sources[path_key] = 0
+            ledger.reset_sources.add(path_key)
+        snapshot_end_offset = _complete_end_offset(path)
+        if start_offset >= snapshot_end_offset:
+            continue
         with path.open("rb") as file:
             file.seek(start_offset)
-            for source_range in _stream_source_ranges(path, file, start_offset, max_chunk_bytes=max_chunk_bytes):
-                yield source_range
+            for source_event in _stream_source_events(
+                path,
+                file,
+                start_offset,
+                snapshot_end_offset=snapshot_end_offset,
+                max_chunk_bytes=max_chunk_bytes,
+            ):
+                yield source_event
 
 
 def _complete_end_offset(path: Path) -> int:
@@ -1271,72 +1428,185 @@ def _complete_end_offset(path: Path) -> int:
             offset += len(chunk)
 
 
-def _stream_source_ranges(
+def _stream_source_events(
     path: Path,
     file: BinaryIO,
     start_offset: int,
     *,
+    snapshot_end_offset: int,
     max_chunk_bytes: int,
-) -> Iterator[SourceRange]:
+) -> Iterator[SourceEvent]:
     path_hash = _path_hash(path)
     chunk_start_offset = start_offset
     chunk = bytearray()
-    while True:
+    while file.tell() < snapshot_end_offset:
         line_start_offset = file.tell()
-        line = file.readline(max_chunk_bytes + 1)
+        read_limit = min(max_chunk_bytes + 1, snapshot_end_offset - line_start_offset)
+        line = file.readline(read_limit)
         if not line:
             break
-        if len(line) > max_chunk_bytes:
-            if line.endswith(b"\n") or _remainder_contains_newline(file):
-                if chunk:
-                    yield SourceRange(
-                        path=path,
-                        path_hash=path_hash,
-                        start_offset=chunk_start_offset,
-                        end_offset=line_start_offset,
-                        content=bytes(chunk),
-                    )
-                raise CollectorError(f"native trace line exceeds {max_chunk_bytes} byte upload chunk limit")
-            break
-        if not line.endswith(b"\n"):
-            break
-        if chunk and len(chunk) + len(line) > max_chunk_bytes:
-            yield SourceRange(
+        if len(line) > max_chunk_bytes or not line.endswith(b"\n"):
+            if chunk:
+                yield _source_event(
+                    path=path,
+                    path_hash=path_hash,
+                    start_offset=chunk_start_offset,
+                    content=bytes(chunk),
+                )
+            if line.endswith(b"\n"):
+                yield _oversized_source_event(
+                    path=path,
+                    path_hash=path_hash,
+                    start_offset=line_start_offset,
+                    content=line,
+                    reason="decoded_size",
+                )
+            else:
+                yield _read_oversized_source_event(
+                    path=path,
+                    path_hash=path_hash,
+                    file=file,
+                    start_offset=line_start_offset,
+                    first_piece=line,
+                    snapshot_end_offset=snapshot_end_offset,
+                    reason="decoded_size",
+                )
+            chunk = bytearray()
+            chunk_start_offset = file.tell()
+            continue
+
+        line_encoded_size = _encoded_content_size(line)
+        if line_encoded_size > max_chunk_bytes:
+            if chunk:
+                yield _source_event(
+                    path=path,
+                    path_hash=path_hash,
+                    start_offset=chunk_start_offset,
+                    content=bytes(chunk),
+                )
+            yield _oversized_source_event(
                 path=path,
                 path_hash=path_hash,
-                start_offset=chunk_start_offset,
-                end_offset=line_start_offset,
-                content=bytes(chunk),
+                start_offset=line_start_offset,
+                content=line,
+                reason="encoded_size",
             )
             chunk = bytearray()
-            chunk_start_offset = line_start_offset
-        elif not chunk:
+            chunk_start_offset = file.tell()
+            continue
+
+        if chunk:
+            candidate = bytes(chunk) + line
+            if len(candidate) > max_chunk_bytes or _encoded_content_size(candidate) > max_chunk_bytes:
+                yield _source_event(
+                    path=path,
+                    path_hash=path_hash,
+                    start_offset=chunk_start_offset,
+                    content=bytes(chunk),
+                )
+                chunk = bytearray(line)
+                chunk_start_offset = line_start_offset
+                continue
+        else:
             chunk_start_offset = line_start_offset
         chunk.extend(line)
 
     if chunk:
-        yield SourceRange(
+        yield _source_event(
             path=path,
             path_hash=path_hash,
             start_offset=chunk_start_offset,
-            end_offset=chunk_start_offset + len(chunk),
             content=bytes(chunk),
         )
 
 
-def _remainder_contains_newline(file: BinaryIO) -> bool:
-    while True:
-        chunk = file.read(SOURCE_READ_BLOCK_BYTES)
-        if not chunk:
-            return False
-        if b"\n" in chunk:
-            return True
+def _source_event(*, path: Path, path_hash: str, start_offset: int, content: bytes) -> SourceEvent:
+    return SourceEvent(
+        kind="jsonl_range",
+        path=path,
+        path_hash=path_hash,
+        start_offset=start_offset,
+        end_offset=start_offset + len(content),
+        byte_count=len(content),
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        content=content,
+        oversized_reason=None,
+    )
 
 
-def _advance_ledger(ledger: SourceLedger, ranges: list[SourceRange]) -> None:
-    for source_range in ranges:
-        path_key = str(source_range.path)
-        ledger.sources[path_key] = max(ledger.sources.get(path_key, 0), source_range.end_offset)
+def _oversized_source_event(
+    *,
+    path: Path,
+    path_hash: str,
+    start_offset: int,
+    content: bytes,
+    reason: str,
+) -> SourceEvent:
+    return SourceEvent(
+        kind="oversized_record",
+        path=path,
+        path_hash=path_hash,
+        start_offset=start_offset,
+        end_offset=start_offset + len(content),
+        byte_count=len(content),
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        content=None,
+        oversized_reason=reason,
+    )
+
+
+def _read_oversized_source_event(
+    *,
+    path: Path,
+    path_hash: str,
+    file: BinaryIO,
+    start_offset: int,
+    first_piece: bytes,
+    snapshot_end_offset: int,
+    reason: str,
+) -> SourceEvent:
+    content_hash = hashlib.sha256()
+    content_hash.update(first_piece)
+    byte_count = len(first_piece)
+    while file.tell() < snapshot_end_offset:
+        remaining = snapshot_end_offset - file.tell()
+        block = file.read(min(SOURCE_READ_BLOCK_BYTES, remaining))
+        if not block:
+            break
+        newline_index = block.find(b"\n")
+        if newline_index == -1:
+            content_hash.update(block)
+            byte_count += len(block)
+            continue
+        record_tail = block[: newline_index + 1]
+        content_hash.update(record_tail)
+        byte_count += len(record_tail)
+        extra_bytes = len(block) - len(record_tail)
+        if extra_bytes:
+            file.seek(file.tell() - extra_bytes)
+        break
+
+    return SourceEvent(
+        kind="oversized_record",
+        path=path,
+        path_hash=path_hash,
+        start_offset=start_offset,
+        end_offset=start_offset + byte_count,
+        byte_count=byte_count,
+        content_sha256=content_hash.hexdigest(),
+        content=None,
+        oversized_reason=reason,
+    )
+
+
+def _encoded_content_size(content: bytes) -> int:
+    return len(base64.b64encode(gzip.compress(content)))
+
+
+def _advance_ledger(ledger: SourceLedger, events: list[SourceEvent]) -> None:
+    for source_event in events:
+        path_key = str(source_event.path)
+        ledger.sources[path_key] = max(ledger.sources.get(path_key, 0), source_event.end_offset)
 
 
 def _iter_upload_batches(
@@ -1344,24 +1614,25 @@ def _iter_upload_batches(
     host: Host,
     metadata: RuntimeMetadata,
     policy: HostPolicy,
-    ranges: Iterator[SourceRange],
+    events: Iterator[SourceEvent],
     lifecycle_event: Optional[LifecycleEvent],
 ) -> Iterator[UploadBatch]:
     current_chunks: list[JsonValue] = []
-    current_ranges: list[SourceRange] = []
+    current_events: list[SourceEvent] = []
+    current_encoded_bytes = 0
     current_decoded_bytes = 0
-    batch_started_at_ms = int(time.time() * 1000)
-    batch_index = 0
 
-    for source_range in ranges:
-        chunk = _upload_chunk_payload(source_range, lifecycle_event)
-        if _string_value(chunk.get("content_gzip_base64")) is None:
-            raise CollectorError("trace upload chunk payload is missing encoded content")
-        decoded_size = len(source_range.content)
+    for source_event in events:
+        chunk = _upload_event_payload(source_event, lifecycle_event)
+        encoded_size = _upload_payload_encoded_size(chunk)
+        decoded_size = source_event.byte_count if source_event.kind == "jsonl_range" else 0
+        if encoded_size > policy.trace_collection.max_batch_bytes:
+            raise CollectorError("native trace chunk exceeds trace_collection.max_batch_bytes")
         if decoded_size > policy.trace_collection.max_batch_bytes:
             raise CollectorError("native trace chunk exceeds trace_collection.max_batch_bytes")
         batch_is_full = current_chunks and (
-            current_decoded_bytes + decoded_size > policy.trace_collection.max_batch_bytes
+            current_encoded_bytes + encoded_size > policy.trace_collection.max_batch_bytes
+            or current_decoded_bytes + decoded_size > policy.trace_collection.max_batch_bytes
             or len(current_chunks) >= MAX_UPLOAD_CHUNKS_PER_BATCH
         )
         if batch_is_full:
@@ -1370,16 +1641,15 @@ def _iter_upload_batches(
                 metadata=metadata,
                 policy=policy,
                 chunks=current_chunks,
-                ranges=current_ranges,
-                batch_started_at_ms=batch_started_at_ms,
-                batch_index=batch_index,
+                events=current_events,
             )
-            batch_index += 1
             current_chunks = []
-            current_ranges = []
+            current_events = []
+            current_encoded_bytes = 0
             current_decoded_bytes = 0
         current_chunks.append(chunk)
-        current_ranges.append(source_range)
+        current_events.append(source_event)
+        current_encoded_bytes += encoded_size
         current_decoded_bytes += decoded_size
 
     if current_chunks:
@@ -1388,23 +1658,45 @@ def _iter_upload_batches(
             metadata=metadata,
             policy=policy,
             chunks=current_chunks,
-            ranges=current_ranges,
-            batch_started_at_ms=batch_started_at_ms,
-            batch_index=batch_index,
+            events=current_events,
         )
 
 
-def _upload_chunk_payload(source_range: SourceRange, lifecycle_event: Optional[LifecycleEvent]) -> dict[str, JsonValue]:
-    compressed = gzip.compress(source_range.content)
+def _upload_event_payload(source_event: SourceEvent, lifecycle_event: Optional[LifecycleEvent]) -> dict[str, JsonValue]:
+    if source_event.kind == "jsonl_range":
+        content = source_event.content
+        if content is None:
+            raise CollectorError("native trace upload range is missing content")
+        compressed = gzip.compress(content)
+        return {
+            "kind": "jsonl_range",
+            "source_path_hash": source_event.path_hash,
+            "start_offset": source_event.start_offset,
+            "end_offset": source_event.end_offset,
+            "line_count": len(content.splitlines()),
+            "content_sha256": source_event.content_sha256,
+            "content_gzip_base64": base64.b64encode(compressed).decode("ascii"),
+            "lifecycle_event": lifecycle_event,
+        }
+    if source_event.oversized_reason is None:
+        raise CollectorError("native trace skipped record is missing oversized reason")
     return {
-        "source_path_hash": source_range.path_hash,
-        "start_offset": source_range.start_offset,
-        "end_offset": source_range.end_offset,
-        "line_count": len(source_range.content.splitlines()),
-        "content_sha256": hashlib.sha256(source_range.content).hexdigest(),
-        "content_gzip_base64": base64.b64encode(compressed).decode("ascii"),
+        "kind": "oversized_record",
+        "source_path_hash": source_event.path_hash,
+        "start_offset": source_event.start_offset,
+        "end_offset": source_event.end_offset,
+        "byte_count": source_event.byte_count,
+        "content_sha256": source_event.content_sha256,
+        "oversized_reason": source_event.oversized_reason,
         "lifecycle_event": lifecycle_event,
     }
+
+
+def _upload_payload_encoded_size(payload: dict[str, JsonValue]) -> int:
+    encoded_content = _string_value(payload.get("content_gzip_base64"))
+    if encoded_content is None:
+        return 0
+    return len(encoded_content.encode("ascii"))
 
 
 def _upload_batch(
@@ -1413,12 +1705,10 @@ def _upload_batch(
     metadata: RuntimeMetadata,
     policy: HostPolicy,
     chunks: list[JsonValue],
-    ranges: list[SourceRange],
-    batch_started_at_ms: int,
-    batch_index: int,
+    events: list[SourceEvent],
 ) -> UploadBatch:
     request: dict[str, JsonValue] = {
-        "batch_id": f"{host}-{batch_started_at_ms}-{os.getpid()}-{batch_index}",
+        "batch_id": _stable_upload_batch_id(host, policy, chunks),
         "source": host,
         "host": host,
         "policy_version": policy.policy_version,
@@ -1427,7 +1717,37 @@ def _upload_batch(
         "uploaded_at": _utc_now_iso(),
         "chunks": chunks,
     }
-    return UploadBatch(request=request, ranges=list(ranges))
+    raw_artifact_count = sum(1 for event in events if event.kind == "jsonl_range")
+    skipped_record_count = sum(1 for event in events if event.kind == "oversized_record")
+    return UploadBatch(
+        request=request,
+        events=list(events),
+        raw_artifact_count=raw_artifact_count,
+        skipped_record_count=skipped_record_count,
+    )
+
+
+def _stable_upload_batch_id(host: Host, policy: HostPolicy, chunks: list[JsonValue]) -> str:
+    identities: list[dict[str, JsonValue]] = []
+    for chunk_value in chunks:
+        chunk = _json_mapping(chunk_value)
+        identities.append(
+            {
+                "kind": _string_value(chunk.get("kind")) or "jsonl_range",
+                "source_path_hash": _string_value(chunk.get("source_path_hash")) or "",
+                "start_offset": _int_value(chunk.get("start_offset")) or 0,
+                "end_offset": _int_value(chunk.get("end_offset")) or 0,
+                "content_sha256": _string_value(chunk.get("content_sha256")) or "",
+            }
+        )
+    stable_identity = {
+        "host": host,
+        "policy_version": policy.policy_version,
+        "chunks": identities,
+    }
+    encoded_identity = json.dumps(stable_identity, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(encoded_identity).hexdigest()
+    return f"{host}-{policy.policy_version}-{digest[:32]}"
 
 
 def _post_upload_batch(
@@ -1503,14 +1823,29 @@ def _validate_upload_response(
     if policy_version != expected_policy_version:
         raise CollectorError(f"worker response policy_version did not match request for {urlsplit(url).path}")
     request_chunks = request.get("chunks")
-    expected_raw_artifacts = len(request_chunks) if isinstance(request_chunks, list) else 0
+    expected_raw_artifacts = 0
+    expected_skipped_records = 0
+    if isinstance(request_chunks, list):
+        for chunk_value in request_chunks:
+            chunk = _json_mapping(chunk_value)
+            if chunk is None:
+                continue
+            if chunk.get("kind") == "oversized_record":
+                expected_skipped_records += 1
+            else:
+                expected_raw_artifacts += 1
     raw_artifact_count = _int_value(response.get("raw_artifact_count"))
     if raw_artifact_count != expected_raw_artifacts:
         raise CollectorError(f"worker response raw_artifact_count did not match request for {urlsplit(url).path}")
+    skipped_record_count = _int_value(response.get("skipped_record_count"))
+    if expected_skipped_records and skipped_record_count != expected_skipped_records:
+        raise CollectorError(f"worker response skipped_record_count did not match request for {urlsplit(url).path}")
     for field in ("raw_artifact_count", "trace_count", "event_count", "unparsed_record_count"):
         value = _int_value(response.get(field))
         if value is None or value < 0:
             raise CollectorError(f"worker response {field} must be a non-negative integer")
+    if skipped_record_count is not None and skipped_record_count < 0:
+        raise CollectorError(f"worker response skipped_record_count must be a non-negative integer")
 
 
 def _require_accepted_response(response: dict[str, JsonValue], url: str) -> None:
@@ -1648,9 +1983,7 @@ def _validate_http_url(value: str, field_name: str) -> SplitResult:
 def _normalize_base_url(value: str, *, label: str = "worker base URL") -> str:
     stripped = value.strip().rstrip("/")
     parsed = _validate_http_url(stripped, label)
-    if (
-        parsed.path not in {"", "/"}
-    ):
+    if parsed.path not in {"", "/"}:
         raise CollectorError(f"{label} must not include a path")
     _validate_worker_transport(parsed, label)
     return stripped

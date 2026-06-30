@@ -4,6 +4,7 @@ import ast
 import base64
 import datetime as dt
 import gzip
+import hashlib
 import json
 import os
 import runpy
@@ -34,8 +35,9 @@ COLLECTOR_ASSET_PATH = (
 
 
 class _ReadForbiddenBinaryFile:
-    def __init__(self, file: BinaryIO) -> None:
+    def __init__(self, file: BinaryIO, *, max_read_size: int | None = None) -> None:
         self._file = file
+        self._max_read_size = max_read_size
 
     def __enter__(self) -> "_ReadForbiddenBinaryFile":
         self._file.__enter__()
@@ -50,9 +52,18 @@ class _ReadForbiddenBinaryFile:
         self._file.__exit__(exc_type, exc_value, traceback)
 
     def read(self, *_args: object, **_kwargs: object) -> bytes:
-        raise AssertionError("collector must stream trace files with readline instead of reading the unread tail")
+        size = _args[0] if _args else -1
+        if not isinstance(size, int) or size < 0:
+            raise AssertionError("collector must not read an unbounded trace file tail")
+        if self._max_read_size is not None and size > self._max_read_size:
+            raise AssertionError("collector trace file reads must stay within the configured block size")
+        return self._file.read(size)
 
     def readline(self, size: int = -1) -> bytes:
+        if size < 0:
+            raise AssertionError("collector must bound trace file line reads")
+        if self._max_read_size is not None and size > self._max_read_size:
+            raise AssertionError("collector trace file line reads must stay within the configured block size")
         return self._file.readline(size)
 
     def seek(self, offset: int, whence: int = 0) -> int:
@@ -162,6 +173,20 @@ runpy.run_path({json.dumps(str(COLLECTOR_ASSET_PATH))}, run_name="promptless_tra
     assert result.returncode == 0, result.stderr
 
 
+def test_collector_directory_fsync_is_noop_on_windows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    collector_module = runpy.run_path(str(COLLECTOR_ASSET_PATH), run_name="promptless_trace_collector_fsync_test")
+    collector_os = collector_module["os"]
+    fsync_directory = collector_module["_fsync_directory"]
+
+    def fail_open(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("directory fsync should not try os.open on Windows")
+
+    monkeypatch.setattr(collector_os, "name", "nt")
+    monkeypatch.setattr(collector_os, "open", fail_open)
+
+    fsync_directory(tmp_path)
+
+
 def test_collector_asset_runs_under_python39_when_available(tmp_path: Path) -> None:
     python39 = _python39_executable()
     if python39 is None:
@@ -235,6 +260,187 @@ def test_collector_disabled_without_bootstrap_flag_exits_zero_without_state(tmp_
     assert quiet_result.returncode == 0
     assert quiet_result.stdout == ""
     assert quiet_result.stderr == ""
+
+
+def test_collector_default_ledger_path_is_host_global(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    collector_module = runpy.run_path(str(COLLECTOR_ASSET_PATH), run_name="promptless_trace_collector_ledger_path_test")
+    ledger_path = collector_module["_ledger_path"]
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("PROMPTLESS_TRACE_COLLECTOR_LEDGER", raising=False)
+    monkeypatch.setenv("PLUGIN_DATA", str(tmp_path / "plugin-data"))
+    monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path / "claude-plugin-data"))
+
+    assert ledger_path() == tmp_path / "home/.promptless/instruction-hub/trace-collector-ledger.json"
+
+
+def test_collector_migrates_legacy_plugin_ledger_before_uploading_pending_ranges(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        legacy_ledger_path = plugin_data / "trace-collector-ledger.json"
+        global_ledger_path = home / ".promptless/instruction-hub/trace-collector-ledger.json"
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        acknowledged_line = b'{"type":"turn","id":"already-uploaded"}\n'
+        pending_line = b'{"type":"turn","id":"pending"}\n'
+        rollout_path.write_bytes(acknowledged_line + pending_line)
+        legacy_ledger_path.write_text(
+            json.dumps({"schema_version": 1, "sources": {str(rollout_path): len(acknowledged_line)}})
+        )
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_TRACE_COLLECTOR_LEDGER": "",
+            },
+            lifecycle="stop",
+        )
+
+        assert payload["baseline_only"] is False
+        assert payload["uploaded_chunks"] == 1
+        assert len(server.uploads) == 1
+        upload_chunks = _json_array(server.uploads[0]["chunks"], "chunks")
+        uploaded_chunk = _json_mapping(upload_chunks[0], "chunks[0]")
+        assert uploaded_chunk["start_offset"] == len(acknowledged_line)
+        assert uploaded_chunk["end_offset"] == len(acknowledged_line) + len(pending_line)
+        assert _decode_chunk(uploaded_chunk) == pending_line
+        global_ledger = _json_mapping(json.loads(global_ledger_path.read_text()), "ledger")
+        global_sources = _json_mapping(global_ledger["sources"], "ledger.sources")
+        assert global_sources[str(rollout_path)] == len(acknowledged_line) + len(pending_line)
+        effective_config = _json_mapping(server.check_ins[0]["effective_config"], "effective_config")
+        assert effective_config["source_ledger_path"] == str(global_ledger_path)
+    finally:
+        server.stop()
+
+
+def test_collector_migrates_legacy_plugin_ledger_without_duplicate_backfill(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(forward_only_first_install=False)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        legacy_ledger_path = plugin_data / "trace-collector-ledger.json"
+        global_ledger_path = home / ".promptless/instruction-hub/trace-collector-ledger.json"
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        complete_line = b'{"type":"turn","id":"already-uploaded"}\n'
+        rollout_path.write_bytes(complete_line)
+        legacy_ledger_path.write_text(
+            json.dumps({"schema_version": 1, "sources": {str(rollout_path): len(complete_line)}})
+        )
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_TRACE_COLLECTOR_LEDGER": "",
+            },
+            lifecycle="stop",
+        )
+
+        assert payload["baseline_only"] is False
+        assert payload["uploaded_chunks"] == 0
+        assert server.uploads == []
+        global_ledger = _json_mapping(json.loads(global_ledger_path.read_text()), "ledger")
+        global_sources = _json_mapping(global_ledger["sources"], "ledger.sources")
+        assert global_sources[str(rollout_path)] == len(complete_line)
+    finally:
+        server.stop()
+
+
+def test_collector_imports_late_legacy_plugin_ledger_into_existing_global_ledger(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        codex_plugin_data = tmp_path / "codex-plugin-data"
+        claude_plugin_data = tmp_path / "claude-plugin-data"
+        codex_plugin_data.mkdir()
+        claude_plugin_data.mkdir()
+        codex_legacy_ledger_path = codex_plugin_data / "trace-collector-ledger.json"
+        claude_legacy_ledger_path = claude_plugin_data / "trace-collector-ledger.json"
+        global_ledger_path = home / ".promptless/instruction-hub/trace-collector-ledger.json"
+        global_ledger_path.parent.mkdir(parents=True)
+
+        codex_rollout_path = home / ".codex/sessions/rollout.jsonl"
+        codex_rollout_path.parent.mkdir(parents=True)
+        codex_line = b'{"type":"turn","id":"codex-uploaded"}\n'
+        codex_rollout_path.write_bytes(codex_line)
+
+        claude_rollout_path = home / ".claude/projects/acme/session.jsonl"
+        claude_rollout_path.parent.mkdir(parents=True)
+        acknowledged_claude_line = b'{"type":"turn","id":"claude-uploaded"}\n'
+        pending_claude_line = b'{"type":"turn","id":"claude-pending"}\n'
+        claude_rollout_path.write_bytes(acknowledged_claude_line + pending_claude_line)
+
+        global_ledger_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "sources": {str(codex_rollout_path): len(codex_line)},
+                    "legacy_ledger_imports": [str(codex_legacy_ledger_path)],
+                }
+            )
+        )
+        claude_legacy_ledger_path.write_text(
+            json.dumps({"schema_version": 1, "sources": {str(claude_rollout_path): len(acknowledged_claude_line)}})
+        )
+
+        payload, _result = _run_collector(
+            hub_root / "dist/claude/core",
+            "claude",
+            {
+                "HOME": str(home),
+                "CLAUDE_PLUGIN_DATA": str(claude_plugin_data),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_TRACE_COLLECTOR_LEDGER": "",
+            },
+            lifecycle="stop",
+        )
+
+        assert payload["baseline_only"] is False
+        assert payload["uploaded_chunks"] == 1
+        assert len(server.uploads) == 1
+        upload_chunks = _json_array(server.uploads[0]["chunks"], "chunks")
+        uploaded_chunk = _json_mapping(upload_chunks[0], "chunks[0]")
+        assert uploaded_chunk["start_offset"] == len(acknowledged_claude_line)
+        assert uploaded_chunk["end_offset"] == len(acknowledged_claude_line) + len(pending_claude_line)
+        assert _decode_chunk(uploaded_chunk) == pending_claude_line
+
+        global_ledger = _json_mapping(json.loads(global_ledger_path.read_text()), "ledger")
+        global_sources = _json_mapping(global_ledger["sources"], "ledger.sources")
+        assert global_sources[str(codex_rollout_path)] == len(codex_line)
+        assert global_sources[str(claude_rollout_path)] == len(acknowledged_claude_line) + len(pending_claude_line)
+        legacy_imports = _json_array(global_ledger["legacy_ledger_imports"], "ledger.legacy_ledger_imports")
+        assert set(legacy_imports) == {str(codex_legacy_ledger_path), str(claude_legacy_ledger_path)}
+    finally:
+        server.stop()
 
 
 def test_collector_enrolls_host_credential_and_checkins(tmp_path: Path) -> None:
@@ -489,6 +695,76 @@ def test_collector_does_not_advance_ledger_when_upload_fails(tmp_path: Path) -> 
         server.stop()
 
 
+def test_collector_reuses_stable_batch_id_when_retrying_same_source_range(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(upload_status=503, forward_only_first_install=False)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        rollout_path.write_text('{"type":"turn","id":"retry"}\n')
+        env = {
+            "HOME": str(home),
+            "PLUGIN_DATA": str(plugin_data),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        _run_collector(hub_root / "dist/codex/core", "codex", env, lifecycle="stop", expected_status="error")
+        _run_collector(hub_root / "dist/codex/core", "codex", env, lifecycle="stop", expected_status="error")
+
+        assert len(server.uploads) == 2
+        assert server.uploads[0]["batch_id"] == server.uploads[1]["batch_id"]
+    finally:
+        server.stop()
+
+
+def test_collector_changes_stable_batch_id_when_same_range_content_changes(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(upload_status=503, forward_only_first_install=False)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        first_line = b'{"type":"turn","id":"same-a"}\n'
+        second_line = b'{"type":"turn","id":"same-b"}\n'
+        assert len(first_line) == len(second_line)
+        env = {
+            "HOME": str(home),
+            "PLUGIN_DATA": str(plugin_data),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        rollout_path.write_bytes(first_line)
+        _run_collector(hub_root / "dist/codex/core", "codex", env, lifecycle="stop", expected_status="error")
+        rollout_path.write_bytes(second_line)
+        _run_collector(hub_root / "dist/codex/core", "codex", env, lifecycle="stop", expected_status="error")
+
+        assert len(server.uploads) == 2
+        assert server.uploads[0]["batch_id"] != server.uploads[1]["batch_id"]
+        ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
+        assert _json_mapping(ledger["sources"], "ledger.sources") == {}
+    finally:
+        server.stop()
+
+
 def test_collector_does_not_advance_ledger_when_upload_response_lacks_acceptance(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -688,7 +964,16 @@ def test_collector_quiet_failure_reports_error_check_in(tmp_path: Path) -> None:
         server.stop()
 
 
-def test_collector_recovers_truncated_ledger_by_retrying_from_start(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "ledger_content",
+    [
+        "{",
+        "{}",
+        json.dumps({"schema_version": 1, "sources": []}),
+        json.dumps({"schema_version": 1, "sources": {"rollout.jsonl": -1}}),
+    ],
+)
+def test_collector_recovers_corrupt_ledger_by_baselining_current_end(tmp_path: Path, ledger_content: str) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
@@ -699,7 +984,7 @@ def test_collector_recovers_truncated_ledger_by_retrying_from_start(tmp_path: Pa
         plugin_data = tmp_path / "plugin-data"
         plugin_data.mkdir()
         ledger_path = plugin_data / "trace-collector-ledger.json"
-        ledger_path.write_text("{")
+        ledger_path.write_text(ledger_content)
 
         rollout_path = home / ".codex/sessions/rollout.jsonl"
         rollout_path.parent.mkdir(parents=True)
@@ -718,14 +1003,17 @@ def test_collector_recovers_truncated_ledger_by_retrying_from_start(tmp_path: Pa
             lifecycle="stop",
         )
 
-        assert payload["baseline_only"] is False
-        assert payload["uploaded_chunks"] == 1
-        assert len(server.uploads) == 1
-        chunk = _json_mapping(_json_array(server.uploads[0]["chunks"], "chunks")[0], "chunks[0]")
-        assert _decode_chunk(chunk) == complete_line
+        assert payload["baseline_only"] is True
+        assert payload["ledger_recovered"] is True
+        assert payload["uploaded_chunks"] == 0
+        assert server.uploads == []
         ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
         ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
         assert ledger_sources[str(rollout_path)] == len(complete_line)
+        assert list(plugin_data.glob("trace-collector-ledger.json.corrupt-*"))
+        drift_reports = _json_array(server.check_ins[0]["drift_reports"], "drift_reports")
+        drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
+        assert drift_report["kind"] == "trace_ledger_corrupt"
     finally:
         server.stop()
 
@@ -896,7 +1184,7 @@ def test_collector_splits_uploads_by_policy_batch_limit(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
-    server = _FakeWorkerServer(forward_only_first_install=False, max_batch_bytes=200)
+    server = _FakeWorkerServer(forward_only_first_install=False, max_batch_bytes=220)
     server.start()
     try:
         home = tmp_path / "home"
@@ -907,10 +1195,10 @@ def test_collector_splits_uploads_by_policy_batch_limit(tmp_path: Path) -> None:
 
         rollout_path = home / ".codex/sessions/rollout.jsonl"
         rollout_path.parent.mkdir(parents=True)
-        lines = [
-            (json.dumps({"type": "turn", "id": f"id-{index}", "payload": "x" * 50}) + "\n").encode("utf-8")
-            for index in range(4)
-        ]
+        lines = []
+        for index in range(4):
+            payload = base64.b64encode(bytes(((index * 53 + offset) % 256 for offset in range(72)))).decode("ascii")
+            lines.append((json.dumps({"type": "turn", "id": f"id-{index}", "payload": payload}) + "\n").encode("utf-8"))
         rollout_path.write_bytes(b"".join(lines))
 
         payload, _result = _run_collector(
@@ -925,20 +1213,69 @@ def test_collector_splits_uploads_by_policy_batch_limit(tmp_path: Path) -> None:
             lifecycle="stop",
         )
 
-        assert payload["uploaded_chunks"] == 2
-        assert len(server.uploads) == 2
         uploaded_chunks = [
             _json_mapping(chunk, "chunk")
             for upload in server.uploads
             for chunk in _json_array(upload["chunks"], "chunks")
         ]
+        assert payload["uploaded_chunks"] == len(uploaded_chunks)
         decoded_chunks = [_decode_chunk(chunk) for chunk in uploaded_chunks]
         assert b"".join(decoded_chunks) == b"".join(lines)
+        assert len(server.uploads) > 1
         for upload in server.uploads:
             chunks = [_json_mapping(chunk, "chunk") for chunk in _json_array(upload["chunks"], "chunks")]
+            encoded_size = sum(len(str(chunk["content_gzip_base64"]).encode("ascii")) for chunk in chunks)
             decoded_size = sum(len(_decode_chunk(chunk)) for chunk in chunks)
-            assert decoded_size <= 200
-        assert all(len(decoded_chunk) <= 200 for decoded_chunk in decoded_chunks)
+            assert encoded_size <= 220
+            assert decoded_size <= 220
+        assert all(len(str(chunk["content_gzip_base64"]).encode("ascii")) <= 220 for chunk in uploaded_chunks)
+        ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
+        ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert ledger_sources[str(rollout_path)] == sum(len(line) for line in lines)
+    finally:
+        server.stop()
+
+
+def test_collector_splits_uploads_by_decoded_policy_batch_limit(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    max_batch_bytes = 220
+    server = _FakeWorkerServer(forward_only_first_install=False, max_batch_bytes=max_batch_bytes)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        lines = [
+            (json.dumps({"type": "turn", "id": f"id-{index}", "payload": "x" * 110}) + "\n").encode("utf-8")
+            for index in range(3)
+        ]
+        assert all(len(line) <= max_batch_bytes for line in lines)
+        rollout_path.write_bytes(b"".join(lines))
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            lifecycle="stop",
+        )
+
+        assert payload["uploaded_chunks"] == 3
+        assert len(server.uploads) == 3
+        for upload in server.uploads:
+            chunks = [_json_mapping(chunk, "chunk") for chunk in _json_array(upload["chunks"], "chunks")]
+            assert sum(len(_decode_chunk(chunk)) for chunk in chunks) <= max_batch_bytes
         ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
         ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
         assert ledger_sources[str(rollout_path)] == sum(len(line) for line in lines)
@@ -989,16 +1326,189 @@ def test_collector_uploads_single_record_up_to_policy_batch_limit(tmp_path: Path
         server.stop()
 
 
-def test_collector_streams_source_ranges_without_tail_read(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_collector_reports_oversized_record_and_advances_ledger(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(forward_only_first_install=False, max_batch_bytes=220)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        first_line = b'{"type":"turn","id":"before"}\n'
+        oversized_line = (json.dumps({"type": "turn", "id": "huge", "payload": "x" * 260}) + "\n").encode("utf-8")
+        second_line = b'{"type":"turn","id":"after"}\n'
+        assert len(oversized_line) > 220
+        rollout_path.write_bytes(first_line + oversized_line + second_line)
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            lifecycle="stop",
+        )
+
+        assert payload["uploaded_chunks"] == 2
+        assert payload["skipped_records"] == 1
+        chunks = [
+            _json_mapping(chunk, "chunk")
+            for upload in server.uploads
+            for chunk in _json_array(upload["chunks"], "chunks")
+        ]
+        assert [chunk["kind"] for chunk in chunks] == ["jsonl_range", "oversized_record", "jsonl_range"]
+        skipped_chunk = chunks[1]
+        assert skipped_chunk["start_offset"] == len(first_line)
+        assert skipped_chunk["end_offset"] == len(first_line) + len(oversized_line)
+        assert skipped_chunk["byte_count"] == len(oversized_line)
+        assert skipped_chunk["oversized_reason"] == "decoded_size"
+        assert _decode_chunk(chunks[0]) == first_line
+        assert _decode_chunk(chunks[2]) == second_line
+        ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
+        ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert ledger_sources[str(rollout_path)] == len(first_line) + len(oversized_line) + len(second_line)
+    finally:
+        server.stop()
+
+
+def test_collector_does_not_advance_ledger_when_skipped_record_ack_miscounts(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    upload_response: dict[str, JsonValue] = {
+        "accepted": True,
+        "batch_id": "filled-by-test",
+        "policy_version": 7,
+        "raw_artifact_count": 0,
+        "skipped_record_count": 0,
+        "trace_count": 0,
+        "event_count": 0,
+        "unparsed_record_count": 0,
+    }
+
+    def fill_batch_id(payload: dict[str, JsonValue]) -> None:
+        upload_response["batch_id"] = payload["batch_id"]
+
+    server = _FakeWorkerServer(
+        upload_response=upload_response,
+        before_upload_response=fill_batch_id,
+        forward_only_first_install=False,
+        max_batch_bytes=220,
+    )
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        oversized_line = (json.dumps({"type": "turn", "id": "huge", "payload": "x" * 260}) + "\n").encode("utf-8")
+        assert len(oversized_line) > 220
+        rollout_path.write_bytes(oversized_line)
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            lifecycle="stop",
+            expected_status="error",
+        )
+
+        assert "skipped_record_count did not match request" in str(payload["message"])
+        assert len(server.uploads) == 1
+        ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
+        assert _json_mapping(ledger["sources"], "ledger.sources") == {}
+    finally:
+        server.stop()
+
+
+def test_collector_reports_record_that_exceeds_encoded_upload_limit(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    max_batch_bytes = 180
+    server = _FakeWorkerServer(forward_only_first_install=False, max_batch_bytes=max_batch_bytes)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        encoded_oversized_line = b""
+        for payload_size in range(32, 160):
+            candidate_payload = base64.b64encode(bytes((offset % 251 for offset in range(payload_size)))).decode(
+                "ascii"
+            )
+            candidate = (json.dumps({"type": "turn", "id": "encoded", "payload": candidate_payload}) + "\n").encode(
+                "utf-8"
+            )
+            encoded_size = len(base64.b64encode(gzip.compress(candidate)).decode("ascii").encode("ascii"))
+            if len(candidate) <= max_batch_bytes and encoded_size > max_batch_bytes:
+                encoded_oversized_line = candidate
+                break
+        assert encoded_oversized_line
+        rollout_path.write_bytes(encoded_oversized_line)
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            lifecycle="stop",
+        )
+
+        assert payload["uploaded_chunks"] == 0
+        assert payload["skipped_records"] == 1
+        chunks = _json_array(server.uploads[0]["chunks"], "chunks")
+        skipped_chunk = _json_mapping(chunks[0], "chunks[0]")
+        assert skipped_chunk["kind"] == "oversized_record"
+        assert skipped_chunk["oversized_reason"] == "encoded_size"
+        assert skipped_chunk["byte_count"] == len(encoded_oversized_line)
+        ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
+        ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert ledger_sources[str(rollout_path)] == len(encoded_oversized_line)
+    finally:
+        server.stop()
+
+
+def test_collector_streams_source_events_without_unbounded_tail_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     collector_module = runpy.run_path(str(COLLECTOR_ASSET_PATH), run_name="promptless_trace_collector_stream_test")
-    iter_source_ranges = collector_module["_iter_source_ranges"]
+    iter_source_events = collector_module["_iter_source_events"]
     source_ledger = collector_module["SourceLedger"]
 
     rollout_path = tmp_path / "rollout.jsonl"
-    lines = [
-        (json.dumps({"type": "turn", "id": f"id-{index}", "payload": "x" * 40}) + "\n").encode("utf-8")
-        for index in range(8)
-    ]
+    lines = []
+    for index in range(4):
+        payload = base64.b64encode(bytes(((index * 47 + offset) % 256 for offset in range(72)))).decode("ascii")
+        lines.append((json.dumps({"type": "turn", "id": f"id-{index}", "payload": payload}) + "\n").encode("utf-8"))
     rollout_path.write_bytes(b"".join(lines))
     original_path_open = Path.open
 
@@ -1017,16 +1527,64 @@ def test_collector_streams_source_ranges_without_tail_read(monkeypatch: pytest.M
     monkeypatch.setattr(Path, "open", guarded_open)
 
     ledger = source_ledger(path=tmp_path / "ledger.json", is_new=False, sources={})
-    ranges = list(iter_source_ranges((rollout_path,), ledger, max_chunk_bytes=128))
+    events = list(iter_source_events((rollout_path,), ledger, max_chunk_bytes=220))
 
-    assert len(ranges) > 1
-    assert b"".join(source_range.content for source_range in ranges) == b"".join(lines)
+    assert len(events) > 1
+    assert all(source_event.kind == "jsonl_range" for source_event in events)
+    contents = []
+    for source_event in events:
+        assert source_event.content is not None
+        contents.append(source_event.content)
+    assert b"".join(contents) == b"".join(lines)
     expected_start_offsets = [0]
-    for source_range in ranges[:-1]:
-        expected_start_offsets.append(source_range.end_offset)
-    assert [source_range.start_offset for source_range in ranges] == expected_start_offsets
-    assert ranges[-1].end_offset == sum(len(line) for line in lines)
-    assert all(len(source_range.content) <= 128 for source_range in ranges)
+    for source_event in events[:-1]:
+        expected_start_offsets.append(source_event.end_offset)
+    assert [source_event.start_offset for source_event in events] == expected_start_offsets
+    assert events[-1].end_offset == sum(len(line) for line in lines)
+    assert all(
+        len(base64.b64encode(gzip.compress(content)).decode("ascii").encode("ascii")) <= 220 for content in contents
+    )
+
+
+def test_collector_hashes_oversized_source_event_with_bounded_reads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    collector_module = runpy.run_path(str(COLLECTOR_ASSET_PATH), run_name="promptless_trace_collector_oversized_test")
+    iter_source_events = collector_module["_iter_source_events"]
+    source_ledger = collector_module["SourceLedger"]
+    source_read_block_bytes = collector_module["SOURCE_READ_BLOCK_BYTES"]
+
+    rollout_path = tmp_path / "rollout.jsonl"
+    oversized_line = (
+        json.dumps({"type": "turn", "id": "huge", "payload": "x" * (source_read_block_bytes + 2048)}) + "\n"
+    ).encode("utf-8")
+    rollout_path.write_bytes(oversized_line)
+    original_path_open = Path.open
+
+    def guarded_open(
+        path: Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> object:
+        if path == rollout_path and "b" in mode:
+            return _ReadForbiddenBinaryFile(open(path, "rb"), max_read_size=source_read_block_bytes)
+        return original_path_open(path, mode, buffering, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    ledger = source_ledger(path=tmp_path / "ledger.json", is_new=False, sources={})
+    events = list(iter_source_events((rollout_path,), ledger, max_chunk_bytes=128))
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.kind == "oversized_record"
+    assert event.content is None
+    assert event.byte_count == len(oversized_line)
+    assert event.end_offset == len(oversized_line)
+    assert event.content_sha256 == hashlib.sha256(oversized_line).hexdigest()
 
 
 def test_collector_advances_ledger_through_first_accepted_batch_when_later_batch_fails(tmp_path: Path) -> None:
@@ -1035,7 +1593,7 @@ def test_collector_advances_ledger_through_first_accepted_batch_when_later_batch
     build_hub(hub_root)
     server = _FakeWorkerServer(
         forward_only_first_install=False,
-        max_batch_bytes=200,
+        max_batch_bytes=220,
         upload_responses=[(200, None), (503, None)],
     )
     server.start()
@@ -1048,10 +1606,10 @@ def test_collector_advances_ledger_through_first_accepted_batch_when_later_batch
 
         rollout_path = home / ".codex/sessions/rollout.jsonl"
         rollout_path.parent.mkdir(parents=True)
-        lines = [
-            (json.dumps({"type": "turn", "id": f"id-{index}", "payload": "x" * 50}) + "\n").encode("utf-8")
-            for index in range(4)
-        ]
+        lines = []
+        for index in range(4):
+            payload = base64.b64encode(bytes(((index * 59 + offset) % 256 for offset in range(72)))).decode("ascii")
+            lines.append((json.dumps({"type": "turn", "id": f"id-{index}", "payload": payload}) + "\n").encode("utf-8"))
         rollout_path.write_bytes(b"".join(lines))
 
         payload, _result = _run_collector(
@@ -1119,6 +1677,60 @@ def test_collector_ledger_save_preserves_higher_existing_offsets(tmp_path: Path)
         ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
         ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
         assert ledger_sources[str(rollout_path)] == higher_offset
+    finally:
+        server.stop()
+
+
+def test_collector_persists_cursor_reset_after_trace_file_truncation(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(forward_only_first_install=False)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        complete_line = b'{"type":"turn","id":"replacement"}\n'
+        rollout_path.write_bytes(complete_line)
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {str(rollout_path): 150}}))
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            lifecycle="stop",
+        )
+
+        assert payload["uploaded_chunks"] == 1
+        ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
+        ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert ledger_sources[str(rollout_path)] == len(complete_line)
+
+        server.uploads.clear()
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            lifecycle="stop",
+        )
+
+        assert payload["uploaded_chunks"] == 0
+        assert server.uploads == []
     finally:
         server.stop()
 
@@ -1368,6 +1980,9 @@ def _collector_test_overrides(overrides: dict[str, str]) -> dict[str, str]:
     result = dict(overrides)
     result.pop("CODEX_HOME", None)
     result.pop("PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN", None)
+    ledger_parent = result.get("PLUGIN_DATA") or result.get("CLAUDE_PLUGIN_DATA")
+    if ledger_parent is not None:
+        result.setdefault("PROMPTLESS_TRACE_COLLECTOR_LEDGER", str(Path(ledger_parent) / "trace-collector-ledger.json"))
     worker_base_url = result.get("PROMPTLESS_WORKER_BASE_URL")
     if worker_base_url is not None:
         result.setdefault("PIGS_FLY", "1")
@@ -1631,14 +2246,23 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
 
     def _default_upload_response(self, status: int, payload: dict[str, JsonValue]) -> dict[str, JsonValue]:
         chunks = payload.get("chunks")
-        chunk_count = len(chunks) if isinstance(chunks, list) else 0
+        raw_artifact_count = 0
+        skipped_record_count = 0
+        if isinstance(chunks, list):
+            for chunk_value in chunks:
+                chunk = _json_mapping(chunk_value, "chunk")
+                if chunk.get("kind") == "oversized_record":
+                    skipped_record_count += 1
+                else:
+                    raw_artifact_count += 1
         return {
             "accepted": status < 400,
             "batch_id": payload.get("batch_id"),
             "policy_version": payload.get("policy_version"),
-            "raw_artifact_count": chunk_count if status < 400 else 0,
-            "trace_count": chunk_count if status < 400 else 0,
-            "event_count": chunk_count if status < 400 else 0,
+            "raw_artifact_count": raw_artifact_count if status < 400 else 0,
+            "skipped_record_count": skipped_record_count if status < 400 else 0,
+            "trace_count": raw_artifact_count if status < 400 else 0,
+            "event_count": raw_artifact_count if status < 400 else 0,
             "unparsed_record_count": 0,
         }
 
