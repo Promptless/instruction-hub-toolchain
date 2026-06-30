@@ -22,7 +22,7 @@ HOST_RUNTIME_EXECUTABLE = "promptless-host-runtime"
 # policy fetch, local config write, and check-in network calls.
 HOST_RUNTIME_HOOK_TIMEOUT_SECONDS = 90
 HOST_RUNTIME_CHANNEL = "stable"
-HOST_RUNTIME_VERSION = "0.2.0"
+HOST_RUNTIME_VERSION = "0.2.1"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
 SUPPORTED_HOST_RUNTIME_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 

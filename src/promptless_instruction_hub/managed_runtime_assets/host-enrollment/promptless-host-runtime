@@ -34,7 +34,7 @@ if os.name == "nt":
 else:
     import fcntl
 
-RUNTIME_VERSION = "0.2.0"
+RUNTIME_VERSION = "0.2.1"
 RUNTIME_CHANNEL = "stable"
 RUNTIME_EXECUTABLE = "promptless-host-runtime"
 MANAGED_RUNTIME_ID = "host-runtime"
@@ -52,6 +52,21 @@ CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
 OPEN_BROWSER_ENV = "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER"
 CALLBACK_STATE_PARAM = "state"
+INTERNAL_PROMPTLESS_EMAIL_DOMAIN = "gopromptless.ai"
+INTERNAL_PROMPTLESS_WELCOME_SHOWN_AT_KEY = "internal_promptless_welcome_shown_at"
+INTERNAL_PROMPTLESS_WELCOME_MESSAGE = "\n".join(
+    [
+        "            ,-,------,",
+        r"          _ \(\(_,--'",
+        r"     <`--'\>/(/(__",
+        "     /. .  `'` '  \\",
+        "    (`')  ,        @",
+        "     `-._,        /",
+        "        )-)_/--( > ",
+        "       ''''  ''''",
+        "welcome propmtless pigfooder.",
+    ]
+)
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
 
@@ -136,6 +151,7 @@ class HostCredential:
     value: str
     credential_id: str | None
     deployment_instance_id: str | None
+    internal_promptless_user: bool = False
 
 
 @dataclass(frozen=True)
@@ -227,7 +243,11 @@ def _run_ensure_command(host: Host, *, quiet: bool) -> int:
     try:
         return _run_ensure(host, quiet=quiet)
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
-        _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
+        _emit(
+            {"status": "error", "host": host, "message": _redact_text(str(exc))},
+            quiet=quiet,
+            internal_welcome_notice=_claim_internal_promptless_welcome(quiet=quiet),
+        )
         return 0
     finally:
         _flush_control_output()
@@ -341,6 +361,7 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
             },
             quiet=quiet,
             update_notice=update_notice,
+            internal_welcome_notice=_claim_internal_promptless_welcome(quiet=quiet),
         )
         return 0
     credential = enrollment_attempt.credential
@@ -361,10 +382,13 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
                 },
                 quiet=quiet,
                 update_notice=update_notice,
+                internal_welcome_notice=_claim_internal_promptless_welcome(quiet=quiet),
             )
             return 0
         credential = enrollment_attempt.credential
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
+    credential = _credential_with_identity(credential, signed_policy)
+    _store_internal_promptless_identity(context, credential)
     policy = _validate_signed_policy(signed_policy, host)
     if _requires_newer_bootstrap(policy.required_bootstrap_version, RUNTIME_VERSION):
         result = _blocked_result(
@@ -382,6 +406,7 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
             {"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host},
             quiet=quiet,
             update_notice=update_notice,
+            internal_welcome_notice=_claim_internal_promptless_welcome(credential=credential, quiet=quiet),
         )
         return 0
 
@@ -391,6 +416,7 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
         {"status": result.status, "host": host, "needs_restart": result.needs_restart},
         quiet=quiet,
         update_notice=update_notice,
+        internal_welcome_notice=_claim_internal_promptless_welcome(credential=credential, quiet=quiet),
     )
     return 0
 
@@ -598,6 +624,47 @@ def _record_plugin_version_seen(pending: PendingPluginUpdate) -> None:
             _write_state(state_path, state)
     except (OSError, BootstrapError):
         return
+
+
+def _claim_internal_promptless_welcome(
+    credential: HostCredential | None = None,
+    *,
+    quiet: bool,
+) -> str | None:
+    """Return the internal dogfood welcome once for a host-global Promptless user state."""
+
+    if quiet or not _has_internal_promptless_identity(credential):
+        return None
+    try:
+        state_path = _state_path()
+        with _state_file_lock(state_path):
+            state = _load_state(state_path)
+            if _string_value(state.get(INTERNAL_PROMPTLESS_WELCOME_SHOWN_AT_KEY)) is not None:
+                return None
+            state[INTERNAL_PROMPTLESS_WELCOME_SHOWN_AT_KEY] = dt.datetime.now(dt.timezone.utc).isoformat()
+            _write_state(state_path, state)
+    except (OSError, BootstrapError):
+        return None
+    return INTERNAL_PROMPTLESS_WELCOME_MESSAGE
+
+
+def _has_internal_promptless_identity(credential: HostCredential | None) -> bool:
+    if credential is not None and credential.internal_promptless_user:
+        return True
+    return _has_stored_internal_promptless_identity()
+
+
+def _has_stored_internal_promptless_identity() -> bool:
+    try:
+        state_path = _state_path()
+        with _state_file_lock(state_path):
+            state = _load_state(state_path)
+            credentials = _json_mapping_or_empty(state.get("credentials"))
+            return any(
+                _is_internal_promptless_identity(_json_mapping_or_empty(value)) for value in credentials.values()
+            )
+    except (OSError, BootstrapError):
+        return False
 
 
 def _resolve_host(host_arg: str) -> Host:
@@ -816,11 +883,43 @@ def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None
             value=credential_value,
             credential_id=credential_id,
             deployment_instance_id=deployment_instance_id,
+            internal_promptless_user=_is_internal_promptless_identity(cached_credential),
         )
         if credential_value
         else None
     )
     return credential
+
+
+def _credential_with_identity(credential: HostCredential, payload: dict[str, JsonValue]) -> HostCredential:
+    if credential.internal_promptless_user or not _is_internal_promptless_identity(payload):
+        return credential
+    return HostCredential(
+        value=credential.value,
+        credential_id=credential.credential_id,
+        deployment_instance_id=credential.deployment_instance_id,
+        internal_promptless_user=True,
+    )
+
+
+def _store_internal_promptless_identity(context: EnrollmentContext, credential: HostCredential) -> None:
+    if not credential.internal_promptless_user:
+        return
+    try:
+        state_path = _state_path()
+        with _state_file_lock(state_path):
+            state = _load_state(state_path)
+            credentials = _json_mapping_or_empty(state.get("credentials"))
+            key = _credential_cache_key(context)
+            cached_credential = _json_mapping_or_empty(credentials.get(key))
+            if not cached_credential or cached_credential.get("internal_promptless_user") is True:
+                return
+            cached_credential["internal_promptless_user"] = True
+            credentials[key] = cached_credential
+            state["credentials"] = credentials
+            _write_state(state_path, state)
+    except (OSError, BootstrapError):
+        return
 
 
 def _forget_cached_host_credential(context: EnrollmentContext) -> None:
@@ -1084,6 +1183,7 @@ def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSess
                     value=host_credential,
                     credential_id=_string_value(response.get("credential_id")),
                     deployment_instance_id=session.deployment_instance_id,
+                    internal_promptless_user=_is_internal_promptless_identity(response),
                 )
             )
         if status in {"expired", "consumed"}:
@@ -1113,6 +1213,8 @@ def _store_host_credential(
             "target": context.metadata.target,
             "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
+        if credential.internal_promptless_user:
+            credentials[_credential_cache_key(context)]["internal_promptless_user"] = True
         state["credentials"] = credentials
         pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
         pending_enrollments.pop(_credential_cache_key(context), None)
@@ -1815,6 +1917,40 @@ def _string_value(value: object) -> str | None:
     return None
 
 
+def _identity_email(payload: dict[str, JsonValue]) -> str | None:
+    for key in ("user_email", "email", "account_email"):
+        email = _normalize_email(_string_value(payload.get(key)))
+        if email is not None:
+            return email
+    for nested_key in ("user", "identity", "account"):
+        nested = _json_mapping_or_empty(payload.get(nested_key))
+        for email_key in ("email", "user_email"):
+            email = _normalize_email(_string_value(nested.get(email_key)))
+            if email is not None:
+                return email
+    return None
+
+
+def _is_internal_promptless_identity(payload: dict[str, JsonValue]) -> bool:
+    return payload.get("internal_promptless_user") is True or _is_internal_promptless_email(_identity_email(payload))
+
+
+def _normalize_email(value: str | None) -> str | None:
+    if value is None:
+        return None
+    email = value.strip().lower()
+    if len(email) > 254 or "@" not in email or email.startswith("@") or email.endswith("@"):
+        return None
+    if any(char.isspace() for char in email):
+        return None
+    return email
+
+
+def _is_internal_promptless_email(email: str | None) -> bool:
+    normalized = _normalize_email(email)
+    return normalized is not None and normalized.endswith(f"@{INTERNAL_PROMPTLESS_EMAIL_DOMAIN}")
+
+
 def _runtime_target(value: object, fallback: Host) -> Host:
     if value == "codex" or value == "claude":
         return value
@@ -1853,6 +1989,7 @@ def _emit(
     *,
     quiet: bool = False,
     update_notice: str | None = None,
+    internal_welcome_notice: str | None = None,
 ) -> None:
     if quiet:
         return
@@ -1866,7 +2003,7 @@ def _emit(
     # (status/host/needs_restart/reason) still goes to stderr, which neither host parses as hook
     # control output.
     # https://developers.openai.com/codex/hooks  https://code.claude.com/docs/en/hooks
-    message = " ".join(text for text in (update_notice, _enrollment_user_message(payload)) if text is not None)
+    message = _system_message(update_notice, internal_welcome_notice, _enrollment_user_message(payload))
     terminal_sequence = _terminal_sequence(payload, message)
     diagnostic = dict(payload)
     if message:
@@ -1885,6 +2022,14 @@ def _emit(
         # Keep stdout to one hook-control object, but let terminal outcomes replace the
         # preliminary browser-start banner before the process exits.
         _queue_control_output(payload, control)
+
+
+def _system_message(*parts: str | None) -> str:
+    messages = [part for part in parts if part is not None]
+    if not messages:
+        return ""
+    separator = "\n\n" if any("\n" in message for message in messages) else " "
+    return separator.join(messages)
 
 
 def _queue_control_output(payload: dict[str, JsonValue], control: dict[str, JsonValue]) -> None:

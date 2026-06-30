@@ -68,7 +68,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert runtime["id"] == "host-runtime"
         assert runtime["status"] == "included"
         assert runtime["target"] == target
-        assert runtime["version"] == "0.2.0"
+        assert runtime["version"] == "0.2.1"
         assert runtime["channel"] == "stable"
         assert runtime["path"] == f"bin/{HOST_RUNTIME_BIN}"
         assert len(runtime["sha256"]) == 64
@@ -111,7 +111,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     )
     assert payload["id"] == "host-runtime"
     assert payload["name"] == HOST_RUNTIME_BIN
-    assert payload["version"] == "0.2.0"
+    assert payload["version"] == "0.2.1"
     assert payload["channel"] == "stable"
     assert len(_json_string(payload["sha256"], "sha256")) == 64
 
@@ -123,7 +123,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert text_version.returncode == 0
-    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.0\n"
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.1\n"
     assert text_version.stderr == ""
 
 
@@ -306,6 +306,61 @@ def test_bootstrap_runs_without_local_dogfood_gate(tmp_path: Path) -> None:
         assert len(server.session_requests) == 1
         assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
         assert len(server.check_ins) == 1
+    finally:
+        server.stop()
+
+
+def test_bootstrap_welcomes_internal_promptless_user_once(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    internal_policy = _policy_with()
+    internal_policy["user_email"] = "Adit@GoPromptless.AI"
+    server = _FakeWorkerServer(policy=internal_policy)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        first_payload, first_result = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
+        first_message = _json_string(first_payload["systemMessage"], "systemMessage")
+        assert "welcome propmtless pigfooder." in first_message
+        assert ",-,------," in first_message
+        assert "Restart Codex" in first_message
+        first_stdout = _json_mapping(
+            validate_json_value(json.loads(first_result.stdout), "bootstrap stdout"),
+            "bootstrap stdout",
+        )
+        assert first_stdout == {"systemMessage": first_message}
+
+        state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        shown_at = _json_string(state["internal_promptless_welcome_shown_at"], "welcome shown at")
+        assert shown_at != ""
+        credentials = _json_mapping(state["credentials"], "credentials")
+        assert len(credentials) == 1
+        credential = _json_mapping(next(iter(credentials.values())), "credential")
+        assert credential["internal_promptless_user"] is True
+        assert "user_email" not in credential
+        assert "email" not in credential
+
+        second_payload, second_result = _run_bootstrap(
+            hub_root / "dist/codex/core", "codex", env, expected_status="configured"
+        )
+        assert "systemMessage" not in second_payload
+        assert second_result.stdout == ""
+        second_state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        assert second_state["internal_promptless_welcome_shown_at"] == shown_at
     finally:
         server.stop()
 
@@ -652,7 +707,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
         assert server.session_requests[0]["package_id"] == "core"
-        assert server.session_requests[0]["bootstrap_version"] == "0.2.0"
+        assert server.session_requests[0]["bootstrap_version"] == "0.2.1"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
         assert server.session_requests[1]["target"] == "claude"
         assert server.policy_requests == [
@@ -672,7 +727,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "policy_version",
                 "status",
             }
-            assert check_in["bootstrap_version"] == "0.2.0"
+            assert check_in["bootstrap_version"] == "0.2.1"
             assert check_in["plugin_version"] == "0.1.0"
             assert check_in["status"] == "needs_restart"
             assert check_in["needs_restart"] is True
