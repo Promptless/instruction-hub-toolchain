@@ -167,7 +167,10 @@ def test_bootstrap_uses_plugin_data_for_state_file(tmp_path: Path) -> None:
         assert len(server.check_ins) == 1
         assert server.check_ins[0]["host"] == "codex"
         assert len(server.session_requests) == 1
-        assert (plugin_data / "host-enrollment-state.json").exists()
+        state = json.loads((plugin_data / "host-enrollment-state.json").read_text())
+        credentials = _json_mapping(validate_json_value(state["credentials"], "credentials"), "credentials")
+        stored_credential = _json_mapping(next(iter(credentials.values())), "stored credential")
+        assert stored_credential["deployment_instance_id"] == "worker-local-1"
     finally:
         server.stop()
 
@@ -246,7 +249,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert claude_settings["env"]["OTEL_LOG_ASSISTANT_RESPONSES"] == "0"
 
         assert len(server.session_requests) == 2
-        assert server.session_requests[0]["deployment_instance_id"] == "worker-local-1"
+        assert "deployment_instance_id" not in server.session_requests[0]
         assert server.session_requests[0]["target"] == "codex"
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
@@ -281,6 +284,42 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         claude_effective_config = _json_mapping(server.check_ins[1]["effective_config"], "claude effective_config")
         assert codex_effective_config["collector_metrics_endpoint"] is None
         assert claude_effective_config["collector_metrics_endpoint"] == "http://127.0.0.1:4318/v1/metrics"
+    finally:
+        server.stop()
+
+
+def test_bootstrap_requires_session_response_deployment_instance_id(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer(
+        session_response={
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "device_code": "plihenroll_devicecode",
+            "approval_url": "https://app.promptless.ai/instruction-hub/enroll?token=approval-token",
+            "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
+            "poll_interval_seconds": 1,
+        }
+    )
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, _result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "host enrollment session response missing required fields" in str(payload["message"])
+        assert not (home / ".codex/config.toml").exists()
+        assert server.policy_requests == []
+        assert server.check_ins == []
     finally:
         server.stop()
 
@@ -747,12 +786,24 @@ def _invalid_policy(case: str) -> dict[str, JsonValue]:
     return payload
 
 
+def _session_response() -> dict[str, JsonValue]:
+    return {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "deployment_instance_id": "worker-local-1",
+        "device_code": "plihenroll_devicecode",
+        "approval_url": "https://app.promptless.ai/instruction-hub/enroll?token=approval-token",
+        "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
+        "poll_interval_seconds": 1,
+    }
+
+
 class _FakeWorkerServer:
     def __init__(
         self,
         *,
         policy: dict[str, JsonValue] | None = None,
         post_response: dict[str, JsonValue] | None = None,
+        session_response: dict[str, JsonValue] | None = None,
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
         self.policy_requests: list[str] = []
@@ -764,6 +815,7 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.session_requests = self.session_requests
         _FakeWorkerHandler.policy_response = policy or _signed_policy()
         _FakeWorkerHandler.post_response = post_response
+        _FakeWorkerHandler.session_response = session_response
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
@@ -784,18 +836,10 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     poll_requests: ClassVar[list[dict[str, JsonValue]]] = []
     policy_response: ClassVar[dict[str, JsonValue]]
     post_response: ClassVar[dict[str, JsonValue] | None]
+    session_response: ClassVar[dict[str, JsonValue] | None]
     session_requests: ClassVar[list[dict[str, JsonValue]]] = []
 
     def do_GET(self) -> None:
-        if self.path == "/healthz":
-            self._write_json(
-                {
-                    "status": "ok",
-                    "deployment_instance_id": "worker-local-1",
-                    "worker_version": "test",
-                }
-            )
-            return
         parsed = urlsplit(self.path)
         target = parse_qs(parsed.query).get("target")
         if (
@@ -813,15 +857,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         if self.path == "/v0/host-enrollment/sessions":
             payload = self._read_json_request("session create request")
             self.session_requests.append(payload)
-            self._write_json(
-                {
-                    "session_id": "11111111-1111-4111-8111-111111111111",
-                    "device_code": "plihenroll_devicecode",
-                    "approval_url": "https://app.promptless.ai/instruction-hub/enroll?token=approval-token",
-                    "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
-                    "poll_interval_seconds": 1,
-                }
-            )
+            self._write_json(self.session_response or _session_response())
             return
         if self.path == "/v0/host-enrollment/sessions/11111111-1111-4111-8111-111111111111/poll":
             payload = self._read_json_request("session poll request")

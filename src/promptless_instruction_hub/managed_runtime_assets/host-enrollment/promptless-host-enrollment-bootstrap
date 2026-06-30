@@ -57,13 +57,6 @@ class BootstrapAuthError(BootstrapError):
 
 
 @dataclass(frozen=True)
-class WorkerHealth:
-    """Worker metadata needed to bind a local host credential."""
-
-    deployment_instance_id: str
-
-
-@dataclass(frozen=True)
 class RuntimeMetadata:
     """Runtime metadata reported in worker check-ins."""
 
@@ -103,7 +96,6 @@ class EnrollmentContext:
     """Host identity and plugin metadata sent to the worker enrollment bridge."""
 
     worker_base_url: str
-    deployment_instance_id: str
     metadata: RuntimeMetadata
     host_instance_id: str
     host_label: str
@@ -116,6 +108,7 @@ class HostCredential:
 
     value: str
     credential_id: str | None
+    deployment_instance_id: str | None
 
 
 @dataclass(frozen=True)
@@ -123,6 +116,7 @@ class EnrollmentSession:
     """Pending browser approval session created by the worker."""
 
     session_id: str
+    deployment_instance_id: str
     device_code: str
     approval_url: str
     expires_at: dt.datetime
@@ -171,8 +165,7 @@ def _run(host_arg: str, *, quiet: bool) -> int:
     plugin_root = _plugin_root()
     worker_base_url = _worker_base_url()
     metadata = _load_runtime_metadata(plugin_root, host)
-    health = _get_worker_health(worker_base_url)
-    context = _enrollment_context(worker_base_url, health, metadata)
+    context = _enrollment_context(worker_base_url, metadata)
     credential = _obtain_host_credential(context)
     if credential is None:
         _emit({"status": "setup_pending", "reason": "approval_pending", "host": host}, quiet=quiet)
@@ -236,15 +229,7 @@ def _worker_base_url() -> str:
     return _normalize_base_url(os.environ.get("PROMPTLESS_WORKER_BASE_URL") or DEFAULT_WORKER_BASE_URL)
 
 
-def _get_worker_health(worker_base_url: str) -> WorkerHealth:
-    payload = _get_json(_worker_url(worker_base_url, "/healthz"), None, label="worker health response")
-    deployment_instance_id = _non_empty(_string_value(payload.get("deployment_instance_id")))
-    if deployment_instance_id is None:
-        raise BootstrapError("worker health response missing deployment_instance_id")
-    return WorkerHealth(deployment_instance_id=deployment_instance_id)
-
-
-def _enrollment_context(worker_base_url: str, health: WorkerHealth, metadata: RuntimeMetadata) -> EnrollmentContext:
+def _enrollment_context(worker_base_url: str, metadata: RuntimeMetadata) -> EnrollmentContext:
     state_path = _state_path()
     state = _load_state(state_path)
     host_instance_id = _host_instance_id(state)
@@ -253,7 +238,6 @@ def _enrollment_context(worker_base_url: str, health: WorkerHealth, metadata: Ru
         _write_state(state_path, state)
     return EnrollmentContext(
         worker_base_url=worker_base_url,
-        deployment_instance_id=health.deployment_instance_id,
         metadata=metadata,
         host_instance_id=host_instance_id,
         host_label=_host_label(),
@@ -327,7 +311,16 @@ def _cached_host_credential(context: EnrollmentContext) -> CredentialLookup:
     cached_credential = _json_mapping_or_empty(credentials.get(_credential_cache_key(context)))
     credential_value = _string_value(cached_credential.get("value"))
     credential_id = _string_value(cached_credential.get("credential_id"))
-    credential = HostCredential(value=credential_value, credential_id=credential_id) if credential_value else None
+    deployment_instance_id = _string_value(cached_credential.get("deployment_instance_id"))
+    credential = (
+        HostCredential(
+            value=credential_value,
+            credential_id=credential_id,
+            deployment_instance_id=deployment_instance_id,
+        )
+        if credential_value
+        else None
+    )
     return CredentialLookup(credential=credential, state=state, state_path=state_path)
 
 
@@ -375,10 +368,18 @@ def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, Jso
     device_code = _string_value(session_value.get("device_code"))
     approval_url = _string_value(session_value.get("approval_url"))
     poll_interval_seconds = _optional_int_value(session_value.get("poll_interval_seconds"))
-    if session_id is None or device_code is None or approval_url is None or poll_interval_seconds is None:
+    deployment_instance_id = _string_value(session_value.get("deployment_instance_id"))
+    if (
+        session_id is None
+        or deployment_instance_id is None
+        or device_code is None
+        or approval_url is None
+        or poll_interval_seconds is None
+    ):
         return None
     return EnrollmentSession(
         session_id=session_id,
+        deployment_instance_id=deployment_instance_id,
         device_code=device_code,
         approval_url=approval_url,
         expires_at=expires_at,
@@ -388,7 +389,6 @@ def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, Jso
 
 def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSession:
     payload: dict[str, JsonValue] = {
-        "deployment_instance_id": context.deployment_instance_id,
         "target": context.metadata.target,
         "plugin_id": context.metadata.plugin_id,
         "plugin_version": context.metadata.plugin_version,
@@ -406,16 +406,18 @@ def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSession:
         label="host enrollment session response",
     )
     session_id = _string_value(response.get("session_id"))
+    deployment_instance_id = _string_value(response.get("deployment_instance_id"))
     device_code = _string_value(response.get("device_code"))
     approval_url = _string_value(response.get("approval_url"))
     expires_at = _datetime_value(response.get("expires_at"), "host enrollment session expires_at")
     poll_interval_seconds = _int_value(response.get("poll_interval_seconds"), "host enrollment poll interval")
-    if session_id is None or device_code is None or approval_url is None:
+    if session_id is None or deployment_instance_id is None or device_code is None or approval_url is None:
         raise BootstrapError("host enrollment session response missing required fields")
     if poll_interval_seconds < 1 or poll_interval_seconds > 30:
         raise BootstrapError("host enrollment poll interval must be between 1 and 30 seconds")
     return EnrollmentSession(
         session_id=session_id,
+        deployment_instance_id=deployment_instance_id,
         device_code=device_code,
         approval_url=approval_url,
         expires_at=expires_at,
@@ -432,6 +434,7 @@ def _store_pending_enrollment(
     pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
     pending_enrollments[_credential_cache_key(context)] = {
         "session_id": session.session_id,
+        "deployment_instance_id": session.deployment_instance_id,
         "device_code": session.device_code,
         "approval_url": session.approval_url,
         "expires_at": session.expires_at.isoformat(),
@@ -455,7 +458,11 @@ def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSess
             host_credential = _string_value(response.get("host_credential"))
             if host_credential is None:
                 raise BootstrapError("approved host enrollment poll response missing host_credential")
-            return HostCredential(value=host_credential, credential_id=_string_value(response.get("credential_id")))
+            return HostCredential(
+                value=host_credential,
+                credential_id=_string_value(response.get("credential_id")),
+                deployment_instance_id=session.deployment_instance_id,
+            )
         if status in {"expired", "consumed"}:
             _forget_pending_enrollment(context)
             return None
@@ -478,7 +485,7 @@ def _store_host_credential(
         "value": credential.value,
         "credential_id": credential.credential_id,
         "worker_base_url": context.worker_base_url,
-        "deployment_instance_id": context.deployment_instance_id,
+        "deployment_instance_id": credential.deployment_instance_id,
         "target": context.metadata.target,
         "plugin_id": context.metadata.plugin_id,
         "package_id": context.metadata.package_id,
@@ -502,7 +509,6 @@ def _forget_pending_enrollment(context: EnrollmentContext) -> None:
 
 def _credential_cache_key(context: EnrollmentContext) -> str:
     cache_material = {
-        "deployment_instance_id": context.deployment_instance_id,
         "package_id": context.metadata.package_id,
         "plugin_id": context.metadata.plugin_id,
         "target": context.metadata.target,
