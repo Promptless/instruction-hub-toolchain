@@ -1,3 +1,16 @@
+```
+             ,-,------,
+              _ \(\(_,--'
+         <`--'\>/(/(__
+         /. .  `'` '  \
+        (`')  ,        @
+         `-._,        /
+            )-)_/--( >
+           ''''  ''''
+
+pig.
+```
+
 # Promptless Instruction Hub Toolchain
 
 This repository is the canonical public toolchain for Promptless Instruction
