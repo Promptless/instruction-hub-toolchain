@@ -469,8 +469,14 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"
+        assert "OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
+        assert "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
+        assert "OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
         assert claude_settings["env"]["OTEL_LOG_USER_PROMPTS"] == "1"
         assert claude_settings["env"]["OTEL_LOG_ASSISTANT_RESPONSES"] == "0"
+        assert claude_settings["env"]["OTEL_LOG_TOOL_DETAILS"] == "1"
+        assert claude_settings["env"]["OTEL_LOG_TOOL_CONTENT"] == "1"
+        assert claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"] == "0"
 
         assert len(server.session_requests) == 2
         codex_callback_state = _callback_state(server.session_requests[0]["callback_url"], "codex callback_url")
@@ -838,6 +844,39 @@ def test_bootstrap_surfaces_enrollment_message_only_on_change(tmp_path: Path) ->
 
         steady_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env, expected_status="configured")
         assert "systemMessage" not in steady_codex
+    finally:
+        server.stop()
+
+
+def test_bootstrap_configures_claude_raw_api_bodies_inline_capture(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    policy = _policy_with()
+    capture_policy = _json_mapping(policy["policy"], "policy")["capture_policy"]
+    assert isinstance(capture_policy, dict)
+    capture_policy["raw_api_bodies"] = "full_local_default"
+    server = _FakeWorkerServer(policy=policy)
+    server.start()
+    try:
+        claude_home = tmp_path / "claude-home"
+        _run_bootstrap(
+            hub_root / "dist/claude/core",
+            "claude",
+            {
+                "HOME": str(claude_home),
+                "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+        )
+
+        claude_settings = json.loads((claude_home / ".claude/settings.json").read_text())
+        assert claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"] == "1"
+        assert claude_settings["env"]["OTEL_LOG_TOOL_CONTENT"] == "1"
+        assert "OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
+        assert not (claude_home / ".promptless/instruction-hub/claude-raw-api-bodies").exists()
     finally:
         server.stop()
 

@@ -1225,8 +1225,10 @@ def _read_settings(settings_path: Path) -> dict[str, JsonValue]:
 
 
 def _claude_env(policy: HostPolicy) -> dict[str, str]:
-    # Claude Code supports OTel through settings.json env keys.
-    # https://docs.anthropic.com/en/docs/claude-code/monitoring-usage
+    # Claude Code's inline content attributes are producer-bounded before export. Keep raw API
+    # bodies inline so the hosted collector receives them; file mode needs a separate uploader or
+    # file collector before we can claim those local body_ref files are ingested.
+    # https://code.claude.com/docs/en/monitoring-usage
     return {
         CLAUDE_MANAGED_ENV_MARKER: "1",
         "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
