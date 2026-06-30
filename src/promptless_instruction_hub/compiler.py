@@ -114,7 +114,7 @@ def _write_file_if_missing(path: Path, data: JsonValue) -> None:
 def _check_generated_output(hub_root: Path, output_root: Path) -> None:
     stale_paths = [str(path) for path in GENERATED_PATHS if not trees_equal(hub_root / path, output_root / path)]
     if stale_paths:
-        msg = f"generated Instruction Hub output is stale for: {', '.join(stale_paths)}; run `pi build`"
+        msg = f"generated Instruction Hub output is stale for: {', '.join(stale_paths)}; run `pig build`"
         raise BuildCheckFailedError(msg)
 
 

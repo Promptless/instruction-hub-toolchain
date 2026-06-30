@@ -76,7 +76,7 @@ Every generated plugin embeds local metadata as root files inside each plugin:
 
 The old `.promptless/instruction-hub.yaml` and generated `.promptless/...`
 layout is not read or migrated by this toolchain. Existing hubs must rename
-their config to `hub.yaml` and regenerate output with `pi build`.
+their config to `hub.yaml` and regenerate output with `pig build`.
 
 ## Release Model
 
