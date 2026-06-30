@@ -765,9 +765,11 @@ def _run_bootstrap(
 
 
 def _start_bootstrap(plugin_root: Path, host: str, env: dict[str, str]) -> subprocess.Popen[str]:
+    process_env = _clean_env()
+    process_env.update(env)
     return subprocess.Popen(
         [str(plugin_root / "bin" / BOOTSTRAP_BIN), "--host", host],
-        env=_clean_env(**env),
+        env=process_env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
