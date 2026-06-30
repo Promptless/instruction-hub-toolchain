@@ -9,7 +9,7 @@ import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
@@ -313,7 +313,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert claude_settings["env"]["OTEL_LOG_ASSISTANT_RESPONSES"] == "0"
 
         assert len(server.session_requests) == 2
-        assert "deployment_instance_id" not in server.session_requests[0]
+        assert server.session_requests[0]["deployment_instance_id"] == "worker-local-1"
         assert server.session_requests[0]["target"] == "codex"
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
@@ -352,7 +352,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         server.stop()
 
 
-def test_bootstrap_requires_session_response_deployment_instance_id(tmp_path: Path) -> None:
+def test_bootstrap_requires_callback_deployment_instance_id(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -360,7 +360,7 @@ def test_bootstrap_requires_session_response_deployment_instance_id(tmp_path: Pa
         session_response={
             "session_id": "11111111-1111-4111-8111-111111111111",
             "device_code": "plihenroll_devicecode",
-            "approval_url": "https://app.promptless.ai/instruction-hub/enroll?token=approval-token",
+            "poll_url": "https://api.gopromptless.ai/v1/instruction-hub/host-enrollments/sessions/11111111-1111-4111-8111-111111111111/poll",
             "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
             "poll_interval_seconds": 1,
         }
@@ -380,7 +380,7 @@ def test_bootstrap_requires_session_response_deployment_instance_id(tmp_path: Pa
             expected_status="error",
         )
 
-        assert "host enrollment session response missing required fields" in str(payload["message"])
+        assert "host enrollment callback missing required fields" in str(payload["message"])
         assert not (home / ".codex/config.toml").exists()
         assert server.policy_requests == []
         assert server.check_ins == []
@@ -769,6 +769,8 @@ def _run_bootstrap(
 def _start_bootstrap(plugin_root: Path, host: str, env: dict[str, str]) -> subprocess.Popen[str]:
     process_env = _clean_env()
     process_env.update(env)
+    if "PROMPTLESS_WORKER_BASE_URL" in process_env and "PROMPTLESS_DASHBOARD_BASE_URL" not in process_env:
+        process_env["PROMPTLESS_DASHBOARD_BASE_URL"] = process_env["PROMPTLESS_WORKER_BASE_URL"]
     return subprocess.Popen(
         [str(plugin_root / "bin" / BOOTSTRAP_BIN), "--host", host],
         env=process_env,
@@ -809,6 +811,8 @@ def _clean_env(*, enable_bootstrap: bool = True, **overrides: str) -> dict[str, 
     if enable_bootstrap:
         env["PIGS_FLY"] = "True"
     env.update(overrides)
+    if "PROMPTLESS_WORKER_BASE_URL" in env and "PROMPTLESS_DASHBOARD_BASE_URL" not in env:
+        env["PROMPTLESS_DASHBOARD_BASE_URL"] = env["PROMPTLESS_WORKER_BASE_URL"]
     return env
 
 
@@ -889,7 +893,6 @@ def _session_response() -> dict[str, JsonValue]:
         "session_id": "11111111-1111-4111-8111-111111111111",
         "deployment_instance_id": "worker-local-1",
         "device_code": "plihenroll_devicecode",
-        "approval_url": "https://app.promptless.ai/instruction-hub/enroll?token=approval-token",
         "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
         "poll_interval_seconds": 1,
     }
@@ -945,6 +948,38 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
+        if parsed.path == "/healthz":
+            self._write_json(
+                {
+                    "status": "ok",
+                    "deployment_instance_id": "worker-local-1",
+                    "worker_version": "0.1.0-test",
+                }
+            )
+            return
+        if parsed.path == "/instruction-hub/enroll/start":
+            payload = self._single_value_query_payload(parsed.query)
+            callback_url = _json_string(payload.get("callback_url"), "callback_url")
+            if callback_url is None:
+                self.send_response(400)
+                self.end_headers()
+                return
+            self._record_session_request(payload)
+            session_response = self._session_response_payload()
+            approval_params = {"callback_url": callback_url, **session_response}
+            hosted_approval_url = f"{self._base_url()}/instruction-hub/enroll?{urlencode(approval_params)}"
+            self._redirect(hosted_approval_url)
+            return
+        if parsed.path == "/instruction-hub/enroll":
+            payload = self._single_value_query_payload(parsed.query)
+            callback_url = _json_string(payload.pop("callback_url", None), "callback_url")
+            if callback_url is None:
+                self.send_response(400)
+                self.end_headers()
+                return
+            callback_query = urlencode({"status": "approved", **payload})
+            self._redirect(f"{callback_url}?{callback_query}")
+            return
         target = parse_qs(parsed.query).get("target")
         if (
             parsed.path != "/v0/host-enrollment/policy"
@@ -958,12 +993,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self._write_json(self.policy_response)
 
     def do_POST(self) -> None:
-        if self.path == "/v0/host-enrollment/sessions":
-            payload = self._read_json_request("session create request")
-            self._record_session_request(payload)
-            self._write_json(self.session_response or _session_response())
-            return
-        if self.path == "/v0/host-enrollment/sessions/11111111-1111-4111-8111-111111111111/poll":
+        if self.path == "/v1/instruction-hub/host-enrollments/sessions/11111111-1111-4111-8111-111111111111/poll":
             payload = self._read_json_request("session poll request")
             if payload.get("device_code") != "plihenroll_devicecode":
                 self.send_response(401)
@@ -1000,6 +1030,32 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _base_url(self) -> str:
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
+
+    def _session_response_payload(self) -> dict[str, JsonValue]:
+        payload = dict(self.session_response or _session_response())
+        payload.setdefault(
+            "poll_url",
+            f"{self._base_url()}/v1/instruction-hub/host-enrollments/sessions/11111111-1111-4111-8111-111111111111/poll",
+        )
+        return payload
+
+    def _single_value_query_payload(self, query: str) -> dict[str, JsonValue]:
+        parsed_query = parse_qs(query, keep_blank_values=False)
+        payload: dict[str, JsonValue] = {}
+        for key, values in parsed_query.items():
+            if len(values) == 1:
+                payload[key] = values[0]
+        return payload
 
     def _read_json_request(self, label: str) -> dict[str, JsonValue]:
         length = int(self.headers["Content-Length"])
