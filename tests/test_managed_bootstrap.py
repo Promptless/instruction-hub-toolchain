@@ -175,6 +175,68 @@ def test_bootstrap_uses_plugin_data_for_state_file(tmp_path: Path) -> None:
         server.stop()
 
 
+def test_bootstrap_concurrent_hooks_preserve_shared_state_file(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer(session_barrier_count=2)
+    server.start()
+    codex_process: subprocess.Popen[str] | None = None
+    claude_process: subprocess.Popen[str] | None = None
+    try:
+        plugin_data = tmp_path / "plugin-data"
+        codex_home = tmp_path / "codex-home"
+        claude_home = tmp_path / "claude-home"
+        codex_process = _start_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(codex_home),
+                "CODEX_HOME": str(codex_home / ".codex"),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+        )
+        claude_process = _start_bootstrap(
+            hub_root / "dist/claude/core",
+            "claude",
+            {
+                "HOME": str(claude_home),
+                "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+        )
+
+        _read_bootstrap_process(codex_process)
+        _read_bootstrap_process(claude_process)
+
+        state = json.loads((plugin_data / "host-enrollment-state.json").read_text())
+        credentials = _json_mapping(validate_json_value(state["credentials"], "credentials"), "credentials")
+        stored_credentials = [_json_mapping(value, "stored credential") for value in credentials.values()]
+        assert {
+            _json_string(credential["target"], "stored credential target") for credential in stored_credentials
+        } == {
+            "codex",
+            "claude",
+        }
+        assert {
+            _json_string(credential["deployment_instance_id"], "stored credential deployment_instance_id")
+            for credential in stored_credentials
+        } == {"worker-local-1"}
+        assert _json_mapping(validate_json_value(state["pending_enrollments"], "pending_enrollments"), "pending") == {}
+        assert len(server.session_requests) == 2
+        assert len(server.check_ins) == 2
+    finally:
+        for process in (codex_process, claude_process):
+            if process is not None and process.poll() is None:
+                process.kill()
+        server.stop()
+
+
 def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -702,6 +764,38 @@ def _run_bootstrap(
     return payload, result
 
 
+def _start_bootstrap(plugin_root: Path, host: str, env: dict[str, str]) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [str(plugin_root / "bin" / BOOTSTRAP_BIN), "--host", host],
+        env=_clean_env(**env),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _read_bootstrap_process(
+    process: subprocess.Popen[str],
+    *,
+    expected_status: str = "needs_restart",
+) -> dict[str, JsonValue]:
+    try:
+        stdout, stderr = process.communicate(timeout=80)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        pytest.fail(f"bootstrap timed out with stdout={stdout!r} stderr={stderr!r}")
+    assert process.returncode == 0
+    assert "plihost_localcredential" not in stdout
+    assert "plihost_localcredential" not in stderr
+    assert "plihenroll_devicecode" not in stdout
+    assert "plihenroll_devicecode" not in stderr
+    payload_text = stdout.strip() or stderr.strip()
+    payload = _json_mapping(validate_json_value(json.loads(payload_text), "bootstrap output"), "bootstrap output")
+    assert payload["status"] == expected_status
+    return payload
+
+
 def _clean_env(*, enable_bootstrap: bool = True, **overrides: str) -> dict[str, str]:
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -804,11 +898,13 @@ class _FakeWorkerServer:
         policy: dict[str, JsonValue] | None = None,
         post_response: dict[str, JsonValue] | None = None,
         session_response: dict[str, JsonValue] | None = None,
+        session_barrier_count: int = 0,
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
         self.policy_requests: list[str] = []
         self.poll_requests: list[dict[str, JsonValue]] = []
         self.session_requests: list[dict[str, JsonValue]] = []
+        self._session_condition = threading.Condition()
         _FakeWorkerHandler.check_ins = self.check_ins
         _FakeWorkerHandler.policy_requests = self.policy_requests
         _FakeWorkerHandler.poll_requests = self.poll_requests
@@ -816,6 +912,8 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.policy_response = policy or _signed_policy()
         _FakeWorkerHandler.post_response = post_response
         _FakeWorkerHandler.session_response = session_response
+        _FakeWorkerHandler.session_barrier_count = session_barrier_count
+        _FakeWorkerHandler.session_condition = self._session_condition
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
@@ -837,6 +935,8 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     policy_response: ClassVar[dict[str, JsonValue]]
     post_response: ClassVar[dict[str, JsonValue] | None]
     session_response: ClassVar[dict[str, JsonValue] | None]
+    session_barrier_count: ClassVar[int] = 0
+    session_condition: ClassVar[threading.Condition | None] = None
     session_requests: ClassVar[list[dict[str, JsonValue]]] = []
 
     def do_GET(self) -> None:
@@ -856,7 +956,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path == "/v0/host-enrollment/sessions":
             payload = self._read_json_request("session create request")
-            self.session_requests.append(payload)
+            self._record_session_request(payload)
             self._write_json(self.session_response or _session_response())
             return
         if self.path == "/v0/host-enrollment/sessions/11111111-1111-4111-8111-111111111111/poll":
@@ -903,6 +1003,18 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             validate_json_value(json.loads(self.rfile.read(length)), label),
             label,
         )
+
+    def _record_session_request(self, payload: dict[str, JsonValue]) -> None:
+        condition = self.session_condition
+        if condition is None or self.session_barrier_count <= 1:
+            self.session_requests.append(payload)
+            return
+        with condition:
+            self.session_requests.append(payload)
+            if len(self.session_requests) >= self.session_barrier_count:
+                condition.notify_all()
+                return
+            condition.wait_for(lambda: len(self.session_requests) >= self.session_barrier_count, timeout=10)
 
 
 def _signed_policy() -> dict[str, JsonValue]:

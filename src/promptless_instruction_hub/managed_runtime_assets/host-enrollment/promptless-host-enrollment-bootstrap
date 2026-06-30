@@ -19,10 +19,17 @@ import urllib.error
 import urllib.request
 import uuid
 import webbrowser
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, TextIO
+from typing import BinaryIO, Literal, TextIO
 from urllib.parse import SplitResult, urlencode, urlsplit
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 BOOTSTRAP_VERSION = "0.1.0"
 BOOTSTRAP_CHANNEL = "stable"
@@ -124,15 +131,6 @@ class EnrollmentSession:
 
 
 @dataclass(frozen=True)
-class CredentialLookup:
-    """Credential lookup result from local state."""
-
-    credential: HostCredential | None
-    state: dict[str, JsonValue]
-    state_path: Path
-
-
-@dataclass(frozen=True)
 class ConfigResult:
     """Host config write result."""
 
@@ -231,11 +229,12 @@ def _worker_base_url() -> str:
 
 def _enrollment_context(worker_base_url: str, metadata: RuntimeMetadata) -> EnrollmentContext:
     state_path = _state_path()
-    state = _load_state(state_path)
-    host_instance_id = _host_instance_id(state)
-    if state.get("host_instance_id") != host_instance_id:
-        state["host_instance_id"] = host_instance_id
-        _write_state(state_path, state)
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        host_instance_id = _host_instance_id(state)
+        if state.get("host_instance_id") != host_instance_id:
+            state["host_instance_id"] = host_instance_id
+            _write_state(state_path, state)
     return EnrollmentContext(
         worker_base_url=worker_base_url,
         metadata=metadata,
@@ -274,6 +273,43 @@ def _write_state(path: Path, state: dict[str, JsonValue]) -> None:
         pass
 
 
+@contextmanager
+def _state_file_lock(path: Path) -> Iterator[None]:
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        _lock_state_file(lock_file)
+        try:
+            yield
+        finally:
+            _unlock_state_file(lock_file)
+
+
+def _lock_state_file(lock_file: BinaryIO) -> None:
+    if os.name == "nt":
+        _ensure_windows_lock_byte(lock_file)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_state_file(lock_file: BinaryIO) -> None:
+    if os.name == "nt":
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _ensure_windows_lock_byte(lock_file: BinaryIO) -> None:
+    lock_file.seek(0)
+    if lock_file.read(1) == b"":
+        lock_file.seek(0)
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
+
+
 def _host_instance_id(state: dict[str, JsonValue]) -> str:
     existing = _non_empty(_string_value(state.get("host_instance_id")))
     if existing is not None:
@@ -298,13 +334,13 @@ def _truncate(value: str, max_length: int) -> str:
 
 
 def _obtain_host_credential(context: EnrollmentContext) -> HostCredential | None:
-    lookup = _cached_host_credential(context)
-    if lookup.credential is not None:
-        return lookup.credential
-    return _enroll_host_credential(context, state=lookup.state, state_path=lookup.state_path)
+    credential = _cached_host_credential(context)
+    if credential is not None:
+        return credential
+    return _enroll_host_credential(context)
 
 
-def _cached_host_credential(context: EnrollmentContext) -> CredentialLookup:
+def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None:
     state_path = _state_path()
     state = _load_state(state_path)
     credentials = _json_mapping_or_empty(state.get("credentials"))
@@ -321,39 +357,39 @@ def _cached_host_credential(context: EnrollmentContext) -> CredentialLookup:
         if credential_value
         else None
     )
-    return CredentialLookup(credential=credential, state=state, state_path=state_path)
+    return credential
 
 
 def _forget_cached_host_credential(context: EnrollmentContext) -> None:
     state_path = _state_path()
-    state = _load_state(state_path)
-    credentials = _json_mapping_or_empty(state.get("credentials"))
-    key = _credential_cache_key(context)
-    if key in credentials:
-        del credentials[key]
-        state["credentials"] = credentials
-        _write_state(state_path, state)
-
-
-def _enroll_host_credential(
-    context: EnrollmentContext,
-    *,
-    state: dict[str, JsonValue] | None = None,
-    state_path: Path | None = None,
-) -> HostCredential | None:
-    state_path = state_path or _state_path()
-    if state is None:
+    with _state_file_lock(state_path):
         state = _load_state(state_path)
-    session = _pending_enrollment_session(context, state)
+        credentials = _json_mapping_or_empty(state.get("credentials"))
+        key = _credential_cache_key(context)
+        if key in credentials:
+            del credentials[key]
+            state["credentials"] = credentials
+            _write_state(state_path, state)
+
+
+def _enroll_host_credential(context: EnrollmentContext) -> HostCredential | None:
+    state_path = _state_path()
+    session = _load_pending_enrollment_session(context, state_path)
     if session is None:
-        session = _create_enrollment_session(context)
-        _store_pending_enrollment(context, state_path, state, session)
-        _open_approval_url(session.approval_url)
+        created_session = _create_enrollment_session(context)
+        session, stored_new_session = _store_pending_enrollment(context, state_path, created_session)
+        if stored_new_session:
+            _open_approval_url(session.approval_url)
     credential = _poll_enrollment_session(context, session)
     if credential is None:
         return None
-    _store_host_credential(context, state_path, state, credential)
+    _store_host_credential(context, state_path, credential)
     return credential
+
+
+def _load_pending_enrollment_session(context: EnrollmentContext, state_path: Path) -> EnrollmentSession | None:
+    with _state_file_lock(state_path):
+        return _pending_enrollment_session(context, _load_state(state_path))
 
 
 def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, JsonValue]) -> EnrollmentSession | None:
@@ -428,20 +464,25 @@ def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSession:
 def _store_pending_enrollment(
     context: EnrollmentContext,
     state_path: Path,
-    state: dict[str, JsonValue],
     session: EnrollmentSession,
-) -> None:
-    pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
-    pending_enrollments[_credential_cache_key(context)] = {
-        "session_id": session.session_id,
-        "deployment_instance_id": session.deployment_instance_id,
-        "device_code": session.device_code,
-        "approval_url": session.approval_url,
-        "expires_at": session.expires_at.isoformat(),
-        "poll_interval_seconds": session.poll_interval_seconds,
-    }
-    state["pending_enrollments"] = pending_enrollments
-    _write_state(state_path, state)
+) -> tuple[EnrollmentSession, bool]:
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        existing_session = _pending_enrollment_session(context, state)
+        if existing_session is not None:
+            return existing_session, False
+        pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+        pending_enrollments[_credential_cache_key(context)] = {
+            "session_id": session.session_id,
+            "deployment_instance_id": session.deployment_instance_id,
+            "device_code": session.device_code,
+            "approval_url": session.approval_url,
+            "expires_at": session.expires_at.isoformat(),
+            "poll_interval_seconds": session.poll_interval_seconds,
+        }
+        state["pending_enrollments"] = pending_enrollments
+        _write_state(state_path, state)
+        return session, True
 
 
 def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSession) -> HostCredential | None:
@@ -477,34 +518,36 @@ def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSess
 def _store_host_credential(
     context: EnrollmentContext,
     state_path: Path,
-    state: dict[str, JsonValue],
     credential: HostCredential,
 ) -> None:
-    credentials = _json_mapping_or_empty(state.get("credentials"))
-    credentials[_credential_cache_key(context)] = {
-        "value": credential.value,
-        "credential_id": credential.credential_id,
-        "worker_base_url": context.worker_base_url,
-        "deployment_instance_id": credential.deployment_instance_id,
-        "target": context.metadata.target,
-        "plugin_id": context.metadata.plugin_id,
-        "package_id": context.metadata.package_id,
-        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-    }
-    state["credentials"] = credentials
-    pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
-    pending_enrollments.pop(_credential_cache_key(context), None)
-    state["pending_enrollments"] = pending_enrollments
-    _write_state(state_path, state)
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        credentials = _json_mapping_or_empty(state.get("credentials"))
+        credentials[_credential_cache_key(context)] = {
+            "value": credential.value,
+            "credential_id": credential.credential_id,
+            "worker_base_url": context.worker_base_url,
+            "deployment_instance_id": credential.deployment_instance_id,
+            "target": context.metadata.target,
+            "plugin_id": context.metadata.plugin_id,
+            "package_id": context.metadata.package_id,
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        state["credentials"] = credentials
+        pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+        pending_enrollments.pop(_credential_cache_key(context), None)
+        state["pending_enrollments"] = pending_enrollments
+        _write_state(state_path, state)
 
 
 def _forget_pending_enrollment(context: EnrollmentContext) -> None:
     state_path = _state_path()
-    state = _load_state(state_path)
-    pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
-    if pending_enrollments.pop(_credential_cache_key(context), None) is not None:
-        state["pending_enrollments"] = pending_enrollments
-        _write_state(state_path, state)
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+        if pending_enrollments.pop(_credential_cache_key(context), None) is not None:
+            state["pending_enrollments"] = pending_enrollments
+            _write_state(state_path, state)
 
 
 def _credential_cache_key(context: EnrollmentContext) -> str:
