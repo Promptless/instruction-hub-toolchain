@@ -97,10 +97,19 @@ case-insensitive), the dogfood bootstrap uses
 worker's public `/healthz` identity, opens the hosted Promptless dashboard start
 URL, and listens on a loopback callback with a per-attempt state token for the
 approved session proof. It then polls the hosted runtime for a one-time per-host
-credential, caches that credential in plugin/user data, and uses the host
-credential to fetch
+credential, caches that credential, and uses the host credential to fetch
 `/v0/host-enrollment/policy?target=...` and post
 `/v0/host-enrollment/check-ins`.
+
+Host enrollment is per host, not per plugin. The credential and pending approval
+are cached at a single host-global path (`~/.promptless/instruction-hub/`) and
+keyed only on the worker deployment and agent host (claude/codex), so every
+Promptless plugin a user installs from the hub shares one credential. A
+non-blocking, per-credential enrollment-leader lock ensures that when multiple
+plugins start at once, exactly one drives the single browser approval while the
+others reuse the result or defer to a later session. The per-plugin
+`CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA` directories are intentionally not used for this
+state.
 
 Before the customer-grade release, replace that script with a static native
 binary built and versioned by Promptless, then bundled into the toolchain
