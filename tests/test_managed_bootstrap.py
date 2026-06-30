@@ -90,6 +90,7 @@ def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: 
 
     assert result.returncode == 0
     assert json.loads(result.stderr)["status"] == "error"
+    assert result.stdout == ""
     assert not (home / ".codex/config.toml").exists()
 
     quiet_result = subprocess.run(
@@ -132,7 +133,7 @@ def test_bootstrap_requires_local_pigs_fly_flag_before_auth_flow(tmp_path: Path)
         )
 
         assert payload["reason"] == "pigs_fly_not_enabled"
-        assert result.stderr == ""
+        assert result.stdout == ""
         assert not (home / ".codex/config.toml").exists()
         assert server.session_requests == []
         assert server.policy_requests == []
@@ -682,6 +683,42 @@ def test_bootstrap_surfaces_enrollment_message_only_on_change(tmp_path: Path) ->
         server.stop()
 
 
+def test_bootstrap_stdout_stays_codex_schema_safe(tmp_path: Path) -> None:
+    # Regression: Codex rejects SessionStart hook stdout that carries keys outside its schema
+    # (serde deny_unknown_fields) with "hook returned invalid session start JSON output". The
+    # bootstrap's diagnostic fields (status/host/needs_restart/reason) must never reach stdout —
+    # only the user-facing systemMessage may, and stdout stays empty when there is no message.
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        codex_env = {
+            "HOME": str(tmp_path / "codex-home"),
+            "CODEX_HOME": str(tmp_path / "codex-home/.codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        # Fresh config write surfaces a restart banner: stdout is exactly {"systemMessage": ...}.
+        _, configured_result = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        configured_stdout = _json_mapping(
+            validate_json_value(json.loads(configured_result.stdout), "codex stdout"), "codex stdout"
+        )
+        assert set(configured_stdout) == {"systemMessage"}
+        for forbidden_key in ("status", "host", "needs_restart", "reason"):
+            assert forbidden_key not in configured_stdout
+
+        # Steady state has nothing to say: stdout is empty so Codex treats it as success.
+        _, steady_result = _run_bootstrap(
+            hub_root / "dist/codex/core", "codex", codex_env, expected_status="configured"
+        )
+        assert steady_result.stdout == ""
+    finally:
+        server.stop()
+
+
 def test_bootstrap_announces_plugin_update_per_host(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -763,7 +800,7 @@ def test_bootstrap_update_notice_tolerates_unreadable_state(tmp_path: Path) -> N
 
     assert payload["reason"] == "pigs_fly_not_enabled"
     assert "systemMessage" not in payload
-    assert result.stderr == ""
+    assert result.stdout == ""
 
 
 def test_bootstrap_defers_recording_update_until_notice_surfaces(tmp_path: Path) -> None:
@@ -954,6 +991,35 @@ def test_bootstrap_rejects_invalid_check_in_success_response(tmp_path: Path) -> 
         server.stop()
 
 
+# Codex validates SessionStart hook *stdout* against a strict schema (serde deny_unknown_fields) and
+# rejects any key outside continue/stopReason/systemMessage/suppressOutput/hookSpecificOutput with
+# "hook returned invalid session start JSON output". The bootstrap therefore keeps stdout to the
+# user-facing systemMessage alone (empty when silent) and writes its diagnostic status object — the
+# status/host/needs_restart/reason fields Codex would reject — to stderr, which is not parsed.
+CODEX_SAFE_STDOUT_KEYS = frozenset({"systemMessage"})
+
+
+def _assert_session_start_streams(stdout: str, stderr: str, expected_status: str) -> dict[str, JsonValue]:
+    """Assert the SessionStart hook stream split and return the stderr diagnostic object.
+
+    stderr always carries the full diagnostic (status/host/...); stdout carries only the
+    schema-safe systemMessage and stays empty when there is no user-facing message.
+    """
+
+    diagnostic = _json_mapping(
+        validate_json_value(json.loads(stderr.strip()), "bootstrap diagnostic"), "bootstrap diagnostic"
+    )
+    assert diagnostic["status"] == expected_status
+    stdout_text = stdout.strip()
+    if stdout_text:
+        control = _json_mapping(validate_json_value(json.loads(stdout_text), "bootstrap stdout"), "bootstrap stdout")
+        assert set(control) <= CODEX_SAFE_STDOUT_KEYS, f"stdout leaks non-schema keys: {sorted(set(control))}"
+        assert control["systemMessage"] == diagnostic["systemMessage"]
+    else:
+        assert "systemMessage" not in diagnostic
+    return diagnostic
+
+
 def _run_bootstrap(
     plugin_root: Path,
     host: str,
@@ -974,13 +1040,7 @@ def _run_bootstrap(
     assert "plihost_localcredential" not in result.stderr
     assert "plihenroll_devicecode" not in result.stdout
     assert "plihenroll_devicecode" not in result.stderr
-    payload_text = result.stdout.strip() or result.stderr.strip()
-    payload = (
-        _json_mapping(validate_json_value(json.loads(payload_text), "bootstrap output"), "bootstrap output")
-        if payload_text
-        else {}
-    )
-    assert payload["status"] == expected_status
+    payload = _assert_session_start_streams(result.stdout, result.stderr, expected_status)
     return payload, result
 
 
@@ -1014,10 +1074,7 @@ def _read_bootstrap_process(
     assert "plihost_localcredential" not in stderr
     assert "plihenroll_devicecode" not in stdout
     assert "plihenroll_devicecode" not in stderr
-    payload_text = stdout.strip() or stderr.strip()
-    payload = _json_mapping(validate_json_value(json.loads(payload_text), "bootstrap output"), "bootstrap output")
-    assert payload["status"] == expected_status
-    return payload
+    return _assert_session_start_streams(stdout, stderr, expected_status)
 
 
 def _clean_env(*, enable_bootstrap: bool = True, **overrides: str) -> dict[str, str]:
