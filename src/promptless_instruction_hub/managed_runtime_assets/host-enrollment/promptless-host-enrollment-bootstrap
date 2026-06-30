@@ -47,10 +47,10 @@ STATE_FILE_NAME = "host-enrollment-state.json"
 HTTP_TIMEOUT_SECONDS = 10
 ENROLLMENT_POLL_DEADLINE_SECONDS = 35
 CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
-OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT_BYTES = 1024 * 1024 * 1024
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
 BOOTSTRAP_AUTH_FLAG_ENV = "PIGS_FLY"
 OPEN_BROWSER_ENV = "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER"
+CLAUDE_RAW_API_BODY_DIR_NAME = "claude-raw-api-bodies"
 CALLBACK_STATE_PARAM = "state"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
@@ -1187,6 +1187,8 @@ def _configure_claude(policy: HostPolicy) -> ConfigResult:
             message="Existing unmanaged Claude telemetry env was left unchanged",
             details={"path": str(settings_path), "env_keys": unmanaged_conflicts},
         )
+    if _capture_enabled(policy, "raw_api_bodies"):
+        _ensure_private_dir(_claude_raw_api_body_dir())
     current_settings = json.dumps(settings, sort_keys=True)
     env.update(desired_env)
     changed = json.dumps(settings, sort_keys=True) != current_settings
@@ -1214,8 +1216,9 @@ def _read_settings(settings_path: Path) -> dict[str, JsonValue]:
 
 
 def _claude_env(policy: HostPolicy) -> dict[str, str]:
-    # Claude Code supports OTel through settings.json env keys.
-    # https://docs.anthropic.com/en/docs/claude-code/monitoring-usage
+    # Claude Code supports OTel through settings.json env keys. Its inline tool content and raw
+    # API body event attributes are producer-truncated; file mode is the supported untruncated path.
+    # https://code.claude.com/docs/en/monitoring-usage
     return {
         CLAUDE_MANAGED_ENV_MARKER: "1",
         "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
@@ -1228,17 +1231,32 @@ def _claude_env(policy: HostPolicy) -> dict[str, str]:
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": policy.collector.traces_endpoint,
         "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": policy.collector.metrics_endpoint,
         "OTEL_EXPORTER_OTLP_HEADERS": _otel_headers(policy.collector.headers),
-        "OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT": str(OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT_BYTES),
-        "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT": str(OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT_BYTES),
-        "OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT": str(OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT_BYTES),
         "OTEL_LOG_USER_PROMPTS": _env_bool(_capture_enabled(policy, "user_prompts")),
         # Claude Code falls back to OTEL_LOG_USER_PROMPTS for assistant responses
         # when unset. Keep responses off until policy exposes an explicit field.
         "OTEL_LOG_ASSISTANT_RESPONSES": "0",
         "OTEL_LOG_TOOL_DETAILS": _env_bool(_capture_enabled(policy, "tool_inputs")),
         "OTEL_LOG_TOOL_CONTENT": _env_bool(_capture_enabled(policy, "tool_outputs")),
-        "OTEL_LOG_RAW_API_BODIES": _env_bool(_capture_enabled(policy, "raw_api_bodies")),
+        "OTEL_LOG_RAW_API_BODIES": _claude_raw_api_body_capture_value(policy),
     }
+
+
+def _claude_raw_api_body_capture_value(policy: HostPolicy) -> str:
+    if not _capture_enabled(policy, "raw_api_bodies"):
+        return "0"
+    return f"file:{_claude_raw_api_body_dir()}"
+
+
+def _claude_raw_api_body_dir() -> Path:
+    return _state_path().parent / CLAUDE_RAW_API_BODY_DIR_NAME
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
 
 
 def _unmanaged_claude_env_conflicts(env: dict[object, object], desired_env: dict[str, str]) -> list[str]:
