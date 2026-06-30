@@ -155,14 +155,13 @@ def _trace_collector_hook_entry(target: Harness, event_name: str) -> dict[str, J
         hook_command: dict[str, JsonValue] = {
             "command": (
                 f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" '
-                f"--host claude --lifecycle {lifecycle} --quiet"
+                f"--host claude --lifecycle {lifecycle}"
             ),
         }
     else:
         hook_command = {
             "command": (
-                f'python3 "${{PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" '
-                f"--host codex --lifecycle {lifecycle} --quiet"
+                f'python3 "${{PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" --host codex --lifecycle {lifecycle}'
             ),
         }
 
@@ -172,6 +171,7 @@ def _trace_collector_hook_entry(target: Harness, event_name: str) -> dict[str, J
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
     # Promptless-built static native binary so customer machines do not need Python or uv.
+    # Generated hooks deliberately omit --quiet so local setup and upload statuses are visible.
     entry: dict[str, JsonValue] = {
         "hooks": [
             {

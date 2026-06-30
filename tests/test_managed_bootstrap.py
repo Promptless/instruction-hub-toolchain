@@ -46,6 +46,7 @@ def test_build_injects_managed_trace_collector_runtime(tmp_path: Path) -> None:
             command_hooks = _json_array(entry["hooks"], f"hooks.{event_name}[0].hooks")
             hook = _json_mapping(command_hooks[0], f"hooks.{event_name}[0].hooks[0]")
             assert hook["command"] == _collector_command(target, event_name)
+            assert "--quiet" not in str(hook["command"])
             assert hook["timeout"] == 45
             assert hook["statusMessage"] == "Uploading Promptless traces"
             if event_name == "SessionStart":
@@ -1182,8 +1183,8 @@ def _clean_env(**overrides: str) -> dict[str, str]:
 def _collector_command(target: str, event_name: str) -> str:
     lifecycle = {"SessionStart": "session_start", "Stop": "stop", "SessionEnd": "session_end"}[event_name]
     if target == "claude":
-        return f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{COLLECTOR_BIN}" --host claude --lifecycle {lifecycle} --quiet'
-    return f'python3 "${{PLUGIN_ROOT}}/bin/{COLLECTOR_BIN}" --host codex --lifecycle {lifecycle} --quiet'
+        return f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{COLLECTOR_BIN}" --host claude --lifecycle {lifecycle}'
+    return f'python3 "${{PLUGIN_ROOT}}/bin/{COLLECTOR_BIN}" --host codex --lifecycle {lifecycle}'
 
 
 def _decode_chunk(chunk: dict[str, JsonValue]) -> bytes:
