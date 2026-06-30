@@ -1646,10 +1646,11 @@ def _iter_source_events(
             start_offset = 0
             ledger.sources[path_key] = 0
             ledger.reset_sources.add(path_key)
-        snapshot_end_offset = _complete_end_offset(path)
-        if start_offset >= snapshot_end_offset:
-            continue
         with path.open("rb") as file:
+            file.seek(0, os.SEEK_END)
+            snapshot_end_offset = file.tell()
+            if start_offset >= snapshot_end_offset:
+                continue
             file.seek(start_offset)
             for source_event in _stream_source_events(
                 path,
@@ -1693,6 +1694,16 @@ def _stream_source_events(
         if not line:
             break
         if len(line) > max_chunk_bytes or not line.endswith(b"\n"):
+            if not line.endswith(b"\n") and file.tell() >= snapshot_end_offset:
+                if chunk:
+                    yield _source_event(
+                        path=path,
+                        path_hash=path_hash,
+                        start_offset=chunk_start_offset,
+                        content=bytes(chunk),
+                    )
+                    chunk = bytearray()
+                break
             if chunk:
                 yield _source_event(
                     path=path,

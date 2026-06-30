@@ -36,9 +36,16 @@ COLLECTOR_ASSET_PATH = (
 
 
 class _ReadForbiddenBinaryFile:
-    def __init__(self, file: BinaryIO, *, max_read_size: int | None = None) -> None:
+    def __init__(
+        self,
+        file: BinaryIO,
+        *,
+        max_read_size: int | None = None,
+        forbidden_before_offset: int | None = None,
+    ) -> None:
         self._file = file
         self._max_read_size = max_read_size
+        self._forbidden_before_offset = forbidden_before_offset
 
     def __enter__(self) -> "_ReadForbiddenBinaryFile":
         self._file.__enter__()
@@ -58,6 +65,7 @@ class _ReadForbiddenBinaryFile:
             raise AssertionError("collector must not read an unbounded trace file tail")
         if self._max_read_size is not None and size > self._max_read_size:
             raise AssertionError("collector trace file reads must stay within the configured block size")
+        self._assert_read_allowed()
         return self._file.read(size)
 
     def readline(self, size: int = -1) -> bytes:
@@ -65,6 +73,7 @@ class _ReadForbiddenBinaryFile:
             raise AssertionError("collector must bound trace file line reads")
         if self._max_read_size is not None and size > self._max_read_size:
             raise AssertionError("collector trace file line reads must stay within the configured block size")
+        self._assert_read_allowed()
         return self._file.readline(size)
 
     def seek(self, offset: int, whence: int = 0) -> int:
@@ -72,6 +81,12 @@ class _ReadForbiddenBinaryFile:
 
     def tell(self) -> int:
         return self._file.tell()
+
+    def _assert_read_allowed(self) -> None:
+        if self._forbidden_before_offset is None:
+            return
+        if self._file.tell() < self._forbidden_before_offset:
+            raise AssertionError("collector must not read trace bytes before the ledger offset")
 
 
 def _assert_no_promptless_directory(root: Path) -> None:
@@ -2037,6 +2052,52 @@ def test_collector_streams_source_events_without_unbounded_tail_read(
     assert all(
         len(base64.b64encode(gzip.compress(content)).decode("ascii").encode("ascii")) <= 220 for content in contents
     )
+
+
+def test_collector_streams_from_ledger_offset_without_prefix_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    collector_module = runpy.run_path(str(COLLECTOR_ASSET_PATH), run_name="promptless_trace_collector_offset_test")
+    iter_source_events = collector_module["_iter_source_events"]
+    source_ledger = collector_module["SourceLedger"]
+
+    rollout_path = tmp_path / "rollout.jsonl"
+    prefix = b"".join(
+        (json.dumps({"type": "turn", "id": f"old-{index}", "payload": "x" * 80}) + "\n").encode("utf-8")
+        for index in range(40)
+    )
+    start_offset = len(prefix)
+    pending_lines = [
+        (json.dumps({"type": "turn", "id": "new-1", "payload": "ready"}) + "\n").encode("utf-8"),
+        (json.dumps({"type": "turn", "id": "new-2", "payload": "done"}) + "\n").encode("utf-8"),
+    ]
+    incomplete_line = b'{"type":"turn","id":"partial"'
+    rollout_path.write_bytes(prefix + b"".join(pending_lines) + incomplete_line)
+    original_path_open = Path.open
+
+    def guarded_open(
+        path: Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> object:
+        if path == rollout_path and "b" in mode:
+            return _ReadForbiddenBinaryFile(open(path, "rb"), forbidden_before_offset=start_offset)
+        return original_path_open(path, mode, buffering, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    ledger = source_ledger(path=tmp_path / "ledger.json", is_new=False, sources={str(rollout_path): start_offset})
+    events = list(iter_source_events((rollout_path,), ledger, max_chunk_bytes=4096))
+
+    assert len(events) == 1
+    source_event = events[0]
+    assert source_event.kind == "jsonl_range"
+    assert source_event.start_offset == start_offset
+    assert source_event.end_offset == start_offset + sum(len(line) for line in pending_lines)
+    assert source_event.content == b"".join(pending_lines)
 
 
 def test_collector_hashes_oversized_source_event_with_bounded_reads(
