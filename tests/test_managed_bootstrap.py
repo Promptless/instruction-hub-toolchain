@@ -328,6 +328,7 @@ def test_collector_migrates_legacy_plugin_ledger_before_uploading_pending_ranges
 
         assert payload["baseline_only"] is False
         assert payload["uploaded_chunks"] == 1
+        assert server.upload_requests == ["/v0/traces/batches?target=codex"]
         assert len(server.uploads) == 1
         upload_chunks = _json_array(server.uploads[0]["chunks"], "chunks")
         uploaded_chunk = _json_mapping(upload_chunks[0], "chunks[0]")
@@ -443,6 +444,7 @@ def test_collector_imports_late_legacy_plugin_ledger_into_existing_global_ledger
 
         assert payload["baseline_only"] is False
         assert payload["uploaded_chunks"] == 1
+        assert server.upload_requests == ["/v0/traces/batches?target=claude"]
         assert len(server.uploads) == 1
         upload_chunks = _json_array(server.uploads[0]["chunks"], "chunks")
         uploaded_chunk = _json_mapping(upload_chunks[0], "chunks[0]")
@@ -2852,6 +2854,7 @@ class _FakeWorkerServer:
         self.policy_requests: list[str] = []
         self.poll_requests: list[dict[str, JsonValue]] = []
         self.check_ins: list[dict[str, JsonValue]] = []
+        self.upload_requests: list[str] = []
         self.uploads: list[dict[str, JsonValue]] = []
         self._thread: threading.Thread | None = None
 
@@ -2878,6 +2881,7 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.policy_requests = self.policy_requests
         _FakeWorkerHandler.poll_requests = self.poll_requests
         _FakeWorkerHandler.check_ins = self.check_ins
+        _FakeWorkerHandler.upload_requests = self.upload_requests
         _FakeWorkerHandler.uploads = self.uploads
 
     def start(self) -> None:
@@ -2907,6 +2911,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     policy_requests: ClassVar[list[str]]
     poll_requests: ClassVar[list[dict[str, JsonValue]]]
     check_ins: ClassVar[list[dict[str, JsonValue]]]
+    upload_requests: ClassVar[list[str]]
     uploads: ClassVar[list[dict[str, JsonValue]]]
 
     def do_GET(self) -> None:
@@ -2951,7 +2956,13 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
                 }
             self._send_json(self.check_in_status, response)
             return
-        if self.path == "/v0/traces/batches":
+        if parsed.path == "/v0/traces/batches":
+            query = parse_qs(parsed.query)
+            target_values = query.get("target")
+            assert target_values in (["codex"], ["claude"])
+            assert payload.get("host") == target_values[0]
+            assert payload.get("source") == target_values[0]
+            self.upload_requests.append(self.path)
             self.uploads.append(payload)
             before_upload_response = type(self).before_upload_response
             if before_upload_response is not None:

@@ -434,6 +434,7 @@ def _run_collector(
                 _post_upload_batch(
                     policy.trace_collection.upload_endpoint,
                     credential.value,
+                    host,
                     policy,
                     upload_batch,
                 )
@@ -1999,11 +2000,18 @@ def _stable_upload_batch_id(host: Host, policy: HostPolicy, chunks: list[JsonVal
 def _post_upload_batch(
     url: str,
     token: str,
+    host: Host,
     policy: HostPolicy,
     upload_batch: UploadBatch,
 ) -> None:
-    response = _post_json(url, token, upload_batch.request)
-    _validate_upload_response(response, upload_batch.request, policy.policy_version, url)
+    upload_url = _trace_upload_url(url, host)
+    response = _post_json(upload_url, token, upload_batch.request)
+    _validate_upload_response(response, upload_batch.request, policy.policy_version, upload_url)
+
+
+def _trace_upload_url(url: str, host: Host) -> str:
+    parsed = urlsplit(url)
+    return parsed._replace(query=urlencode({"target": host})).geturl()
 
 
 def _post_check_in(
