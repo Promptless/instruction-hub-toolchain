@@ -26,7 +26,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import BinaryIO, Literal, TextIO
+from typing import BinaryIO, Literal, Union
 from urllib.parse import SplitResult, parse_qs, urlencode, urlsplit
 
 if os.name == "nt":
@@ -55,8 +55,12 @@ CALLBACK_STATE_PARAM = "state"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
 
-JsonScalar = str | int | float | bool | None
-JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+# This bin runs under the host's own python3, which on macOS is the system Python 3.9
+# (/usr/bin/python3). Keep runtime-evaluated unions off the PEP 604 ``X | Y`` form (3.10+): these
+# aliases and the isinstance() in _json_value() are evaluated at import/call time, unlike annotations
+# (kept lazy by ``from __future__ import annotations``). Use typing.Union / isinstance tuples instead.
+JsonScalar = Union[str, int, float, bool, None]
+JsonValue = Union[JsonScalar, list["JsonValue"], dict[str, "JsonValue"]]
 CAPTURE_POLICY_VALUES = frozenset({"disabled", "full_local_default"})
 HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
@@ -155,15 +159,15 @@ def main() -> int:
     parser.add_argument("--host", choices=("auto", "codex", "claude"), default="auto")
     parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
     args = parser.parse_args()
+    host = _resolve_host(args.host)
     try:
-        return _run(args.host, quiet=args.quiet)
+        return _run(host, quiet=args.quiet)
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
-        _emit({"status": "error", "message": _redact_text(str(exc))}, quiet=args.quiet, stream=sys.stderr)
+        _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=args.quiet)
         return 0
 
 
-def _run(host_arg: str, *, quiet: bool) -> int:
-    host = _resolve_host(host_arg)
+def _run(host: Host, *, quiet: bool) -> int:
     # Compute any plugin-update notice independent of the enrollment gate so every install (not
     # just enrolled hosts) learns when the Instruction Hub plugin version changed. Both Claude and
     # Codex render the SessionStart `systemMessage`. The new version is recorded only after the
@@ -317,9 +321,13 @@ def _resolve_host(host_arg: str) -> Host:
 
 
 def _bootstrap_auth_flow_enabled() -> bool:
-    """Return whether the end-user device has enabled bootstrap auth testing."""
+    """Return whether the end-user device has enabled bootstrap auth testing.
 
-    return os.environ.get(BOOTSTRAP_AUTH_FLAG_ENV) == "True"
+    Accepts any case-insensitive truthy spelling of ``PIGS_FLY`` (``"1"`` or
+    ``"true"``) so the dogfood gate is not tripped by, e.g., ``true`` vs ``True``.
+    """
+
+    return os.environ.get(BOOTSTRAP_AUTH_FLAG_ENV, "").strip().lower() in {"1", "true"}
 
 
 def _plugin_root() -> Path | None:
@@ -372,9 +380,12 @@ def _worker_deployment_instance_id(worker_base_url: str) -> str:
 
 
 def _state_path() -> Path:
-    for raw_dir in (os.environ.get("PLUGIN_DATA"), os.environ.get("CLAUDE_PLUGIN_DATA")):
-        if raw_dir:
-            return Path(raw_dir).expanduser() / STATE_FILE_NAME
+    # Host enrollment is a per-host concept: one approved credential and one OTel policy cover
+    # every Promptless plugin this user installs from the hub. Persist the state at a single
+    # host-global path so multiple plugins coordinate through one file (and one credential)
+    # instead of each enrolling -- and opening its own browser window -- independently. The
+    # per-plugin CLAUDE_PLUGIN_DATA/PLUGIN_DATA directories are intentionally not used here: the
+    # agent host sets a different one per plugin, which would re-fragment the shared host state.
     return Path.home() / ".promptless/instruction-hub" / STATE_FILE_NAME
 
 
@@ -435,6 +446,45 @@ def _ensure_windows_lock_byte(lock_file: BinaryIO) -> None:
         lock_file.write(b"\0")
         lock_file.flush()
     lock_file.seek(0)
+
+
+@contextmanager
+def _enrollment_leader_lock(context: EnrollmentContext, state_path: Path) -> Iterator[bool]:
+    """Serialize browser-approval enrollment across the plugins that share this host credential.
+
+    Yields ``True`` to the single process that wins the lock (the leader, which opens the one
+    browser approval) and ``False`` to any concurrent process for the same credential (a
+    follower, which must not open a second browser). The lock is scoped to the credential cache
+    key so independent agent hosts (claude vs codex) still enroll in parallel, and it is
+    non-blocking so a follower returns immediately and defers to a later session instead of
+    stacking up behind the leader's approval wait.
+    """
+
+    lock_path = state_path.with_name(f"host-enrollment-{_credential_cache_key(context)}.enroll.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        acquired = _try_lock_state_file(lock_file)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                _unlock_state_file(lock_file)
+
+
+def _try_lock_state_file(lock_file: BinaryIO) -> bool:
+    """Attempt a non-blocking exclusive lock, returning True when acquired and False when held elsewhere."""
+    if os.name == "nt":
+        _ensure_windows_lock_byte(lock_file)
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
 
 
 def _host_instance_id(state: dict[str, JsonValue]) -> str:
@@ -502,13 +552,34 @@ def _forget_cached_host_credential(context: EnrollmentContext) -> None:
 def _enroll_host_credential(context: EnrollmentContext) -> HostCredential | None:
     state_path = _state_path()
     session = _load_pending_enrollment_session(context, state_path)
-    if session is None:
-        created_session = _create_enrollment_session(context)
-        if created_session is None:
-            return None
-        session, stored_new_session = _store_pending_enrollment(context, state_path, created_session)
-        if not stored_new_session:
-            session = _load_pending_enrollment_session(context, state_path) or session
+    if session is not None:
+        # A pending session already exists (e.g. left by an earlier session start); polling it
+        # opens no browser, so no cross-plugin coordination is needed here.
+        return _complete_host_enrollment(context, state_path, session)
+    # A fresh enrollment opens a browser. Serialize that across every plugin on this host so only
+    # the leader drives the single browser approval; concurrent followers reuse the resulting
+    # credential or defer rather than opening their own browser window.
+    with _enrollment_leader_lock(context, state_path) as is_enrollment_leader:
+        if not is_enrollment_leader:
+            return _cached_host_credential(context)
+        # Re-check under the lock: a previous leader may have just finished enrolling this host.
+        credential = _cached_host_credential(context)
+        if credential is not None:
+            return credential
+        session = _load_pending_enrollment_session(context, state_path)
+        if session is None:
+            created_session = _create_enrollment_session(context)
+            session, stored_new_session = _store_pending_enrollment(context, state_path, created_session)
+            if not stored_new_session:
+                session = _load_pending_enrollment_session(context, state_path) or session
+        return _complete_host_enrollment(context, state_path, session)
+
+
+def _complete_host_enrollment(
+    context: EnrollmentContext,
+    state_path: Path,
+    session: EnrollmentSession,
+) -> HostCredential | None:
     credential = _poll_enrollment_session(context, session)
     if credential is None:
         return None
@@ -556,14 +627,20 @@ def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, Jso
     )
 
 
-def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSession | None:
+def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSession:
     with _EnrollmentCallbackServer() as callback_server:
         start_url = _hosted_enrollment_start_url(context, callback_server.callback_url)
         if not _open_hosted_enrollment_url(start_url):
-            return None
+            raise BootstrapError(
+                "could not open the Promptless enrollment browser. Check that a default browser is "
+                "available, then restart the agent from a desktop session."
+            )
         callback_payload = callback_server.wait(ENROLLMENT_CALLBACK_DEADLINE_SECONDS)
     if callback_payload is None:
-        return None
+        raise BootstrapError(
+            "Promptless enrollment did not receive browser approval before the local callback timed "
+            "out. Approve the browser prompt, then restart the agent."
+        )
     return _enrollment_session_from_callback(context, callback_payload)
 
 
@@ -782,8 +859,6 @@ def _store_host_credential(
             "worker_base_url": context.worker_base_url,
             "deployment_instance_id": credential.deployment_instance_id,
             "target": context.metadata.target,
-            "plugin_id": context.metadata.plugin_id,
-            "package_id": context.metadata.package_id,
             "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
         state["credentials"] = credentials
@@ -804,10 +879,12 @@ def _forget_pending_enrollment(context: EnrollmentContext) -> None:
 
 
 def _credential_cache_key(context: EnrollmentContext) -> str:
+    # Key the credential and pending enrollment on host-level identity only: the worker
+    # deployment and the agent host (claude/codex). Every plugin from the hub on this machine
+    # maps to the same key, so one browser approval enrolls the host once and all of its plugins
+    # reuse the resulting credential. Plugin- and package-scoped fields are deliberately excluded.
     cache_material = {
         "deployment_instance_id": context.deployment_instance_id,
-        "package_id": context.metadata.package_id,
-        "plugin_id": context.metadata.plugin_id,
         "target": context.metadata.target,
         "worker_base_url": context.worker_base_url,
     }
@@ -1066,6 +1143,14 @@ def _configure_codex(policy: HostPolicy) -> ConfigResult:
             message="Codex policy requires capture controls this bootstrap cannot enforce",
             details={"path": str(config_path), "capture_policy_keys": unsupported_capture_fields},
         )
+    if _has_malformed_managed_blocks(existing):
+        return _blocked_result(
+            "codex",
+            policy,
+            kind="manual_config_required",
+            message="Existing Codex managed telemetry markers are malformed",
+            details={"path": str(config_path)},
+        )
     unmanaged_source = _without_managed_block(existing)
     if _has_unmanaged_codex_otel_config(unmanaged_source):
         return _blocked_result(
@@ -1126,9 +1211,17 @@ def _has_unmanaged_codex_otel_config(existing: str) -> bool:
 
 
 def _without_managed_block(existing: str) -> str:
-    if existing.count(MANAGED_BEGIN) != 1 or existing.count(MANAGED_END) != 1:
-        return existing
-    return _managed_block_pattern().sub("", existing, count=1)
+    return _managed_block_pattern().sub("", existing)
+
+
+def _has_malformed_managed_blocks(existing: str) -> bool:
+    begin_count = existing.count(MANAGED_BEGIN)
+    end_count = existing.count(MANAGED_END)
+    if begin_count != end_count:
+        return begin_count > 0 or end_count > 0
+    if begin_count == 0:
+        return False
+    return sum(1 for _ in _managed_block_pattern().finditer(existing)) != begin_count
 
 
 def _managed_block_pattern() -> re.Pattern[str]:
@@ -1185,8 +1278,10 @@ def _read_settings(settings_path: Path) -> dict[str, JsonValue]:
 
 
 def _claude_env(policy: HostPolicy) -> dict[str, str]:
-    # Claude Code supports OTel through settings.json env keys.
-    # https://docs.anthropic.com/en/docs/claude-code/monitoring-usage
+    # Claude Code's inline content attributes are producer-bounded before export. Keep raw API
+    # bodies inline so the hosted collector receives them; file mode needs a separate uploader or
+    # file collector before we can claim those local body_ref files are ingested.
+    # https://code.claude.com/docs/en/monitoring-usage
     return {
         CLAUDE_MANAGED_ENV_MARKER: "1",
         "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
@@ -1195,6 +1290,7 @@ def _claude_env(policy: HostPolicy) -> dict[str, str]:
         "OTEL_METRICS_EXPORTER": "otlp",
         "OTEL_TRACES_EXPORTER": "otlp",
         "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": _otlp_http_base_endpoint(policy.collector.traces_endpoint),
         "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": policy.collector.logs_endpoint,
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": policy.collector.traces_endpoint,
         "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": policy.collector.metrics_endpoint,
@@ -1207,6 +1303,11 @@ def _claude_env(policy: HostPolicy) -> dict[str, str]:
         "OTEL_LOG_TOOL_CONTENT": _env_bool(_capture_enabled(policy, "tool_outputs")),
         "OTEL_LOG_RAW_API_BODIES": _env_bool(_capture_enabled(policy, "raw_api_bodies")),
     }
+
+
+def _otlp_http_base_endpoint(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _unmanaged_claude_env_conflicts(env: dict[object, object], desired_env: dict[str, str]) -> list[str]:
@@ -1301,8 +1402,10 @@ def _updated_config_reports(host: Host, path: Path, changed: bool) -> list[dict[
 
 
 def _replace_managed_block(existing: str, managed_block: str) -> str:
-    if MANAGED_BEGIN in existing and MANAGED_END in existing:
-        return _managed_block_pattern().sub(managed_block, existing, count=1)
+    existing_block = _managed_block_pattern().search(existing)
+    if existing_block is not None:
+        suffix = _managed_block_pattern().sub("", existing[existing_block.end() :])
+        return existing[: existing_block.start()] + managed_block + suffix
     prefix = existing.rstrip()
     if not prefix:
         return managed_block
@@ -1444,7 +1547,7 @@ def _json_object(value: dict[object, object]) -> dict[str, JsonValue]:
 
 
 def _json_value(value: object) -> JsonValue:
-    if value is None or isinstance(value, str | int | float | bool):
+    if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, list):
         return [_json_value(child) for child in value]
@@ -1532,22 +1635,28 @@ def _emit(
     payload: dict[str, JsonValue],
     *,
     quiet: bool = False,
-    stream: TextIO | None = None,
     update_notice: str | None = None,
 ) -> None:
     if quiet:
         return
-    output = dict(payload)
-    # Both Claude and Codex surface a SessionStart hook's `systemMessage` to the user; raw stdout
-    # is only added to the model context. The status JSON stays in the payload for manual
-    # troubleshooting; the extra field is ignored by the host hook parsers.
-    # https://code.claude.com/docs/en/hooks  https://developers.openai.com/codex/hooks
-    messages = [message for message in (update_notice, _enrollment_user_message(payload)) if message is not None]
-    if messages:
-        output["systemMessage"] = " ".join(messages)
-    output_stream = stream or sys.stdout
-    output_stream.write(json.dumps(_redact_json(output), sort_keys=True) + "\n")
-    output_stream.flush()
+    # SessionStart hook output contract. Codex validates the hook's *stdout* against a strict schema
+    # (serde deny_unknown_fields): only continue/stopReason/systemMessage/suppressOutput/
+    # hookSpecificOutput are accepted, and any extra key makes Codex reject the whole object with
+    # "hook returned invalid session start JSON output". Claude Code ignores unrecognized fields, but
+    # Codex does not. So stdout carries only the user-facing systemMessage — and nothing at all when
+    # there is no message, which Codex treats as success — while the full diagnostic status object
+    # (status/host/needs_restart/reason) goes to stderr, which neither host parses as hook output.
+    # https://developers.openai.com/codex/hooks  https://code.claude.com/docs/en/hooks
+    message = " ".join(text for text in (update_notice, _enrollment_user_message(payload)) if text is not None)
+    diagnostic = dict(payload)
+    if message:
+        diagnostic["systemMessage"] = message
+    sys.stderr.write(json.dumps(_redact_json(diagnostic), sort_keys=True) + "\n")
+    sys.stderr.flush()
+    if message:
+        control: dict[str, JsonValue] = {"systemMessage": message}
+        sys.stdout.write(json.dumps(_redact_json(control), sort_keys=True) + "\n")
+        sys.stdout.flush()
 
 
 @dataclass(frozen=True)
@@ -1568,15 +1677,21 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
     """Return a user-facing enrollment-status message for the host, or None to stay silent.
 
     Both Claude and Codex surface a message, and only for outcomes worth showing on a hook that
-    runs every startup/resume: a fresh config write, a pending browser approval, or a block. The
-    steady "already configured", gate-disabled, and error states stay silent so the hook does not
-    banner every session (errors still reach stderr/the debug log).
+    runs every startup/resume: a fresh config write, a pending browser approval, a block, or a
+    failure that needs user action. The steady "already configured" and gate-disabled states stay
+    silent so the hook does not banner every session.
     """
 
+    status = payload.get("status")
     host_label = HOST_DISPLAY_NAMES.get(_string_value(payload.get("host")) or "")
+    if status == "error":
+        host_name = host_label.name if host_label is not None else "the agent host"
+        details = _string_value(payload.get("message"))
+        if details:
+            return f"Promptless host enrollment failed for {host_name}: {details}"
+        return f"Promptless host enrollment failed for {host_name}. Check the hook diagnostic output."
     if host_label is None:
         return None
-    status = payload.get("status")
     if status == "needs_restart":
         return f"Promptless telemetry configured for {host_label.name}. Restart {host_label.name} to start telemetry."
     if status == "setup_pending":

@@ -1159,10 +1159,6 @@ def test_publish_version_rejects_invalid_authoritative_release_manifest(tmp_path
     (previous_release_root / "hub.release.json").write_text(
         json.dumps({"plugin": {"id": "acme", "name": "Acme", "version": "not-semver"}, "version_basis": {}})
     )
-    _write_legacy_plugin_manifest(
-        previous_release_root / "dist/claude/core/.claude-plugin/plugin.json",
-        version="9.9.9",
-    )
 
     with pytest.raises(ValueError, match=r"hub\.release\.json: plugin\.version must be SemVer"):
         resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
@@ -1315,10 +1311,6 @@ def test_publish_version_rejects_release_manifest_without_version_basis(tmp_path
     (previous_release_root / "hub.release.json").write_text(
         json.dumps({"plugin": {"id": "acme", "name": "Acme", "version": "0.1.0"}})
     )
-    _write_legacy_plugin_manifest(
-        previous_release_root / "dist/claude/core/.claude-plugin/plugin.json",
-        version="9.9.9",
-    )
 
     with pytest.raises(ValueError, match=r"hub\.release\.json: version_basis is missing"):
         resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
@@ -1356,49 +1348,14 @@ def test_publish_version_rejects_missing_previous_hub_path(tmp_path: Path) -> No
         resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root, hub_relative_path="hub")
 
 
-def test_publish_version_bumps_from_legacy_plugin_manifest_without_release_manifest(tmp_path: Path) -> None:
+def test_publish_version_uses_config_floor_when_previous_release_has_no_manifest(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
-    init_hub(hub_root)
+    init_hub(hub_root, plugin_version="0.3.0")
     previous_release_root = tmp_path / "previous-release"
     previous_release_root.mkdir()
-    _write_legacy_plugin_manifest(
-        previous_release_root / "dist/claude/core/.claude-plugin/plugin.json",
-        version="0.1.0",
-    )
+    (previous_release_root / "dist").mkdir()
 
-    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.1"
-
-
-def test_publish_version_rejects_inconsistent_legacy_plugin_manifest_versions(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root)
-    previous_release_root = tmp_path / "previous-release"
-    previous_release_root.mkdir()
-    _write_legacy_plugin_manifest(
-        previous_release_root / "dist/claude/core/.claude-plugin/plugin.json",
-        version="0.1.0",
-    )
-    _write_legacy_plugin_manifest(
-        previous_release_root / "dist/codex/core/.codex-plugin/plugin.json",
-        version="0.2.0",
-    )
-
-    with pytest.raises(ValueError, match="legacy plugin manifests disagree on version"):
-        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
-
-
-def test_publish_version_rejects_invalid_legacy_plugin_manifest_version(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root)
-    previous_release_root = tmp_path / "previous-release"
-    previous_release_root.mkdir()
-    _write_legacy_plugin_manifest(
-        previous_release_root / "dist/claude/core/.claude-plugin/plugin.json",
-        version="bad",
-    )
-
-    with pytest.raises(ValueError, match=r"plugin\.json: version must be SemVer"):
-        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
+    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.3.0"
 
 
 def test_action_publish_supports_subdirectory_hub_root_and_custom_release_branch(tmp_path: Path) -> None:
@@ -2005,11 +1962,6 @@ def _release_branch_plugin_versions(
         json.loads(_git_output(repo, "show", f"origin/release/stable:{manifest_path}"))["version"]
         for manifest_path in manifest_paths
     }
-
-
-def _write_legacy_plugin_manifest(manifest_path: Path, *, version: str) -> None:
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps({"version": version}))
 
 
 def _init_action_repo(root: Path, *, targets: tuple[str, ...], hub_root_name: str = ".") -> Path:

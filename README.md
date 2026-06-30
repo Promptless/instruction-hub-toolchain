@@ -76,7 +76,7 @@ Every generated plugin embeds local metadata as root files inside each plugin:
 
 The old `.promptless/instruction-hub.yaml` and generated `.promptless/...`
 layout is not read or migrated by this toolchain. Existing hubs must rename
-their config to `hub.yaml` and regenerate output with `pi build`.
+their config to `hub.yaml` and regenerate output with `pig build`.
 
 ## Release Model
 
@@ -91,15 +91,35 @@ into generated customer plugins, including the host enrollment bootstrap used by
 Codex and Claude startup hooks. During dogfood, generated hooks invoke the
 bundled stdlib-only Python script with `python3`.
 
-When local `PIGS_FLY=True` is set, the dogfood bootstrap uses
+When local `PIGS_FLY` is set to a truthy value (`1` or `true`,
+case-insensitive), the dogfood bootstrap uses
 `PROMPTLESS_WORKER_BASE_URL` or the default production worker. It reads the
 worker's public `/healthz` identity, opens the hosted Promptless dashboard start
 URL, and listens on a loopback callback with a per-attempt state token for the
 approved session proof. It then polls the hosted runtime for a one-time per-host
-credential, caches that credential in plugin/user data, and uses the host
-credential to fetch
+credential, caches that credential, and uses the host credential to fetch
 `/v0/host-enrollment/policy?target=...` and post
 `/v0/host-enrollment/check-ins`.
+
+Host enrollment is per host, not per plugin. The credential and pending approval
+are cached at a single host-global path (`~/.promptless/instruction-hub/`) and
+keyed only on the worker deployment and agent host (claude/codex), so every
+Promptless plugin a user installs from the hub shares one credential. A
+non-blocking, per-credential enrollment-leader lock ensures that when multiple
+plugins start at once, exactly one drives the single browser approval while the
+others reuse the result or defer to a later session. The per-plugin
+`CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA` directories are intentionally not used for this
+state.
+
+For Claude Code, managed telemetry follows Claude's supported capture paths
+instead of relying on OpenTelemetry SDK attribute-length variables to override
+producer-side truncation. Inline tool content remains Claude-bounded OTel event
+content. When policy enables raw API body capture, the bootstrap uses inline
+`OTEL_LOG_RAW_API_BODIES=1` so request/response body events reach the configured
+collector through the standard OTel logs pipeline. Claude's `file:<dir>` mode can
+write untruncated local `body_ref` files, but the bootstrap must not enable or
+report that mode as ingested until a local collector or uploader publishes those
+files to Promptless.
 
 Before the customer-grade release, replace that script with a static native
 binary built and versioned by Promptless, then bundled into the toolchain
