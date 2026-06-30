@@ -15,7 +15,7 @@ from promptless_instruction_hub.models import Harness, HubConfig, PackageDefinit
 
 RuntimeStatus = Literal["included"]
 
-TRACE_COLLECTOR_RUNTIME_ID = "native-trace-collector"
+TRACE_COLLECTOR_RUNTIME_ID = "local-trace-collector"
 TRACE_COLLECTOR_ASSET_DIR = "trace-collector"
 TRACE_COLLECTOR_EXECUTABLE = "promptless-trace-collector"
 TRACE_COLLECTOR_HOOK_TIMEOUT_SECONDS = 90

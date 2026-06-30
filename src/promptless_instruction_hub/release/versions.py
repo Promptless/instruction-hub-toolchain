@@ -63,7 +63,7 @@ MANAGED_RUNTIME_KEYS = frozenset(
 )
 SUPPORT_KEYS = frozenset({"mode", "reason"})
 SUPPORT_MODES = frozenset({"agent-skill", "native", "projected", "unsupported"})
-MANAGED_RUNTIME_IDS = frozenset({"native-trace-collector", "host-enrollment-bootstrap"})
+MANAGED_RUNTIME_IDS = frozenset({"local-trace-collector", "host-enrollment-bootstrap"})
 MANAGED_RUNTIME_VERSIONED_FIELDS = frozenset({"executable", "hook", "path", "sha256"})
 
 

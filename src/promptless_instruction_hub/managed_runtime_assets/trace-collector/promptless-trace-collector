@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload native Claude and Codex trace JSONL ranges to a Promptless worker."""
+"""Upload local Claude and Codex trace JSONL ranges to a Promptless worker."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from urllib.parse import SplitResult, parse_qs, urlencode, urlsplit
 COLLECTOR_VERSION = "0.1.0"
 COLLECTOR_CHANNEL = "stable"
 COLLECTOR_EXECUTABLE = "promptless-trace-collector"
-MANAGED_RUNTIME_ID = "native-trace-collector"
+MANAGED_RUNTIME_ID = "local-trace-collector"
 DEFAULT_WORKER_BASE_URL = "https://pig.promptless.ai"
 DEFAULT_DASHBOARD_BASE_URL = "https://app.gopromptless.ai"
 MANAGED_RUNTIME_MANIFEST = Path("hub.managed-runtimes.json")
@@ -190,7 +190,7 @@ class SourceLedger:
 def main() -> int:
     """Run trace collection and return a non-blocking hook exit code."""
 
-    parser = argparse.ArgumentParser(description="Promptless native trace collector")
+    parser = argparse.ArgumentParser(description="Promptless local trace collector")
     parser.add_argument("--host", choices=("auto", "codex", "claude"), default="auto")
     parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
     parser.add_argument("--lifecycle", choices=("session_start", "stop", "session_end"), default=None)
@@ -379,7 +379,7 @@ def _post_error_check_in(
             drift_reports=[
                 {
                     "kind": "trace_collector_error",
-                    "message": "Native trace collector failed after loading hosted policy",
+                    "message": "Local trace collector failed after loading hosted policy",
                     "repaired": False,
                     "details": {"error": _redact_text(error_message)[:400]},
                 }

@@ -1947,7 +1947,7 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
         "toolchain_version",
         "version",
     ]
-    assert managed_runtime_schema["properties"]["id"] == {"const": "native-trace-collector"}
+    assert managed_runtime_schema["properties"]["id"] == {"const": "local-trace-collector"}
     assert managed_runtime_schema["properties"]["status"] == {"const": "included"}
     assert managed_runtime_schema["properties"]["target"] == {"enum": ["claude", "codex"]}
     assert managed_runtime_schema["properties"]["version"] == schema["properties"]["plugin"]["properties"]["version"]

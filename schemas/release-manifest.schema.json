@@ -102,7 +102,7 @@
         ],
         "properties": {
           "id": {
-            "const": "native-trace-collector"
+            "const": "local-trace-collector"
           },
           "package_id": {
             "type": "string",

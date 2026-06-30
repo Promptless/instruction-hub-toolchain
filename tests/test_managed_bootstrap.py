@@ -23,7 +23,7 @@ from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.fs import JsonValue, validate_json_value
 
 COLLECTOR_BIN = "promptless-trace-collector"
-TRACE_COLLECTOR_ID = "native-trace-collector"
+TRACE_COLLECTOR_ID = "local-trace-collector"
 HOST_CREDENTIAL = "plihost_localcredential"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
 COLLECTOR_ASSET_PATH = (
