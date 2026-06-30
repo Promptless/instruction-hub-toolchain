@@ -45,11 +45,11 @@ MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_RUNTIME_MANIFEST = Path("hub.managed-runtimes.json")
 STATE_FILE_NAME = "host-enrollment-state.json"
 LAST_STATUS_FILE_NAME = "last-bootstrap-status.json"
+RAW_API_BODIES_DIR_NAME = "claude-raw-api-bodies"
 HTTP_TIMEOUT_SECONDS = 10
 ENROLLMENT_POLL_DEADLINE_SECONDS = 35
 CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
-BOOTSTRAP_AUTH_FLAG_ENV = "PIGS_FLY"
 OPEN_BROWSER_ENV = "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER"
 CALLBACK_STATE_PARAM = "state"
 Host = Literal["codex", "claude"]
@@ -63,6 +63,16 @@ JsonScalar = Union[str, int, float, bool, None]
 JsonValue = Union[JsonScalar, list["JsonValue"], dict[str, "JsonValue"]]
 CAPTURE_POLICY_VALUES = frozenset({"disabled", "full_local_default"})
 HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_PENDING_CONTROL_OUTPUT: dict[str, JsonValue] | None = None
+_PENDING_CONTROL_OUTPUT_PRIORITY = -1
+_CONTROL_OUTPUT_STATUS_PRIORITY = {
+    "browser_enrollment_starting": 10,
+    "configured": 20,
+    "needs_restart": 80,
+    "setup_pending": 90,
+    "blocked": 100,
+    "error": 110,
+}
 
 
 class BootstrapError(RuntimeError):
@@ -181,6 +191,8 @@ def main() -> int:
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
         _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=args.quiet)
         return 0
+    finally:
+        _flush_control_output()
 
 
 def _run(host: Host, *, quiet: bool) -> int:
@@ -202,18 +214,10 @@ def _run(host: Host, *, quiet: bool) -> int:
 
 
 def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, update_notice: str | None) -> int:
-    if not _bootstrap_auth_flow_enabled():
-        _emit(
-            {"status": "disabled", "reason": "pigs_fly_not_enabled", "host": host},
-            quiet=quiet,
-            update_notice=update_notice,
-        )
-        return 0
-
     worker_base_url = _worker_base_url()
     dashboard_base_url = _dashboard_base_url()
     context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
-    enrollment_attempt = _obtain_host_credential(context)
+    enrollment_attempt = _obtain_host_credential(context, quiet=quiet)
     if enrollment_attempt.credential is None:
         _emit(
             {
@@ -233,7 +237,7 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
     except BootstrapAuthError:
         _forget_cached_host_credential(context)
-        enrollment_attempt = _enroll_host_credential(context)
+        enrollment_attempt = _enroll_host_credential(context, quiet=quiet)
         if enrollment_attempt.credential is None:
             _emit(
                 {
@@ -292,9 +296,9 @@ def _pending_plugin_update(metadata: RuntimeMetadata) -> PendingPluginUpdate | N
     The installed version comes from the plugin's managed-runtime manifest; the last-seen version is
     read from the host data dir (which survives plugin updates), keyed by host so a data dir shared
     between Claude and Codex tracks each separately. This is read-only and best-effort: a missing,
-    unwritable, or corrupt data dir must never turn an otherwise healthy or gate-disabled SessionStart
-    into an error, so state I/O and parse failures yield no notice. The notice is None on a first
-    install (nothing seen yet); the version is still returned so the caller can record it.
+    unwritable, or corrupt data dir must never turn an otherwise healthy SessionStart into an error,
+    so state I/O and parse failures yield no notice. The notice is None on a first install (nothing
+    seen yet); the version is still returned so the caller can record it.
     """
 
     current_version = metadata.plugin_version
@@ -344,16 +348,6 @@ def _resolve_host(host_arg: str) -> Host:
     if os.environ.get("CLAUDE_PLUGIN_ROOT"):
         return "claude"
     return "codex"
-
-
-def _bootstrap_auth_flow_enabled() -> bool:
-    """Return whether the end-user device has enabled bootstrap auth testing.
-
-    Accepts any case-insensitive truthy spelling of ``PIGS_FLY`` (``"1"`` or
-    ``"true"``) so the dogfood gate is not tripped by, e.g., ``true`` vs ``True``.
-    """
-
-    return os.environ.get(BOOTSTRAP_AUTH_FLAG_ENV, "").strip().lower() in {"1", "true"}
 
 
 def _plugin_root() -> Path | None:
@@ -417,6 +411,10 @@ def _state_path() -> Path:
 
 def _last_status_path() -> Path:
     return _state_path().with_name(LAST_STATUS_FILE_NAME)
+
+
+def _raw_api_bodies_path() -> Path:
+    return _state_path().with_name(RAW_API_BODIES_DIR_NAME)
 
 
 def _load_state(path: Path) -> dict[str, JsonValue]:
@@ -540,11 +538,11 @@ def _truncate(value: str, max_length: int) -> str:
     return value[:max_length]
 
 
-def _obtain_host_credential(context: EnrollmentContext) -> EnrollmentAttempt:
+def _obtain_host_credential(context: EnrollmentContext, *, quiet: bool) -> EnrollmentAttempt:
     credential = _cached_host_credential(context)
     if credential is not None:
         return EnrollmentAttempt(credential=credential)
-    return _enroll_host_credential(context)
+    return _enroll_host_credential(context, quiet=quiet)
 
 
 def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None:
@@ -579,7 +577,7 @@ def _forget_cached_host_credential(context: EnrollmentContext) -> None:
             _write_state(state_path, state)
 
 
-def _enroll_host_credential(context: EnrollmentContext) -> EnrollmentAttempt:
+def _enroll_host_credential(context: EnrollmentContext, *, quiet: bool) -> EnrollmentAttempt:
     state_path = _state_path()
     session = _load_pending_enrollment_session(context, state_path)
     if session is not None:
@@ -598,6 +596,7 @@ def _enroll_host_credential(context: EnrollmentContext) -> EnrollmentAttempt:
             return EnrollmentAttempt(credential=credential)
         session = _load_pending_enrollment_session(context, state_path)
         if session is None:
+            _emit({"status": "browser_enrollment_starting", "host": context.metadata.target}, quiet=quiet)
             created_session = _create_enrollment_session(context)
             if created_session.session is None:
                 return EnrollmentAttempt(credential=None, reason=created_session.reason or "approval_pending")
@@ -1271,31 +1270,41 @@ def _read_settings(settings_path: Path) -> dict[str, JsonValue]:
 
 
 def _claude_env(policy: HostPolicy) -> dict[str, str]:
-    # Claude Code's inline content attributes are producer-bounded before export. Keep raw API
-    # bodies inline so the hosted collector receives them; file mode needs a separate uploader or
-    # file collector before we can claim those local body_ref files are ingested.
+    # Claude Code's inline content attributes are producer-bounded before export. File-mode raw API
+    # bodies preserve full request/response JSON locally and emit body_ref events through OTLP.
     # https://code.claude.com/docs/en/monitoring-usage
     return {
         CLAUDE_MANAGED_ENV_MARKER: "1",
         "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
         "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+        "ENABLE_BETA_TRACING_DETAILED": "1",
+        "BETA_TRACING_ENDPOINT": policy.collector.traces_endpoint,
         "OTEL_LOGS_EXPORTER": "otlp",
         "OTEL_METRICS_EXPORTER": "otlp",
         "OTEL_TRACES_EXPORTER": "otlp",
         "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
         "OTEL_EXPORTER_OTLP_ENDPOINT": _otlp_http_base_endpoint(policy.collector.traces_endpoint),
+        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": "http/protobuf",
         "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": policy.collector.logs_endpoint,
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": policy.collector.traces_endpoint,
+        "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf",
         "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": policy.collector.metrics_endpoint,
         "OTEL_EXPORTER_OTLP_HEADERS": _otel_headers(policy.collector.headers),
         "OTEL_LOG_USER_PROMPTS": _env_bool(_capture_enabled(policy, "user_prompts")),
-        # Claude Code falls back to OTEL_LOG_USER_PROMPTS for assistant responses
-        # when unset. Keep responses off until policy exposes an explicit field.
-        "OTEL_LOG_ASSISTANT_RESPONSES": "0",
+        "OTEL_LOG_ASSISTANT_RESPONSES": _env_bool(_capture_enabled(policy, "user_prompts")),
         "OTEL_LOG_TOOL_DETAILS": _env_bool(_capture_enabled(policy, "tool_inputs")),
         "OTEL_LOG_TOOL_CONTENT": _env_bool(_capture_enabled(policy, "tool_outputs")),
-        "OTEL_LOG_RAW_API_BODIES": _env_bool(_capture_enabled(policy, "raw_api_bodies")),
+        "OTEL_LOG_RAW_API_BODIES": _raw_api_bodies_env(policy),
     }
+
+
+def _raw_api_bodies_env(policy: HostPolicy) -> str:
+    if not _capture_enabled(policy, "raw_api_bodies"):
+        return "0"
+    raw_api_bodies_path = _raw_api_bodies_path()
+    raw_api_bodies_path.mkdir(parents=True, exist_ok=True)
+    return f"file:{raw_api_bodies_path}"
 
 
 def _otlp_http_base_endpoint(endpoint: str) -> str:
@@ -1658,8 +1667,38 @@ def _emit(
             control["systemMessage"] = message
         if terminal_sequence is not None:
             control["terminalSequence"] = terminal_sequence
-        sys.stdout.write(json.dumps(_redact_json(control), sort_keys=True) + "\n")
-        sys.stdout.flush()
+        # Keep stdout to one hook-control object, but let terminal outcomes replace the
+        # preliminary browser-start banner before the process exits.
+        _queue_control_output(payload, control)
+
+
+def _queue_control_output(payload: dict[str, JsonValue], control: dict[str, JsonValue]) -> None:
+    global _PENDING_CONTROL_OUTPUT, _PENDING_CONTROL_OUTPUT_PRIORITY
+
+    if _PENDING_CONTROL_OUTPUT == control:
+        return
+    priority = _control_output_priority(payload)
+    if _PENDING_CONTROL_OUTPUT is None or priority >= _PENDING_CONTROL_OUTPUT_PRIORITY:
+        _PENDING_CONTROL_OUTPUT = dict(control)
+        _PENDING_CONTROL_OUTPUT_PRIORITY = priority
+
+
+def _flush_control_output() -> None:
+    global _PENDING_CONTROL_OUTPUT, _PENDING_CONTROL_OUTPUT_PRIORITY
+
+    if _PENDING_CONTROL_OUTPUT is None:
+        return
+    sys.stdout.write(json.dumps(_redact_json(_PENDING_CONTROL_OUTPUT), sort_keys=True) + "\n")
+    sys.stdout.flush()
+    _PENDING_CONTROL_OUTPUT = None
+    _PENDING_CONTROL_OUTPUT_PRIORITY = -1
+
+
+def _control_output_priority(payload: dict[str, JsonValue]) -> int:
+    status = _string_value(payload.get("status"))
+    if status is None:
+        return 0
+    return _CONTROL_OUTPUT_STATUS_PRIORITY.get(status, 0)
 
 
 def _write_last_status(diagnostic: dict[str, JsonValue]) -> None:
@@ -1695,8 +1734,8 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
 
     Both Claude and Codex surface a message, and only for outcomes worth showing on a hook that
     runs every startup/resume: a fresh config write, a pending browser approval, a block, or an
-    failure that needs user action. The steady "already configured" and gate-disabled states stay
-    silent so the hook does not banner every session.
+    failure that needs user action. The steady "already configured" state stays silent so the hook
+    does not banner every session.
     """
 
     status = payload.get("status")
@@ -1709,6 +1748,11 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
         return f"Promptless host enrollment failed for {host_name}. Check the hook diagnostic output."
     if host_label is None:
         return None
+    if status == "browser_enrollment_starting":
+        return (
+            "Promptless Instruction Governance telemetry is starting browser-based enrollment. "
+            "Approve the Promptless browser tab to continue."
+        )
     if status == "needs_restart":
         return f"Promptless telemetry configured for {host_label.name}. Restart {host_label.name} to start telemetry."
     if status == "setup_pending":
@@ -1755,7 +1799,7 @@ def _terminal_sequence(payload: dict[str, JsonValue], message: str) -> str | Non
     if not message or payload.get("host") != "claude":
         return None
     status = payload.get("status")
-    if status not in {"blocked", "error", "needs_restart", "setup_pending"}:
+    if status not in {"blocked", "browser_enrollment_starting", "error", "needs_restart", "setup_pending"}:
         return None
     body = _terminal_notification_body(payload)
     return f"\033]777;notify;Promptless;{body}\007"
