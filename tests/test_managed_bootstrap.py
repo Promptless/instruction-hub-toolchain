@@ -323,7 +323,9 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert server.session_requests[0]["package_id"] == "core"
         assert server.session_requests[0]["bootstrap_version"] == "0.1.0"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
+        assert server.session_requests[0]["pending_callback"] == "1"
         assert server.session_requests[1]["target"] == "claude"
+        assert server.session_requests[1]["pending_callback"] == "1"
         assert server.policy_requests == [
             "/v0/host-enrollment/policy?target=codex",
             "/v0/host-enrollment/policy?target=claude",
@@ -1224,6 +1226,14 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             session_response = self._session_response_payload()
             approval_params = {"callback_url": callback_url, **session_response}
             hosted_approval_url = f"{self._base_url()}/instruction-hub/enroll?{urlencode(approval_params)}"
+            if payload.get("pending_callback") == "1":
+                pending_params = {
+                    "status": "pending",
+                    "approval_url": hosted_approval_url,
+                    **session_response,
+                }
+                self._redirect(_url_with_query_params(callback_url, pending_params))
+                return
             self._redirect(hosted_approval_url)
             return
         if parsed.path == "/instruction-hub/enroll":
