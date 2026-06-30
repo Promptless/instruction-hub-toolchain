@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import ast
 import base64
 import datetime as dt
 import gzip
 import json
 import os
+import shutil
 import subprocess
+import sys
 import threading
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +26,9 @@ COLLECTOR_BIN = "promptless-trace-collector"
 TRACE_COLLECTOR_ID = "native-trace-collector"
 HOST_CREDENTIAL = "plihost_localcredential"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
+COLLECTOR_ASSET_PATH = (
+    Path(__file__).parents[1] / "src/promptless_instruction_hub/managed_runtime_assets/trace-collector" / COLLECTOR_BIN
+)
 
 
 def _assert_no_promptless_directory(root: Path) -> None:
@@ -88,6 +94,72 @@ def test_build_injects_managed_trace_collector_runtime(tmp_path: Path) -> None:
     managed_runtimes = _json_array(release_manifest["managed_runtimes"], "managed_runtimes")
     assert {_json_mapping(runtime, "runtime")["target"] for runtime in managed_runtimes} == {"codex", "claude"}
     _assert_no_promptless_directory(hub_root)
+
+
+def test_collector_asset_remains_python39_compatible() -> None:
+    source = COLLECTOR_ASSET_PATH.read_text()
+
+    ast.parse(source, filename=str(COLLECTOR_ASSET_PATH), feature_version=(3, 9))
+
+    assert " | " not in source
+    assert "strict=" not in source
+
+
+def test_collector_asset_imports_without_posix_fcntl_available() -> None:
+    script = f"""
+import builtins
+import runpy
+
+real_import = builtins.__import__
+
+def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "fcntl":
+        raise ModuleNotFoundError("No module named 'fcntl'")
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = blocked_import
+runpy.run_path({json.dumps(str(COLLECTOR_ASSET_PATH))}, run_name="promptless_trace_collector_import_test")
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_collector_asset_runs_under_python39_when_available(tmp_path: Path) -> None:
+    python39 = _python39_executable()
+    if python39 is None:
+        pytest.skip("python3.9 is not installed")
+
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    home = tmp_path / "home"
+    plugin_data = tmp_path / "plugin-data"
+
+    result = subprocess.run(
+        [python39, str(hub_root / "dist/codex/core/bin" / COLLECTOR_BIN), "--host", "codex"],
+        env=_clean_env(
+            HOME=str(home),
+            PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+            PLUGIN_DATA=str(plugin_data),
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stderr)["status"] == "disabled"
+    assert json.loads(result.stderr)["reason"] == "pigs_fly_not_enabled"
+    assert result.stdout == ""
+    assert not (plugin_data / "trace-collector-ledger.json").exists()
+    assert not _host_state_path(home).exists()
 
 
 def test_collector_disabled_without_bootstrap_flag_exits_zero_without_state(tmp_path: Path) -> None:
@@ -1158,6 +1230,22 @@ def _clean_env(**overrides: str) -> dict[str, str]:
     overrides = _collector_test_overrides(overrides)
     clean_env.update(overrides)
     return clean_env
+
+
+def _python39_executable() -> str | None:
+    for candidate in ("python3.9", "python3"):
+        executable = shutil.which(candidate)
+        if executable is None:
+            continue
+        result = subprocess.run(
+            [executable, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip() == "3.9":
+            return executable
+    return None
 
 
 def _collector_test_overrides(overrides: dict[str, str]) -> dict[str, str]:

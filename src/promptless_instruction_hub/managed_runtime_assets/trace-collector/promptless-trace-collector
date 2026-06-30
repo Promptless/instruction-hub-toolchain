@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
-import fcntl
 import getpass
 import glob
 import gzip
@@ -29,7 +28,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal, Optional, Union
 from urllib.parse import SplitResult, parse_qs, urlencode, urlsplit
 
 COLLECTOR_VERSION = "0.1.0"
@@ -60,8 +59,8 @@ Host = Literal["codex", "claude"]
 LifecycleEvent = Literal["session_start", "stop", "session_end"]
 CollectorStatus = Literal["blocked", "configured", "error"]
 
-JsonScalar = str | int | float | bool | None
-JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+JsonScalar = Union[str, int, float, bool, None]
+JsonValue = Union[JsonScalar, list["JsonValue"], dict[str, "JsonValue"]]
 
 
 class CollectorError(RuntimeError):
@@ -104,8 +103,8 @@ class HostCredential:
     """Local per-host credential approved through the browser flow."""
 
     value: str
-    credential_id: str | None
-    deployment_instance_id: str | None
+    credential_id: Optional[str]
+    deployment_instance_id: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -148,7 +147,7 @@ class HostPolicy:
     trace_collection: TraceCollectionPolicy
     enabled_hosts: tuple[Host, ...]
     capture_policy: dict[str, str]
-    required_bootstrap_version: str | None
+    required_bootstrap_version: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -208,7 +207,7 @@ def _run(
     host_arg: str,
     *,
     quiet: bool,
-    explicit_lifecycle: str | None,
+    explicit_lifecycle: Optional[str],
     hook_context: dict[str, JsonValue],
 ) -> int:
     host = _resolve_host(host_arg)
@@ -414,8 +413,8 @@ def _resolve_host(host_arg: str) -> Host:
 
 
 def _resolve_lifecycle_event(
-    explicit_lifecycle: str | None, hook_context: dict[str, JsonValue]
-) -> LifecycleEvent | None:
+    explicit_lifecycle: Optional[str], hook_context: dict[str, JsonValue]
+) -> Optional[LifecycleEvent]:
     if explicit_lifecycle in {"session_start", "stop", "session_end"}:
         return explicit_lifecycle
     for key in ("hook_event_name", "event_name", "event", "hook", "type"):
@@ -432,7 +431,7 @@ def _resolve_lifecycle_event(
     return None
 
 
-def _plugin_root() -> Path | None:
+def _plugin_root() -> Optional[Path]:
     raw_root = os.environ.get("PLUGIN_ROOT") or os.environ.get("CLAUDE_PLUGIN_ROOT")
     if raw_root is None or raw_root.strip() == "":
         return None
@@ -517,15 +516,86 @@ def _write_state(path: Path, state: dict[str, JsonValue]) -> None:
 
 
 @contextmanager
+def _file_lock(lock_file: BinaryIO, *, blocking: bool) -> Iterator[bool]:
+    acquired = _acquire_file_lock(lock_file, blocking=blocking)
+    if not acquired:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        _release_file_lock(lock_file)
+
+
+def _acquire_file_lock(lock_file: BinaryIO, *, blocking: bool) -> bool:
+    if os.name == "nt":
+        return _acquire_windows_file_lock(lock_file, blocking=blocking)
+    return _acquire_posix_file_lock(lock_file, blocking=blocking)
+
+
+def _acquire_posix_file_lock(lock_file: BinaryIO, *, blocking: bool) -> bool:
+    import fcntl
+
+    lock_mode = fcntl.LOCK_EX
+    if not blocking:
+        lock_mode += fcntl.LOCK_NB
+    try:
+        fcntl.flock(lock_file.fileno(), lock_mode)
+    except OSError:
+        if blocking:
+            raise
+        return False
+    return True
+
+
+def _acquire_windows_file_lock(lock_file: BinaryIO, *, blocking: bool) -> bool:
+    _prepare_windows_lock_region(lock_file)
+    if not blocking:
+        return _try_windows_file_lock(lock_file)
+
+    while not _try_windows_file_lock(lock_file):
+        time.sleep(0.05)
+    return True
+
+
+def _try_windows_file_lock(lock_file: BinaryIO) -> bool:
+    import msvcrt
+
+    try:
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        return False
+    return True
+
+
+def _prepare_windows_lock_region(lock_file: BinaryIO) -> None:
+    lock_file.seek(0, os.SEEK_END)
+    if lock_file.tell() == 0:
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
+
+
+def _release_file_lock(lock_file: BinaryIO) -> None:
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
 def _state_file_lock(path: Path) -> Iterator[None]:
     lock_path = path.with_name(f"{path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
+        with _file_lock(lock_file, blocking=True):
             yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager
@@ -533,15 +603,11 @@ def _enrollment_leader_lock(context: EnrollmentContext, state_path: Path) -> Ite
     lock_path = state_path.with_name(f"host-enrollment-{_credential_cache_key(context)}.enroll.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock_file:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
-        try:
+        with _file_lock(lock_file, blocking=False) as acquired:
+            if not acquired:
+                yield False
+                return
             yield True
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _host_instance_id(state: dict[str, JsonValue]) -> str:
@@ -567,14 +633,14 @@ def _truncate(value: str, max_length: int) -> str:
     return value[:max_length]
 
 
-def _obtain_host_credential(context: EnrollmentContext) -> HostCredential | None:
+def _obtain_host_credential(context: EnrollmentContext) -> Optional[HostCredential]:
     credential = _cached_host_credential(context)
     if credential is not None:
         return credential
     return _enroll_host_credential(context)
 
 
-def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None:
+def _cached_host_credential(context: EnrollmentContext) -> Optional[HostCredential]:
     state = _load_state(_state_path())
     credentials = _json_mapping_or_empty(state.get("credentials"))
     cached_credential = _json_mapping_or_empty(credentials.get(_credential_cache_key(context)))
@@ -598,7 +664,7 @@ def _forget_cached_host_credential(context: EnrollmentContext) -> None:
             _write_state(state_path, state)
 
 
-def _enroll_host_credential(context: EnrollmentContext) -> HostCredential | None:
+def _enroll_host_credential(context: EnrollmentContext) -> Optional[HostCredential]:
     state_path = _state_path()
     session = _load_pending_enrollment_session(context, state_path)
     if session is not None:
@@ -622,7 +688,7 @@ def _complete_host_enrollment(
     context: EnrollmentContext,
     state_path: Path,
     session: EnrollmentSession,
-) -> HostCredential | None:
+) -> Optional[HostCredential]:
     credential = _poll_enrollment_session(context, session)
     if credential is None:
         return None
@@ -630,12 +696,12 @@ def _complete_host_enrollment(
     return credential
 
 
-def _load_pending_enrollment_session(context: EnrollmentContext, state_path: Path) -> EnrollmentSession | None:
+def _load_pending_enrollment_session(context: EnrollmentContext, state_path: Path) -> Optional[EnrollmentSession]:
     with _state_file_lock(state_path):
         return _pending_enrollment_session(context, _load_state(state_path))
 
 
-def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, JsonValue]) -> EnrollmentSession | None:
+def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, JsonValue]) -> Optional[EnrollmentSession]:
     pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
     session_value = _json_mapping_or_empty(pending_enrollments.get(_credential_cache_key(context)))
     if not session_value:
@@ -708,7 +774,7 @@ class _EnrollmentCallbackServer:
 
     def __init__(self) -> None:
         self._event = threading.Event()
-        self._payload: dict[str, str] | None = None
+        self._payload: Optional[dict[str, str]] = None
         self._state = secrets.token_urlsafe(32)
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         host, port = self._server.server_address
@@ -724,7 +790,7 @@ class _EnrollmentCallbackServer:
         self._server.server_close()
         self._thread.join(timeout=5)
 
-    def wait(self, timeout_seconds: float) -> dict[str, str] | None:
+    def wait(self, timeout_seconds: float) -> Optional[dict[str, str]]:
         if not self._event.wait(timeout_seconds):
             return None
         return self._payload
@@ -818,7 +884,7 @@ def _store_pending_enrollment(
         return session, True
 
 
-def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSession) -> HostCredential | None:
+def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSession) -> Optional[HostCredential]:
     deadline = time.monotonic() + ENROLLMENT_POLL_DEADLINE_SECONDS
     while True:
         response = _post_json(
@@ -915,7 +981,7 @@ def _worker_url(worker_base_url: str, path: str) -> str:
     return f"{worker_base_url}{path}"
 
 
-def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetadata:
+def _load_runtime_metadata(plugin_root: Optional[Path], host: Host) -> RuntimeMetadata:
     defaults = RuntimeMetadata(
         collector_version=COLLECTOR_VERSION,
         collector_channel=COLLECTOR_CHANNEL,
@@ -1018,7 +1084,7 @@ def _validate_trace_collection(value: dict[str, JsonValue], host: Host) -> Trace
     )
 
 
-def _host_tuple(value: JsonValue | None, field_name: str) -> tuple[Host, ...]:
+def _host_tuple(value: Optional[JsonValue], field_name: str) -> tuple[Host, ...]:
     if not isinstance(value, list) or not value:
         raise CollectorError(f"{field_name} must be a non-empty array")
     hosts: list[Host] = []
@@ -1031,7 +1097,7 @@ def _host_tuple(value: JsonValue | None, field_name: str) -> tuple[Host, ...]:
     return tuple(hosts)
 
 
-def _native_root_tuple(value: JsonValue | None) -> tuple[NativeRoot, ...]:
+def _native_root_tuple(value: Optional[JsonValue]) -> tuple[NativeRoot, ...]:
     if value is None:
         return ()
     if not isinstance(value, list):
@@ -1083,12 +1149,9 @@ def _ledger_path() -> Path:
 def _ledger_lock(path: Path) -> Iterator[None]:
     lock_path = path.with_name(f"{path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
+    with lock_path.open("a+b") as lock_file:
+        with _file_lock(lock_file, blocking=True):
             yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _load_ledger(path: Path) -> SourceLedger:
@@ -1137,7 +1200,7 @@ def _save_ledger(ledger: SourceLedger) -> None:
         merged_sources[key] = max(merged_sources.get(key, 0), offset)
     payload = {"schema_version": 1, "sources": {key: merged_sources[key] for key in sorted(merged_sources)}}
     content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    temp_path: Path | None = None
+    temp_path: Optional[Path] = None
     try:
         with tempfile.NamedTemporaryFile(
             "w",
@@ -1251,7 +1314,7 @@ def _build_upload_batches(
     metadata: RuntimeMetadata,
     policy: HostPolicy,
     ranges: list[SourceRange],
-    lifecycle_event: LifecycleEvent | None,
+    lifecycle_event: Optional[LifecycleEvent],
 ) -> list[UploadBatch]:
     batches: list[UploadBatch] = []
     current_chunks: list[JsonValue] = []
@@ -1304,7 +1367,7 @@ def _build_upload_batches(
     return batches
 
 
-def _upload_chunk_payload(source_range: SourceRange, lifecycle_event: LifecycleEvent | None) -> dict[str, JsonValue]:
+def _upload_chunk_payload(source_range: SourceRange, lifecycle_event: Optional[LifecycleEvent]) -> dict[str, JsonValue]:
     compressed = gzip.compress(source_range.content)
     return {
         "source_path_hash": source_range.path_hash,
@@ -1428,7 +1491,7 @@ def _require_accepted_response(response: dict[str, JsonValue], url: str) -> None
         raise CollectorError(f"worker did not accept request for {urlsplit(url).path}")
 
 
-def _capture_enabled(capture_policy: dict[str, str], key: str) -> bool | None:
+def _capture_enabled(capture_policy: dict[str, str], key: str) -> Optional[bool]:
     value = capture_policy.get(key)
     if value is None:
         return None
@@ -1438,8 +1501,8 @@ def _capture_enabled(capture_policy: dict[str, str], key: str) -> bool | None:
 def _trace_upload_suppression(
     policy: HostPolicy,
     host: Host,
-    lifecycle_event: LifecycleEvent | None,
-) -> UploadSuppression | None:
+    lifecycle_event: Optional[LifecycleEvent],
+) -> Optional[UploadSuppression]:
     disabled_capture_keys = _native_upload_disabled_capture_keys(policy.capture_policy)
     if disabled_capture_keys:
         return UploadSuppression(
@@ -1468,7 +1531,7 @@ def _trace_upload_suppression(
     return None
 
 
-def _is_terminal_lifecycle_event(host: Host, lifecycle_event: LifecycleEvent | None) -> bool:
+def _is_terminal_lifecycle_event(host: Host, lifecycle_event: Optional[LifecycleEvent]) -> bool:
     if host == "codex":
         return lifecycle_event == "stop"
     return lifecycle_event == "session_end"
@@ -1486,7 +1549,7 @@ def _native_upload_disabled_capture_keys(capture_policy: dict[str, str]) -> list
     return sorted(key for key in required_keys if capture_policy.get(key) != "full_local_default")
 
 
-def _get_json(url: str, token: str | None, *, label: str = "worker response") -> JsonValue:
+def _get_json(url: str, token: Optional[str], *, label: str = "worker response") -> JsonValue:
     request = urllib.request.Request(url, headers=_auth_headers(token), method="GET")
     try:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
@@ -1499,7 +1562,7 @@ def _get_json(url: str, token: str | None, *, label: str = "worker response") ->
 
 def _post_json(
     url: str,
-    token: str | None,
+    token: Optional[str],
     payload: dict[str, JsonValue],
     *,
     label: str = "worker response",
@@ -1524,7 +1587,7 @@ def _post_json(
     return response_mapping
 
 
-def _auth_headers(token: str | None) -> dict[str, str]:
+def _auth_headers(token: Optional[str]) -> dict[str, str]:
     headers = {
         "Accept": "application/json",
         "User-Agent": f"promptless-trace-collector/{COLLECTOR_VERSION}",
@@ -1584,11 +1647,11 @@ def _is_loopback_parsed_url(parsed: SplitResult) -> bool:
     return _is_loopback_host(parsed.hostname)
 
 
-def _is_loopback_host(hostname: str | None) -> bool:
+def _is_loopback_host(hostname: Optional[str]) -> bool:
     return hostname in {"127.0.0.1", "::1", "localhost"}
 
 
-def _requires_newer_runtime(required: str | None, current: str) -> bool:
+def _requires_newer_runtime(required: Optional[str], current: str) -> bool:
     if required is None:
         return False
     comparison = _compare_semver(current, required)
@@ -1597,7 +1660,7 @@ def _requires_newer_runtime(required: str | None, current: str) -> bool:
     return comparison < 0
 
 
-def _compare_semver(first: str, second: str) -> int | None:
+def _compare_semver(first: str, second: str) -> Optional[int]:
     first_match = SEMVER_RE.match(first)
     second_match = SEMVER_RE.match(second)
     if first_match is None or second_match is None:
@@ -1609,7 +1672,7 @@ def _compare_semver(first: str, second: str) -> int | None:
     return _compare_prerelease(first_match.group(4), second_match.group(4))
 
 
-def _compare_prerelease(first: str | None, second: str | None) -> int:
+def _compare_prerelease(first: Optional[str], second: Optional[str]) -> int:
     if first == second:
         return 0
     if first is None:
@@ -1618,7 +1681,7 @@ def _compare_prerelease(first: str | None, second: str | None) -> int:
         return -1
     first_identifiers = first.split(".")
     second_identifiers = second.split(".")
-    for first_part, second_part in zip(first_identifiers, second_identifiers, strict=False):
+    for first_part, second_part in zip(first_identifiers, second_identifiers):
         comparison = _compare_prerelease_identifier(first_part, second_part)
         if comparison != 0:
             return comparison
@@ -1657,7 +1720,7 @@ def _load_json_value(value: object) -> JsonValue:
     return converted
 
 
-def _json_mapping(value: object) -> dict[str, JsonValue] | None:
+def _json_mapping(value: object) -> Optional[dict[str, JsonValue]]:
     if not isinstance(value, dict):
         return None
     result: dict[str, JsonValue] = {}
@@ -1670,14 +1733,14 @@ def _json_mapping(value: object) -> dict[str, JsonValue] | None:
     return result
 
 
-def _json_mapping_or_empty(value: JsonValue | None) -> dict[str, JsonValue]:
+def _json_mapping_or_empty(value: Optional[JsonValue]) -> dict[str, JsonValue]:
     if isinstance(value, dict):
         return value
     return {}
 
 
-def _json_value(value: object) -> JsonValue | _InvalidJson:
-    if value is None or isinstance(value, str | int | float | bool):
+def _json_value(value: object) -> Union[JsonValue, _InvalidJson]:
+    if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, list):
         result: list[JsonValue] = []
@@ -1698,7 +1761,7 @@ def _json_value(value: object) -> JsonValue | _InvalidJson:
     return _INVALID_JSON
 
 
-def _string_mapping(value: JsonValue | None, field_name: str) -> dict[str, str]:
+def _string_mapping(value: Optional[JsonValue], field_name: str) -> dict[str, str]:
     if not isinstance(value, dict):
         raise CollectorError(f"{field_name} must be an object")
     result: dict[str, str] = {}
@@ -1708,19 +1771,19 @@ def _string_mapping(value: JsonValue | None, field_name: str) -> dict[str, str]:
     return result
 
 
-def _host_value(value: JsonValue | None) -> Host | None:
+def _host_value(value: Optional[JsonValue]) -> Optional[Host]:
     if value == "codex" or value == "claude":
         return value
     return None
 
 
-def _string_value(value: JsonValue | None) -> str | None:
+def _string_value(value: Optional[JsonValue]) -> Optional[str]:
     if isinstance(value, str) and value != "":
         return value
     return None
 
 
-def _int_value(value: JsonValue | None) -> int | None:
+def _int_value(value: Optional[JsonValue]) -> Optional[int]:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -1728,13 +1791,13 @@ def _int_value(value: JsonValue | None) -> int | None:
     return None
 
 
-def _bool_value(value: JsonValue | None, *, default: bool) -> bool:
+def _bool_value(value: Optional[JsonValue], *, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     return default
 
 
-def _required_datetime_value(value: JsonValue | None, field_name: str) -> dt.datetime:
+def _required_datetime_value(value: Optional[JsonValue], field_name: str) -> dt.datetime:
     text = _string_value(value)
     if text is None:
         raise CollectorError(f"{field_name} must be an ISO timestamp")
@@ -1747,13 +1810,13 @@ def _required_datetime_value(value: JsonValue | None, field_name: str) -> dt.dat
     return parsed
 
 
-def _optional_datetime_value(value: JsonValue | None, field_name: str) -> dt.datetime | None:
+def _optional_datetime_value(value: Optional[JsonValue], field_name: str) -> Optional[dt.datetime]:
     if value is None:
         return None
     return _required_datetime_value(value, field_name)
 
 
-def _int_string_value(value: str | None, field_name: str) -> int:
+def _int_string_value(value: Optional[str], field_name: str) -> int:
     if value is None:
         raise CollectorError(f"{field_name} must be an integer")
     try:
@@ -1762,7 +1825,7 @@ def _int_string_value(value: str | None, field_name: str) -> int:
         raise CollectorError(f"{field_name} must be an integer") from exc
 
 
-def _optional_int_value(value: JsonValue | None) -> int | None:
+def _optional_int_value(value: Optional[JsonValue]) -> Optional[int]:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -1770,7 +1833,7 @@ def _optional_int_value(value: JsonValue | None) -> int | None:
     return None
 
 
-def _non_empty(value: str | None) -> str | None:
+def _non_empty(value: Optional[str]) -> Optional[str]:
     if value is None or value.strip() == "":
         return None
     return value
@@ -1789,7 +1852,7 @@ def _utc_now_iso() -> str:
 
 
 def _atomic_write_text(path: Path, body: str) -> None:
-    temp_path: Path | None = None
+    temp_path: Optional[Path] = None
     try:
         with tempfile.NamedTemporaryFile(
             "w",
@@ -1809,7 +1872,7 @@ def _atomic_write_text(path: Path, body: str) -> None:
             temp_path.unlink()
 
 
-def _emit(payload: dict[str, JsonValue], *, quiet: bool, stream: object | None = None) -> None:
+def _emit(payload: dict[str, JsonValue], *, quiet: bool, stream: Optional[object] = None) -> None:
     if quiet:
         return
     diagnostic_stream = stream if stream is not None else sys.stderr
@@ -1820,7 +1883,7 @@ def _emit(payload: dict[str, JsonValue], *, quiet: bool, stream: object | None =
             print(json.dumps({"systemMessage": user_message}, sort_keys=True), file=sys.stdout)
 
 
-def _hook_user_message(payload: dict[str, JsonValue]) -> str | None:
+def _hook_user_message(payload: dict[str, JsonValue]) -> Optional[str]:
     status = _string_value(payload.get("status"))
     if status == "setup_pending":
         return "Promptless trace collection is waiting for browser approval. Approve the opened tab, then restart the agent."
