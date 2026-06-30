@@ -76,7 +76,7 @@ Every generated plugin embeds local metadata as root files inside each plugin:
 
 The old `.promptless/instruction-hub.yaml` and generated `.promptless/...`
 layout is not read or migrated by this toolchain. Existing hubs must rename
-their config to `hub.yaml` and regenerate output with `pi build`.
+their config to `hub.yaml` and regenerate output with `pig build`.
 
 ## Release Model
 
@@ -91,7 +91,8 @@ into generated customer plugins, including the host enrollment bootstrap used by
 Codex and Claude startup hooks. During dogfood, generated hooks invoke the
 bundled stdlib-only Python script with `python3`.
 
-When local `PIGS_FLY=True` is set, the dogfood bootstrap uses
+When local `PIGS_FLY` is set to a truthy value (`1` or `true`,
+case-insensitive), the dogfood bootstrap uses
 `PROMPTLESS_WORKER_BASE_URL` or the default production worker. It reads the
 worker's public `/healthz` identity, opens the hosted Promptless dashboard start
 URL, and listens on a loopback callback with a per-attempt state token for the

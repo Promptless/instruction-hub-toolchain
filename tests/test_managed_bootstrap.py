@@ -149,6 +149,63 @@ def test_bootstrap_requires_local_pigs_fly_flag_before_auth_flow(tmp_path: Path)
         server.stop()
 
 
+@pytest.fixture(scope="module")
+def codex_plugin_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build the generated Codex plugin once for the flag-parsing assertions."""
+
+    hub_root = tmp_path_factory.mktemp("flag-hub") / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    return hub_root / "dist/codex/core"
+
+
+@pytest.mark.parametrize(
+    ("flag_value", "expected_status"),
+    [
+        ("1", "error"),
+        ("true", "error"),
+        ("True", "error"),
+        ("TRUE", "error"),
+        (" true ", "error"),
+        ("0", "disabled"),
+        ("false", "disabled"),
+        ("", "disabled"),
+        ("2", "disabled"),
+    ],
+)
+def test_bootstrap_flag_accepts_truthy_values(
+    tmp_path: Path,
+    codex_plugin_root: Path,
+    flag_value: str,
+    expected_status: str,
+) -> None:
+    """The dogfood gate accepts case-insensitive ``1``/``true`` and rejects everything else.
+
+    A truthy flag lets the bootstrap proceed past the gate to the worker call, which fails
+    fast against an unreachable worker (``error``). A falsy or unrecognized flag short-circuits
+    before any network contact (``disabled``).
+    """
+
+    home = tmp_path / "home"
+    payload, _ = _run_bootstrap(
+        codex_plugin_root,
+        "codex",
+        {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(codex_plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": "http://127.0.0.1:9",
+            "PIGS_FLY": flag_value,
+        },
+        expected_status=expected_status,
+        enable_bootstrap=False,
+    )
+
+    if expected_status == "disabled":
+        assert payload["reason"] == "pigs_fly_not_enabled"
+    assert not (home / ".codex/config.toml").exists()
+
+
 def test_bootstrap_persists_host_global_state_file(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -369,6 +426,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert claude_settings["env"]["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] == "1"
         assert claude_settings["env"]["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://127.0.0.1:4318"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"

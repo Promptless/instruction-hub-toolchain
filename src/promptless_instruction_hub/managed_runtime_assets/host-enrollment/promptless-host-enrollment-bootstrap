@@ -317,9 +317,13 @@ def _resolve_host(host_arg: str) -> Host:
 
 
 def _bootstrap_auth_flow_enabled() -> bool:
-    """Return whether the end-user device has enabled bootstrap auth testing."""
+    """Return whether the end-user device has enabled bootstrap auth testing.
 
-    return os.environ.get(BOOTSTRAP_AUTH_FLAG_ENV) == "True"
+    Accepts any case-insensitive truthy spelling of ``PIGS_FLY`` (``"1"`` or
+    ``"true"``) so the dogfood gate is not tripped by, e.g., ``true`` vs ``True``.
+    """
+
+    return os.environ.get(BOOTSTRAP_AUTH_FLAG_ENV, "").strip().lower() in {"1", "true"}
 
 
 def _plugin_root() -> Path | None:
@@ -1227,6 +1231,7 @@ def _claude_env(policy: HostPolicy) -> dict[str, str]:
         "OTEL_METRICS_EXPORTER": "otlp",
         "OTEL_TRACES_EXPORTER": "otlp",
         "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": _otlp_http_base_endpoint(policy.collector.traces_endpoint),
         "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": policy.collector.logs_endpoint,
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": policy.collector.traces_endpoint,
         "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": policy.collector.metrics_endpoint,
@@ -1257,6 +1262,11 @@ def _ensure_private_dir(path: Path) -> None:
         path.chmod(0o700)
     except OSError:
         pass
+
+
+def _otlp_http_base_endpoint(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _unmanaged_claude_env_conflicts(env: dict[object, object], desired_env: dict[str, str]) -> list[str]:

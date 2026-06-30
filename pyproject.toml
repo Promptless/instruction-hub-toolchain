@@ -10,7 +10,7 @@ dependencies = [
 
 [project.scripts]
 promptless-instruction-hub = "promptless_instruction_hub.cli:main"
-pi = "promptless_instruction_hub.cli:main"
+pig = "promptless_instruction_hub.cli:main"
 
 [build-system]
 requires = ["hatchling"]
