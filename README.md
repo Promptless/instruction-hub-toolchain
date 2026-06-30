@@ -78,6 +78,16 @@ into generated customer plugins, including the host enrollment bootstrap used by
 Codex and Claude startup hooks. During dogfood, generated hooks invoke the
 bundled stdlib-only Python script with `python3`.
 
+When local `PIGS_FLY=True` is set, the dogfood bootstrap uses
+`PROMPTLESS_WORKER_BASE_URL` or the default production worker. It creates a
+browser-approved host enrollment session through the worker-local
+`/v0/host-enrollment/sessions` bridge. The session-create response must include
+the worker's `deployment_instance_id`; the bootstrap does not require a separate
+unauthenticated discovery endpoint. It then polls the matching session endpoint
+for a one-time per-host credential, caches that credential in plugin/user data,
+and uses the host credential to fetch `/v0/host-enrollment/policy?target=...`
+and post `/v0/host-enrollment/check-ins`.
+
 Before the customer-grade release, replace that script with a static native
 binary built and versioned by Promptless, then bundled into the toolchain
 release. Customer Instruction Hub repositories should not need Python, uv, Go,
