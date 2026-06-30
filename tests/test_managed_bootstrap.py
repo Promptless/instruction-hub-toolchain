@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.error
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -79,6 +80,22 @@ def _assert_no_promptless_directory(root: Path) -> None:
 
 def _host_state_path(home: Path) -> Path:
     return home / HOST_STATE_REL_PATH
+
+
+def _last_seen_plugin_versions(home: Path) -> dict[str, JsonValue]:
+    state = _json_mapping(json.loads(_host_state_path(home).read_text()), "state")
+    return _json_mapping(state["last_seen_plugin_versions"], "last_seen_plugin_versions")
+
+
+def _assert_stdout_system_message_only(result: subprocess.CompletedProcess[str], expected_substring: str) -> str:
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    message_payload = _json_mapping(validate_json_value(json.loads(lines[0]), "stdout"), "stdout")
+    assert set(message_payload) == {"systemMessage"}
+    system_message = message_payload["systemMessage"]
+    assert isinstance(system_message, str)
+    assert expected_substring in system_message
+    return system_message
 
 
 def test_build_injects_managed_trace_collector_runtime(tmp_path: Path) -> None:
@@ -215,10 +232,10 @@ def test_collector_asset_runs_under_python39_when_available(tmp_path: Path) -> N
     assert json.loads(result.stderr)["reason"] == "pigs_fly_not_enabled"
     assert result.stdout == ""
     assert not (plugin_data / "trace-collector-ledger.json").exists()
-    assert not _host_state_path(home).exists()
+    assert _last_seen_plugin_versions(home) == {"codex": "0.1.0"}
 
 
-def test_collector_disabled_without_bootstrap_flag_exits_zero_without_state(tmp_path: Path) -> None:
+def test_collector_disabled_without_bootstrap_flag_exits_zero_without_ledger(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
@@ -242,7 +259,7 @@ def test_collector_disabled_without_bootstrap_flag_exits_zero_without_state(tmp_
     assert json.loads(result.stderr)["reason"] == "pigs_fly_not_enabled"
     assert result.stdout == ""
     assert not (plugin_data / "trace-collector-ledger.json").exists()
-    assert not _host_state_path(home).exists()
+    assert _last_seen_plugin_versions(home) == {"codex": "0.1.0"}
     assert "plihost_" not in result.stderr
 
     quiet_result = subprocess.run(
@@ -443,6 +460,125 @@ def test_collector_imports_late_legacy_plugin_ledger_into_existing_global_ledger
         server.stop()
 
 
+def test_collector_announces_plugin_update_per_host(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    home = tmp_path / "home"
+
+    def plugin_env(plugin_root: Path) -> dict[str, str]:
+        env = {
+            "HOME": str(home),
+            "PLUGIN_ROOT": str(plugin_root),
+        }
+        if "claude" in plugin_root.parts:
+            env["CLAUDE_PLUGIN_ROOT"] = str(plugin_root)
+        return env
+
+    for host in ("codex", "claude"):
+        plugin_root = hub_root / f"dist/{host}/core"
+        _payload, result = _run_collector(plugin_root, host, plugin_env(plugin_root), expected_status="disabled")
+        assert result.stdout == ""
+
+    assert _last_seen_plugin_versions(home) == {"codex": "0.1.0", "claude": "0.1.0"}
+
+    _rewrite_hub_plugin_version(hub_root, "0.1.0", "0.2.0")
+    build_hub(hub_root)
+
+    for host in ("codex", "claude"):
+        plugin_root = hub_root / f"dist/{host}/core"
+        payload, result = _run_collector(plugin_root, host, plugin_env(plugin_root), expected_status="disabled")
+        message = _assert_stdout_system_message_only(
+            result,
+            "Promptless Instruction Hub updated to v0.2.0 (was v0.1.0).",
+        )
+        assert payload["systemMessage"] == message
+
+    assert _last_seen_plugin_versions(home) == {"codex": "0.2.0", "claude": "0.2.0"}
+
+    for host in ("codex", "claude"):
+        plugin_root = hub_root / f"dist/{host}/core"
+        _payload, result = _run_collector(plugin_root, host, plugin_env(plugin_root), expected_status="disabled")
+        assert result.stdout == ""
+
+
+def test_collector_update_notice_tolerates_unreadable_state(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    home = tmp_path / "home"
+    state_path = _host_state_path(home)
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text("{")
+
+    _payload, result = _run_collector(
+        hub_root / "dist/codex/core",
+        "codex",
+        {
+            "HOME": str(home),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+        },
+        expected_status="disabled",
+    )
+
+    assert result.stdout == ""
+    assert state_path.read_text() == "{"
+
+
+def test_collector_defers_recording_update_until_notice_surfaces(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    home = tmp_path / "home"
+    plugin_root = hub_root / "dist/codex/core"
+
+    _run_collector(
+        plugin_root,
+        "codex",
+        {
+            "HOME": str(home),
+            "PLUGIN_ROOT": str(plugin_root),
+        },
+        expected_status="disabled",
+    )
+    assert _last_seen_plugin_versions(home) == {"codex": "0.1.0"}
+
+    _rewrite_hub_plugin_version(hub_root, "0.1.0", "0.2.0")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+
+    _payload, failed_result = _run_collector(
+        plugin_root,
+        "codex",
+        {
+            "HOME": str(home),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": "http://example.com",
+            "PROMPTLESS_TRACE_COLLECTOR_ALLOW_TEST_URL_OVERRIDES": "0",
+        },
+        expected_status="error",
+    )
+    _assert_stdout_system_message_only(failed_result, "Promptless trace collection failed")
+    assert _last_seen_plugin_versions(home) == {"codex": "0.1.0"}
+
+    payload, healthy_result = _run_collector(
+        plugin_root,
+        "codex",
+        {
+            "HOME": str(home),
+            "PLUGIN_ROOT": str(plugin_root),
+        },
+        expected_status="disabled",
+    )
+
+    message = _assert_stdout_system_message_only(
+        healthy_result,
+        "Promptless Instruction Hub updated to v0.2.0 (was v0.1.0).",
+    )
+    assert payload["systemMessage"] == message
+    assert _last_seen_plugin_versions(home) == {"codex": "0.2.0"}
+
+
 def test_collector_enrolls_host_credential_and_checkins(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -487,6 +623,114 @@ def test_collector_enrolls_host_credential_and_checkins(tmp_path: Path) -> None:
         assert credential["value"] == HOST_CREDENTIAL
         assert credential["deployment_instance_id"] == "worker-local-1"
     finally:
+        server.stop()
+
+
+def test_collector_rejects_loopback_callback_with_wrong_state(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer(callback_state_override="attacker-state")
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "hosted enrollment start request failed with HTTP 403" in str(payload["message"])
+        _assert_stdout_system_message_only(result, "Promptless trace collection failed")
+        assert server.poll_requests == []
+        assert server.policy_requests == []
+        assert server.check_ins == []
+        state = _json_mapping(json.loads(_host_state_path(home).read_text()), "state")
+        assert "credentials" not in state
+    finally:
+        server.stop()
+
+
+def test_collector_requires_callback_deployment_instance_id(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer(callback_payload_overrides={"deployment_instance_id": None})
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "host enrollment callback missing required fields" in str(payload["message"])
+        _assert_stdout_system_message_only(result, "Promptless trace collection failed")
+        assert server.policy_requests == []
+        assert server.check_ins == []
+        state = _json_mapping(json.loads(_host_state_path(home).read_text()), "state")
+        assert "credentials" not in state
+    finally:
+        server.stop()
+
+
+def test_collector_concurrent_same_host_plugins_enroll_once(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    dev_process: subprocess.Popen[str] | None = None
+    ops_process: subprocess.Popen[str] | None = None
+    try:
+        home = tmp_path / "home"
+        dev_plugin = _clone_plugin_with_identity(
+            hub_root / "dist/claude/core", tmp_path / "plugin-dev", plugin_id="hub-dev", package_id="dev"
+        )
+        ops_plugin = _clone_plugin_with_identity(
+            hub_root / "dist/claude/core", tmp_path / "plugin-ops", plugin_id="hub-ops", package_id="ops"
+        )
+
+        def claude_plugin_env(plugin_root: Path) -> dict[str, str]:
+            return {
+                "HOME": str(home),
+                "PLUGIN_ROOT": str(plugin_root),
+                "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+                "CLAUDE_PLUGIN_DATA": str(tmp_path / f"{plugin_root.name}-data"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            }
+
+        dev_process = _start_collector(dev_plugin, "claude", claude_plugin_env(dev_plugin))
+        ops_process = _start_collector(ops_plugin, "claude", claude_plugin_env(ops_plugin))
+
+        dev_payload = _read_any_collector_status(dev_process)
+        ops_payload = _read_any_collector_status(ops_process)
+
+        assert len(server.session_requests) == 1
+        state = _json_mapping(json.loads(_host_state_path(home).read_text()), "state")
+        credentials = _json_mapping(state["credentials"], "credentials")
+        assert len(credentials) == 1
+        stored_credential = _json_mapping(next(iter(credentials.values())), "stored credential")
+        assert stored_credential["target"] == "claude"
+        assert _json_mapping(state["pending_enrollments"], "pending_enrollments") == {}
+        statuses = {dev_payload["status"], ops_payload["status"]}
+        assert statuses & {"configured"}
+        assert statuses <= {"configured", "setup_pending"}
+    finally:
+        for process in (dev_process, ops_process):
+            if process is not None and process.poll() is None:
+                process.kill()
         server.stop()
 
 
@@ -1369,6 +1613,58 @@ def test_collector_suppresses_trace_upload_when_capture_policy_cannot_store_raw_
         drift_reports = _json_array(server.check_ins[0]["drift_reports"], "drift_reports")
         drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
         assert drift_report["kind"] == "trace_upload_suppressed_by_capture_policy"
+        effective_config = _json_mapping(server.check_ins[0]["effective_config"], "effective_config")
+        assert effective_config["user_prompts_enabled"] is False
+        assert effective_config["raw_native_artifacts_enabled"] is True
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize(
+    ("capture_policy_overrides", "expected_message"),
+    [
+        ({"raw_native_artifacts": "enabled"}, "policy.capture_policy.raw_native_artifacts must be one of"),
+        ({"raw_native_artifacts": None}, "policy.capture_policy.raw_native_artifacts must be a string"),
+    ],
+)
+def test_collector_rejects_invalid_capture_policy_before_upload_or_ledger(
+    tmp_path: Path,
+    capture_policy_overrides: dict[str, str | None],
+    expected_message: str,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(
+        capture_policy_overrides=capture_policy_overrides,
+        forward_only_first_install=False,
+    )
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        rollout_path.write_text('{"type":"turn","id":"bad-policy"}\n')
+
+        payload, result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            lifecycle="stop",
+            expected_status="error",
+        )
+
+        assert expected_message in str(payload["message"])
+        _assert_stdout_system_message_only(result, "Promptless trace collection failed")
+        assert server.check_ins == []
+        assert server.uploads == []
+        assert not (plugin_data / "trace-collector-ledger.json").exists()
     finally:
         server.stop()
 
@@ -1949,7 +2245,38 @@ def test_collector_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path
     )
 
     assert "worker base URL must use HTTPS unless" in str(payload["message"])
-    assert result.stdout == ""
+    _assert_stdout_system_message_only(result, "Promptless trace collection failed")
+
+
+def test_collector_stdout_stays_codex_schema_safe_for_setup_pending(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(poll_response={"status": "expired"})
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            lifecycle="stop",
+            expected_status="setup_pending",
+        )
+
+        message = _assert_stdout_system_message_only(
+            result,
+            "Promptless trace collection is waiting for browser approval.",
+        )
+        assert payload["systemMessage"] == message
+        assert server.policy_requests == []
+        assert server.check_ins == []
+    finally:
+        server.stop()
 
 
 def test_build_appends_collector_hooks_to_existing_hook_asset(tmp_path: Path) -> None:
@@ -2034,7 +2361,7 @@ def test_collector_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> 
     server.start()
     try:
         home = tmp_path / "home"
-        payload, _result = _run_collector(
+        payload, result = _run_collector(
             hub_root / "dist/codex/core",
             "codex",
             {
@@ -2046,6 +2373,10 @@ def test_collector_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> 
         )
 
         assert payload["reason"] == "collector_upgrade_required"
+        _assert_stdout_system_message_only(
+            result,
+            "Promptless trace collection needs a newer Instruction Hub plugin before it can run.",
+        )
         assert server.uploads == []
         assert len(server.check_ins) == 1
         check_in = server.check_ins[0]
@@ -2273,6 +2604,41 @@ def _run_collector(
     return payload, result
 
 
+def _start_collector(
+    plugin_root: Path,
+    host: str,
+    env: dict[str, str],
+    *,
+    lifecycle: str | None = None,
+) -> subprocess.Popen[str]:
+    command = [str(plugin_root / "bin" / COLLECTOR_BIN), "--host", host]
+    if lifecycle is not None:
+        command.extend(["--lifecycle", lifecycle])
+    return subprocess.Popen(
+        command,
+        env=_clean_env(**env),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _read_any_collector_status(process: subprocess.Popen[str]) -> dict[str, JsonValue]:
+    try:
+        stdout, stderr = process.communicate(timeout=80)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        pytest.fail(f"collector timed out with stdout={stdout!r} stderr={stderr!r}")
+    assert process.returncode == 0
+    assert HOST_CREDENTIAL not in stdout
+    assert HOST_CREDENTIAL not in stderr
+    result = subprocess.CompletedProcess(args=[], returncode=process.returncode, stdout=stdout, stderr=stderr)
+    payload = _last_collector_payload(result)
+    assert payload is not None
+    return payload
+
+
 def _clean_env(**overrides: str) -> dict[str, str]:
     clean_env = {
         "PATH": os.environ.get("PATH", ""),
@@ -2335,11 +2701,42 @@ def _last_collector_payload(result: subprocess.CompletedProcess[str]) -> dict[st
     return None
 
 
+def _clone_plugin_with_identity(source_plugin: Path, destination: Path, *, plugin_id: str, package_id: str) -> Path:
+    shutil.copytree(source_plugin, destination)
+    manifest_path = destination / "hub.managed-runtimes.json"
+    manifest = _json_mapping(validate_json_value(json.loads(manifest_path.read_text()), "manifest"), "manifest")
+    runtimes = _json_array(manifest["managed_runtimes"], "managed_runtimes")
+    runtime = _json_mapping(runtimes[0], "managed_runtimes[0]")
+    runtime["plugin_id"] = plugin_id
+    runtime["package_id"] = package_id
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return destination
+
+
 def _collector_command(target: str, event_name: str) -> str:
     lifecycle = {"SessionStart": "session_start", "Stop": "stop", "SessionEnd": "session_end"}[event_name]
     if target == "claude":
         return f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{COLLECTOR_BIN}" --host claude --lifecycle {lifecycle}'
     return f'python3 "${{PLUGIN_ROOT}}/bin/{COLLECTOR_BIN}" --host codex --lifecycle {lifecycle}'
+
+
+def _rewrite_hub_plugin_version(hub_root: Path, old_version: str, new_version: str) -> None:
+    hub_yaml = hub_root / "hub.yaml"
+    body = hub_yaml.read_text()
+    old_line = f"plugin_version: {old_version}"
+    assert old_line in body
+    hub_yaml.write_text(body.replace(old_line, f"plugin_version: {new_version}", 1))
+
+
+def _callback_url_with_state(callback_url: str, state: str) -> str:
+    parsed = urlsplit(callback_url)
+    query_pairs: list[tuple[str, str]] = []
+    for key, values in parse_qs(parsed.query, keep_blank_values=False).items():
+        if key == "state":
+            continue
+        query_pairs.extend((key, value) for value in values)
+    query_pairs.append(("state", state))
+    return parsed._replace(query=urlencode(query_pairs)).geturl()
 
 
 def _decode_chunk(chunk: dict[str, JsonValue]) -> bytes:
@@ -2374,7 +2771,7 @@ def _policy_with(
     forward_only_first_install: bool = True,
     include_in_progress_traces: bool = True,
     max_batch_bytes: int = 1048576,
-    capture_policy_overrides: dict[str, str] | None = None,
+    capture_policy_overrides: dict[str, str | None] | None = None,
     plugin_permissions_overrides: dict[str, JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
     capture_policy: dict[str, JsonValue] = {
@@ -2386,7 +2783,11 @@ def _policy_with(
         "raw_native_artifacts": "full_local_default",
     }
     if capture_policy_overrides is not None:
-        capture_policy.update(capture_policy_overrides)
+        for key, value in capture_policy_overrides.items():
+            if value is None:
+                capture_policy.pop(key, None)
+            else:
+                capture_policy[key] = value
     plugin_permissions: dict[str, JsonValue] = {
         "write_user_config": True,
         "repair_user_config": True,
@@ -2438,8 +2839,11 @@ class _FakeWorkerServer:
         forward_only_first_install: bool = True,
         include_in_progress_traces: bool = True,
         max_batch_bytes: int = 1048576,
-        capture_policy_overrides: dict[str, str] | None = None,
+        capture_policy_overrides: dict[str, str | None] | None = None,
         plugin_permissions_overrides: dict[str, JsonValue] | None = None,
+        poll_response: dict[str, JsonValue] | None = None,
+        callback_payload_overrides: dict[str, str | None] | None = None,
+        callback_state_override: str | None = None,
     ) -> None:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
@@ -2467,6 +2871,9 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.upload_response = upload_response
         _FakeWorkerHandler.upload_responses = upload_responses
         _FakeWorkerHandler.before_upload_response = before_upload_response
+        _FakeWorkerHandler.poll_response = poll_response
+        _FakeWorkerHandler.callback_payload_overrides = callback_payload_overrides
+        _FakeWorkerHandler.callback_state_override = callback_state_override
         _FakeWorkerHandler.session_requests = self.session_requests
         _FakeWorkerHandler.policy_requests = self.policy_requests
         _FakeWorkerHandler.poll_requests = self.poll_requests
@@ -2493,6 +2900,9 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     upload_response: ClassVar[dict[str, JsonValue] | None]
     upload_responses: ClassVar[list[tuple[int, dict[str, JsonValue] | None]] | None]
     before_upload_response: ClassVar[Callable[[dict[str, JsonValue]], None] | None]
+    poll_response: ClassVar[dict[str, JsonValue] | None]
+    callback_payload_overrides: ClassVar[dict[str, str | None] | None]
+    callback_state_override: ClassVar[str | None]
     session_requests: ClassVar[list[dict[str, JsonValue]]]
     policy_requests: ClassVar[list[str]]
     poll_requests: ClassVar[list[dict[str, JsonValue]]]
@@ -2521,14 +2931,14 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         payload = self._read_json_body()
         if parsed.path.startswith("/v1/instruction-hub/host-enrollments/sessions/"):
             self.poll_requests.append(payload)
-            self._send_json(
-                200,
-                {
+            response = self.poll_response
+            if response is None:
+                response = {
                     "status": "approved",
                     "host_credential": HOST_CREDENTIAL,
                     "credential_id": "credential-local-1",
-                },
-            )
+                }
+            self._send_json(200, response)
             return
         self._assert_authorized()
         if self.path == "/v0/host-enrollment/check-ins":
@@ -2579,9 +2989,21 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             "expires_at": expires_at,
             "poll_interval_seconds": "1",
         }
+        if self.callback_payload_overrides is not None:
+            for key, value in self.callback_payload_overrides.items():
+                if value is None:
+                    callback_payload.pop(key, None)
+                else:
+                    callback_payload[key] = value
+        if self.callback_state_override is not None:
+            callback_url = _callback_url_with_state(callback_url, self.callback_state_override)
         separator = "&" if urlsplit(callback_url).query else "?"
-        with urlopen(f"{callback_url}{separator}{urlencode(callback_payload)}", timeout=5) as response:
-            response.read()
+        try:
+            with urlopen(f"{callback_url}{separator}{urlencode(callback_payload)}", timeout=5) as response:
+                response.read()
+        except urllib.error.URLError:
+            self._send_json(403, {"accepted": False})
+            return
         self._send_json(200, {"accepted": True})
 
     def _read_json_body(self) -> dict[str, JsonValue]:
