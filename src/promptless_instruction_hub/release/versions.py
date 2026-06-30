@@ -80,23 +80,17 @@ def resolve_publish_plugin_version(
         return config_version
 
     previous_manifest_path = previous_hub_root / RELEASE_MANIFEST_PATH
-    if previous_manifest_path.exists():
-        previous_manifest = read_json_mapping(previous_manifest_path)
-        previous_version, previous_basis = _read_authoritative_release_manifest(
-            previous_manifest_path,
-            previous_manifest,
-        )
-        current_basis = _build_current_version_basis(validation, plugin_version=previous_version)
-        if previous_basis == current_basis:
-            return _max_semver(config_version, previous_version)
-        return _max_semver(config_version, _bump_patch(previous_version))
-
-    previous_version = _read_legacy_plugin_manifest_version(previous_hub_root)
-    if previous_version is None:
+    if not previous_manifest_path.exists():
         return config_version
 
-    # Legacy release branches have no root version basis, so the first flat-layout publish
-    # must assume generated output may have changed.
+    previous_manifest = read_json_mapping(previous_manifest_path)
+    previous_version, previous_basis = _read_authoritative_release_manifest(
+        previous_manifest_path,
+        previous_manifest,
+    )
+    current_basis = _build_current_version_basis(validation, plugin_version=previous_version)
+    if previous_basis == current_basis:
+        return _max_semver(config_version, previous_version)
     return _max_semver(config_version, _bump_patch(previous_version))
 
 
@@ -234,31 +228,6 @@ def _validate_release_identity(
     if release_hash != stable_hash(manifest_without_release_hash):
         msg = f"{manifest_path}: release_hash must match manifest content"
         raise ValueError(msg)
-
-
-def _read_legacy_plugin_manifest_version(previous_hub_root: Path) -> str | None:
-    manifest_paths = sorted(
-        [
-            *previous_hub_root.glob("dist/*/*/.claude-plugin/plugin.json"),
-            *previous_hub_root.glob("dist/*/*/.codex-plugin/plugin.json"),
-            *previous_hub_root.glob("dist/*/*/.cursor-plugin/plugin.json"),
-            *previous_hub_root.glob("dist/*/*/gemini-extension.json"),
-        ]
-    )
-    versions: set[str] = set()
-    for manifest_path in manifest_paths:
-        manifest = read_json_mapping(manifest_path)
-        version = manifest.get("version")
-        if not isinstance(version, str) or SEMVER_RE.match(version) is None:
-            msg = f"{manifest_path}: version must be SemVer"
-            raise ValueError(msg)
-        versions.add(version)
-    if not versions:
-        return None
-    if len(versions) > 1:
-        msg = f"{previous_hub_root}: legacy plugin manifests disagree on version: {', '.join(sorted(versions))}"
-        raise ValueError(msg)
-    return next(iter(versions))
 
 
 def _build_current_version_basis(validation: ValidationResult, *, plugin_version: str) -> dict[str, JsonValue]:
