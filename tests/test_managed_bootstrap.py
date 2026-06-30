@@ -1393,9 +1393,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
 
     def _handle_enrollment_start(self, query_string: str) -> None:
         query = parse_qs(query_string)
-        enrollment_request: dict[str, JsonValue] = {
-            key: values[0] for key, values in query.items() if len(values) == 1
-        }
+        enrollment_request: dict[str, JsonValue] = {key: values[0] for key, values in query.items() if len(values) == 1}
         self.session_requests.append(enrollment_request)
         callback_url = enrollment_request.get("callback_url")
         assert isinstance(callback_url, str)
