@@ -44,6 +44,7 @@ MANAGED_BEGIN = "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_RUNTIME_MANIFEST = Path("hub.managed-runtimes.json")
 STATE_FILE_NAME = "host-enrollment-state.json"
+LAST_STATUS_FILE_NAME = "last-bootstrap-status.json"
 HTTP_TIMEOUT_SECONDS = 10
 ENROLLMENT_POLL_DEADLINE_SECONDS = 35
 CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
@@ -130,6 +131,14 @@ class HostCredential:
 
 
 @dataclass(frozen=True)
+class EnrollmentAttempt:
+    """Result of trying to obtain a host credential."""
+
+    credential: HostCredential | None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
 class EnrollmentSession:
     """Pending browser approval session returned through the local callback."""
 
@@ -139,6 +148,14 @@ class EnrollmentSession:
     poll_url: str
     expires_at: dt.datetime
     poll_interval_seconds: int
+
+
+@dataclass(frozen=True)
+class EnrollmentSessionAttempt:
+    """Result of creating or retrieving an enrollment approval session."""
+
+    session: EnrollmentSession | None
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -196,14 +213,19 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
     worker_base_url = _worker_base_url()
     dashboard_base_url = _dashboard_base_url()
     context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
-    credential = _obtain_host_credential(context)
-    if credential is None:
+    enrollment_attempt = _obtain_host_credential(context)
+    if enrollment_attempt.credential is None:
         _emit(
-            {"status": "setup_pending", "reason": "approval_pending", "host": host},
+            {
+                "status": "setup_pending",
+                "reason": enrollment_attempt.reason or "approval_pending",
+                "host": host,
+            },
             quiet=quiet,
             update_notice=update_notice,
         )
         return 0
+    credential = enrollment_attempt.credential
 
     policy_url = _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
     check_in_url = _worker_url(worker_base_url, "/v0/host-enrollment/check-ins")
@@ -211,14 +233,19 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
     except BootstrapAuthError:
         _forget_cached_host_credential(context)
-        credential = _enroll_host_credential(context)
-        if credential is None:
+        enrollment_attempt = _enroll_host_credential(context)
+        if enrollment_attempt.credential is None:
             _emit(
-                {"status": "setup_pending", "reason": "approval_pending", "host": host},
+                {
+                    "status": "setup_pending",
+                    "reason": enrollment_attempt.reason or "approval_pending",
+                    "host": host,
+                },
                 quiet=quiet,
                 update_notice=update_notice,
             )
             return 0
+        credential = enrollment_attempt.credential
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
     policy = _validate_signed_policy(signed_policy, host)
     if _requires_newer_bootstrap(policy.required_bootstrap_version, BOOTSTRAP_VERSION):
@@ -388,6 +415,10 @@ def _state_path() -> Path:
     return Path.home() / ".promptless/instruction-hub" / STATE_FILE_NAME
 
 
+def _last_status_path() -> Path:
+    return _state_path().with_name(LAST_STATUS_FILE_NAME)
+
+
 def _load_state(path: Path) -> dict[str, JsonValue]:
     if not path.exists():
         return {}
@@ -509,10 +540,10 @@ def _truncate(value: str, max_length: int) -> str:
     return value[:max_length]
 
 
-def _obtain_host_credential(context: EnrollmentContext) -> HostCredential | None:
+def _obtain_host_credential(context: EnrollmentContext) -> EnrollmentAttempt:
     credential = _cached_host_credential(context)
     if credential is not None:
-        return credential
+        return EnrollmentAttempt(credential=credential)
     return _enroll_host_credential(context)
 
 
@@ -548,7 +579,7 @@ def _forget_cached_host_credential(context: EnrollmentContext) -> None:
             _write_state(state_path, state)
 
 
-def _enroll_host_credential(context: EnrollmentContext) -> HostCredential | None:
+def _enroll_host_credential(context: EnrollmentContext) -> EnrollmentAttempt:
     state_path = _state_path()
     session = _load_pending_enrollment_session(context, state_path)
     if session is not None:
@@ -560,15 +591,17 @@ def _enroll_host_credential(context: EnrollmentContext) -> HostCredential | None
     # credential or defer rather than opening their own browser window.
     with _enrollment_leader_lock(context, state_path) as is_enrollment_leader:
         if not is_enrollment_leader:
-            return _cached_host_credential(context)
+            return EnrollmentAttempt(credential=_cached_host_credential(context), reason="enrollment_in_progress")
         # Re-check under the lock: a previous leader may have just finished enrolling this host.
         credential = _cached_host_credential(context)
         if credential is not None:
-            return credential
+            return EnrollmentAttempt(credential=credential)
         session = _load_pending_enrollment_session(context, state_path)
         if session is None:
             created_session = _create_enrollment_session(context)
-            session, stored_new_session = _store_pending_enrollment(context, state_path, created_session)
+            if created_session.session is None:
+                return EnrollmentAttempt(credential=None, reason=created_session.reason or "approval_pending")
+            session, stored_new_session = _store_pending_enrollment(context, state_path, created_session.session)
             if not stored_new_session:
                 session = _load_pending_enrollment_session(context, state_path) or session
         return _complete_host_enrollment(context, state_path, session)
@@ -578,12 +611,13 @@ def _complete_host_enrollment(
     context: EnrollmentContext,
     state_path: Path,
     session: EnrollmentSession,
-) -> HostCredential | None:
-    credential = _poll_enrollment_session(context, session)
-    if credential is None:
-        return None
+) -> EnrollmentAttempt:
+    enrollment_attempt = _poll_enrollment_session(context, session)
+    if enrollment_attempt.credential is None:
+        return enrollment_attempt
+    credential = enrollment_attempt.credential
     _store_host_credential(context, state_path, credential)
-    return credential
+    return EnrollmentAttempt(credential=credential)
 
 
 def _load_pending_enrollment_session(context: EnrollmentContext, state_path: Path) -> EnrollmentSession | None:
@@ -626,21 +660,15 @@ def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, Jso
     )
 
 
-def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSession:
+def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSessionAttempt:
     with _EnrollmentCallbackServer() as callback_server:
         start_url = _hosted_enrollment_start_url(context, callback_server.callback_url)
         if not _open_hosted_enrollment_url(start_url):
-            raise BootstrapError(
-                "could not open the Promptless enrollment browser. Check that a default browser is "
-                "available, then restart the agent from a desktop session."
-            )
+            return EnrollmentSessionAttempt(session=None, reason="browser_launch_failed")
         callback_payload = callback_server.wait(ENROLLMENT_POLL_DEADLINE_SECONDS)
     if callback_payload is None:
-        raise BootstrapError(
-            "Promptless enrollment did not receive browser approval before the local callback timed "
-            "out. Approve the browser prompt, then restart the agent."
-        )
-    return _enrollment_session_from_callback(context, callback_payload)
+        return EnrollmentSessionAttempt(session=None, reason="browser_approval_timeout")
+    return EnrollmentSessionAttempt(session=_enrollment_session_from_callback(context, callback_payload))
 
 
 def _hosted_enrollment_start_url(context: EnrollmentContext, callback_url: str) -> str:
@@ -778,7 +806,7 @@ def _store_pending_enrollment(
         return session, True
 
 
-def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSession) -> HostCredential | None:
+def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSession) -> EnrollmentAttempt:
     deadline = time.monotonic() + ENROLLMENT_POLL_DEADLINE_SECONDS
     while True:
         response = _post_json_response(
@@ -792,19 +820,21 @@ def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSess
             host_credential = _string_value(response.get("host_credential"))
             if host_credential is None:
                 raise BootstrapError("approved host enrollment poll response missing host_credential")
-            return HostCredential(
-                value=host_credential,
-                credential_id=_string_value(response.get("credential_id")),
-                deployment_instance_id=session.deployment_instance_id,
+            return EnrollmentAttempt(
+                credential=HostCredential(
+                    value=host_credential,
+                    credential_id=_string_value(response.get("credential_id")),
+                    deployment_instance_id=session.deployment_instance_id,
+                )
             )
         if status in {"expired", "consumed"}:
             _forget_pending_enrollment(context)
-            return None
+            return EnrollmentAttempt(credential=None, reason="approval_expired")
         if status != "pending":
             raise BootstrapError("host enrollment poll response has invalid status")
         remaining_seconds = deadline - time.monotonic()
         if remaining_seconds <= 0:
-            return None
+            return EnrollmentAttempt(credential=None, reason="approval_pending")
         time.sleep(min(float(session.poll_interval_seconds), remaining_seconds))
 
 
@@ -1606,20 +1636,44 @@ def _emit(
     # (serde deny_unknown_fields): only continue/stopReason/systemMessage/suppressOutput/
     # hookSpecificOutput are accepted, and any extra key makes Codex reject the whole object with
     # "hook returned invalid session start JSON output". Claude Code ignores unrecognized fields, but
-    # Codex does not. So stdout carries only the user-facing systemMessage — and nothing at all when
-    # there is no message, which Codex treats as success — while the full diagnostic status object
-    # (status/host/needs_restart/reason) goes to stderr, which neither host parses as hook output.
+    # Codex does not. So Codex stdout carries only the user-facing systemMessage — and nothing at
+    # all when there is no message, which Codex treats as success. Claude stdout may also carry
+    # terminalSequence for a terminal-level notification. The full diagnostic status object
+    # (status/host/needs_restart/reason) still goes to stderr, which neither host parses as hook
+    # control output.
     # https://developers.openai.com/codex/hooks  https://code.claude.com/docs/en/hooks
     message = " ".join(text for text in (update_notice, _enrollment_user_message(payload)) if text is not None)
+    terminal_sequence = _terminal_sequence(payload, message)
     diagnostic = dict(payload)
     if message:
         diagnostic["systemMessage"] = message
+    if terminal_sequence is not None:
+        diagnostic["terminalSequence"] = terminal_sequence
+    _write_last_status(diagnostic)
     sys.stderr.write(json.dumps(_redact_json(diagnostic), sort_keys=True) + "\n")
     sys.stderr.flush()
-    if message:
-        control: dict[str, JsonValue] = {"systemMessage": message}
+    if message or terminal_sequence is not None:
+        control: dict[str, JsonValue] = {}
+        if message:
+            control["systemMessage"] = message
+        if terminal_sequence is not None:
+            control["terminalSequence"] = terminal_sequence
         sys.stdout.write(json.dumps(_redact_json(control), sort_keys=True) + "\n")
         sys.stdout.flush()
+
+
+def _write_last_status(diagnostic: dict[str, JsonValue]) -> None:
+    payload = dict(diagnostic)
+    payload["emitted_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    try:
+        path = _last_status_path()
+        _atomic_write_text(path, json.dumps(_redact_json(payload), indent=2, sort_keys=True) + "\n")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except OSError:
+        return
 
 
 @dataclass(frozen=True)
@@ -1640,7 +1694,7 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
     """Return a user-facing enrollment-status message for the host, or None to stay silent.
 
     Both Claude and Codex surface a message, and only for outcomes worth showing on a hook that
-    runs every startup/resume: a fresh config write, a pending browser approval, a block, or a
+    runs every startup/resume: a fresh config write, a pending browser approval, a block, or an
     failure that needs user action. The steady "already configured" and gate-disabled states stay
     silent so the hook does not banner every session.
     """
@@ -1658,9 +1712,34 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
     if status == "needs_restart":
         return f"Promptless telemetry configured for {host_label.name}. Restart {host_label.name} to start telemetry."
     if status == "setup_pending":
+        reason = payload.get("reason")
+        if reason == "browser_launch_failed":
+            return (
+                f"Promptless host enrollment could not open a browser for {host_label.name}. "
+                "Restart from a desktop session with browser access, then approve the Promptless enrollment prompt. "
+                "Details were saved to ~/.promptless/instruction-hub/last-bootstrap-status.json."
+            )
+        if reason == "browser_approval_timeout":
+            return (
+                f"Promptless host enrollment did not receive browser approval before timing out. "
+                f"Restart {host_label.name} and approve the Promptless enrollment prompt."
+            )
+        if reason == "enrollment_in_progress":
+            return (
+                "Promptless host enrollment is already running in another installed Promptless plugin. "
+                f"Finish that approval, then restart {host_label.name}."
+            )
+        if reason == "approval_expired":
+            return f"Promptless host enrollment approval expired. Restart {host_label.name} to request a fresh approval."
         return (
             "Promptless host enrollment is awaiting browser approval. "
             f"Approve in the browser tab that opened, then restart {host_label.name}."
+        )
+    if status == "error":
+        message = _string_value(payload.get("message")) or "unknown error"
+        return (
+            f"Promptless host enrollment failed for {host_label.name}: {message}. "
+            "Details were saved to ~/.promptless/instruction-hub/last-bootstrap-status.json."
         )
     if status == "blocked":
         if payload.get("reason") == "bootstrap_upgrade_required":
@@ -1670,6 +1749,27 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
             f"Review {host_label.config_path}."
         )
     return None
+
+
+def _terminal_sequence(payload: dict[str, JsonValue], message: str) -> str | None:
+    if not message or payload.get("host") != "claude":
+        return None
+    status = payload.get("status")
+    if status not in {"blocked", "error", "needs_restart", "setup_pending"}:
+        return None
+    body = _terminal_notification_body(payload)
+    return f"\033]777;notify;Promptless;{body}\007"
+
+
+def _terminal_notification_body(payload: dict[str, JsonValue]) -> str:
+    status = payload.get("status")
+    if status == "error":
+        return "Host enrollment failed"
+    if status == "blocked":
+        return "Host enrollment needs review"
+    if status == "needs_restart":
+        return "Telemetry configured; restart Claude Code"
+    return "Host enrollment needs approval"
 
 
 def _redact_json(value: JsonValue) -> JsonValue:

@@ -20,11 +20,17 @@ from promptless_instruction_hub.fs import JsonValue, validate_json_value
 
 BOOTSTRAP_BIN = "promptless-host-enrollment-bootstrap"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
+LAST_STATUS_REL_PATH = Path(".promptless/instruction-hub/last-bootstrap-status.json")
 
 
 def _host_state_path(home: Path) -> Path:
     """Return the host-global enrollment state file shared by every plugin for one user/home."""
     return home / HOST_STATE_REL_PATH
+
+
+def _last_status_path(home: Path) -> Path:
+    """Return the last host-global bootstrap status file for debugging failed hook runs."""
+    return home / LAST_STATUS_REL_PATH
 
 
 def _assert_no_promptless_directory(root: Path) -> None:
@@ -99,6 +105,13 @@ def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: 
     payload = _assert_session_start_streams(result.stdout, result.stderr, "error")
     message = _json_string(payload["systemMessage"], "systemMessage")
     assert "Promptless host enrollment failed for Codex" in message
+    last_status = _json_mapping(
+        validate_json_value(json.loads(_last_status_path(home).read_text()), "last bootstrap status"),
+        "last bootstrap status",
+    )
+    assert last_status["status"] == "error"
+    assert last_status["host"] == "codex"
+    assert "emitted_at" in last_status
     assert not (home / ".codex/config.toml").exists()
 
     quiet_result = subprocess.run(
@@ -169,17 +182,21 @@ def test_bootstrap_surfaces_browser_open_failure(tmp_path: Path) -> None:
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
                 "PROMPTLESS_DASHBOARD_BASE_URL": "https://app.gopromptless.ai",
             },
-            expected_status="error",
+            expected_status="setup_pending",
         )
 
+        assert payload["reason"] == "browser_launch_failed"
         message = _json_string(payload["systemMessage"], "systemMessage")
-        assert "Promptless host enrollment failed for Claude Code" in message
-        assert "could not open the Promptless enrollment browser" in message
+        assert "Promptless host enrollment could not open a browser for Claude Code" in message
         state = json.loads(_host_state_path(home).read_text())
         assert _json_string(state["host_instance_id"], "host_instance_id").startswith("host-")
         assert "credentials" not in state
         assert "pending_enrollments" not in state
-        assert "last_seen_plugin_versions" not in state
+        seen_versions = _json_mapping(
+            validate_json_value(state["last_seen_plugin_versions"], "last seen plugin versions"),
+            "last seen plugin versions",
+        )
+        assert seen_versions["claude"] == "0.1.0"
         assert server.session_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
@@ -401,7 +418,7 @@ def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path
     build_hub(hub_root)
     home = tmp_path / "home"
 
-    payload, _ = _run_bootstrap(
+    payload, result = _run_bootstrap(
         hub_root / "dist/codex/core",
         "codex",
         {
@@ -417,6 +434,56 @@ def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path
     assert "worker base URL must use HTTPS unless" in str(payload["message"])
     message = _json_string(payload["systemMessage"], "systemMessage")
     assert "Promptless host enrollment failed for Codex" in message
+    assert result.stdout != ""
+
+
+def test_bootstrap_reports_browser_launch_failure_without_claiming_browser_opened(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, result = _run_bootstrap(
+            hub_root / "dist/claude/core",
+            "claude",
+            {
+                "HOME": str(home),
+                "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_DASHBOARD_BASE_URL": "https://app.gopromptless.ai",
+            },
+            expected_status="setup_pending",
+        )
+
+        assert payload["reason"] == "browser_launch_failed"
+        message = _json_string(payload["systemMessage"], "systemMessage")
+        assert "could not open a browser" in message
+        assert "browser tab that opened" not in message
+        assert _json_string(payload["terminalSequence"], "terminalSequence").startswith("\x1b]777;notify;Promptless;")
+        stdout_payload = _json_mapping(validate_json_value(json.loads(result.stdout), "bootstrap stdout"), "stdout")
+        assert set(stdout_payload) == {"systemMessage", "terminalSequence"}
+        assert stdout_payload["systemMessage"] == payload["systemMessage"]
+        assert stdout_payload["terminalSequence"] == payload["terminalSequence"]
+        last_status = _json_mapping(
+            validate_json_value(json.loads(_last_status_path(home).read_text()), "last bootstrap status"),
+            "last bootstrap status",
+        )
+        assert last_status["status"] == "setup_pending"
+        assert last_status["reason"] == "browser_launch_failed"
+        assert last_status["systemMessage"] == payload["systemMessage"]
+        assert last_status["terminalSequence"] == payload["terminalSequence"]
+        assert "emitted_at" in last_status
+        assert not (home / ".claude/settings.json").exists()
+        assert server.session_requests == []
+        assert server.policy_requests == []
+        assert server.poll_requests == []
+        assert server.check_ins == []
+    finally:
+        server.stop()
 
 
 def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Path) -> None:
@@ -1363,10 +1430,13 @@ def test_bootstrap_rejects_invalid_check_in_success_response(tmp_path: Path) -> 
 
 # Codex validates SessionStart hook *stdout* against a strict schema (serde deny_unknown_fields) and
 # rejects any key outside continue/stopReason/systemMessage/suppressOutput/hookSpecificOutput with
-# "hook returned invalid session start JSON output". The bootstrap therefore keeps stdout to the
-# user-facing systemMessage alone (empty when silent) and writes its diagnostic status object — the
-# status/host/needs_restart/reason fields Codex would reject — to stderr, which is not parsed.
+# "hook returned invalid session start JSON output". The bootstrap therefore keeps Codex stdout to
+# the user-facing systemMessage alone (empty when silent) and writes its diagnostic status object —
+# the status/host/needs_restart/reason fields Codex would reject — to stderr, which is not parsed.
+# Claude also accepts terminalSequence, so Claude-only runs may include it to trigger a visible
+# terminal notification when the TUI does not render the hook's systemMessage prominently.
 CODEX_SAFE_STDOUT_KEYS = frozenset({"systemMessage"})
+CLAUDE_SAFE_STDOUT_KEYS = frozenset({"systemMessage", "terminalSequence"})
 
 
 def _parse_session_start_streams(stdout: str, stderr: str) -> dict[str, JsonValue]:
@@ -1382,10 +1452,13 @@ def _parse_session_start_streams(stdout: str, stderr: str) -> dict[str, JsonValu
     stdout_text = stdout.strip()
     if stdout_text:
         control = _json_mapping(validate_json_value(json.loads(stdout_text), "bootstrap stdout"), "bootstrap stdout")
-        assert set(control) <= CODEX_SAFE_STDOUT_KEYS, f"stdout leaks non-schema keys: {sorted(set(control))}"
-        assert control["systemMessage"] == diagnostic["systemMessage"]
+        allowed_keys = CLAUDE_SAFE_STDOUT_KEYS if diagnostic.get("host") == "claude" else CODEX_SAFE_STDOUT_KEYS
+        assert set(control) <= allowed_keys, f"stdout leaks non-schema keys: {sorted(set(control))}"
+        for key, value in control.items():
+            assert value == diagnostic[key]
     else:
         assert "systemMessage" not in diagnostic
+        assert "terminalSequence" not in diagnostic
     return diagnostic
 
 
