@@ -237,6 +237,155 @@ def test_collector_disabled_without_bootstrap_flag_exits_zero_without_state(tmp_
     assert quiet_result.stderr == ""
 
 
+def test_collector_collect_subcommand_exits_zero_when_disabled(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    home = tmp_path / "home"
+    plugin_data = tmp_path / "plugin-data"
+
+    result = subprocess.run(
+        [str(hub_root / "dist/codex/core/bin" / COLLECTOR_BIN), "collect", "--host", "codex"],
+        env=_clean_env(
+            HOME=str(home),
+            PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+            PLUGIN_DATA=str(plugin_data),
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stderr)["status"] == "disabled"
+    assert result.stdout == ""
+    assert not (plugin_data / "trace-collector-ledger.json").exists()
+    assert not _host_state_path(home).exists()
+
+
+def test_collector_enroll_subcommand_obtains_host_credential_without_policy_or_ledger(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        result = subprocess.run(
+            [str(hub_root / "dist/codex/core/bin" / COLLECTOR_BIN), "enroll", "--host", "codex"],
+            env=_clean_env(
+                HOME=str(home),
+                PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+                PLUGIN_DATA=str(plugin_data),
+                PROMPTLESS_WORKER_BASE_URL=server.base_url,
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0
+        payload = _last_collector_payload(result)
+        assert payload is not None
+        assert payload["status"] == "credential_present"
+        assert payload["credential_cached"] is True
+        assert len(server.session_requests) == 1
+        assert server.policy_requests == []
+        assert server.check_ins == []
+        assert server.uploads == []
+        assert not (plugin_data / "trace-collector-ledger.json").exists()
+        state = _json_mapping(json.loads(_host_state_path(home).read_text()), "state")
+        credentials = _json_mapping(state["credentials"], "credentials")
+        credential = _json_mapping(next(iter(credentials.values())), "credential")
+        assert credential["value"] == HOST_CREDENTIAL
+    finally:
+        server.stop()
+
+
+def test_collector_check_in_subcommand_posts_without_uploading(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(forward_only_first_install=False)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        rollout_path.write_text('{"type":"turn","id":"check-in-only"}\n')
+
+        result = subprocess.run(
+            [str(hub_root / "dist/codex/core/bin" / COLLECTOR_BIN), "check-in", "--host", "codex"],
+            env=_clean_env(
+                HOME=str(home),
+                PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+                PLUGIN_DATA=str(plugin_data),
+                PROMPTLESS_WORKER_BASE_URL=server.base_url,
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0
+        payload = _last_collector_payload(result)
+        assert payload is not None
+        assert payload["status"] == "configured"
+        assert payload["checked_in"] is True
+        assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
+        assert len(server.check_ins) == 1
+        assert server.check_ins[0]["status"] == "configured"
+        assert server.uploads == []
+        assert not (plugin_data / "trace-collector-ledger.json").exists()
+    finally:
+        server.stop()
+
+
+def test_collector_check_in_subcommand_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(required_bootstrap_version="0.2.0", forward_only_first_install=False)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        rollout_path.write_text('{"type":"turn","id":"check-in-blocked"}\n')
+
+        result = subprocess.run(
+            [str(hub_root / "dist/codex/core/bin" / COLLECTOR_BIN), "check-in", "--host", "codex"],
+            env=_clean_env(
+                HOME=str(home),
+                PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+                PLUGIN_DATA=str(plugin_data),
+                PROMPTLESS_WORKER_BASE_URL=server.base_url,
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0
+        payload = _last_collector_payload(result)
+        assert payload is not None
+        assert payload["status"] == "blocked"
+        assert payload["reason"] == "collector_upgrade_required"
+        assert len(server.check_ins) == 1
+        check_in = server.check_ins[0]
+        assert check_in["status"] == "blocked"
+        drift_reports = _json_array(check_in["drift_reports"], "drift_reports")
+        first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
+        assert first_drift_report["kind"] == "collector_upgrade_required"
+        assert server.uploads == []
+        assert not (plugin_data / "trace-collector-ledger.json").exists()
+    finally:
+        server.stop()
+
+
 def test_collector_enrolls_host_credential_and_checkins(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -443,6 +592,50 @@ def test_collector_uploads_existing_lines_on_first_run_when_forward_only_disable
         assert len(server.uploads) == 1
         upload = server.uploads[0]
         chunk = _json_mapping(_json_array(upload["chunks"], "chunks")[0], "chunks[0]")
+        assert _decode_chunk(chunk) == existing_line
+        ledger = _json_mapping(json.loads((plugin_data / "trace-collector-ledger.json").read_text()), "ledger")
+        ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert ledger_sources[str(rollout_path)] == len(existing_line)
+    finally:
+        server.stop()
+
+
+def test_collector_legacy_command_preserves_lifecycle_uploads(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(forward_only_first_install=False)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        existing_line = b'{"type":"turn","id":"legacy-stop"}\n'
+        rollout_path.write_bytes(existing_line)
+
+        result = subprocess.run(
+            [str(hub_root / "dist/codex/core/bin" / COLLECTOR_BIN), "--host", "codex", "--lifecycle", "stop"],
+            env=_clean_env(
+                HOME=str(home),
+                PLUGIN_DATA=str(plugin_data),
+                PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+                PROMPTLESS_WORKER_BASE_URL=server.base_url,
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0
+        payload = _last_collector_payload(result)
+        assert payload is not None
+        assert payload["status"] == "configured"
+        assert payload["uploaded_chunks"] == 1
+        assert len(server.uploads) == 1
+        upload = server.uploads[0]
+        chunk = _json_mapping(_json_array(upload["chunks"], "chunks")[0], "chunks[0]")
+        assert chunk["lifecycle_event"] == "stop"
         assert _decode_chunk(chunk) == existing_line
         ledger = _json_mapping(json.loads((plugin_data / "trace-collector-ledger.json").read_text()), "ledger")
         ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
@@ -1317,7 +1510,7 @@ def _run_collector(
     lifecycle: str | None = None,
     input_payload: dict[str, JsonValue] | None = None,
 ) -> tuple[dict[str, JsonValue], subprocess.CompletedProcess[str]]:
-    command = [str(plugin_root / "bin" / COLLECTOR_BIN), "--host", host]
+    command = [str(plugin_root / "bin" / COLLECTOR_BIN), "collect", "--host", host]
     if lifecycle is not None:
         command.extend(["--lifecycle", lifecycle])
     result = subprocess.run(
@@ -1397,8 +1590,8 @@ def _last_collector_payload(result: subprocess.CompletedProcess[str]) -> dict[st
 def _collector_command(target: str, event_name: str) -> str:
     lifecycle = {"SessionStart": "session_start", "Stop": "stop", "SessionEnd": "session_end"}[event_name]
     if target == "claude":
-        return f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{COLLECTOR_BIN}" --host claude --lifecycle {lifecycle}'
-    return f'python3 "${{PLUGIN_ROOT}}/bin/{COLLECTOR_BIN}" --host codex --lifecycle {lifecycle}'
+        return f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{COLLECTOR_BIN}" collect --host claude --lifecycle {lifecycle}'
+    return f'python3 "${{PLUGIN_ROOT}}/bin/{COLLECTOR_BIN}" collect --host codex --lifecycle {lifecycle}'
 
 
 def _decode_chunk(chunk: dict[str, JsonValue]) -> bytes:
