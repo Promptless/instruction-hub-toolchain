@@ -17,7 +17,7 @@ from promptless_instruction_hub.status import summarize_release_manifest
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the `promptless-instruction-hub` / `pi` command."""
+    """Run the `promptless-instruction-hub` / `pig` command."""
 
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="pi", description="Promptless Instruction Hub")
+    parser = argparse.ArgumentParser(prog="pig", description="Promptless Instruction Hub")
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subcommands.add_parser("init", help="initialize an empty Instruction Hub")

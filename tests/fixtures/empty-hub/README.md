@@ -1,3 +1,3 @@
 # Empty Hub Fixture
 
-This fixture is intentionally empty. Tests initialize it through `pi init` to verify bootstrap behavior.
+This fixture is intentionally empty. Tests initialize it through `pig init` to verify bootstrap behavior.

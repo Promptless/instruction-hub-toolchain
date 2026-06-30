@@ -129,7 +129,7 @@ update_claude_pointer="$(normalize_bool_input "update-claude-pointer" "$update_c
 update_codex_pointer="$(normalize_bool_input "update-codex-pointer" "$update_codex_pointer")"
 update_cursor_pointer="$(normalize_bool_input "update-cursor-pointer" "$update_cursor_pointer")"
 
-pi() {
+pig() {
   uv run --project "$GITHUB_ACTION_PATH" promptless-instruction-hub "$@"
 }
 
@@ -278,7 +278,7 @@ resolve_publish_plugin_version() {
     args+=(--previous-release-root "$previous_release_root")
   fi
 
-  pi "${args[@]}"
+  pig "${args[@]}"
 }
 
 copy_generated_paths() {
@@ -584,14 +584,14 @@ commit_prepared_marketplace_pointers() {
 case "$mode" in
   build)
     hub_rel="$(hub_relative_path)"
-    pi validate --hub "$hub_root"
-    pi build --hub "$hub_root"
+    pig validate --hub "$hub_root"
+    pig build --hub "$hub_root"
     restore_generated_paths_on_default_branch "$hub_rel"
     ;;
   check)
     hub_relative_path >/dev/null
-    pi validate --hub "$hub_root"
-    pi build --hub "$hub_root" --check
+    pig validate --hub "$hub_root"
+    pig build --hub "$hub_root" --check
     ;;
   publish)
     require_publish_source_ref
@@ -600,14 +600,14 @@ case "$mode" in
     payload_root="$(mktemp -d)"
     pointer_root="$(mktemp -d)"
     temp_paths+=("$previous_release_root" "$payload_root" "$pointer_root")
-    pi validate --hub "$hub_root"
+    pig validate --hub "$hub_root"
     if copy_previous_release_branch "$previous_release_root"; then
       previous_release_exists=true
     else
       previous_release_exists=false
     fi
     publish_plugin_version="$(resolve_publish_plugin_version "$previous_release_root" "$hub_rel" "$previous_release_exists")"
-    pi build --hub "$hub_root" --plugin-version "$publish_plugin_version"
+    pig build --hub "$hub_root" --plugin-version "$publish_plugin_version"
     copy_generated_paths "$payload_root" "$hub_rel"
     restore_generated_paths_on_default_branch "$hub_rel"
     marketplace_pointer_paths=()
