@@ -639,7 +639,9 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert claude_settings["env"]["OTEL_LOG_ASSISTANT_RESPONSES"] == "1"
         assert claude_settings["env"]["OTEL_LOG_TOOL_DETAILS"] == "1"
         assert claude_settings["env"]["OTEL_LOG_TOOL_CONTENT"] == "1"
-        assert claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"] == "0"
+        assert claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"] == (
+            f"file:{claude_home / '.promptless/instruction-hub/claude-raw-api-bodies'}"
+        )
 
         assert len(server.session_requests) == 2
         codex_callback_state = _callback_state(server.session_requests[0]["callback_url"], "codex callback_url")
@@ -774,44 +776,6 @@ def test_bootstrap_missing_managed_runtime_manifest_uses_default_metadata(tmp_pa
         assert server.check_ins[0]["plugin_version"] == "unknown"
         assert "plugin_id" not in server.check_ins[0]
         assert "package_id" not in server.check_ins[0]
-    finally:
-        server.stop()
-
-
-def test_bootstrap_blocks_unsupported_codex_capture_policy_values(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    build_hub(hub_root)
-    server = _FakeWorkerServer(
-        policy=_policy_with(
-            capture_policy={
-                "user_prompts": "full_local_default",
-                "tool_inputs": "disabled",
-                "tool_outputs": "full_local_default",
-                "raw_api_bodies": "disabled",
-            }
-        )
-    )
-    server.start()
-    try:
-        codex_home = tmp_path / "codex-home"
-        _run_bootstrap(
-            hub_root / "dist/codex/core",
-            "codex",
-            {
-                "HOME": str(codex_home),
-                "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
-            expected_status="blocked",
-        )
-
-        assert not (codex_home / ".codex/config.toml").exists()
-        drift_reports = _json_list(server.check_ins[0]["drift_reports"], "drift_reports")
-        first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
-        details = _json_mapping(first_drift_report["details"], "drift_reports[0].details")
-        assert details["capture_policy_keys"] == ["tool_inputs"]
     finally:
         server.stop()
 
@@ -1012,7 +976,9 @@ def test_bootstrap_repairs_stale_managed_host_otel_config(tmp_path: Path) -> Non
         assert updated_env["OTEL_LOG_ASSISTANT_RESPONSES"] == "1"
         assert updated_env["OTEL_LOG_TOOL_DETAILS"] == "1"
         assert updated_env["OTEL_LOG_TOOL_CONTENT"] == "1"
-        assert updated_env["OTEL_LOG_RAW_API_BODIES"] == "0"
+        assert updated_env["OTEL_LOG_RAW_API_BODIES"] == (
+            f"file:{claude_home / '.promptless/instruction-hub/claude-raw-api-bodies'}"
+        )
         claude_backups = list(claude_settings.parent.glob("settings.json.*.bak"))
         assert len(claude_backups) == 1
         assert json.loads(claude_backups[0].read_text()) == original_claude_settings
@@ -1202,11 +1168,7 @@ def test_bootstrap_configures_claude_raw_api_bodies_file_capture(tmp_path: Path)
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    policy = _policy_with()
-    capture_policy = _json_mapping(policy["policy"], "policy")["capture_policy"]
-    assert isinstance(capture_policy, dict)
-    capture_policy["raw_api_bodies"] = "full_local_default"
-    server = _FakeWorkerServer(policy=policy)
+    server = _FakeWorkerServer()
     server.start()
     try:
         claude_home = tmp_path / "claude-home"
@@ -1458,7 +1420,6 @@ def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_pa
         "expired",
         "missing-write-permission",
         "wrong-logs-path",
-        "invalid-capture-value",
     ],
 )
 def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> None:
@@ -1804,7 +1765,6 @@ def _invalid_policy(case: str) -> dict[str, JsonValue]:
     payload = _policy_with()
     policy = _json_mapping(payload["policy"], "policy")
     collector = _json_mapping(policy["collector"], "policy.collector")
-    capture_policy = _json_mapping(policy["capture_policy"], "policy.capture_policy")
     permissions = _json_mapping(policy["plugin_permissions"], "policy.plugin_permissions")
 
     if case == "expired":
@@ -1813,8 +1773,6 @@ def _invalid_policy(case: str) -> dict[str, JsonValue]:
         permissions["write_user_config"] = False
     elif case == "wrong-logs-path":
         collector["otlp_http_logs_endpoint"] = "http://127.0.0.1:4318/not-logs"
-    elif case == "invalid-capture-value":
-        capture_policy["tool_outputs"] = "full"
     else:
         raise AssertionError(f"unhandled invalid policy case: {case}")
     return payload
@@ -2032,12 +1990,6 @@ def _signed_policy() -> dict[str, JsonValue]:
                 "tls": None,
             },
             "enabled_hosts": ["codex", "claude"],
-            "capture_policy": {
-                "user_prompts": "full_local_default",
-                "tool_inputs": "full_local_default",
-                "tool_outputs": "full_local_default",
-                "raw_api_bodies": "disabled",
-            },
             "plugin_permissions": {
                 "write_user_config": True,
                 "repair_user_config": True,
