@@ -6,6 +6,7 @@ import datetime as dt
 import gzip
 import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
@@ -13,7 +14,8 @@ import threading
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import ClassVar
+from types import TracebackType
+from typing import BinaryIO, ClassVar
 from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import urlopen
 
@@ -29,6 +31,35 @@ HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.js
 COLLECTOR_ASSET_PATH = (
     Path(__file__).parents[1] / "src/promptless_instruction_hub/managed_runtime_assets/trace-collector" / COLLECTOR_BIN
 )
+
+
+class _ReadForbiddenBinaryFile:
+    def __init__(self, file: BinaryIO) -> None:
+        self._file = file
+
+    def __enter__(self) -> "_ReadForbiddenBinaryFile":
+        self._file.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self._file.__exit__(exc_type, exc_value, traceback)
+
+    def read(self, *_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("collector must stream trace files with readline instead of reading the unread tail")
+
+    def readline(self, size: int = -1) -> bytes:
+        return self._file.readline(size)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._file.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._file.tell()
 
 
 def _assert_no_promptless_directory(root: Path) -> None:
@@ -894,23 +925,108 @@ def test_collector_splits_uploads_by_policy_batch_limit(tmp_path: Path) -> None:
             lifecycle="stop",
         )
 
-        assert payload["uploaded_chunks"] == len(lines)
+        assert payload["uploaded_chunks"] == 2
         assert len(server.uploads) == 2
         uploaded_chunks = [
             _json_mapping(chunk, "chunk")
             for upload in server.uploads
             for chunk in _json_array(upload["chunks"], "chunks")
         ]
-        assert [_decode_chunk(chunk) for chunk in uploaded_chunks] == lines
+        decoded_chunks = [_decode_chunk(chunk) for chunk in uploaded_chunks]
+        assert b"".join(decoded_chunks) == b"".join(lines)
         for upload in server.uploads:
             chunks = [_json_mapping(chunk, "chunk") for chunk in _json_array(upload["chunks"], "chunks")]
             decoded_size = sum(len(_decode_chunk(chunk)) for chunk in chunks)
             assert decoded_size <= 200
+        assert all(len(decoded_chunk) <= 200 for decoded_chunk in decoded_chunks)
         ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
         ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
         assert ledger_sources[str(rollout_path)] == sum(len(line) for line in lines)
     finally:
         server.stop()
+
+
+def test_collector_uploads_single_record_up_to_policy_batch_limit(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(forward_only_first_install=False, max_batch_bytes=300)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        large_line = (json.dumps({"type": "turn", "id": "large", "payload": "x" * 180}) + "\n").encode("utf-8")
+        assert 150 < len(large_line) <= 300
+        rollout_path.write_bytes(large_line)
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            lifecycle="stop",
+        )
+
+        assert payload["uploaded_chunks"] == 1
+        assert len(server.uploads) == 1
+        chunks = _json_array(server.uploads[0]["chunks"], "chunks")
+        chunk = _json_mapping(chunks[0], "chunks[0]")
+        assert _decode_chunk(chunk) == large_line
+        ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
+        ledger_sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert ledger_sources[str(rollout_path)] == len(large_line)
+    finally:
+        server.stop()
+
+
+def test_collector_streams_source_ranges_without_tail_read(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    collector_module = runpy.run_path(str(COLLECTOR_ASSET_PATH), run_name="promptless_trace_collector_stream_test")
+    iter_source_ranges = collector_module["_iter_source_ranges"]
+    source_ledger = collector_module["SourceLedger"]
+
+    rollout_path = tmp_path / "rollout.jsonl"
+    lines = [
+        (json.dumps({"type": "turn", "id": f"id-{index}", "payload": "x" * 40}) + "\n").encode("utf-8")
+        for index in range(8)
+    ]
+    rollout_path.write_bytes(b"".join(lines))
+    original_path_open = Path.open
+
+    def guarded_open(
+        path: Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> object:
+        if path == rollout_path and "b" in mode:
+            return _ReadForbiddenBinaryFile(open(path, "rb"))
+        return original_path_open(path, mode, buffering, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    ledger = source_ledger(path=tmp_path / "ledger.json", is_new=False, sources={})
+    ranges = list(iter_source_ranges((rollout_path,), ledger, max_chunk_bytes=128))
+
+    assert len(ranges) > 1
+    assert b"".join(source_range.content for source_range in ranges) == b"".join(lines)
+    expected_start_offsets = [0]
+    for source_range in ranges[:-1]:
+        expected_start_offsets.append(source_range.end_offset)
+    assert [source_range.start_offset for source_range in ranges] == expected_start_offsets
+    assert ranges[-1].end_offset == sum(len(line) for line in lines)
+    assert all(len(source_range.content) <= 128 for source_range in ranges)
 
 
 def test_collector_advances_ledger_through_first_accepted_batch_when_later_batch_fails(tmp_path: Path) -> None:

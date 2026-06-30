@@ -44,6 +44,7 @@ HTTP_TIMEOUT_SECONDS = 10
 ENROLLMENT_POLL_DEADLINE_SECONDS = 35
 MAX_STDIN_BYTES = 1024 * 1024
 MAX_UPLOAD_CHUNKS_PER_BATCH = 200
+SOURCE_READ_BLOCK_BYTES = 1024 * 1024
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_TRACE_COLLECTOR_ALLOW_TEST_URL_OVERRIDES"
 HOST_ENROLLMENT_TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
 BOOTSTRAP_AUTH_FLAG_ENV = "PIGS_FLY"
@@ -309,30 +310,29 @@ def _run(
                 )
                 return 0
 
-            ranges = _collect_source_ranges(
+            uploaded_chunks = 0
+            ranges = _iter_source_ranges(
                 source_paths,
                 ledger,
-                max_chunk_bytes=max(1, policy.trace_collection.max_batch_bytes // 2),
+                max_chunk_bytes=policy.trace_collection.max_batch_bytes,
             )
-            uploaded_chunks = 0
-            if ranges:
-                upload_batches = _build_upload_batches(
-                    host=host,
-                    metadata=metadata,
-                    policy=policy,
-                    ranges=ranges,
-                    lifecycle_event=lifecycle_event,
+            upload_batches = _iter_upload_batches(
+                host=host,
+                metadata=metadata,
+                policy=policy,
+                ranges=ranges,
+                lifecycle_event=lifecycle_event,
+            )
+            for upload_batch in upload_batches:
+                _post_upload_batch(
+                    policy.trace_collection.upload_endpoint,
+                    credential.value,
+                    policy,
+                    upload_batch,
                 )
-                for upload_batch in upload_batches:
-                    _post_upload_batch(
-                        policy.trace_collection.upload_endpoint,
-                        credential.value,
-                        policy,
-                        upload_batch,
-                    )
-                    _advance_ledger(ledger, upload_batch.ranges)
-                    _save_ledger(ledger)
-                    uploaded_chunks += len(upload_batch.ranges)
+                _advance_ledger(ledger, upload_batch.ranges)
+                _save_ledger(ledger)
+                uploaded_chunks += len(upload_batch.ranges)
 
             _emit(
                 {"status": "configured", "host": host, "baseline_only": False, "uploaded_chunks": uploaded_chunks},
@@ -1236,13 +1236,15 @@ def _baseline_sources(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> N
         ledger.sources[str(path)] = complete_end
 
 
-def _collect_source_ranges(
+def _iter_source_ranges(
     source_paths: tuple[Path, ...],
     ledger: SourceLedger,
     *,
     max_chunk_bytes: int,
-) -> list[SourceRange]:
-    ranges: list[SourceRange] = []
+) -> Iterator[SourceRange]:
+    if max_chunk_bytes <= 0:
+        raise CollectorError("native trace upload chunk limit must be positive")
+
     for path in source_paths:
         path_key = str(path)
         start_offset = ledger.sources.get(path_key, 0)
@@ -1251,55 +1253,84 @@ def _collect_source_ranges(
             start_offset = 0
         with path.open("rb") as file:
             file.seek(start_offset)
-            unread_content = file.read()
-        complete_end = start_offset + _complete_end_from_bytes(unread_content)
-        if complete_end <= start_offset:
-            continue
-        new_content = unread_content[: complete_end - start_offset]
-        offset = start_offset
-        for segment in _split_complete_lines(new_content, max_chunk_bytes=max_chunk_bytes):
-            end_offset = offset + len(segment)
-            ranges.append(
-                SourceRange(
-                    path=path,
-                    path_hash=_path_hash(path),
-                    start_offset=offset,
-                    end_offset=end_offset,
-                    content=segment,
-                )
-            )
-            offset = end_offset
-    return ranges
+            for source_range in _stream_source_ranges(path, file, start_offset, max_chunk_bytes=max_chunk_bytes):
+                yield source_range
 
 
 def _complete_end_offset(path: Path) -> int:
-    return _complete_end_from_bytes(path.read_bytes())
+    complete_end = 0
+    offset = 0
+    with path.open("rb") as file:
+        while True:
+            chunk = file.read(SOURCE_READ_BLOCK_BYTES)
+            if not chunk:
+                return complete_end
+            last_newline = chunk.rfind(b"\n")
+            if last_newline != -1:
+                complete_end = offset + last_newline + 1
+            offset += len(chunk)
 
 
-def _complete_end_from_bytes(content: bytes) -> int:
-    if not content:
-        return 0
-    if content.endswith(b"\n"):
-        return len(content)
-    last_newline = content.rfind(b"\n")
-    if last_newline == -1:
-        return 0
-    return last_newline + 1
-
-
-def _split_complete_lines(content: bytes, *, max_chunk_bytes: int) -> list[bytes]:
-    chunks: list[bytes] = []
-    current = bytearray()
-    for line in content.splitlines(keepends=True):
+def _stream_source_ranges(
+    path: Path,
+    file: BinaryIO,
+    start_offset: int,
+    *,
+    max_chunk_bytes: int,
+) -> Iterator[SourceRange]:
+    path_hash = _path_hash(path)
+    chunk_start_offset = start_offset
+    chunk = bytearray()
+    while True:
+        line_start_offset = file.tell()
+        line = file.readline(max_chunk_bytes + 1)
+        if not line:
+            break
         if len(line) > max_chunk_bytes:
-            raise CollectorError(f"native trace line exceeds {max_chunk_bytes} byte upload chunk limit")
-        if current and len(current) + len(line) > max_chunk_bytes:
-            chunks.append(bytes(current))
-            current = bytearray()
-        current.extend(line)
-    if current:
-        chunks.append(bytes(current))
-    return chunks
+            if line.endswith(b"\n") or _remainder_contains_newline(file):
+                if chunk:
+                    yield SourceRange(
+                        path=path,
+                        path_hash=path_hash,
+                        start_offset=chunk_start_offset,
+                        end_offset=line_start_offset,
+                        content=bytes(chunk),
+                    )
+                raise CollectorError(f"native trace line exceeds {max_chunk_bytes} byte upload chunk limit")
+            break
+        if not line.endswith(b"\n"):
+            break
+        if chunk and len(chunk) + len(line) > max_chunk_bytes:
+            yield SourceRange(
+                path=path,
+                path_hash=path_hash,
+                start_offset=chunk_start_offset,
+                end_offset=line_start_offset,
+                content=bytes(chunk),
+            )
+            chunk = bytearray()
+            chunk_start_offset = line_start_offset
+        elif not chunk:
+            chunk_start_offset = line_start_offset
+        chunk.extend(line)
+
+    if chunk:
+        yield SourceRange(
+            path=path,
+            path_hash=path_hash,
+            start_offset=chunk_start_offset,
+            end_offset=chunk_start_offset + len(chunk),
+            content=bytes(chunk),
+        )
+
+
+def _remainder_contains_newline(file: BinaryIO) -> bool:
+    while True:
+        chunk = file.read(SOURCE_READ_BLOCK_BYTES)
+        if not chunk:
+            return False
+        if b"\n" in chunk:
+            return True
 
 
 def _advance_ledger(ledger: SourceLedger, ranges: list[SourceRange]) -> None:
@@ -1308,19 +1339,19 @@ def _advance_ledger(ledger: SourceLedger, ranges: list[SourceRange]) -> None:
         ledger.sources[path_key] = max(ledger.sources.get(path_key, 0), source_range.end_offset)
 
 
-def _build_upload_batches(
+def _iter_upload_batches(
     *,
     host: Host,
     metadata: RuntimeMetadata,
     policy: HostPolicy,
-    ranges: list[SourceRange],
+    ranges: Iterator[SourceRange],
     lifecycle_event: Optional[LifecycleEvent],
-) -> list[UploadBatch]:
-    batches: list[UploadBatch] = []
+) -> Iterator[UploadBatch]:
     current_chunks: list[JsonValue] = []
     current_ranges: list[SourceRange] = []
     current_decoded_bytes = 0
     batch_started_at_ms = int(time.time() * 1000)
+    batch_index = 0
 
     for source_range in ranges:
         chunk = _upload_chunk_payload(source_range, lifecycle_event)
@@ -1334,17 +1365,16 @@ def _build_upload_batches(
             or len(current_chunks) >= MAX_UPLOAD_CHUNKS_PER_BATCH
         )
         if batch_is_full:
-            batches.append(
-                _upload_batch(
-                    host=host,
-                    metadata=metadata,
-                    policy=policy,
-                    chunks=current_chunks,
-                    ranges=current_ranges,
-                    batch_started_at_ms=batch_started_at_ms,
-                    batch_index=len(batches),
-                )
+            yield _upload_batch(
+                host=host,
+                metadata=metadata,
+                policy=policy,
+                chunks=current_chunks,
+                ranges=current_ranges,
+                batch_started_at_ms=batch_started_at_ms,
+                batch_index=batch_index,
             )
+            batch_index += 1
             current_chunks = []
             current_ranges = []
             current_decoded_bytes = 0
@@ -1353,18 +1383,15 @@ def _build_upload_batches(
         current_decoded_bytes += decoded_size
 
     if current_chunks:
-        batches.append(
-            _upload_batch(
-                host=host,
-                metadata=metadata,
-                policy=policy,
-                chunks=current_chunks,
-                ranges=current_ranges,
-                batch_started_at_ms=batch_started_at_ms,
-                batch_index=len(batches),
-            )
+        yield _upload_batch(
+            host=host,
+            metadata=metadata,
+            policy=policy,
+            chunks=current_chunks,
+            ranges=current_ranges,
+            batch_started_at_ms=batch_started_at_ms,
+            batch_index=batch_index,
         )
-    return batches
 
 
 def _upload_chunk_payload(source_range: SourceRange, lifecycle_event: Optional[LifecycleEvent]) -> dict[str, JsonValue]:
