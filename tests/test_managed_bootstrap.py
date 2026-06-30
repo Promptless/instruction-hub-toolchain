@@ -678,6 +678,12 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
             assert check_in["needs_restart"] is True
             effective_config = _json_mapping(check_in["effective_config"], "effective_config")
             assert effective_config["configured"] is True
+            assert not {
+                "user_prompts_enabled",
+                "tool_inputs_enabled",
+                "tool_outputs_enabled",
+                "raw_api_bodies_enabled",
+            }.intersection(effective_config)
         codex_effective_config = _json_mapping(server.check_ins[0]["effective_config"], "codex effective_config")
         claude_effective_config = _json_mapping(server.check_ins[1]["effective_config"], "claude effective_config")
         assert codex_effective_config["collector_metrics_endpoint"] is None
