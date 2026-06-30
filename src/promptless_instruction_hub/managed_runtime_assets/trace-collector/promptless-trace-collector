@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload local Claude and Codex trace JSONL ranges to a Promptless worker."""
+"""Manage Promptless host enrollment, check-ins, and native trace collection."""
 
 from __future__ import annotations
 
@@ -189,56 +189,130 @@ class SourceLedger:
 
 
 def main() -> int:
-    """Run trace collection and return a non-blocking hook exit code."""
+    """Dispatch the managed runtime command and return the collector exit code."""
 
-    parser = argparse.ArgumentParser(description="Promptless local trace collector")
-    parser.add_argument("--host", choices=("auto", "codex", "claude"), default="auto")
-    parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
-    parser.add_argument("--lifecycle", choices=("session_start", "stop", "session_end"), default=None)
-    args = parser.parse_args()
+    parser = _argument_parser()
+    args = parser.parse_args(_normalize_command_args(sys.argv[1:]))
     try:
+        if args.command == "enroll":
+            return _run_enroll(args.host, quiet=args.quiet)
+        if args.command == "check-in":
+            return _run_check_in(args.host, quiet=args.quiet)
         context = _read_hook_context()
-        return _run(args.host, quiet=args.quiet, explicit_lifecycle=args.lifecycle, hook_context=context)
+        return _run_collect(args.host, quiet=args.quiet, explicit_lifecycle=args.lifecycle, hook_context=context)
     except (CollectorError, OSError, ValueError, urllib.error.URLError) as exc:
         _emit({"status": "error", "message": _redact_text(str(exc))}, quiet=args.quiet, stream=sys.stderr)
         return 0
 
 
-def _run(
+def _argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Promptless local trace collector")
+    subparsers = parser.add_subparsers(dest="command")
+
+    collect = subparsers.add_parser(
+        "collect",
+        parents=[_shared_command_parser()],
+        help="upload complete native trace ranges and advance the ledger",
+        description="Upload complete native trace ranges and advance the source ledger.",
+    )
+    collect.add_argument("--lifecycle", choices=("session_start", "stop", "session_end"), default=None)
+
+    subparsers.add_parser(
+        "enroll",
+        parents=[_shared_command_parser()],
+        help="start or resume host enrollment without touching trace files",
+        description="Start or resume host enrollment and report whether a credential is cached.",
+    )
+
+    subparsers.add_parser(
+        "check-in",
+        parents=[_shared_command_parser()],
+        help="post a worker check-in without scanning or uploading traces",
+        description="Fetch policy and post a worker check-in without scanning or uploading native trace files.",
+    )
+    return parser
+
+
+def _shared_command_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--host", choices=("auto", "codex", "claude"), default="auto")
+    parser.add_argument("--quiet", action="store_true", help="Suppress collector status output")
+    return parser
+
+
+def _normalize_command_args(raw_args: list[str]) -> list[str]:
+    if raw_args and raw_args[0] in {"collect", "enroll", "check-in"}:
+        return raw_args
+    if raw_args and raw_args[0] in {"-h", "--help"}:
+        return raw_args
+    return ["collect", *raw_args]
+
+
+def _run_enroll(host_arg: str, *, quiet: bool) -> int:
+    host, metadata = _runtime_identity(host_arg)
+    enrolled = _ensure_host_credential(host, metadata, quiet=quiet)
+    if enrolled is None:
+        return 0
+    _emit({"status": "credential_present", "host": host, "credential_cached": True}, quiet=quiet)
+    return 0
+
+
+def _run_check_in(host_arg: str, *, quiet: bool) -> int:
+    host, metadata = _runtime_identity(host_arg)
+    enrolled = _ensure_host_credential(host, metadata, quiet=quiet)
+    if enrolled is None:
+        return 0
+    enrollment_context, credential = enrolled
+    policy_result = _fetch_host_policy(host, enrollment_context, credential, quiet=quiet)
+    if policy_result is None:
+        return 0
+    credential, policy = policy_result
+
+    ledger_path = _ledger_path()
+    roots = _native_roots_for_host(host, policy.trace_collection)
+    drift_reports: list[dict[str, JsonValue]] = []
+    check_in_status: CollectorStatus = "configured"
+    if _requires_newer_runtime(policy.required_bootstrap_version, metadata.collector_version):
+        check_in_status = "blocked"
+        drift_reports.append(_collector_upgrade_drift(policy, metadata))
+
+    _post_check_in(
+        _check_in_url(enrollment_context.worker_base_url),
+        credential.value,
+        host,
+        metadata,
+        policy,
+        status=check_in_status,
+        needs_restart=False,
+        ledger_path=ledger_path,
+        root_count=len(roots),
+        drift_reports=drift_reports,
+    )
+    payload: dict[str, JsonValue] = {"status": check_in_status, "host": host, "checked_in": True}
+    if check_in_status == "blocked":
+        payload["reason"] = "collector_upgrade_required"
+    _emit(payload, quiet=quiet)
+    return 0
+
+
+def _run_collect(
     host_arg: str,
     *,
     quiet: bool,
     explicit_lifecycle: Optional[str],
     hook_context: dict[str, JsonValue],
 ) -> int:
-    host = _resolve_host(host_arg)
+    host, metadata = _runtime_identity(host_arg)
     lifecycle_event = _resolve_lifecycle_event(explicit_lifecycle, hook_context)
-    plugin_root = _plugin_root()
-    metadata = _load_runtime_metadata(plugin_root, host)
-    if not _bootstrap_auth_flow_enabled():
-        _emit({"status": "disabled", "reason": "pigs_fly_not_enabled", "host": host}, quiet=quiet)
+    enrolled = _ensure_host_credential(host, metadata, quiet=quiet)
+    if enrolled is None:
         return 0
-
-    worker_base_url = _worker_base_url()
-    dashboard_base_url = _dashboard_base_url()
-    context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
-    credential = _obtain_host_credential(context)
-    if credential is None:
-        _emit({"status": "setup_pending", "reason": "approval_pending", "host": host}, quiet=quiet)
+    enrollment_context, credential = enrolled
+    policy_result = _fetch_host_policy(host, enrollment_context, credential, quiet=quiet)
+    if policy_result is None:
         return 0
-
-    policy_url = _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
-    check_in_url = _worker_url(worker_base_url, "/v0/host-enrollment/check-ins")
-    try:
-        signed_policy = _get_json(policy_url, credential.value, label="policy response")
-    except CollectorAuthError:
-        _forget_cached_host_credential(context)
-        credential = _enroll_host_credential(context)
-        if credential is None:
-            _emit({"status": "setup_pending", "reason": "approval_pending", "host": host}, quiet=quiet)
-            return 0
-        signed_policy = _get_json(policy_url, credential.value, label="policy response")
-    policy = _validate_signed_policy(signed_policy, host)
+    credential, policy = policy_result
+    check_in_url = _check_in_url(enrollment_context.worker_base_url)
     ledger_path = _ledger_path()
     if _requires_newer_runtime(policy.required_bootstrap_version, metadata.collector_version):
         _post_check_in(
@@ -251,17 +325,7 @@ def _run(
             needs_restart=False,
             ledger_path=ledger_path,
             root_count=0,
-            drift_reports=[
-                {
-                    "kind": "collector_upgrade_required",
-                    "message": "Worker policy requires a newer Promptless trace collector",
-                    "repaired": False,
-                    "details": {
-                        "required_bootstrap_version": policy.required_bootstrap_version,
-                        "collector_version": metadata.collector_version,
-                    },
-                }
-            ],
+            drift_reports=[_collector_upgrade_drift(policy, metadata)],
         )
         _emit({"status": "blocked", "reason": "collector_upgrade_required", "host": host}, quiet=quiet)
         return 0
@@ -387,6 +451,72 @@ def _post_error_check_in(
         )
     except (CollectorError, OSError, ValueError, urllib.error.URLError):
         return
+
+
+def _runtime_identity(host_arg: str) -> tuple[Host, RuntimeMetadata]:
+    host = _resolve_host(host_arg)
+    metadata = _load_runtime_metadata(_plugin_root(), host)
+    return host, metadata
+
+
+def _ensure_host_credential(
+    host: Host,
+    metadata: RuntimeMetadata,
+    *,
+    quiet: bool,
+) -> Optional[tuple[EnrollmentContext, HostCredential]]:
+    if not _bootstrap_auth_flow_enabled():
+        _emit({"status": "disabled", "reason": "pigs_fly_not_enabled", "host": host}, quiet=quiet)
+        return None
+
+    worker_base_url = _worker_base_url()
+    dashboard_base_url = _dashboard_base_url()
+    context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+    credential = _obtain_host_credential(context)
+    if credential is None:
+        _emit({"status": "setup_pending", "reason": "approval_pending", "host": host}, quiet=quiet)
+        return None
+    return context, credential
+
+
+def _fetch_host_policy(
+    host: Host,
+    context: EnrollmentContext,
+    credential: HostCredential,
+    *,
+    quiet: bool,
+) -> Optional[tuple[HostCredential, HostPolicy]]:
+    policy_url = _policy_url(context.worker_base_url, host)
+    try:
+        signed_policy = _get_json(policy_url, credential.value, label="policy response")
+    except CollectorAuthError:
+        _forget_cached_host_credential(context)
+        credential = _enroll_host_credential(context)
+        if credential is None:
+            _emit({"status": "setup_pending", "reason": "approval_pending", "host": host}, quiet=quiet)
+            return None
+        signed_policy = _get_json(policy_url, credential.value, label="policy response")
+    return credential, _validate_signed_policy(signed_policy, host)
+
+
+def _policy_url(worker_base_url: str, host: Host) -> str:
+    return _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
+
+
+def _check_in_url(worker_base_url: str) -> str:
+    return _worker_url(worker_base_url, "/v0/host-enrollment/check-ins")
+
+
+def _collector_upgrade_drift(policy: HostPolicy, metadata: RuntimeMetadata) -> dict[str, JsonValue]:
+    return {
+        "kind": "collector_upgrade_required",
+        "message": "Worker policy requires a newer Promptless trace collector",
+        "repaired": False,
+        "details": {
+            "required_bootstrap_version": policy.required_bootstrap_version,
+            "collector_version": metadata.collector_version,
+        },
+    }
 
 
 def _read_hook_context() -> dict[str, JsonValue]:

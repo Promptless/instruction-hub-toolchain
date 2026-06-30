@@ -154,14 +154,15 @@ def _trace_collector_hook_entry(target: Harness, event_name: str) -> dict[str, J
     if target == "claude":
         hook_command: dict[str, JsonValue] = {
             "command": (
-                f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" '
+                f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" collect '
                 f"--host claude --lifecycle {lifecycle}"
             ),
         }
     else:
         hook_command = {
             "command": (
-                f'python3 "${{PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" --host codex --lifecycle {lifecycle}'
+                f'python3 "${{PLUGIN_ROOT}}/bin/{TRACE_COLLECTOR_EXECUTABLE}" collect '
+                f"--host codex --lifecycle {lifecycle}"
             ),
         }
 

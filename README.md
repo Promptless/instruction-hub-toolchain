@@ -110,9 +110,17 @@ others reuse the result or defer to a later session. The per-plugin
 `CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA` directories are intentionally not used for
 credentials.
 
-The collector validates the signed-policy envelope and native trace upload
-policy, then uploads new complete JSONL ranges from the configured native trace
-roots. It maintains a per-user ledger in plugin data so successful uploads
+The collector exposes `collect`, `enroll`, and `check-in` subcommands from the
+single bundled executable. Hooks call `collect`, which reuses the shared host
+enrollment path before validating the signed-policy envelope and native trace
+upload policy. It then uploads new complete JSONL ranges from the configured
+native trace roots. The `enroll` and `check-in` subcommands are available for
+manual setup/debug flows: `enroll` starts or resumes host enrollment and reports
+when a credential is cached or approval is still pending, while `check-in`
+fetches policy and posts a worker check-in without scanning or uploading native
+trace files.
+
+The collector maintains a per-user ledger in plugin data so successful uploads
 advance monotonically and failed uploads are retried. First install defaults to
 forward-only baselining so historical local traces are not uploaded unless
 policy explicitly opts into backfill.
