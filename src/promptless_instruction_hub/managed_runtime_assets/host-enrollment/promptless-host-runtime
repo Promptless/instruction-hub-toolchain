@@ -1574,10 +1574,6 @@ def _effective_config(
         "collector_logs_endpoint": policy.collector.logs_endpoint if configured else None,
         "collector_traces_endpoint": policy.collector.traces_endpoint if configured else None,
         "collector_metrics_endpoint": _effective_metrics_endpoint(host, policy, configured=configured),
-        "user_prompts_enabled": True if configured else None,
-        "tool_inputs_enabled": True if configured else None,
-        "tool_outputs_enabled": True if configured else None,
-        "raw_api_bodies_enabled": True if configured else None,
         "managed_config_detected": managed_config_detected,
     }
     effective_config["config_hash"] = hashlib.sha256(json.dumps(effective_config, sort_keys=True).encode()).hexdigest()
