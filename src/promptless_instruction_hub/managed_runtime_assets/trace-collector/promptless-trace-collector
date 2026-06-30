@@ -50,6 +50,15 @@ HOST_ENROLLMENT_TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_U
 BOOTSTRAP_AUTH_FLAG_ENV = "PIGS_FLY"
 OPEN_BROWSER_ENV = "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER"
 CALLBACK_STATE_PARAM = "state"
+CAPTURE_POLICY_REQUIRED_KEYS = (
+    "user_prompts",
+    "assistant_messages",
+    "reasoning",
+    "tool_inputs",
+    "tool_outputs",
+    "raw_native_artifacts",
+)
+CAPTURE_POLICY_VALUES = frozenset({"disabled", "full_local_default"})
 SEMVER_RE = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-((?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
@@ -188,6 +197,15 @@ class SourceLedger:
     sources: dict[str, int]
 
 
+@dataclass(frozen=True)
+class PendingPluginUpdate:
+    """Installed plugin version to record for a host, with any one-time update notice."""
+
+    target: str
+    version: str
+    notice: Optional[str]
+
+
 def main() -> int:
     """Run trace collection and return a non-blocking hook exit code."""
 
@@ -200,7 +218,7 @@ def main() -> int:
         context = _read_hook_context()
         return _run(args.host, quiet=args.quiet, explicit_lifecycle=args.lifecycle, hook_context=context)
     except (CollectorError, OSError, ValueError, urllib.error.URLError) as exc:
-        _emit({"status": "error", "message": _redact_text(str(exc))}, quiet=args.quiet, stream=sys.stderr)
+        _emit({"status": "error", "message": _redact_text(str(exc))}, quiet=args.quiet)
         return 0
 
 
@@ -215,8 +233,28 @@ def _run(
     lifecycle_event = _resolve_lifecycle_event(explicit_lifecycle, hook_context)
     plugin_root = _plugin_root()
     metadata = _load_runtime_metadata(plugin_root, host)
+    pending_update = _pending_plugin_update(metadata)
+    update_notice = pending_update.notice if pending_update is not None else None
+    exit_code = _run_collector(host, metadata, lifecycle_event, quiet=quiet, update_notice=update_notice)
+    if pending_update is not None and not quiet:
+        _record_plugin_version_seen(pending_update)
+    return exit_code
+
+
+def _run_collector(
+    host: Host,
+    metadata: RuntimeMetadata,
+    lifecycle_event: Optional[LifecycleEvent],
+    *,
+    quiet: bool,
+    update_notice: Optional[str],
+) -> int:
     if not _bootstrap_auth_flow_enabled():
-        _emit({"status": "disabled", "reason": "pigs_fly_not_enabled", "host": host}, quiet=quiet)
+        _emit(
+            {"status": "disabled", "reason": "pigs_fly_not_enabled", "host": host},
+            quiet=quiet,
+            update_notice=update_notice,
+        )
         return 0
 
     worker_base_url = _worker_base_url()
@@ -224,7 +262,11 @@ def _run(
     context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
     credential = _obtain_host_credential(context)
     if credential is None:
-        _emit({"status": "setup_pending", "reason": "approval_pending", "host": host}, quiet=quiet)
+        _emit(
+            {"status": "setup_pending", "reason": "approval_pending", "host": host},
+            quiet=quiet,
+            update_notice=update_notice,
+        )
         return 0
 
     policy_url = _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
@@ -235,7 +277,11 @@ def _run(
         _forget_cached_host_credential(context)
         credential = _enroll_host_credential(context)
         if credential is None:
-            _emit({"status": "setup_pending", "reason": "approval_pending", "host": host}, quiet=quiet)
+            _emit(
+                {"status": "setup_pending", "reason": "approval_pending", "host": host},
+                quiet=quiet,
+                update_notice=update_notice,
+            )
             return 0
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
     policy = _validate_signed_policy(signed_policy, host)
@@ -263,7 +309,11 @@ def _run(
                 }
             ],
         )
-        _emit({"status": "blocked", "reason": "collector_upgrade_required", "host": host}, quiet=quiet)
+        _emit(
+            {"status": "blocked", "reason": "collector_upgrade_required", "host": host},
+            quiet=quiet,
+            update_notice=update_notice,
+        )
         return 0
 
     configured_check_in_accepted = False
@@ -290,7 +340,11 @@ def _run(
             if ledger.is_new and policy.trace_collection.forward_only_first_install:
                 _baseline_sources(ledger, source_paths)
                 _save_ledger(ledger)
-                _emit({"status": "configured", "host": host, "baseline_only": True, "uploaded_chunks": 0}, quiet=quiet)
+                _emit(
+                    {"status": "configured", "host": host, "baseline_only": True, "uploaded_chunks": 0},
+                    quiet=quiet,
+                    update_notice=update_notice,
+                )
                 return 0
 
             if upload_suppression is not None:
@@ -307,6 +361,7 @@ def _run(
                         "suppression_reason": upload_suppression.reason,
                     },
                     quiet=quiet,
+                    update_notice=update_notice,
                 )
                 return 0
 
@@ -337,6 +392,7 @@ def _run(
             _emit(
                 {"status": "configured", "host": host, "baseline_only": False, "uploaded_chunks": uploaded_chunks},
                 quiet=quiet,
+                update_notice=update_notice,
             )
     except (CollectorError, OSError, ValueError, urllib.error.URLError) as exc:
         if configured_check_in_accepted:
@@ -491,6 +547,40 @@ def _worker_deployment_instance_id(worker_base_url: str) -> str:
 
 def _state_path() -> Path:
     return Path.home() / ".promptless/instruction-hub" / STATE_FILE_NAME
+
+
+def _pending_plugin_update(metadata: RuntimeMetadata) -> Optional[PendingPluginUpdate]:
+    current_version = metadata.plugin_version
+    if current_version == "unknown":
+        return None
+    try:
+        state_path = _state_path()
+        with _state_file_lock(state_path):
+            seen_versions = _json_mapping_or_empty(_load_state(state_path).get("last_seen_plugin_versions"))
+        last_seen_version = _string_value(seen_versions.get(metadata.target))
+    except (OSError, CollectorError):
+        return None
+    if last_seen_version == current_version:
+        return None
+    notice = (
+        None
+        if last_seen_version is None
+        else f"Promptless Instruction Hub updated to v{current_version} (was v{last_seen_version})."
+    )
+    return PendingPluginUpdate(target=metadata.target, version=current_version, notice=notice)
+
+
+def _record_plugin_version_seen(pending: PendingPluginUpdate) -> None:
+    try:
+        state_path = _state_path()
+        with _state_file_lock(state_path):
+            state = _load_state(state_path)
+            seen_versions = _json_mapping_or_empty(state.get("last_seen_plugin_versions"))
+            seen_versions[pending.target] = pending.version
+            state["last_seen_plugin_versions"] = seen_versions
+            _write_state(state_path, state)
+    except (OSError, CollectorError):
+        return
 
 
 def _load_state(path: Path) -> dict[str, JsonValue]:
@@ -1052,7 +1142,7 @@ def _validate_signed_policy(value: object, host: Host) -> HostPolicy:
         raise CollectorError("worker policy is missing trace_collection")
     trace_collection = _validate_trace_collection(trace_collection_value, host)
 
-    capture_policy = _string_mapping(policy_value.get("capture_policy"), "capture_policy")
+    capture_policy = _validate_capture_policy(policy_value.get("capture_policy"))
     required_bootstrap_version = _string_value(policy_value.get("required_bootstrap_version"))
     return HostPolicy(
         policy_version=policy_version,
@@ -1082,6 +1172,20 @@ def _validate_trace_collection(value: dict[str, JsonValue], host: Host) -> Trace
         max_batch_bytes=max_batch_bytes,
         native_roots=_native_root_tuple(value.get("native_roots")),
     )
+
+
+def _validate_capture_policy(value: Optional[JsonValue]) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise CollectorError("policy.capture_policy must be an object")
+    capture_policy: dict[str, str] = {}
+    for key in CAPTURE_POLICY_REQUIRED_KEYS:
+        policy_value = _string_value(value.get(key))
+        if policy_value is None:
+            raise CollectorError(f"policy.capture_policy.{key} must be a string")
+        if policy_value not in CAPTURE_POLICY_VALUES:
+            raise CollectorError(f"policy.capture_policy.{key} must be one of {sorted(CAPTURE_POLICY_VALUES)}")
+        capture_policy[key] = policy_value
+    return capture_policy
 
 
 def _host_tuple(value: Optional[JsonValue], field_name: str) -> tuple[Host, ...]:
@@ -1522,7 +1626,7 @@ def _capture_enabled(capture_policy: dict[str, str], key: str) -> Optional[bool]
     value = capture_policy.get(key)
     if value is None:
         return None
-    return value != "disabled"
+    return value == "full_local_default"
 
 
 def _trace_upload_suppression(
@@ -1565,15 +1669,7 @@ def _is_terminal_lifecycle_event(host: Host, lifecycle_event: Optional[Lifecycle
 
 
 def _native_upload_disabled_capture_keys(capture_policy: dict[str, str]) -> list[str]:
-    required_keys = (
-        "user_prompts",
-        "assistant_messages",
-        "reasoning",
-        "tool_inputs",
-        "tool_outputs",
-        "raw_native_artifacts",
-    )
-    return sorted(key for key in required_keys if capture_policy.get(key) != "full_local_default")
+    return sorted(key for key in CAPTURE_POLICY_REQUIRED_KEYS if capture_policy.get(key) != "full_local_default")
 
 
 def _get_json(url: str, token: Optional[str], *, label: str = "worker response") -> JsonValue:
@@ -1648,9 +1744,7 @@ def _validate_http_url(value: str, field_name: str) -> SplitResult:
 def _normalize_base_url(value: str, *, label: str = "worker base URL") -> str:
     stripped = value.strip().rstrip("/")
     parsed = _validate_http_url(stripped, label)
-    if (
-        parsed.path not in {"", "/"}
-    ):
+    if parsed.path not in {"", "/"}:
         raise CollectorError(f"{label} must not include a path")
     _validate_worker_transport(parsed, label)
     return stripped
@@ -1899,15 +1993,23 @@ def _atomic_write_text(path: Path, body: str) -> None:
             temp_path.unlink()
 
 
-def _emit(payload: dict[str, JsonValue], *, quiet: bool, stream: Optional[object] = None) -> None:
+def _emit(
+    payload: dict[str, JsonValue],
+    *,
+    quiet: bool,
+    stream: Optional[object] = None,
+    update_notice: Optional[str] = None,
+) -> None:
     if quiet:
         return
+    message = " ".join(text for text in (update_notice, _hook_user_message(payload)) if text is not None)
+    diagnostic = dict(payload)
+    if message:
+        diagnostic["systemMessage"] = message
     diagnostic_stream = stream if stream is not None else sys.stderr
-    print(json.dumps(_redact_json(payload), sort_keys=True), file=diagnostic_stream)
-    if stream is None:
-        user_message = _hook_user_message(payload)
-        if user_message is not None:
-            print(json.dumps({"systemMessage": user_message}, sort_keys=True), file=sys.stdout)
+    print(json.dumps(_redact_json(diagnostic), sort_keys=True), file=diagnostic_stream)
+    if message:
+        print(json.dumps({"systemMessage": message}, sort_keys=True), file=sys.stdout)
 
 
 def _hook_user_message(payload: dict[str, JsonValue]) -> Optional[str]:
