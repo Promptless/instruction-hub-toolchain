@@ -15,19 +15,19 @@ from promptless_instruction_hub.models import Harness, HubConfig, PackageDefinit
 
 RuntimeStatus = Literal["included"]
 
-HOST_ENROLLMENT_BOOTSTRAP_ID = "host-enrollment-bootstrap"
-HOST_ENROLLMENT_ASSET_DIR = "host-enrollment"
-HOST_ENROLLMENT_EXECUTABLE = "promptless-host-enrollment-bootstrap"
-# Keep this comfortably above the bootstrap poll budget plus session creation,
+HOST_RUNTIME_ID = "host-runtime"
+HOST_RUNTIME_ASSET_DIR = "host-enrollment"
+HOST_RUNTIME_EXECUTABLE = "promptless-host-runtime"
+# Keep this comfortably above the enrollment poll budget plus session creation,
 # policy fetch, local config write, and check-in network calls.
-HOST_ENROLLMENT_HOOK_TIMEOUT_SECONDS = 90
-HOST_ENROLLMENT_CHANNEL = "stable"
-HOST_ENROLLMENT_VERSION = "0.1.0"
+HOST_RUNTIME_HOOK_TIMEOUT_SECONDS = 90
+HOST_RUNTIME_CHANNEL = "stable"
+HOST_RUNTIME_VERSION = "0.2.0"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
-SUPPORTED_HOST_ENROLLMENT_TARGETS: tuple[Harness, ...] = ("claude", "codex")
+SUPPORTED_HOST_RUNTIME_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 
-_ASSET_ROOT = Path(__file__).parent / "managed_runtime_assets" / HOST_ENROLLMENT_ASSET_DIR
-_EXECUTABLE_SOURCE = _ASSET_ROOT / HOST_ENROLLMENT_EXECUTABLE
+_ASSET_ROOT = Path(__file__).parent / "managed_runtime_assets" / HOST_RUNTIME_ASSET_DIR
+_EXECUTABLE_SOURCE = _ASSET_ROOT / HOST_RUNTIME_EXECUTABLE
 
 
 @dataclass(frozen=True)
@@ -83,38 +83,38 @@ def render_managed_runtimes(
     """Write managed-runtime metadata and inject supported runtime artifacts for one generated plugin."""
 
     plugin_id = f"{config.plugin_id}-{package.id}"
-    if target not in SUPPORTED_HOST_ENROLLMENT_TARGETS:
+    if target not in SUPPORTED_HOST_RUNTIME_TARGETS:
         return ()
 
-    _copy_bootstrap_executable(target_root)
-    _write_host_enrollment_hook(target_root, target)
+    _copy_runtime_executable(target_root)
+    _write_host_runtime_hook(target_root, target)
     record = ManagedRuntimeRecord(
-        id=HOST_ENROLLMENT_BOOTSTRAP_ID,
+        id=HOST_RUNTIME_ID,
         status="included",
         target=target,
         package_id=package.id,
         plugin_id=plugin_id,
         plugin_version=config.plugin_version,
         toolchain_version=_toolchain_version(),
-        channel=HOST_ENROLLMENT_CHANNEL,
-        version=HOST_ENROLLMENT_VERSION,
+        channel=HOST_RUNTIME_CHANNEL,
+        version=HOST_RUNTIME_VERSION,
         sha256=file_hash(_EXECUTABLE_SOURCE),
-        executable=HOST_ENROLLMENT_EXECUTABLE,
-        path=f"bin/{HOST_ENROLLMENT_EXECUTABLE}",
+        executable=HOST_RUNTIME_EXECUTABLE,
+        path=f"bin/{HOST_RUNTIME_EXECUTABLE}",
         hook="hooks/hooks.json",
     )
     _write_plugin_manifest(target_root, (record,))
     return (record,)
 
 
-def _copy_bootstrap_executable(target_root: Path) -> None:
-    destination = target_root / "bin" / HOST_ENROLLMENT_EXECUTABLE
+def _copy_runtime_executable(target_root: Path) -> None:
+    destination = target_root / "bin" / HOST_RUNTIME_EXECUTABLE
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(_EXECUTABLE_SOURCE, destination)
     destination.chmod(0o755)
 
 
-def _write_host_enrollment_hook(target_root: Path, target: Harness) -> None:
+def _write_host_runtime_hook(target_root: Path, target: Harness) -> None:
     hook_path = target_root / "hooks/hooks.json"
     hook_config = _existing_hook_config(hook_path)
     hooks = hook_config.setdefault("hooks", {})
@@ -145,11 +145,11 @@ def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
 def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
     if target == "claude":
         hook_command: dict[str, JsonValue] = {
-            "command": f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host claude',
+            "command": f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_EXECUTABLE}" ensure --host claude',
         }
     else:
         hook_command = {
-            "command": f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host codex',
+            "command": f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_EXECUTABLE}" ensure --host codex',
         }
 
     # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
@@ -158,8 +158,8 @@ def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
     # Promptless-built static native binary so customer machines do not need Python or uv.
-    # The hook deliberately omits --quiet so the bootstrap can surface its status. Both Claude and
-    # Codex render a SessionStart `systemMessage`: the bootstrap emits one when the Instruction Hub
+    # The hook deliberately omits --quiet so the runtime can surface its status. Both Claude and
+    # Codex render a SessionStart `systemMessage`: the runtime emits one when the Instruction Hub
     # plugin version changes and for actionable enrollment outcomes (config written, pending
     # approval, blocked). The binary still accepts --quiet for manual runs.
     return {
@@ -167,8 +167,8 @@ def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
         "hooks": [
             {
                 "type": "command",
-                "timeout": HOST_ENROLLMENT_HOOK_TIMEOUT_SECONDS,
-                "statusMessage": "Checking Promptless host enrollment",
+                "timeout": HOST_RUNTIME_HOOK_TIMEOUT_SECONDS,
+                "statusMessage": "Checking Promptless host runtime",
                 **hook_command,
             }
         ],

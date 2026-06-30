@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -15,6 +16,7 @@ from promptless_instruction_hub.cli import main
 from promptless_instruction_hub.compiler import build_hub, init_hub, validate_hub
 from promptless_instruction_hub.errors import BuildCheckFailedError, InstructionHubError
 from promptless_instruction_hub.mcp_status import STATUS_TOOL_NAME, run_status_mcp
+from promptless_instruction_hub.release.hashing import stable_hash
 from promptless_instruction_hub.release.versions import resolve_publish_plugin_version
 from promptless_instruction_hub.scan.hub import scan_hub
 
@@ -22,6 +24,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests/fixtures"
 SCHEMAS = REPO_ROOT / "schemas"
 WORKFLOWS = REPO_ROOT / ".github/workflows"
+
+
+def _write_release_manifest_with_fresh_identity(manifest_path: Path, manifest: dict[str, Any]) -> None:
+    plugin = manifest.get("plugin")
+    assert isinstance(plugin, dict)
+    plugin_version = plugin.get("version")
+    assert isinstance(plugin_version, str)
+    manifest.pop("release_id", None)
+    manifest.pop("release_hash", None)
+    content_hash = stable_hash(manifest)
+    manifest["release_id"] = f"{plugin_version}+{content_hash[:12]}"
+    manifest["release_hash"] = stable_hash(manifest)
+    manifest_path.write_text(json.dumps(manifest))
 
 
 def _assert_no_promptless_directory(root: Path) -> None:
@@ -1151,6 +1166,23 @@ def test_publish_version_prefers_higher_configured_version_floor(tmp_path: Path)
     assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.2.0"
 
 
+def test_publish_version_accepts_legacy_managed_runtime_id_in_previous_release(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Acme")
+    build_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    shutil.copytree(hub_root, previous_release_root)
+    manifest_path = previous_release_root / "hub.release.json"
+    manifest = json.loads(manifest_path.read_text())
+    for runtime in manifest["managed_runtimes"]:
+        runtime["id"] = "host-enrollment-bootstrap"
+    for runtime in manifest["version_basis"]["managed_runtimes"]:
+        runtime["id"] = "host-enrollment-bootstrap"
+    _write_release_manifest_with_fresh_identity(manifest_path, manifest)
+
+    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.1"
+
+
 def test_publish_version_rejects_invalid_authoritative_release_manifest(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -1891,7 +1923,7 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
         "toolchain_version",
         "version",
     ]
-    assert managed_runtime_schema["properties"]["id"] == {"const": "host-enrollment-bootstrap"}
+    assert managed_runtime_schema["properties"]["id"] == {"const": "host-runtime"}
     assert managed_runtime_schema["properties"]["status"] == {"const": "included"}
     assert managed_runtime_schema["properties"]["target"] == {"enum": ["claude", "codex"]}
     assert "oneOf" not in managed_runtime_schema

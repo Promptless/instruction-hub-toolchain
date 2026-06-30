@@ -63,6 +63,9 @@ MANAGED_RUNTIME_KEYS = frozenset(
 )
 SUPPORT_KEYS = frozenset({"mode", "reason"})
 SUPPORT_MODES = frozenset({"agent-skill", "native", "projected", "unsupported"})
+HOST_RUNTIME_ID = "host-runtime"
+LEGACY_HOST_RUNTIME_ID = "host-enrollment-bootstrap"
+PREVIOUS_RELEASE_MANAGED_RUNTIME_IDS = frozenset({HOST_RUNTIME_ID, LEGACY_HOST_RUNTIME_ID})
 
 
 def resolve_publish_plugin_version(
@@ -440,8 +443,9 @@ def _validate_managed_runtimes(manifest_path: Path, runtimes: list[JsonValue], k
         runtime = _require_mapping_value(manifest_path, runtime_value, f"{key_path}[{index}]")
         runtime_path = f"{key_path}[{index}]"
         _require_exact_keys(manifest_path, runtime, runtime_path, MANAGED_RUNTIME_KEYS)
-        if runtime["id"] != "host-enrollment-bootstrap":
-            msg = f"{manifest_path}: {runtime_path}.id must be host-enrollment-bootstrap"
+        runtime_id = runtime["id"]
+        if not isinstance(runtime_id, str) or runtime_id not in PREVIOUS_RELEASE_MANAGED_RUNTIME_IDS:
+            msg = f"{manifest_path}: {runtime_path}.id must be host-runtime or host-enrollment-bootstrap"
             raise ValueError(msg)
         if runtime["status"] != "included":
             msg = f"{manifest_path}: {runtime_path}.status must be included"

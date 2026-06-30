@@ -34,10 +34,10 @@ if os.name == "nt":
 else:
     import fcntl
 
-BOOTSTRAP_VERSION = "0.1.0"
-BOOTSTRAP_CHANNEL = "stable"
-BOOTSTRAP_EXECUTABLE = "promptless-host-enrollment-bootstrap"
-MANAGED_RUNTIME_ID = "host-enrollment-bootstrap"
+RUNTIME_VERSION = "0.2.0"
+RUNTIME_CHANNEL = "stable"
+RUNTIME_EXECUTABLE = "promptless-host-runtime"
+MANAGED_RUNTIME_ID = "host-runtime"
 DEFAULT_WORKER_BASE_URL = "https://pig.promptless.ai"
 DEFAULT_DASHBOARD_BASE_URL = "https://app.gopromptless.ai"
 MANAGED_BEGIN = "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT"
@@ -178,28 +178,144 @@ class ConfigResult:
     drift_reports: list[dict[str, JsonValue]]
 
 
-def main() -> int:
-    """Run host enrollment and return a non-blocking hook exit code."""
+def main(argv: list[str] | None = None) -> int:
+    """Run the requested host-runtime command."""
 
-    parser = argparse.ArgumentParser(description="Promptless host enrollment bootstrap")
-    parser.add_argument("--host", choices=("auto", "codex", "claude"), default="auto")
-    parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
-    args = parser.parse_args()
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.command == "version":
+        return _run_version_command(json_output=args.json)
     host = _resolve_host(args.host)
+    if args.command == "ensure":
+        return _run_ensure_command(host, quiet=args.quiet)
+    if args.command == "status":
+        return _run_status_command(host)
+    if args.command == "enroll":
+        return _run_enroll_command(host)
+    if args.command == "reset":
+        return _run_reset_command(host)
+    parser.error(f"unknown command: {args.command}")
+    return 2
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=RUNTIME_EXECUTABLE, description="Promptless host runtime")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    ensure_parser = subcommands.add_parser("ensure", help="Enroll if needed and ensure host telemetry config")
+    _add_host_argument(ensure_parser)
+    ensure_parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
+
+    status_parser = subcommands.add_parser("status", help="Print local host-runtime status as JSON")
+    _add_host_argument(status_parser)
+
+    enroll_parser = subcommands.add_parser("enroll", help="Enroll the host credential without editing host config")
+    _add_host_argument(enroll_parser)
+
+    reset_parser = subcommands.add_parser("reset", help="Clear cached host credentials and pending enrollment state")
+    _add_host_argument(reset_parser)
+    reset_parser.add_argument("--yes", action="store_true", required=True, help="Confirm local state reset")
+
+    version_parser = subcommands.add_parser("version", help="Print host-runtime version")
+    version_parser.add_argument("--json", action="store_true", help="Print version metadata as JSON")
+    return parser
+
+
+def _add_host_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--host", choices=("auto", "codex", "claude"), default="auto")
+
+
+def _run_ensure_command(host: Host, *, quiet: bool) -> int:
     try:
-        return _run(host, quiet=args.quiet)
+        return _run_ensure(host, quiet=quiet)
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
-        _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=args.quiet)
+        _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
         return 0
     finally:
         _flush_control_output()
 
 
-def _run(host: Host, *, quiet: bool) -> int:
-    # Compute any plugin-update notice independent of the enrollment gate so every install (not
-    # just enrolled hosts) learns when the Instruction Hub plugin version changed. Both Claude and
-    # Codex render the SessionStart `systemMessage`. The new version is recorded only after the
-    # hook output is emitted below, so a later failure re-announces it on the next healthy session.
+def _run_status_command(host: Host) -> int:
+    try:
+        payload = _status_payload(host)
+    except (BootstrapError, OSError, ValueError) as exc:
+        _emit_command_json({"status": "error", "host": host, "message": _redact_text(str(exc))})
+        return 1
+    _emit_command_json(payload)
+    return 0
+
+
+def _run_enroll_command(host: Host) -> int:
+    try:
+        plugin_root = _plugin_root()
+        metadata = _load_runtime_metadata(plugin_root, host)
+        worker_base_url = _worker_base_url()
+        dashboard_base_url = _dashboard_base_url()
+        context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+        enrollment_attempt = _obtain_host_credential(context, quiet=True)
+        if enrollment_attempt.credential is None:
+            _emit_command_json(
+                {
+                    "status": "setup_pending",
+                    "reason": enrollment_attempt.reason or "approval_pending",
+                    "host": host,
+                }
+            )
+            return 0
+        credential = enrollment_attempt.credential
+        _emit_command_json(
+            {
+                "status": "enrolled",
+                "host": host,
+                "credential_id": credential.credential_id,
+                "deployment_instance_id": credential.deployment_instance_id or context.deployment_instance_id,
+                "host_instance_id": context.host_instance_id,
+            }
+        )
+        return 0
+    except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
+        _emit_command_json({"status": "error", "host": host, "message": _redact_text(str(exc))})
+        return 1
+
+
+def _run_reset_command(host: Host) -> int:
+    try:
+        credentials_removed, pending_removed = _reset_host_state(host)
+    except (BootstrapError, OSError, ValueError) as exc:
+        _emit_command_json({"status": "error", "host": host, "message": _redact_text(str(exc))})
+        return 1
+    _emit_command_json(
+        {
+            "status": "reset",
+            "host": host,
+            "credentials_removed": credentials_removed,
+            "pending_enrollments_removed": pending_removed,
+        }
+    )
+    return 0
+
+
+def _run_version_command(*, json_output: bool) -> int:
+    payload = {
+        "id": MANAGED_RUNTIME_ID,
+        "name": RUNTIME_EXECUTABLE,
+        "version": RUNTIME_VERSION,
+        "channel": RUNTIME_CHANNEL,
+        "sha256": _self_sha256(),
+    }
+    if json_output:
+        _emit_command_json(payload)
+    else:
+        sys.stdout.write(f"{RUNTIME_EXECUTABLE} {RUNTIME_VERSION}\n")
+        sys.stdout.flush()
+    return 0
+
+
+def _run_ensure(host: Host, *, quiet: bool) -> int:
+    # Compute any plugin-update notice before enrollment so every install learns when the
+    # Instruction Hub plugin version changed. Both Claude and Codex render the SessionStart
+    # `systemMessage`. The new version is recorded only after the hook output is emitted below,
+    # so a later failure re-announces it on the next healthy session.
     plugin_root = _plugin_root()
     metadata = _load_runtime_metadata(plugin_root, host)
     pending_update = _pending_plugin_update(metadata)
@@ -252,15 +368,15 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
         credential = enrollment_attempt.credential
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
     policy = _validate_signed_policy(signed_policy, host)
-    if _requires_newer_bootstrap(policy.required_bootstrap_version, BOOTSTRAP_VERSION):
+    if _requires_newer_bootstrap(policy.required_bootstrap_version, RUNTIME_VERSION):
         result = _blocked_result(
             host,
             policy,
             kind="bootstrap_upgrade_required",
-            message="Worker policy requires a newer Promptless bootstrap runtime",
+            message="Worker policy requires a newer Promptless host runtime",
             details={
                 "required_bootstrap_version": policy.required_bootstrap_version,
-                "bootstrap_version": BOOTSTRAP_VERSION,
+                "bootstrap_version": RUNTIME_VERSION,
             },
         )
         _post_check_in(check_in_url, credential, host, metadata, policy, result)
@@ -279,6 +395,150 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
         update_notice=update_notice,
     )
     return 0
+
+
+def _status_payload(host: Host) -> dict[str, JsonValue]:
+    state_path = _state_path()
+    state = _load_state(state_path)
+    credentials = _credential_statuses_for_host(state, host)
+    pending_counts = _pending_enrollment_counts(state, host)
+    seen_versions = _json_mapping_or_empty(state.get("last_seen_plugin_versions"))
+    return {
+        "status": "ok",
+        "host": host,
+        "runtime": {
+            "id": MANAGED_RUNTIME_ID,
+            "name": RUNTIME_EXECUTABLE,
+            "version": RUNTIME_VERSION,
+            "channel": RUNTIME_CHANNEL,
+            "sha256": _self_sha256(),
+        },
+        "state": {
+            "path": str(state_path),
+            "exists": state_path.exists(),
+            "host_instance_id": _string_value(state.get("host_instance_id")),
+            "credential_count": len(credentials),
+            "credentials": credentials,
+            "pending_enrollment_count": pending_counts[0],
+            "legacy_pending_enrollment_count": pending_counts[1],
+            "last_seen_plugin_version": _string_value(seen_versions.get(host)),
+        },
+        "config": _host_config_status(host),
+    }
+
+
+def _credential_statuses_for_host(state: dict[str, JsonValue], host: Host) -> list[dict[str, JsonValue]]:
+    statuses: list[dict[str, JsonValue]] = []
+    credentials = _json_mapping_or_empty(state.get("credentials"))
+    for credential_value in credentials.values():
+        credential = _json_mapping_or_empty(credential_value)
+        if _string_value(credential.get("target")) != host:
+            continue
+        if _string_value(credential.get("value")) is None:
+            continue
+        statuses.append(
+            {
+                "credential_id": _string_value(credential.get("credential_id")),
+                "deployment_instance_id": _string_value(credential.get("deployment_instance_id")),
+                "worker_base_url": _string_value(credential.get("worker_base_url")),
+                "updated_at": _string_value(credential.get("updated_at")),
+            }
+        )
+    return sorted(statuses, key=lambda item: _string_value(item.get("updated_at")) or "")
+
+
+def _pending_enrollment_counts(state: dict[str, JsonValue], host: Host) -> tuple[int, int]:
+    pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+    host_pending = 0
+    legacy_pending = 0
+    for pending_value in pending_enrollments.values():
+        pending = _json_mapping_or_empty(pending_value)
+        target = _string_value(pending.get("target"))
+        if target == host:
+            host_pending += 1
+        elif target is None:
+            legacy_pending += 1
+    return host_pending, legacy_pending
+
+
+def _host_config_status(host: Host) -> dict[str, JsonValue]:
+    if host == "codex":
+        return _codex_config_status()
+    return _claude_config_status()
+
+
+def _codex_config_status() -> dict[str, JsonValue]:
+    config_path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser() / "config.toml"
+    result: dict[str, JsonValue] = {"path": str(config_path), "exists": config_path.exists()}
+    if not config_path.exists():
+        result["managed_config_detected"] = False
+        return result
+    try:
+        existing = config_path.read_text()
+    except OSError as exc:
+        result["read_error"] = _redact_text(str(exc))
+        result["managed_config_detected"] = False
+        return result
+    malformed = _has_malformed_managed_blocks(existing)
+    result["malformed_managed_config"] = malformed
+    result["managed_config_detected"] = not malformed and _managed_block_pattern().search(existing) is not None
+    return result
+
+
+def _claude_config_status() -> dict[str, JsonValue]:
+    settings_path = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser() / "settings.json"
+    result: dict[str, JsonValue] = {"path": str(settings_path), "exists": settings_path.exists()}
+    if not settings_path.exists():
+        result["managed_config_detected"] = False
+        return result
+    try:
+        settings = json.loads(settings_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        result["read_error"] = _redact_text(str(exc))
+        result["managed_config_detected"] = False
+        return result
+    if not isinstance(settings, dict):
+        result["read_error"] = "settings file is not a JSON object"
+        result["managed_config_detected"] = False
+        return result
+    env = settings.get("env")
+    result["managed_config_detected"] = isinstance(env, dict) and _string_value(env.get(CLAUDE_MANAGED_ENV_MARKER)) == "1"
+    return result
+
+
+def _reset_host_state(host: Host) -> tuple[int, int]:
+    state_path = _state_path()
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        credentials = _json_mapping_or_empty(state.get("credentials"))
+        kept_credentials: dict[str, JsonValue] = {}
+        credentials_removed = 0
+        for key, credential_value in credentials.items():
+            credential = _json_mapping_or_empty(credential_value)
+            if _string_value(credential.get("target")) == host:
+                credentials_removed += 1
+                continue
+            kept_credentials[key] = credential_value
+        state["credentials"] = kept_credentials
+
+        pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+        kept_pending: dict[str, JsonValue] = {}
+        pending_removed = 0
+        for key, pending_value in pending_enrollments.items():
+            pending = _json_mapping_or_empty(pending_value)
+            target = _string_value(pending.get("target"))
+            if target == host or target is None:
+                pending_removed += 1
+                continue
+            kept_pending[key] = pending_value
+        state["pending_enrollments"] = kept_pending
+        _write_state(state_path, state)
+    return credentials_removed, pending_removed
+
+
+def _emit_command_json(payload: dict[str, JsonValue]) -> None:
+    sys.stdout.write(json.dumps(_redact_json(payload), sort_keys=True) + "\n")
+    sys.stdout.flush()
 
 
 @dataclass(frozen=True)
@@ -799,6 +1059,8 @@ def _store_pending_enrollment(
             "poll_url": session.poll_url,
             "expires_at": session.expires_at.isoformat(),
             "poll_interval_seconds": session.poll_interval_seconds,
+            "target": context.metadata.target,
+            "worker_base_url": context.worker_base_url,
         }
         state["pending_enrollments"] = pending_enrollments
         _write_state(state_path, state)
@@ -910,8 +1172,8 @@ def _worker_url(worker_base_url: str, path: str) -> str:
 
 def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetadata:
     defaults = RuntimeMetadata(
-        bootstrap_version=BOOTSTRAP_VERSION,
-        bootstrap_channel=BOOTSTRAP_CHANNEL,
+        bootstrap_version=RUNTIME_VERSION,
+        bootstrap_channel=RUNTIME_CHANNEL,
         bootstrap_sha256=_self_sha256(),
         toolchain_version="unknown",
         plugin_id="unknown",
@@ -939,8 +1201,8 @@ def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetad
         if runtime.get("id") != MANAGED_RUNTIME_ID or runtime.get("status") != "included":
             continue
         return RuntimeMetadata(
-            bootstrap_version=BOOTSTRAP_VERSION,
-            bootstrap_channel=BOOTSTRAP_CHANNEL,
+            bootstrap_version=RUNTIME_VERSION,
+            bootstrap_channel=RUNTIME_CHANNEL,
             bootstrap_sha256=_self_sha256(),
             toolchain_version=_string_value(runtime.get("toolchain_version")) or "unknown",
             plugin_id=_string_value(runtime.get("plugin_id")) or "unknown",
@@ -1787,7 +2049,7 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
         )
     if status == "blocked":
         if payload.get("reason") == "bootstrap_upgrade_required":
-            return "Promptless host enrollment is blocked: a newer Promptless bootstrap runtime is required."
+            return "Promptless host enrollment is blocked: a newer Promptless host runtime is required."
         return (
             "Promptless host enrollment is blocked: existing telemetry settings were left unchanged. "
             f"Review {host_label.config_path}."

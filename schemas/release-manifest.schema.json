@@ -102,7 +102,7 @@
         ],
         "properties": {
           "id": {
-            "const": "host-enrollment-bootstrap"
+            "const": "host-runtime"
           },
           "package_id": {
             "type": "string",

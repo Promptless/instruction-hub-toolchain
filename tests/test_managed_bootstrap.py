@@ -18,7 +18,7 @@ from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, validate_json_value
 
-BOOTSTRAP_BIN = "promptless-host-enrollment-bootstrap"
+HOST_RUNTIME_BIN = "promptless-host-runtime"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
 LAST_STATUS_REL_PATH = Path(".promptless/instruction-hub/last-bootstrap-status.json")
 BROWSER_ENROLLMENT_MESSAGE = (
@@ -49,28 +49,28 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
 
     for target in ("codex", "claude"):
         plugin_root = hub_root / "dist" / target / "core"
-        bootstrap_path = plugin_root / "bin" / BOOTSTRAP_BIN
+        bootstrap_path = plugin_root / "bin" / HOST_RUNTIME_BIN
         assert bootstrap_path.exists()
         assert os.access(bootstrap_path, os.X_OK)
         hooks = json.loads((plugin_root / "hooks/hooks.json").read_text())
         hook = hooks["hooks"]["SessionStart"][0]["hooks"][0]
         if target == "claude":
             hook_command = hook["command"]
-            assert hook_command == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host claude'
+            assert hook_command == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host claude'
         else:
             hook_command = hook["command"]
-            assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host codex'
+            assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host codex'
         assert "--quiet" not in hook_command
         assert hook["timeout"] == 90
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
-        assert runtime["id"] == "host-enrollment-bootstrap"
+        assert runtime["id"] == "host-runtime"
         assert runtime["status"] == "included"
         assert runtime["target"] == target
-        assert runtime["version"] == "0.1.0"
+        assert runtime["version"] == "0.2.0"
         assert runtime["channel"] == "stable"
-        assert runtime["path"] == f"bin/{BOOTSTRAP_BIN}"
+        assert runtime["path"] == f"bin/{HOST_RUNTIME_BIN}"
         assert len(runtime["sha256"]) == 64
 
     codex_manifest = json.loads((hub_root / "dist/codex/core/.codex-plugin/plugin.json").read_text())
@@ -78,12 +78,149 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
 
     for target in ("cursor", "gemini"):
         plugin_root = hub_root / "dist" / target / "core"
-        assert not (plugin_root / "bin" / BOOTSTRAP_BIN).exists()
+        assert not (plugin_root / "bin" / HOST_RUNTIME_BIN).exists()
         assert not (plugin_root / "hub.managed-runtimes.json").exists()
 
     release_manifest = json.loads((hub_root / "hub.release.json").read_text())
     assert {runtime["target"] for runtime in release_manifest["managed_runtimes"]} == {"codex", "claude"}
     _assert_no_promptless_directory(hub_root)
+
+
+def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    runtime_path = plugin_root / "bin" / HOST_RUNTIME_BIN
+    home = tmp_path / "home"
+
+    missing_command = subprocess.run(
+        [str(runtime_path)],
+        env=_clean_env(HOME=str(home), PLUGIN_ROOT=str(plugin_root)),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert missing_command.returncode == 2
+    assert "usage:" in missing_command.stderr
+
+    payload, _ = _run_runtime_json(
+        plugin_root,
+        ["version", "--json"],
+        {"HOME": str(home), "PLUGIN_ROOT": str(plugin_root)},
+    )
+    assert payload["id"] == "host-runtime"
+    assert payload["name"] == HOST_RUNTIME_BIN
+    assert payload["version"] == "0.2.0"
+    assert payload["channel"] == "stable"
+    assert len(_json_string(payload["sha256"], "sha256")) == 64
+
+    text_version = subprocess.run(
+        [str(runtime_path), "version"],
+        env=_clean_env(HOME=str(home), PLUGIN_ROOT=str(plugin_root)),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert text_version.returncode == 0
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.0\n"
+    assert text_version.stderr == ""
+
+
+def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        enroll_payload, _ = _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        assert enroll_payload["status"] == "enrolled"
+        assert enroll_payload["host"] == "codex"
+        assert enroll_payload["credential_id"] == "22222222-2222-4222-8222-222222222222"
+        assert not (home / ".codex/config.toml").exists()
+        assert len(server.session_requests) == 1
+        assert len(server.poll_requests) == 1
+        assert server.policy_requests == []
+        assert server.check_ins == []
+
+        status_payload, _ = _run_runtime_json(
+            plugin_root,
+            ["status", "--host", "codex"],
+            env,
+        )
+        assert status_payload["status"] == "ok"
+        status_state = _json_mapping(status_payload["state"], "status.state")
+        status_config = _json_mapping(status_payload["config"], "status.config")
+        assert status_state["credential_count"] == 1
+        assert status_state["pending_enrollment_count"] == 0
+        assert status_config["managed_config_detected"] is False
+        assert len(server.session_requests) == 1
+        assert len(server.poll_requests) == 1
+        assert server.policy_requests == []
+        assert server.check_ins == []
+
+        _run_bootstrap(plugin_root, "codex", env)
+        assert (home / ".codex/config.toml").exists()
+        assert len(server.session_requests) == 1
+        assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
+        assert len(server.check_ins) == 1
+
+        configured_status, _ = _run_runtime_json(
+            plugin_root,
+            ["status", "--host", "codex"],
+            env,
+        )
+        configured_state = _json_mapping(configured_status["state"], "configured.state")
+        configured_config = _json_mapping(configured_status["config"], "configured.config")
+        host_instance_id = _json_string(configured_state["host_instance_id"], "host_instance_id")
+        assert configured_state["credential_count"] == 1
+        assert configured_state["last_seen_plugin_version"] == "0.1.0"
+        assert configured_config["managed_config_detected"] is True
+        assert len(server.session_requests) == 1
+        assert len(server.check_ins) == 1
+
+        reset_payload, _ = _run_runtime_json(
+            plugin_root,
+            ["reset", "--host", "codex", "--yes"],
+            env,
+        )
+        assert reset_payload == {
+            "credentials_removed": 1,
+            "host": "codex",
+            "pending_enrollments_removed": 0,
+            "status": "reset",
+        }
+        state_after_reset = json.loads(_host_state_path(home).read_text())
+        assert state_after_reset["host_instance_id"] == host_instance_id
+        assert state_after_reset["last_seen_plugin_versions"] == {"codex": "0.1.0"}
+        assert state_after_reset["credentials"] == {}
+        assert state_after_reset["pending_enrollments"] == {}
+        assert (home / ".codex/config.toml").exists()
+        assert len(server.session_requests) == 1
+        assert len(server.check_ins) == 1
+
+        reset_status, _ = _run_runtime_json(
+            plugin_root,
+            ["status", "--host", "codex"],
+            env,
+        )
+        reset_state = _json_mapping(reset_status["state"], "reset.state")
+        reset_config = _json_mapping(reset_status["config"], "reset.config")
+        assert reset_state["credential_count"] == 0
+        assert reset_state["last_seen_plugin_version"] == "0.1.0"
+        assert reset_config["managed_config_detected"] is True
+    finally:
+        server.stop()
 
 
 def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: Path) -> None:
@@ -93,7 +230,7 @@ def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: 
     home = tmp_path / "home"
 
     result = subprocess.run(
-        [str(hub_root / "dist/codex/core/bin" / BOOTSTRAP_BIN), "--host", "codex"],
+        [str(hub_root / "dist/codex/core/bin" / HOST_RUNTIME_BIN), "ensure", "--host", "codex"],
         env=_clean_env(
             HOME=str(home),
             CODEX_HOME=str(home / ".codex"),
@@ -119,7 +256,7 @@ def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: 
     assert not (home / ".codex/config.toml").exists()
 
     quiet_result = subprocess.run(
-        [str(hub_root / "dist/codex/core/bin" / BOOTSTRAP_BIN), "--host", "codex", "--quiet"],
+        [str(hub_root / "dist/codex/core/bin" / HOST_RUNTIME_BIN), "ensure", "--host", "codex", "--quiet"],
         env=_clean_env(
             HOME=str(home),
             CODEX_HOME=str(home / ".codex"),
@@ -513,7 +650,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
         assert server.session_requests[0]["package_id"] == "core"
-        assert server.session_requests[0]["bootstrap_version"] == "0.1.0"
+        assert server.session_requests[0]["bootstrap_version"] == "0.2.0"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
         assert server.session_requests[1]["target"] == "claude"
         assert server.policy_requests == [
@@ -533,7 +670,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "policy_version",
                 "status",
             }
-            assert check_in["bootstrap_version"] == "0.1.0"
+            assert check_in["bootstrap_version"] == "0.2.0"
             assert check_in["plugin_version"] == "0.1.0"
             assert check_in["status"] == "needs_restart"
             assert check_in["needs_restart"] is True
@@ -948,7 +1085,7 @@ def test_build_appends_bootstrap_hook_to_existing_hook_asset(tmp_path: Path) -> 
     hooks = json.loads((hub_root / "dist/codex/core/hooks/hooks.json").read_text())
     session_start = hooks["hooks"]["SessionStart"]
     assert session_start[0]["hooks"][0]["command"] == "existing-hook"
-    assert f"bin/{BOOTSTRAP_BIN}" in session_start[1]["hooks"][0]["command"]
+    assert f"bin/{HOST_RUNTIME_BIN}" in session_start[1]["hooks"][0]["command"]
 
 
 def test_build_rejects_malformed_existing_hook_asset(tmp_path: Path) -> None:
@@ -1354,7 +1491,7 @@ def test_bootstrap_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> 
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(policy=_policy_with(required_bootstrap_version="0.2.0"))
+    server = _FakeWorkerServer(policy=_policy_with(required_bootstrap_version="0.3.0"))
     server.start()
     try:
         home = tmp_path / "home"
@@ -1468,7 +1605,7 @@ def _run_bootstrap(
     expected_status: str = "needs_restart",
 ) -> tuple[dict[str, JsonValue], subprocess.CompletedProcess[str]]:
     result = subprocess.run(
-        [str(plugin_root / "bin" / BOOTSTRAP_BIN), "--host", host],
+        [str(plugin_root / "bin" / HOST_RUNTIME_BIN), "ensure", "--host", host],
         env=_clean_env(**env),
         text=True,
         capture_output=True,
@@ -1483,13 +1620,37 @@ def _run_bootstrap(
     return payload, result
 
 
+def _run_runtime_json(
+    plugin_root: Path,
+    args: list[str],
+    env: dict[str, str],
+    *,
+    expected_returncode: int = 0,
+) -> tuple[dict[str, JsonValue], subprocess.CompletedProcess[str]]:
+    result = subprocess.run(
+        [str(plugin_root / "bin" / HOST_RUNTIME_BIN), *args],
+        env=_clean_env(**env),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == expected_returncode
+    assert "plihost_localcredential" not in result.stdout
+    assert "plihost_localcredential" not in result.stderr
+    assert "plihenroll_devicecode" not in result.stdout
+    assert "plihenroll_devicecode" not in result.stderr
+    assert result.stderr == ""
+    payload = validate_json_value(json.loads(result.stdout), "runtime command stdout")
+    return _json_mapping(payload, "runtime command stdout"), result
+
+
 def _start_bootstrap(plugin_root: Path, host: str, env: dict[str, str]) -> subprocess.Popen[str]:
     process_env = _clean_env()
     process_env.update(env)
     if "PROMPTLESS_WORKER_BASE_URL" in process_env and "PROMPTLESS_DASHBOARD_BASE_URL" not in process_env:
         process_env["PROMPTLESS_DASHBOARD_BASE_URL"] = process_env["PROMPTLESS_WORKER_BASE_URL"]
     return subprocess.Popen(
-        [str(plugin_root / "bin" / BOOTSTRAP_BIN), "--host", host],
+        [str(plugin_root / "bin" / HOST_RUNTIME_BIN), "ensure", "--host", host],
         env=process_env,
         text=True,
         stdout=subprocess.PIPE,
@@ -1881,7 +2042,7 @@ def _signed_policy() -> dict[str, JsonValue]:
                 "write_user_config": True,
                 "repair_user_config": True,
             },
-            "required_bootstrap_version": "0.1.0",
+            "required_bootstrap_version": "0.2.0",
         },
         "signature": "hmac-sha256-v1:test",
         "signed_at": now.isoformat(),
