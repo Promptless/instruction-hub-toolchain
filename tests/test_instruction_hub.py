@@ -2021,11 +2021,6 @@ def _release_branch_plugin_versions(
     }
 
 
-def _write_legacy_plugin_manifest(manifest_path: Path, *, version: str) -> None:
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps({"version": version}))
-
-
 def _rewrite_release_identity(manifest: dict[str, JsonValue]) -> None:
     plugin = _json_mapping(manifest["plugin"], "plugin")
     plugin_version = plugin["version"]
