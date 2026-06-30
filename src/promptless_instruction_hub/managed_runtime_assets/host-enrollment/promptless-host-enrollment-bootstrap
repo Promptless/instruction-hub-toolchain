@@ -371,9 +371,12 @@ def _worker_deployment_instance_id(worker_base_url: str) -> str:
 
 
 def _state_path() -> Path:
-    for raw_dir in (os.environ.get("PLUGIN_DATA"), os.environ.get("CLAUDE_PLUGIN_DATA")):
-        if raw_dir:
-            return Path(raw_dir).expanduser() / STATE_FILE_NAME
+    # Host enrollment is a per-host concept: one approved credential and one OTel policy cover
+    # every Promptless plugin this user installs from the hub. Persist the state at a single
+    # host-global path so multiple plugins coordinate through one file (and one credential)
+    # instead of each enrolling -- and opening its own browser window -- independently. The
+    # per-plugin CLAUDE_PLUGIN_DATA/PLUGIN_DATA directories are intentionally not used here: the
+    # agent host sets a different one per plugin, which would re-fragment the shared host state.
     return Path.home() / ".promptless/instruction-hub" / STATE_FILE_NAME
 
 
@@ -434,6 +437,45 @@ def _ensure_windows_lock_byte(lock_file: BinaryIO) -> None:
         lock_file.write(b"\0")
         lock_file.flush()
     lock_file.seek(0)
+
+
+@contextmanager
+def _enrollment_leader_lock(context: EnrollmentContext, state_path: Path) -> Iterator[bool]:
+    """Serialize browser-approval enrollment across the plugins that share this host credential.
+
+    Yields ``True`` to the single process that wins the lock (the leader, which opens the one
+    browser approval) and ``False`` to any concurrent process for the same credential (a
+    follower, which must not open a second browser). The lock is scoped to the credential cache
+    key so independent agent hosts (claude vs codex) still enroll in parallel, and it is
+    non-blocking so a follower returns immediately and defers to a later session instead of
+    stacking up behind the leader's approval wait.
+    """
+
+    lock_path = state_path.with_name(f"host-enrollment-{_credential_cache_key(context)}.enroll.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        acquired = _try_lock_state_file(lock_file)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                _unlock_state_file(lock_file)
+
+
+def _try_lock_state_file(lock_file: BinaryIO) -> bool:
+    """Attempt a non-blocking exclusive lock, returning True when acquired and False when held elsewhere."""
+    if os.name == "nt":
+        _ensure_windows_lock_byte(lock_file)
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
 
 
 def _host_instance_id(state: dict[str, JsonValue]) -> str:
@@ -501,13 +543,36 @@ def _forget_cached_host_credential(context: EnrollmentContext) -> None:
 def _enroll_host_credential(context: EnrollmentContext) -> HostCredential | None:
     state_path = _state_path()
     session = _load_pending_enrollment_session(context, state_path)
-    if session is None:
-        created_session = _create_enrollment_session(context)
-        if created_session is None:
-            return None
-        session, stored_new_session = _store_pending_enrollment(context, state_path, created_session)
-        if not stored_new_session:
-            session = _load_pending_enrollment_session(context, state_path) or session
+    if session is not None:
+        # A pending session already exists (e.g. left by an earlier session start); polling it
+        # opens no browser, so no cross-plugin coordination is needed here.
+        return _complete_host_enrollment(context, state_path, session)
+    # A fresh enrollment opens a browser. Serialize that across every plugin on this host so only
+    # the leader drives the single browser approval; concurrent followers reuse the resulting
+    # credential or defer rather than opening their own browser window.
+    with _enrollment_leader_lock(context, state_path) as is_enrollment_leader:
+        if not is_enrollment_leader:
+            return _cached_host_credential(context)
+        # Re-check under the lock: a previous leader may have just finished enrolling this host.
+        credential = _cached_host_credential(context)
+        if credential is not None:
+            return credential
+        session = _load_pending_enrollment_session(context, state_path)
+        if session is None:
+            created_session = _create_enrollment_session(context)
+            if created_session is None:
+                return None
+            session, stored_new_session = _store_pending_enrollment(context, state_path, created_session)
+            if not stored_new_session:
+                session = _load_pending_enrollment_session(context, state_path) or session
+        return _complete_host_enrollment(context, state_path, session)
+
+
+def _complete_host_enrollment(
+    context: EnrollmentContext,
+    state_path: Path,
+    session: EnrollmentSession,
+) -> HostCredential | None:
     credential = _poll_enrollment_session(context, session)
     if credential is None:
         return None
@@ -745,8 +810,6 @@ def _store_host_credential(
             "worker_base_url": context.worker_base_url,
             "deployment_instance_id": credential.deployment_instance_id,
             "target": context.metadata.target,
-            "plugin_id": context.metadata.plugin_id,
-            "package_id": context.metadata.package_id,
             "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
         state["credentials"] = credentials
@@ -767,10 +830,12 @@ def _forget_pending_enrollment(context: EnrollmentContext) -> None:
 
 
 def _credential_cache_key(context: EnrollmentContext) -> str:
+    # Key the credential and pending enrollment on host-level identity only: the worker
+    # deployment and the agent host (claude/codex). Every plugin from the hub on this machine
+    # maps to the same key, so one browser approval enrolls the host once and all of its plugins
+    # reuse the resulting credential. Plugin- and package-scoped fields are deliberately excluded.
     cache_material = {
         "deployment_instance_id": context.deployment_instance_id,
-        "package_id": context.metadata.package_id,
-        "plugin_id": context.metadata.plugin_id,
         "target": context.metadata.target,
         "worker_base_url": context.worker_base_url,
     }
