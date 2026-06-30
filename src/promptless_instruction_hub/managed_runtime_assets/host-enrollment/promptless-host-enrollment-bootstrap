@@ -1327,31 +1327,46 @@ def _emit(
     output_stream.flush()
 
 
-def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
-    """Return a user-facing enrollment-status message for the Claude host, or None to stay silent.
+@dataclass(frozen=True)
+class HostDisplay:
+    """Human-facing host name and user config path used in SessionStart messages."""
 
-    Only the Claude host surfaces a message, and only for outcomes worth showing on a hook
-    that runs every startup/resume: a fresh config write, a pending browser approval, or a
-    block. The steady "already configured", gate-disabled, and error states stay silent so the
-    hook does not banner every session (errors still reach stderr/the debug log).
+    name: str
+    config_path: str
+
+
+HOST_DISPLAY_NAMES: dict[str, HostDisplay] = {
+    "claude": HostDisplay(name="Claude Code", config_path="~/.claude/settings.json"),
+    "codex": HostDisplay(name="Codex", config_path="~/.codex/config.toml"),
+}
+
+
+def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
+    """Return a user-facing enrollment-status message for the host, or None to stay silent.
+
+    Both Claude and Codex surface a message, and only for outcomes worth showing on a hook that
+    runs every startup/resume: a fresh config write, a pending browser approval, or a block. The
+    steady "already configured", gate-disabled, and error states stay silent so the hook does not
+    banner every session (errors still reach stderr/the debug log).
     """
 
-    if payload.get("host") != "claude":
+    host_label = HOST_DISPLAY_NAMES.get(_string_value(payload.get("host")) or "")
+    if host_label is None:
         return None
     status = payload.get("status")
     if status == "needs_restart":
-        return "Promptless telemetry configured for Claude Code. Restart Claude Code to start exporting."
+        return f"Promptless telemetry configured for {host_label.name}. Restart {host_label.name} to start telemetry."
     if status == "setup_pending":
         return (
             "Promptless host enrollment is awaiting browser approval. "
-            "Approve in the browser tab that opened, then restart Claude Code."
+            f"Approve in the browser tab that opened, then restart {host_label.name}."
         )
     if status == "blocked":
         if payload.get("reason") == "bootstrap_upgrade_required":
             return "Promptless host enrollment is blocked: a newer Promptless bootstrap runtime is required."
         return (
             "Promptless host enrollment is blocked: existing telemetry settings were left unchanged. "
-            "Review ~/.claude/settings.json."
+            f"Review {host_label.config_path}."
         )
     return None
 

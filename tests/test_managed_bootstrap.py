@@ -561,7 +561,7 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
         codex_config.parent.mkdir(parents=True)
         codex_config.write_text('[otel]\nenvironment = "local"\n')
 
-        _run_bootstrap(
+        codex_payload, _ = _run_bootstrap(
             hub_root / "dist/codex/core",
             "codex",
             {
@@ -575,6 +575,7 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
 
         assert codex_config.read_text() == '[otel]\nenvironment = "local"\n'
         assert server.check_ins[-1]["status"] == "blocked"
+        assert "blocked" in _json_string(codex_payload["systemMessage"], "systemMessage").lower()
 
         claude_home = tmp_path / "claude-home"
         claude_settings = claude_home / ".claude/settings.json"
@@ -604,7 +605,7 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
         server.stop()
 
 
-def test_bootstrap_claude_surfaces_system_message_only_on_change(tmp_path: Path) -> None:
+def test_bootstrap_surfaces_enrollment_message_only_on_change(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -620,26 +621,31 @@ def test_bootstrap_claude_surfaces_system_message_only_on_change(tmp_path: Path)
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
-        first_payload, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
-        assert "restart" in _json_string(first_payload["systemMessage"], "systemMessage").lower()
+        # Fresh config write surfaces a restart prompt naming the host; the steady state is silent.
+        first_claude, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
+        claude_message = _json_string(first_claude["systemMessage"], "systemMessage")
+        assert "Claude Code" in claude_message
+        assert "to start telemetry" in claude_message
 
-        steady_payload, _ = _run_bootstrap(
+        steady_claude, _ = _run_bootstrap(
             hub_root / "dist/claude/core", "claude", claude_env, expected_status="configured"
         )
-        assert "systemMessage" not in steady_payload
+        assert "systemMessage" not in steady_claude
 
         codex_home = tmp_path / "codex-home"
-        codex_payload, _ = _run_bootstrap(
-            hub_root / "dist/codex/core",
-            "codex",
-            {
-                "HOME": str(codex_home),
-                "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
-        )
-        assert "systemMessage" not in codex_payload
+        codex_env = {
+            "HOME": str(codex_home),
+            "CODEX_HOME": str(codex_home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+        first_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        codex_message = _json_string(first_codex["systemMessage"], "systemMessage")
+        assert "Codex" in codex_message
+        assert "to start telemetry" in codex_message
+
+        steady_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env, expected_status="configured")
+        assert "systemMessage" not in steady_codex
     finally:
         server.stop()
 
@@ -669,11 +675,12 @@ def test_bootstrap_announces_plugin_update_per_host(tmp_path: Path) -> None:
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
-        # First install on each host records the version silently (an install is not an update).
+        # First install on each host records the version silently (an install is not an update),
+        # so the only message is the fresh-config restart prompt, never an "updated" notice.
         first_claude, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
         assert "updated" not in _json_string(first_claude["systemMessage"], "systemMessage").lower()
         first_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
-        assert "systemMessage" not in first_codex
+        assert "updated" not in _json_string(first_codex["systemMessage"], "systemMessage").lower()
 
         # Rebuild the same hub at a newer version, then re-run: each host announces the change once.
         build_hub(hub_root, plugin_version="0.2.0")

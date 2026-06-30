@@ -160,8 +160,8 @@ def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
     # Promptless-built static native binary so customer machines do not need Python or uv.
     # The hook deliberately omits --quiet so the bootstrap can surface its status. Both Claude and
     # Codex render a SessionStart `systemMessage`: the bootstrap emits one when the Instruction Hub
-    # plugin version changes (both hosts) and for actionable Claude enrollment outcomes (config
-    # written, pending approval, blocked). The binary still accepts --quiet for manual runs.
+    # plugin version changes and for actionable enrollment outcomes (config written, pending
+    # approval, blocked). The binary still accepts --quiet for manual runs.
     return {
         "matcher": "startup|resume",
         "hooks": [
