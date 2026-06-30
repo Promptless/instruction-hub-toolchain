@@ -39,11 +39,11 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         hook = hooks["hooks"]["SessionStart"][0]["hooks"][0]
         if target == "claude":
             hook_command = hook["command"]
-            assert hook_command == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host claude --quiet'
+            assert hook_command == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host claude'
         else:
             hook_command = hook["command"]
-            assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host codex --quiet'
-        assert "--quiet" in hook_command
+            assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host codex'
+        assert "--quiet" not in hook_command
         assert hook["timeout"] == 90
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
@@ -305,7 +305,9 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert claude_settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
         assert claude_settings["env"]["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] == "1"
         assert claude_settings["env"]["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
+        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
+        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"
         assert claude_settings["env"]["OTEL_LOG_USER_PROMPTS"] == "1"
         assert claude_settings["env"]["OTEL_LOG_ASSISTANT_RESPONSES"] == "0"
