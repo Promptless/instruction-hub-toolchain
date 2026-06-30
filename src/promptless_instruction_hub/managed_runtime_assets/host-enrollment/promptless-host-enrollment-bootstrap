@@ -158,15 +158,15 @@ def main() -> int:
     parser.add_argument("--host", choices=("auto", "codex", "claude"), default="auto")
     parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
     args = parser.parse_args()
+    host = _resolve_host(args.host)
     try:
-        return _run(args.host, quiet=args.quiet)
+        return _run(host, quiet=args.quiet)
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
-        _emit({"status": "error", "message": _redact_text(str(exc))}, quiet=args.quiet)
+        _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=args.quiet)
         return 0
 
 
-def _run(host_arg: str, *, quiet: bool) -> int:
-    host = _resolve_host(host_arg)
+def _run(host: Host, *, quiet: bool) -> int:
     # Compute any plugin-update notice independent of the enrollment gate so every install (not
     # just enrolled hosts) learns when the Instruction Hub plugin version changed. Both Claude and
     # Codex render the SessionStart `systemMessage`. The new version is recorded only after the
@@ -568,8 +568,6 @@ def _enroll_host_credential(context: EnrollmentContext) -> HostCredential | None
         session = _load_pending_enrollment_session(context, state_path)
         if session is None:
             created_session = _create_enrollment_session(context)
-            if created_session is None:
-                return None
             session, stored_new_session = _store_pending_enrollment(context, state_path, created_session)
             if not stored_new_session:
                 session = _load_pending_enrollment_session(context, state_path) or session
@@ -628,14 +626,20 @@ def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, Jso
     )
 
 
-def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSession | None:
+def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSession:
     with _EnrollmentCallbackServer() as callback_server:
         start_url = _hosted_enrollment_start_url(context, callback_server.callback_url)
         if not _open_hosted_enrollment_url(start_url):
-            return None
+            raise BootstrapError(
+                "could not open the Promptless enrollment browser. Check that a default browser is "
+                "available, then restart the agent from a desktop session."
+            )
         callback_payload = callback_server.wait(ENROLLMENT_POLL_DEADLINE_SECONDS)
     if callback_payload is None:
-        return None
+        raise BootstrapError(
+            "Promptless enrollment did not receive browser approval before the local callback timed "
+            "out. Approve the browser prompt, then restart the agent."
+        )
     return _enrollment_session_from_callback(context, callback_payload)
 
 
@@ -1616,15 +1620,21 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
     """Return a user-facing enrollment-status message for the host, or None to stay silent.
 
     Both Claude and Codex surface a message, and only for outcomes worth showing on a hook that
-    runs every startup/resume: a fresh config write, a pending browser approval, or a block. The
-    steady "already configured", gate-disabled, and error states stay silent so the hook does not
-    banner every session (errors still reach stderr/the debug log).
+    runs every startup/resume: a fresh config write, a pending browser approval, a block, or a
+    failure that needs user action. The steady "already configured" and gate-disabled states stay
+    silent so the hook does not banner every session.
     """
 
+    status = payload.get("status")
     host_label = HOST_DISPLAY_NAMES.get(_string_value(payload.get("host")) or "")
+    if status == "error":
+        host_name = host_label.name if host_label is not None else "the agent host"
+        details = _string_value(payload.get("message"))
+        if details:
+            return f"Promptless host enrollment failed for {host_name}: {details}"
+        return f"Promptless host enrollment failed for {host_name}. Check the hook diagnostic output."
     if host_label is None:
         return None
-    status = payload.get("status")
     if status == "needs_restart":
         return f"Promptless telemetry configured for {host_label.name}. Restart {host_label.name} to start telemetry."
     if status == "setup_pending":

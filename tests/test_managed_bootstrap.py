@@ -96,8 +96,9 @@ def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: 
     )
 
     assert result.returncode == 0
-    assert json.loads(result.stderr)["status"] == "error"
-    assert result.stdout == ""
+    payload = _assert_session_start_streams(result.stdout, result.stderr, "error")
+    message = _json_string(payload["systemMessage"], "systemMessage")
+    assert "Promptless host enrollment failed for Codex" in message
     assert not (home / ".codex/config.toml").exists()
 
     quiet_result = subprocess.run(
@@ -142,6 +143,43 @@ def test_bootstrap_requires_local_pigs_fly_flag_before_auth_flow(tmp_path: Path)
         assert payload["reason"] == "pigs_fly_not_enabled"
         assert result.stdout == ""
         assert not (home / ".codex/config.toml").exists()
+        assert server.session_requests == []
+        assert server.policy_requests == []
+        assert server.check_ins == []
+    finally:
+        server.stop()
+
+
+def test_bootstrap_surfaces_browser_open_failure(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, _ = _run_bootstrap(
+            hub_root / "dist/claude/core",
+            "claude",
+            {
+                "HOME": str(home),
+                "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_DASHBOARD_BASE_URL": "https://app.gopromptless.ai",
+            },
+            expected_status="error",
+        )
+
+        message = _json_string(payload["systemMessage"], "systemMessage")
+        assert "Promptless host enrollment failed for Claude Code" in message
+        assert "could not open the Promptless enrollment browser" in message
+        state = json.loads(_host_state_path(home).read_text())
+        assert _json_string(state["host_instance_id"], "host_instance_id").startswith("host-")
+        assert "credentials" not in state
+        assert "pending_enrollments" not in state
+        assert "last_seen_plugin_versions" not in state
         assert server.session_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
@@ -363,7 +401,7 @@ def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path
     build_hub(hub_root)
     home = tmp_path / "home"
 
-    payload, result = _run_bootstrap(
+    payload, _ = _run_bootstrap(
         hub_root / "dist/codex/core",
         "codex",
         {
@@ -377,7 +415,8 @@ def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path
     )
 
     assert "worker base URL must use HTTPS unless" in str(payload["message"])
-    assert result.stdout == ""
+    message = _json_string(payload["systemMessage"], "systemMessage")
+    assert "Promptless host enrollment failed for Codex" in message
 
 
 def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Path) -> None:
