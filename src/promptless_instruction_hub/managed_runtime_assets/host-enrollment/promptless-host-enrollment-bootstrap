@@ -156,17 +156,29 @@ def main() -> int:
 
 def _run(host_arg: str, *, quiet: bool) -> int:
     host = _resolve_host(host_arg)
+    # Surface a plugin-update notice independent of the enrollment gate so every install (not
+    # just enrolled hosts) learns when the Instruction Hub plugin version changed. Both Claude
+    # and Codex render the SessionStart `systemMessage`.
+    plugin_root = _plugin_root()
+    metadata = _load_runtime_metadata(plugin_root, host)
+    update_notice = _plugin_update_notice(metadata)
     if not _bootstrap_auth_flow_enabled():
-        _emit({"status": "disabled", "reason": "pigs_fly_not_enabled", "host": host}, quiet=quiet)
+        _emit(
+            {"status": "disabled", "reason": "pigs_fly_not_enabled", "host": host},
+            quiet=quiet,
+            update_notice=update_notice,
+        )
         return 0
 
-    plugin_root = _plugin_root()
     worker_base_url = _worker_base_url()
-    metadata = _load_runtime_metadata(plugin_root, host)
     context = _enrollment_context(worker_base_url, metadata)
     credential = _obtain_host_credential(context)
     if credential is None:
-        _emit({"status": "setup_pending", "reason": "approval_pending", "host": host}, quiet=quiet)
+        _emit(
+            {"status": "setup_pending", "reason": "approval_pending", "host": host},
+            quiet=quiet,
+            update_notice=update_notice,
+        )
         return 0
 
     policy_url = _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
@@ -177,7 +189,11 @@ def _run(host_arg: str, *, quiet: bool) -> int:
         _forget_cached_host_credential(context)
         credential = _enroll_host_credential(context)
         if credential is None:
-            _emit({"status": "setup_pending", "reason": "approval_pending", "host": host}, quiet=quiet)
+            _emit(
+                {"status": "setup_pending", "reason": "approval_pending", "host": host},
+                quiet=quiet,
+                update_notice=update_notice,
+            )
             return 0
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
     policy = _validate_signed_policy(signed_policy, host)
@@ -193,13 +209,49 @@ def _run(host_arg: str, *, quiet: bool) -> int:
             },
         )
         _post_check_in(check_in_url, credential, host, metadata, policy, result)
-        _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
+        _emit(
+            {"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host},
+            quiet=quiet,
+            update_notice=update_notice,
+        )
         return 0
 
     result = _configure_host(host, policy)
     _post_check_in(check_in_url, credential, host, metadata, policy, result)
-    _emit({"status": result.status, "host": host, "needs_restart": result.needs_restart}, quiet=quiet)
+    _emit(
+        {"status": result.status, "host": host, "needs_restart": result.needs_restart},
+        quiet=quiet,
+        update_notice=update_notice,
+    )
     return 0
+
+
+def _plugin_update_notice(metadata: RuntimeMetadata) -> str | None:
+    """Return a "plugin updated" message when the installed version changed since last seen, else None.
+
+    The installed version is read from the plugin's managed-runtime manifest each run; the last-seen
+    version is persisted in the host data dir (which survives plugin updates). The message shows once
+    per upgrade. It stays silent on a first install (nothing seen yet) and when the version is unknown,
+    so the rollout of this behavior does not falsely announce an update.
+    """
+
+    current_version = metadata.plugin_version
+    if current_version == "unknown":
+        return None
+    state_path = _state_path()
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        # Key by host so a data dir shared between Claude and Codex tracks each version separately.
+        seen_versions = _json_mapping_or_empty(state.get("last_seen_plugin_versions"))
+        last_seen_version = _string_value(seen_versions.get(metadata.target))
+        if last_seen_version == current_version:
+            return None
+        seen_versions[metadata.target] = current_version
+        state["last_seen_plugin_versions"] = seen_versions
+        _write_state(state_path, state)
+    if last_seen_version is None:
+        return None
+    return f"Promptless Instruction Hub updated to v{current_version} (was v{last_seen_version})."
 
 
 def _resolve_host(host_arg: str) -> Host:
@@ -1258,12 +1310,50 @@ def _emit(
     *,
     quiet: bool = False,
     stream: TextIO | None = None,
+    update_notice: str | None = None,
 ) -> None:
     if quiet:
         return
+    output = dict(payload)
+    # Both Claude and Codex surface a SessionStart hook's `systemMessage` to the user; raw stdout
+    # is only added to the model context. The status JSON stays in the payload for manual
+    # troubleshooting; the extra field is ignored by the host hook parsers.
+    # https://code.claude.com/docs/en/hooks  https://developers.openai.com/codex/hooks
+    messages = [message for message in (update_notice, _enrollment_user_message(payload)) if message is not None]
+    if messages:
+        output["systemMessage"] = " ".join(messages)
     output_stream = stream or sys.stdout
-    output_stream.write(json.dumps(_redact_json(payload), sort_keys=True) + "\n")
+    output_stream.write(json.dumps(_redact_json(output), sort_keys=True) + "\n")
     output_stream.flush()
+
+
+def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
+    """Return a user-facing enrollment-status message for the Claude host, or None to stay silent.
+
+    Only the Claude host surfaces a message, and only for outcomes worth showing on a hook
+    that runs every startup/resume: a fresh config write, a pending browser approval, or a
+    block. The steady "already configured", gate-disabled, and error states stay silent so the
+    hook does not banner every session (errors still reach stderr/the debug log).
+    """
+
+    if payload.get("host") != "claude":
+        return None
+    status = payload.get("status")
+    if status == "needs_restart":
+        return "Promptless telemetry configured for Claude Code. Restart Claude Code to start exporting."
+    if status == "setup_pending":
+        return (
+            "Promptless host enrollment is awaiting browser approval. "
+            "Approve in the browser tab that opened, then restart Claude Code."
+        )
+    if status == "blocked":
+        if payload.get("reason") == "bootstrap_upgrade_required":
+            return "Promptless host enrollment is blocked: a newer Promptless bootstrap runtime is required."
+        return (
+            "Promptless host enrollment is blocked: existing telemetry settings were left unchanged. "
+            "Review ~/.claude/settings.json."
+        )
+    return None
 
 
 def _redact_json(value: JsonValue) -> JsonValue:

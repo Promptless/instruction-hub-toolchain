@@ -581,7 +581,7 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
         claude_settings.parent.mkdir(parents=True)
         claude_settings.write_text('{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"Authorization=Bearer customer-token"}}\n')
 
-        _run_bootstrap(
+        claude_payload, _ = _run_bootstrap(
             hub_root / "dist/claude/core",
             "claude",
             {
@@ -599,6 +599,101 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
             == '{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"Authorization=Bearer customer-token"}}\n'
         )
         assert server.check_ins[-1]["status"] == "blocked"
+        assert "blocked" in _json_string(claude_payload["systemMessage"], "systemMessage").lower()
+    finally:
+        server.stop()
+
+
+def test_bootstrap_claude_surfaces_system_message_only_on_change(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        claude_home = tmp_path / "claude-home"
+        claude_env = {
+            "HOME": str(claude_home),
+            "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
+            "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+            "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        first_payload, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
+        assert "restart" in _json_string(first_payload["systemMessage"], "systemMessage").lower()
+
+        steady_payload, _ = _run_bootstrap(
+            hub_root / "dist/claude/core", "claude", claude_env, expected_status="configured"
+        )
+        assert "systemMessage" not in steady_payload
+
+        codex_home = tmp_path / "codex-home"
+        codex_payload, _ = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(codex_home),
+                "CODEX_HOME": str(codex_home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+        )
+        assert "systemMessage" not in codex_payload
+    finally:
+        server.stop()
+
+
+def test_bootstrap_announces_plugin_update_per_host(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root, plugin_version="0.1.0")
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        claude_env = {
+            "HOME": str(tmp_path / "claude-home"),
+            "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-home/.claude"),
+            "PLUGIN_DATA": str(plugin_data),
+            "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+            "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+        codex_env = {
+            "HOME": str(tmp_path / "codex-home"),
+            "CODEX_HOME": str(tmp_path / "codex-home/.codex"),
+            "PLUGIN_DATA": str(plugin_data),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        # First install on each host records the version silently (an install is not an update).
+        first_claude, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
+        assert "updated" not in _json_string(first_claude["systemMessage"], "systemMessage").lower()
+        first_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        assert "systemMessage" not in first_codex
+
+        # Rebuild the same hub at a newer version, then re-run: each host announces the change once.
+        build_hub(hub_root, plugin_version="0.2.0")
+        upgraded_claude, _ = _run_bootstrap(
+            hub_root / "dist/claude/core", "claude", claude_env, expected_status="configured"
+        )
+        claude_message = _json_string(upgraded_claude["systemMessage"], "systemMessage")
+        assert "0.2.0" in claude_message and "0.1.0" in claude_message
+
+        upgraded_codex, _ = _run_bootstrap(
+            hub_root / "dist/codex/core", "codex", codex_env, expected_status="configured"
+        )
+        codex_message = _json_string(upgraded_codex["systemMessage"], "systemMessage")
+        assert "0.2.0" in codex_message and "0.1.0" in codex_message
+
+        # A subsequent run at the same version is silent again.
+        steady_claude, _ = _run_bootstrap(
+            hub_root / "dist/claude/core", "claude", claude_env, expected_status="configured"
+        )
+        assert "systemMessage" not in steady_claude
     finally:
         server.stop()
 
