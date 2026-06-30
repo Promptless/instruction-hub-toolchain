@@ -9,7 +9,7 @@ import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
@@ -313,7 +313,10 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert claude_settings["env"]["OTEL_LOG_ASSISTANT_RESPONSES"] == "0"
 
         assert len(server.session_requests) == 2
-        assert "deployment_instance_id" not in server.session_requests[0]
+        codex_callback_state = _callback_state(server.session_requests[0]["callback_url"], "codex callback_url")
+        claude_callback_state = _callback_state(server.session_requests[1]["callback_url"], "claude callback_url")
+        assert codex_callback_state != claude_callback_state
+        assert server.session_requests[0]["deployment_instance_id"] == "worker-local-1"
         assert server.session_requests[0]["target"] == "codex"
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
@@ -352,7 +355,36 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         server.stop()
 
 
-def test_bootstrap_requires_session_response_deployment_instance_id(tmp_path: Path) -> None:
+def test_bootstrap_rejects_loopback_callback_with_wrong_state(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer(callback_state_override="attacker-state")
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, _result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "hosted enrollment start request failed with HTTP 403" in str(payload["message"])
+        assert not (home / ".codex/config.toml").exists()
+        assert server.poll_requests == []
+        assert server.policy_requests == []
+        assert server.check_ins == []
+    finally:
+        server.stop()
+
+
+def test_bootstrap_requires_callback_deployment_instance_id(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -360,7 +392,7 @@ def test_bootstrap_requires_session_response_deployment_instance_id(tmp_path: Pa
         session_response={
             "session_id": "11111111-1111-4111-8111-111111111111",
             "device_code": "plihenroll_devicecode",
-            "approval_url": "https://app.promptless.ai/instruction-hub/enroll?token=approval-token",
+            "poll_url": "https://api.gopromptless.ai/v1/instruction-hub/host-enrollments/sessions/11111111-1111-4111-8111-111111111111/poll",
             "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
             "poll_interval_seconds": 1,
         }
@@ -380,7 +412,7 @@ def test_bootstrap_requires_session_response_deployment_instance_id(tmp_path: Pa
             expected_status="error",
         )
 
-        assert "host enrollment session response missing required fields" in str(payload["message"])
+        assert "host enrollment callback missing required fields" in str(payload["message"])
         assert not (home / ".codex/config.toml").exists()
         assert server.policy_requests == []
         assert server.check_ins == []
@@ -769,6 +801,8 @@ def _run_bootstrap(
 def _start_bootstrap(plugin_root: Path, host: str, env: dict[str, str]) -> subprocess.Popen[str]:
     process_env = _clean_env()
     process_env.update(env)
+    if "PROMPTLESS_WORKER_BASE_URL" in process_env and "PROMPTLESS_DASHBOARD_BASE_URL" not in process_env:
+        process_env["PROMPTLESS_DASHBOARD_BASE_URL"] = process_env["PROMPTLESS_WORKER_BASE_URL"]
     return subprocess.Popen(
         [str(plugin_root / "bin" / BOOTSTRAP_BIN), "--host", host],
         env=process_env,
@@ -809,6 +843,8 @@ def _clean_env(*, enable_bootstrap: bool = True, **overrides: str) -> dict[str, 
     if enable_bootstrap:
         env["PIGS_FLY"] = "True"
     env.update(overrides)
+    if "PROMPTLESS_WORKER_BASE_URL" in env and "PROMPTLESS_DASHBOARD_BASE_URL" not in env:
+        env["PROMPTLESS_DASHBOARD_BASE_URL"] = env["PROMPTLESS_WORKER_BASE_URL"]
     return env
 
 
@@ -825,6 +861,41 @@ def _json_list(value: JsonValue, field_path: str) -> list[JsonValue]:
 def _json_string(value: JsonValue, field_path: str) -> str:
     assert isinstance(value, str), f"{field_path} must be a JSON string"
     return value
+
+
+def _callback_state(callback_url_value: JsonValue, field_path: str) -> str:
+    callback_url = _json_string(callback_url_value, field_path)
+    state_values = parse_qs(urlsplit(callback_url).query).get("state")
+    assert state_values is not None and len(state_values) == 1 and state_values[0] != ""
+    return state_values[0]
+
+
+def _url_with_query_params(url: str, params: dict[str, JsonValue]) -> str:
+    parsed = urlsplit(url)
+    query_pairs: list[tuple[str, str]] = []
+    for key, values in parse_qs(parsed.query, keep_blank_values=False).items():
+        query_pairs.extend((key, value) for value in values)
+    for key, value in params.items():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            query_pairs.append((key, value))
+        elif isinstance(value, (int, float, bool)):
+            query_pairs.append((key, str(value)))
+        else:
+            raise AssertionError(f"{key} must be a query scalar")
+    return parsed._replace(query=urlencode(query_pairs)).geturl()
+
+
+def _callback_url_with_state(callback_url: str, state: str) -> str:
+    parsed = urlsplit(callback_url)
+    query_pairs: list[tuple[str, str]] = []
+    for key, values in parse_qs(parsed.query, keep_blank_values=False).items():
+        if key == "state":
+            continue
+        query_pairs.extend((key, value) for value in values)
+    query_pairs.append(("state", state))
+    return parsed._replace(query=urlencode(query_pairs)).geturl()
 
 
 def _write_native_hook_asset(hub_root: Path, hooks: dict[str, JsonValue]) -> None:
@@ -889,7 +960,6 @@ def _session_response() -> dict[str, JsonValue]:
         "session_id": "11111111-1111-4111-8111-111111111111",
         "deployment_instance_id": "worker-local-1",
         "device_code": "plihenroll_devicecode",
-        "approval_url": "https://app.promptless.ai/instruction-hub/enroll?token=approval-token",
         "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
         "poll_interval_seconds": 1,
     }
@@ -903,6 +973,7 @@ class _FakeWorkerServer:
         post_response: dict[str, JsonValue] | None = None,
         session_response: dict[str, JsonValue] | None = None,
         session_barrier_count: int = 0,
+        callback_state_override: str | None = None,
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
         self.policy_requests: list[str] = []
@@ -918,6 +989,7 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.session_response = session_response
         _FakeWorkerHandler.session_barrier_count = session_barrier_count
         _FakeWorkerHandler.session_condition = self._session_condition
+        _FakeWorkerHandler.callback_state_override = callback_state_override
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
@@ -942,9 +1014,43 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     session_barrier_count: ClassVar[int] = 0
     session_condition: ClassVar[threading.Condition | None] = None
     session_requests: ClassVar[list[dict[str, JsonValue]]] = []
+    callback_state_override: ClassVar[str | None] = None
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
+        if parsed.path == "/healthz":
+            self._write_json(
+                {
+                    "status": "ok",
+                    "deployment_instance_id": "worker-local-1",
+                    "worker_version": "0.1.0-test",
+                }
+            )
+            return
+        if parsed.path == "/instruction-hub/enroll/start":
+            payload = self._single_value_query_payload(parsed.query)
+            callback_url = _json_string(payload.get("callback_url"), "callback_url")
+            if callback_url is None:
+                self.send_response(400)
+                self.end_headers()
+                return
+            self._record_session_request(payload)
+            session_response = self._session_response_payload()
+            approval_params = {"callback_url": callback_url, **session_response}
+            hosted_approval_url = f"{self._base_url()}/instruction-hub/enroll?{urlencode(approval_params)}"
+            self._redirect(hosted_approval_url)
+            return
+        if parsed.path == "/instruction-hub/enroll":
+            payload = self._single_value_query_payload(parsed.query)
+            callback_url = _json_string(payload.pop("callback_url", None), "callback_url")
+            if callback_url is None:
+                self.send_response(400)
+                self.end_headers()
+                return
+            if self.callback_state_override is not None:
+                callback_url = _callback_url_with_state(callback_url, self.callback_state_override)
+            self._redirect(_url_with_query_params(callback_url, {"status": "approved", **payload}))
+            return
         target = parse_qs(parsed.query).get("target")
         if (
             parsed.path != "/v0/host-enrollment/policy"
@@ -958,12 +1064,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self._write_json(self.policy_response)
 
     def do_POST(self) -> None:
-        if self.path == "/v0/host-enrollment/sessions":
-            payload = self._read_json_request("session create request")
-            self._record_session_request(payload)
-            self._write_json(self.session_response or _session_response())
-            return
-        if self.path == "/v0/host-enrollment/sessions/11111111-1111-4111-8111-111111111111/poll":
+        if self.path == "/v1/instruction-hub/host-enrollments/sessions/11111111-1111-4111-8111-111111111111/poll":
             payload = self._read_json_request("session poll request")
             if payload.get("device_code") != "plihenroll_devicecode":
                 self.send_response(401)
@@ -1000,6 +1101,32 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _base_url(self) -> str:
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
+
+    def _session_response_payload(self) -> dict[str, JsonValue]:
+        payload = dict(self.session_response or _session_response())
+        payload.setdefault(
+            "poll_url",
+            f"{self._base_url()}/v1/instruction-hub/host-enrollments/sessions/11111111-1111-4111-8111-111111111111/poll",
+        )
+        return payload
+
+    def _single_value_query_payload(self, query: str) -> dict[str, JsonValue]:
+        parsed_query = parse_qs(query, keep_blank_values=False)
+        payload: dict[str, JsonValue] = {}
+        for key, values in parsed_query.items():
+            if len(values) == 1:
+                payload[key] = values[0]
+        return payload
 
     def _read_json_request(self, label: str) -> dict[str, JsonValue]:
         length = int(self.headers["Content-Length"])
