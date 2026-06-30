@@ -809,7 +809,7 @@ def test_bootstrap_surfaces_enrollment_message_only_on_change(tmp_path: Path) ->
         server.stop()
 
 
-def test_bootstrap_configures_claude_raw_api_bodies_file_capture(tmp_path: Path) -> None:
+def test_bootstrap_configures_claude_raw_api_bodies_inline_capture(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -833,12 +833,11 @@ def test_bootstrap_configures_claude_raw_api_bodies_file_capture(tmp_path: Path)
             },
         )
 
-        raw_body_dir = claude_home / ".promptless/instruction-hub/claude-raw-api-bodies"
         claude_settings = json.loads((claude_home / ".claude/settings.json").read_text())
-        assert claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"] == f"file:{raw_body_dir}"
+        assert claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"] == "1"
         assert claude_settings["env"]["OTEL_LOG_TOOL_CONTENT"] == "1"
         assert "OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
-        assert raw_body_dir.is_dir()
+        assert not (claude_home / ".promptless/instruction-hub/claude-raw-api-bodies").exists()
     finally:
         server.stop()
 

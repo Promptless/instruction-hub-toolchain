@@ -50,7 +50,6 @@ CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
 BOOTSTRAP_AUTH_FLAG_ENV = "PIGS_FLY"
 OPEN_BROWSER_ENV = "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER"
-CLAUDE_RAW_API_BODY_DIR_NAME = "claude-raw-api-bodies"
 CALLBACK_STATE_PARAM = "state"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
@@ -1191,8 +1190,6 @@ def _configure_claude(policy: HostPolicy) -> ConfigResult:
             message="Existing unmanaged Claude telemetry env was left unchanged",
             details={"path": str(settings_path), "env_keys": unmanaged_conflicts},
         )
-    if _capture_enabled(policy, "raw_api_bodies"):
-        _ensure_private_dir(_claude_raw_api_body_dir())
     current_settings = json.dumps(settings, sort_keys=True)
     env.update(desired_env)
     changed = json.dumps(settings, sort_keys=True) != current_settings
@@ -1220,8 +1217,9 @@ def _read_settings(settings_path: Path) -> dict[str, JsonValue]:
 
 
 def _claude_env(policy: HostPolicy) -> dict[str, str]:
-    # Claude Code supports OTel through settings.json env keys. Its inline tool content and raw
-    # API body event attributes are producer-truncated; file mode is the supported untruncated path.
+    # Claude Code's inline content attributes are producer-bounded before export. Keep raw API
+    # bodies inline so the hosted collector receives them; file mode needs a separate uploader or
+    # file collector before we can claim those local body_ref files are ingested.
     # https://code.claude.com/docs/en/monitoring-usage
     return {
         CLAUDE_MANAGED_ENV_MARKER: "1",
@@ -1242,26 +1240,8 @@ def _claude_env(policy: HostPolicy) -> dict[str, str]:
         "OTEL_LOG_ASSISTANT_RESPONSES": "0",
         "OTEL_LOG_TOOL_DETAILS": _env_bool(_capture_enabled(policy, "tool_inputs")),
         "OTEL_LOG_TOOL_CONTENT": _env_bool(_capture_enabled(policy, "tool_outputs")),
-        "OTEL_LOG_RAW_API_BODIES": _claude_raw_api_body_capture_value(policy),
+        "OTEL_LOG_RAW_API_BODIES": _env_bool(_capture_enabled(policy, "raw_api_bodies")),
     }
-
-
-def _claude_raw_api_body_capture_value(policy: HostPolicy) -> str:
-    if not _capture_enabled(policy, "raw_api_bodies"):
-        return "0"
-    return f"file:{_claude_raw_api_body_dir()}"
-
-
-def _claude_raw_api_body_dir() -> Path:
-    return _state_path().parent / CLAUDE_RAW_API_BODY_DIR_NAME
-
-
-def _ensure_private_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    try:
-        path.chmod(0o700)
-    except OSError:
-        pass
 
 
 def _otlp_http_base_endpoint(endpoint: str) -> str:

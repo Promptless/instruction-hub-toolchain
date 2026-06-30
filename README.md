@@ -114,11 +114,11 @@ state.
 For Claude Code, Promptless-managed telemetry follows Claude's supported capture
 paths instead of relying on OpenTelemetry SDK attribute-length variables to
 override producer-side truncation. Inline tool content remains Claude's bounded
-OTel event content. When policy enables raw API body capture, the bootstrap sets
-`OTEL_LOG_RAW_API_BODIES=file:<dir>` under the host-global
-`~/.promptless/instruction-hub/claude-raw-api-bodies` directory so Claude writes
-untruncated request/response bodies locally and emits `body_ref` paths in OTel
-events.
+OTel event content. When policy enables raw API body capture, the bootstrap uses
+inline `OTEL_LOG_RAW_API_BODIES=1` so request/response body events reach the
+configured collector through the standard OTel logs pipeline. Claude's file mode
+can write untruncated local `body_ref` files, but the bootstrap does not enable
+that mode until a sidecar, uploader, or file collector publishes those files.
 
 Before the customer-grade release, replace that script with a static native
 binary built and versioned by Promptless, then bundled into the toolchain
