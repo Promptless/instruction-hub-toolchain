@@ -18,7 +18,7 @@ RuntimeStatus = Literal["included"]
 TRACE_COLLECTOR_RUNTIME_ID = "native-trace-collector"
 TRACE_COLLECTOR_ASSET_DIR = "trace-collector"
 TRACE_COLLECTOR_EXECUTABLE = "promptless-trace-collector"
-TRACE_COLLECTOR_HOOK_TIMEOUT_SECONDS = 45
+TRACE_COLLECTOR_HOOK_TIMEOUT_SECONDS = 90
 TRACE_COLLECTOR_CHANNEL = "stable"
 TRACE_COLLECTOR_VERSION = "0.1.0"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
@@ -171,13 +171,12 @@ def _trace_collector_hook_entry(target: Harness, event_name: str) -> dict[str, J
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
     # Promptless-built static native binary so customer machines do not need Python or uv.
-    # Generated hooks deliberately omit --quiet so local setup and upload statuses are visible.
     entry: dict[str, JsonValue] = {
         "hooks": [
             {
                 "type": "command",
                 "timeout": TRACE_COLLECTOR_HOOK_TIMEOUT_SECONDS,
-                "statusMessage": "Uploading Promptless traces",
+                "statusMessage": "Checking Promptless trace collection",
                 **hook_command,
             }
         ],

@@ -1,3 +1,16 @@
+```
+             ,-,------,
+              _ \(\(_,--'
+         <`--'\>/(/(__
+         /. .  `'` '  \
+        (`')  ,        @
+         `-._,        /
+            )-)_/--( >
+           ''''  ''''
+
+pig.
+```
+
 # Promptless Instruction Hub Toolchain
 
 This repository is the canonical public toolchain for Promptless Instruction
@@ -63,7 +76,7 @@ Every generated plugin embeds local metadata as root files inside each plugin:
 
 The old `.promptless/instruction-hub.yaml` and generated `.promptless/...`
 layout is not read or migrated by this toolchain. Existing hubs must rename
-their config to `hub.yaml` and regenerate output with `pi build`.
+their config to `hub.yaml` and regenerate output with `pig build`.
 
 ## Release Model
 
@@ -78,13 +91,31 @@ generated customer plugins. The current managed runtime is the native trace
 collector used by Codex and Claude lifecycle hooks. During dogfood, generated
 hooks invoke the bundled stdlib-only Python script with `python3`.
 
-The collector reads the private enrollment seed, fetches the signed hosted
-policy through the customer worker, validates the signed-policy envelope and
-native trace upload policy, then uploads new complete JSONL ranges from the
-configured native trace roots. It maintains a per-user ledger in plugin data so
-successful uploads advance monotonically and failed uploads are retried. First
-install defaults to forward-only baselining so historical local traces are not
-uploaded unless policy explicitly opts into backfill.
+When local `PIGS_FLY` is set to a truthy value (`1` or `true`,
+case-insensitive), the dogfood collector uses `PROMPTLESS_WORKER_BASE_URL` or
+the default production worker. It reads the worker's public `/healthz` identity,
+opens the hosted Promptless dashboard start URL, and listens on a loopback
+callback with a per-attempt state token for the approved session proof. It then
+polls the hosted runtime for a per-host credential, caches that credential, and
+uses the host credential to fetch `/v0/host-enrollment/policy?target=...`, post
+`/v0/host-enrollment/check-ins`, and upload native trace batches.
+
+Host enrollment is per host, not per plugin. The credential and pending approval
+are cached at a single host-global path (`~/.promptless/instruction-hub/`) and
+keyed only on the worker deployment and agent host (claude/codex), so every
+Promptless plugin a user installs from the hub shares one credential. A
+non-blocking, per-credential enrollment-leader lock ensures that when multiple
+plugins start at once, exactly one drives the single browser approval while the
+others reuse the result or defer to a later session. The per-plugin
+`CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA` directories are intentionally not used for
+credentials.
+
+The collector validates the signed-policy envelope and native trace upload
+policy, then uploads new complete JSONL ranges from the configured native trace
+roots. It maintains a per-user ledger in plugin data so successful uploads
+advance monotonically and failed uploads are retried. First install defaults to
+forward-only baselining so historical local traces are not uploaded unless
+policy explicitly opts into backfill.
 
 Codex hooks run on `SessionStart` and `Stop`; Claude hooks run on
 `SessionStart`, `Stop`, and `SessionEnd`. When policy disables in-progress

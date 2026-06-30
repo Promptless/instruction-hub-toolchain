@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import gzip
 import json
 import os
@@ -10,6 +11,8 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.request import urlopen
 
 import pytest
 
@@ -18,10 +21,16 @@ from promptless_instruction_hub.fs import JsonValue, validate_json_value
 
 COLLECTOR_BIN = "promptless-trace-collector"
 TRACE_COLLECTOR_ID = "native-trace-collector"
+HOST_CREDENTIAL = "plihost_localcredential"
+HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
 
 
 def _assert_no_promptless_directory(root: Path) -> None:
     assert list(root.rglob(".promptless")) == []
+
+
+def _host_state_path(home: Path) -> Path:
+    return home / HOST_STATE_REL_PATH
 
 
 def test_build_injects_managed_trace_collector_runtime(tmp_path: Path) -> None:
@@ -47,8 +56,8 @@ def test_build_injects_managed_trace_collector_runtime(tmp_path: Path) -> None:
             hook = _json_mapping(command_hooks[0], f"hooks.{event_name}[0].hooks[0]")
             assert hook["command"] == _collector_command(target, event_name)
             assert "--quiet" not in str(hook["command"])
-            assert hook["timeout"] == 45
-            assert hook["statusMessage"] == "Uploading Promptless traces"
+            assert hook["timeout"] == 90
+            assert hook["statusMessage"] == "Checking Promptless trace collection"
             if event_name == "SessionStart":
                 assert entry["matcher"] == "startup|resume"
             else:
@@ -81,7 +90,7 @@ def test_build_injects_managed_trace_collector_runtime(tmp_path: Path) -> None:
     _assert_no_promptless_directory(hub_root)
 
 
-def test_collector_missing_token_exits_zero_without_ledger_write(tmp_path: Path) -> None:
+def test_collector_disabled_without_bootstrap_flag_exits_zero_without_state(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
@@ -92,7 +101,6 @@ def test_collector_missing_token_exits_zero_without_ledger_write(tmp_path: Path)
         [str(hub_root / "dist/codex/core/bin" / COLLECTOR_BIN), "--host", "codex"],
         env=_clean_env(
             HOME=str(home),
-            CODEX_HOME=str(home / ".codex"),
             PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
             PLUGIN_DATA=str(plugin_data),
         ),
@@ -102,15 +110,17 @@ def test_collector_missing_token_exits_zero_without_ledger_write(tmp_path: Path)
     )
 
     assert result.returncode == 0
-    assert json.loads(result.stdout)["status"] == "setup_needed"
+    assert json.loads(result.stderr)["status"] == "disabled"
+    assert json.loads(result.stderr)["reason"] == "pigs_fly_not_enabled"
+    assert result.stdout == ""
     assert not (plugin_data / "trace-collector-ledger.json").exists()
-    assert "plugin-token" not in result.stdout
+    assert not _host_state_path(home).exists()
+    assert "plihost_" not in result.stderr
 
     quiet_result = subprocess.run(
         [str(hub_root / "dist/codex/core/bin" / COLLECTOR_BIN), "--host", "codex", "--quiet"],
         env=_clean_env(
             HOME=str(home),
-            CODEX_HOME=str(home / ".codex"),
             PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
             PLUGIN_DATA=str(plugin_data),
         ),
@@ -124,7 +134,7 @@ def test_collector_missing_token_exits_zero_without_ledger_write(tmp_path: Path)
     assert quiet_result.stderr == ""
 
 
-def test_collector_loads_seed_from_plugin_data_file_and_checkins(tmp_path: Path) -> None:
+def test_collector_enrolls_host_credential_and_checkins(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
@@ -132,23 +142,25 @@ def test_collector_loads_seed_from_plugin_data_file_and_checkins(tmp_path: Path)
     server.start()
     try:
         plugin_data = tmp_path / "plugin-data"
-        plugin_data.mkdir()
-        (plugin_data / "trace-collector-seed.json").write_text(
-            json.dumps({"plugin_enrollment_token": "plugin-token", "worker_base_url": server.base_url})
-        )
-
         home = tmp_path / "home"
         _run_collector(
             hub_root / "dist/codex/core",
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
 
+        assert len(server.session_requests) == 1
+        enrollment_request = server.session_requests[0]
+        assert enrollment_request["deployment_instance_id"] == "worker-local-1"
+        assert enrollment_request["target"] == "codex"
+        assert enrollment_request["plugin_version"] == "0.1.0"
+        assert enrollment_request["bootstrap_version"] == "0.1.0"
+        assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
         assert len(server.check_ins) == 1
         check_in = server.check_ins[0]
         assert check_in["host"] == "codex"
@@ -159,6 +171,12 @@ def test_collector_loads_seed_from_plugin_data_file_and_checkins(tmp_path: Path)
         assert effective_config["native_root_count"] == 1
         assert effective_config["source_ledger_path"] == str(plugin_data / "trace-collector-ledger.json")
         assert effective_config["raw_native_artifacts_enabled"] is True
+        assert not (plugin_data / "host-enrollment-state.json").exists()
+        state = _json_mapping(json.loads(_host_state_path(home).read_text()), "state")
+        credentials = _json_mapping(state["credentials"], "credentials")
+        credential = _json_mapping(next(iter(credentials.values())), "credential")
+        assert credential["value"] == HOST_CREDENTIAL
+        assert credential["deployment_instance_id"] == "worker-local-1"
     finally:
         server.stop()
 
@@ -181,10 +199,8 @@ def test_collector_does_not_upload_when_check_in_rejected(tmp_path: Path) -> Non
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             lifecycle="stop",
@@ -217,10 +233,8 @@ def test_collector_does_not_upload_when_check_in_policy_version_mismatches(tmp_p
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             lifecycle="stop",
@@ -251,10 +265,8 @@ def test_collector_baselines_first_run_and_uploads_new_complete_lines(tmp_path: 
 
         env = {
             "HOME": str(home),
-            "CODEX_HOME": str(home / ".codex"),
             "PLUGIN_DATA": str(plugin_data),
             "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-            "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
         payload, _result = _run_collector(hub_root / "dist/codex/core", "codex", env, lifecycle="session_start")
@@ -316,10 +328,8 @@ def test_collector_uploads_existing_lines_on_first_run_when_forward_only_disable
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             lifecycle="stop",
@@ -360,10 +370,8 @@ def test_collector_does_not_advance_ledger_when_upload_fails(tmp_path: Path) -> 
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="error",
@@ -400,10 +408,8 @@ def test_collector_does_not_advance_ledger_when_upload_response_lacks_acceptance
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="error",
@@ -504,10 +510,8 @@ def test_collector_does_not_advance_ledger_when_upload_ack_is_invalid(
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="error",
@@ -559,10 +563,8 @@ def test_collector_quiet_failure_reports_error_check_in(tmp_path: Path) -> None:
             [str(hub_root / "dist/codex/core/bin" / COLLECTOR_BIN), "--host", "codex", "--quiet"],
             env=_clean_env(
                 HOME=str(home),
-                CODEX_HOME=str(home / ".codex"),
                 PLUGIN_DATA=str(plugin_data),
                 PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
-                PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN="plugin-token",
                 PROMPTLESS_WORKER_BASE_URL=server.base_url,
             ),
             text=True,
@@ -606,10 +608,8 @@ def test_collector_recovers_truncated_ledger_by_retrying_from_start(tmp_path: Pa
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             lifecycle="stop",
@@ -651,7 +651,6 @@ def test_claude_stop_suppresses_uploads_when_policy_requires_terminal_trace(tmp_
                 "HOME": str(home),
                 "CLAUDE_PLUGIN_DATA": str(plugin_data),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             lifecycle="stop",
@@ -688,10 +687,8 @@ def test_codex_stop_uploads_when_policy_requires_terminal_trace(tmp_path: Path) 
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             lifecycle="stop",
@@ -729,7 +726,6 @@ def test_claude_session_end_uploads_when_policy_requires_terminal_trace(tmp_path
                 "HOME": str(home),
                 "CLAUDE_PLUGIN_DATA": str(plugin_data),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             lifecycle="session_end",
@@ -772,10 +768,8 @@ def test_collector_suppresses_trace_upload_when_capture_policy_cannot_store_raw_
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             lifecycle="stop",
@@ -821,10 +815,8 @@ def test_collector_splits_uploads_by_policy_batch_limit(tmp_path: Path) -> None:
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             lifecycle="stop",
@@ -879,10 +871,8 @@ def test_collector_advances_ledger_through_first_accepted_batch_when_later_batch
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             lifecycle="stop",
@@ -930,10 +920,8 @@ def test_collector_ledger_save_preserves_higher_existing_offsets(tmp_path: Path)
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             lifecycle="stop",
@@ -958,9 +946,7 @@ def test_collector_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path
         "codex",
         {
             "HOME": str(home),
-            "CODEX_HOME": str(home / ".codex"),
             "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-            "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
             "PROMPTLESS_WORKER_BASE_URL": "http://example.com",
             "PROMPTLESS_TRACE_COLLECTOR_ALLOW_TEST_URL_OVERRIDES": "0",
         },
@@ -1058,9 +1044,7 @@ def test_collector_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> 
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="blocked",
@@ -1096,10 +1080,8 @@ def test_collector_allows_worker_required_runtime_older_than_current(tmp_path: P
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(plugin_data),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -1125,9 +1107,7 @@ def test_collector_rejects_policy_without_signed_envelope_fields(tmp_path: Path)
             "codex",
             {
                 "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN": "plugin-token",
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="error",
@@ -1161,9 +1141,8 @@ def _run_collector(
         check=False,
     )
     assert result.returncode == 0
-    payload_text = result.stdout.strip() or result.stderr.strip()
-    assert payload_text
-    payload = _json_mapping(validate_json_value(json.loads(payload_text), "collector output"), "collector output")
+    payload = _last_collector_payload(result)
+    assert payload is not None
     assert payload["status"] == expected_status
     return payload, result
 
@@ -1176,8 +1155,39 @@ def _clean_env(**overrides: str) -> dict[str, str]:
     for key in ("SystemRoot", "SYSTEMROOT", "WINDIR"):
         if key in os.environ:
             clean_env[key] = os.environ[key]
+    overrides = _collector_test_overrides(overrides)
     clean_env.update(overrides)
     return clean_env
+
+
+def _collector_test_overrides(overrides: dict[str, str]) -> dict[str, str]:
+    result = dict(overrides)
+    result.pop("CODEX_HOME", None)
+    result.pop("PROMPTLESS_PLUGIN_ENROLLMENT_TOKEN", None)
+    worker_base_url = result.get("PROMPTLESS_WORKER_BASE_URL")
+    if worker_base_url is not None:
+        result.setdefault("PIGS_FLY", "1")
+        result.setdefault("PROMPTLESS_DASHBOARD_BASE_URL", worker_base_url)
+        result.setdefault("PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER", "0")
+        result.setdefault("PROMPTLESS_TRACE_COLLECTOR_ALLOW_TEST_URL_OVERRIDES", "1")
+        result.setdefault("PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES", "1")
+    return result
+
+
+def _last_collector_payload(result: subprocess.CompletedProcess[str]) -> dict[str, JsonValue] | None:
+    for output_name, output in (("stderr", result.stderr), ("stdout", result.stdout)):
+        for line in reversed(output.splitlines()):
+            candidate = line.strip()
+            if not candidate:
+                continue
+            try:
+                value = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            payload = _json_mapping(validate_json_value(value, f"collector {output_name}"), f"collector {output_name}")
+            if "status" in payload:
+                return payload
+    return None
 
 
 def _collector_command(target: str, event_name: str) -> str:
@@ -1263,10 +1273,14 @@ class _FakeWorkerServer:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
+        self.session_requests: list[dict[str, JsonValue]] = []
+        self.policy_requests: list[str] = []
+        self.poll_requests: list[dict[str, JsonValue]] = []
         self.check_ins: list[dict[str, JsonValue]] = []
         self.uploads: list[dict[str, JsonValue]] = []
         self._thread: threading.Thread | None = None
 
+        _FakeWorkerHandler.base_url = self.base_url
         _FakeWorkerHandler.policy_response = _policy_with(
             self.base_url,
             required_bootstrap_version=required_bootstrap_version,
@@ -1281,6 +1295,9 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.upload_response = upload_response
         _FakeWorkerHandler.upload_responses = upload_responses
         _FakeWorkerHandler.before_upload_response = before_upload_response
+        _FakeWorkerHandler.session_requests = self.session_requests
+        _FakeWorkerHandler.policy_requests = self.policy_requests
+        _FakeWorkerHandler.poll_requests = self.poll_requests
         _FakeWorkerHandler.check_ins = self.check_ins
         _FakeWorkerHandler.uploads = self.uploads
 
@@ -1296,6 +1313,7 @@ class _FakeWorkerServer:
 
 
 class _FakeWorkerHandler(BaseHTTPRequestHandler):
+    base_url: ClassVar[str]
     policy_response: ClassVar[dict[str, JsonValue]]
     check_in_status: ClassVar[int]
     check_in_response: ClassVar[dict[str, JsonValue] | None]
@@ -1303,19 +1321,44 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     upload_response: ClassVar[dict[str, JsonValue] | None]
     upload_responses: ClassVar[list[tuple[int, dict[str, JsonValue] | None]] | None]
     before_upload_response: ClassVar[Callable[[dict[str, JsonValue]], None] | None]
+    session_requests: ClassVar[list[dict[str, JsonValue]]]
+    policy_requests: ClassVar[list[str]]
+    poll_requests: ClassVar[list[dict[str, JsonValue]]]
     check_ins: ClassVar[list[dict[str, JsonValue]]]
     uploads: ClassVar[list[dict[str, JsonValue]]]
 
     def do_GET(self) -> None:
-        if self.path == "/v0/host-enrollment/policy":
+        parsed = urlsplit(self.path)
+        if parsed.path == "/healthz":
+            self._send_json(200, {"status": "ok", "deployment_instance_id": "worker-local-1"})
+            return
+        if parsed.path == "/instruction-hub/enroll/start":
+            self._handle_enrollment_start(parsed.query)
+            return
+        if parsed.path == "/v0/host-enrollment/policy":
             self._assert_authorized()
+            query = parse_qs(parsed.query)
+            assert query.get("target") in (["codex"], ["claude"])
+            self.policy_requests.append(self.path)
             self._send_json(200, self.policy_response)
             return
         self._send_json(404, {"accepted": False})
 
     def do_POST(self) -> None:
-        self._assert_authorized()
+        parsed = urlsplit(self.path)
         payload = self._read_json_body()
+        if parsed.path.startswith("/v1/instruction-hub/host-enrollments/sessions/"):
+            self.poll_requests.append(payload)
+            self._send_json(
+                200,
+                {
+                    "status": "approved",
+                    "host_credential": HOST_CREDENTIAL,
+                    "credential_id": "credential-local-1",
+                },
+            )
+            return
+        self._assert_authorized()
         if self.path == "/v0/host-enrollment/check-ins":
             self.check_ins.append(payload)
             response = self.check_in_response
@@ -1346,7 +1389,30 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         return
 
     def _assert_authorized(self) -> None:
-        assert self.headers.get("Authorization") == "Bearer plugin-token"
+        assert self.headers.get("Authorization") == f"Bearer {HOST_CREDENTIAL}"
+
+    def _handle_enrollment_start(self, query_string: str) -> None:
+        query = parse_qs(query_string)
+        enrollment_request: dict[str, JsonValue] = {
+            key: values[0] for key, values in query.items() if len(values) == 1
+        }
+        self.session_requests.append(enrollment_request)
+        callback_url = enrollment_request.get("callback_url")
+        assert isinstance(callback_url, str)
+        expires_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat()
+        callback_payload = {
+            "status": "approved",
+            "session_id": "session-local-1",
+            "deployment_instance_id": "worker-local-1",
+            "device_code": "device-local-1",
+            "poll_url": f"{self.base_url}/v1/instruction-hub/host-enrollments/sessions/session-local-1/poll",
+            "expires_at": expires_at,
+            "poll_interval_seconds": "1",
+        }
+        separator = "&" if urlsplit(callback_url).query else "?"
+        with urlopen(f"{callback_url}{separator}{urlencode(callback_payload)}", timeout=5) as response:
+            response.read()
+        self._send_json(200, {"accepted": True})
 
     def _read_json_body(self) -> dict[str, JsonValue]:
         content_length = int(self.headers.get("Content-Length", "0"))
