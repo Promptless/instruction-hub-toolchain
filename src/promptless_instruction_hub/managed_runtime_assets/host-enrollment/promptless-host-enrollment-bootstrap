@@ -1106,6 +1106,14 @@ def _configure_codex(policy: HostPolicy) -> ConfigResult:
             message="Codex policy requires capture controls this bootstrap cannot enforce",
             details={"path": str(config_path), "capture_policy_keys": unsupported_capture_fields},
         )
+    if _has_malformed_managed_blocks(existing):
+        return _blocked_result(
+            "codex",
+            policy,
+            kind="manual_config_required",
+            message="Existing Codex managed telemetry markers are malformed",
+            details={"path": str(config_path)},
+        )
     unmanaged_source = _without_managed_block(existing)
     if _has_unmanaged_codex_otel_config(unmanaged_source):
         return _blocked_result(
@@ -1166,9 +1174,17 @@ def _has_unmanaged_codex_otel_config(existing: str) -> bool:
 
 
 def _without_managed_block(existing: str) -> str:
-    if existing.count(MANAGED_BEGIN) != 1 or existing.count(MANAGED_END) != 1:
-        return existing
-    return _managed_block_pattern().sub("", existing, count=1)
+    return _managed_block_pattern().sub("", existing)
+
+
+def _has_malformed_managed_blocks(existing: str) -> bool:
+    begin_count = existing.count(MANAGED_BEGIN)
+    end_count = existing.count(MANAGED_END)
+    if begin_count != end_count:
+        return begin_count > 0 or end_count > 0
+    if begin_count == 0:
+        return False
+    return sum(1 for _ in _managed_block_pattern().finditer(existing)) != begin_count
 
 
 def _managed_block_pattern() -> re.Pattern[str]:
@@ -1349,8 +1365,10 @@ def _updated_config_reports(host: Host, path: Path, changed: bool) -> list[dict[
 
 
 def _replace_managed_block(existing: str, managed_block: str) -> str:
-    if MANAGED_BEGIN in existing and MANAGED_END in existing:
-        return _managed_block_pattern().sub(managed_block, existing, count=1)
+    existing_block = _managed_block_pattern().search(existing)
+    if existing_block is not None:
+        suffix = _managed_block_pattern().sub("", existing[existing_block.end() :])
+        return existing[: existing_block.start()] + managed_block + suffix
     prefix = existing.rstrip()
     if not prefix:
         return managed_block
