@@ -26,7 +26,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import BinaryIO, Literal, Union
 from urllib.parse import SplitResult, parse_qs, urlencode, urlsplit
 
 if os.name == "nt":
@@ -54,8 +54,12 @@ CALLBACK_STATE_PARAM = "state"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
 
-JsonScalar = str | int | float | bool | None
-JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+# This bin runs under the host's own python3, which on macOS is the system Python 3.9
+# (/usr/bin/python3). Keep runtime-evaluated unions off the PEP 604 ``X | Y`` form (3.10+): these
+# aliases and the isinstance() in _json_value() are evaluated at import/call time, unlike annotations
+# (kept lazy by ``from __future__ import annotations``). Use typing.Union / isinstance tuples instead.
+JsonScalar = Union[str, int, float, bool, None]
+JsonValue = Union[JsonScalar, list["JsonValue"], dict[str, "JsonValue"]]
 CAPTURE_POLICY_VALUES = frozenset({"disabled", "full_local_default"})
 HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
@@ -1482,7 +1486,7 @@ def _json_object(value: dict[object, object]) -> dict[str, JsonValue]:
 
 
 def _json_value(value: object) -> JsonValue:
-    if value is None or isinstance(value, str | int | float | bool):
+    if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, list):
         return [_json_value(child) for child in value]
