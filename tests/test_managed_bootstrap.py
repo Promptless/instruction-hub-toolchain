@@ -609,6 +609,193 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
         server.stop()
 
 
+def test_bootstrap_repairs_stale_managed_host_otel_config(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        managed_begin = "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT"
+        managed_end = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
+        stale_codex_block = "\n".join(
+            [
+                managed_begin,
+                "[otel]",
+                'environment = "stale"',
+                "log_user_prompt = false",
+                "",
+                "[otel.exporter.otlp-http]",
+                'endpoint = "http://stale.local:4318/v1/logs"',
+                'protocol = "json"',
+                'headers = { Authorization = "Bearer stale-token" }',
+                "",
+                "[otel.trace_exporter.otlp-http]",
+                'endpoint = "http://stale.local:4318/v1/traces"',
+                'protocol = "json"',
+                'headers = { Authorization = "Bearer stale-token" }',
+                managed_end,
+                "",
+            ]
+        )
+        original_codex_config = (
+            'model = "gpt-5"\n\n'
+            f"{stale_codex_block}\n"
+            "[profiles.local]\n"
+            'model = "gpt-5-codex"\n\n'
+            f"{stale_codex_block}"
+        )
+        codex_home = tmp_path / "codex-home"
+        codex_config = codex_home / ".codex/config.toml"
+        codex_config.parent.mkdir(parents=True)
+        codex_config.write_text(original_codex_config)
+
+        codex_payload, _ = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(codex_home),
+                "CODEX_HOME": str(codex_home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+        )
+
+        updated_codex_config = codex_config.read_text()
+        assert updated_codex_config.count(managed_begin) == 1
+        assert updated_codex_config.count(managed_end) == 1
+        assert 'model = "gpt-5"' in updated_codex_config
+        assert "[profiles.local]" in updated_codex_config
+        assert "stale.local" not in updated_codex_config
+        assert 'endpoint = "http://127.0.0.1:4318/v1/logs"' in updated_codex_config
+        assert 'endpoint = "http://127.0.0.1:4318/v1/traces"' in updated_codex_config
+        assert updated_codex_config.count('protocol = "binary"') == 2
+        codex_otel = tomllib.loads(updated_codex_config)["otel"]
+        assert codex_otel["environment"] == "prod"
+        assert codex_otel["log_user_prompt"] is True
+        assert codex_otel["exporter"]["otlp-http"]["headers"] == {"Authorization": "Bearer otlp-token"}
+        assert codex_otel["trace_exporter"]["otlp-http"]["headers"] == {"Authorization": "Bearer otlp-token"}
+        codex_backups = list(codex_config.parent.glob("config.toml.*.bak"))
+        assert len(codex_backups) == 1
+        assert codex_backups[0].read_text() == original_codex_config
+        assert codex_payload["status"] == "needs_restart"
+        codex_drift_reports = _json_list(server.check_ins[-1]["drift_reports"], "codex drift_reports")
+        codex_report = _json_mapping(codex_drift_reports[0], "codex drift_reports[0]")
+        assert codex_report["kind"] == "repaired_user_config"
+        assert codex_report["repaired"] is True
+
+        original_claude_settings = {
+            "env": {
+                "CUSTOM_ENV": "1",
+                "PROMPTLESS_MANAGED_HOST_ENROLLMENT": "1",
+                "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
+                "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": False,
+                "OTEL_LOGS_EXPORTER": "none",
+                "OTEL_METRICS_EXPORTER": ["bad"],
+                "OTEL_TRACES_EXPORTER": "none",
+                "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://stale.local:4318/v1/logs",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://stale.local:4318/v1/traces",
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://stale.local:4318/v1/metrics",
+                "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer stale-token",
+                "OTEL_LOG_USER_PROMPTS": "0",
+                "OTEL_LOG_ASSISTANT_RESPONSES": "1",
+                "OTEL_LOG_TOOL_DETAILS": {"bad": "type"},
+                "OTEL_LOG_TOOL_CONTENT": "0",
+                "OTEL_LOG_RAW_API_BODIES": "1",
+            },
+            "theme": "dark",
+        }
+        claude_home = tmp_path / "claude-home"
+        claude_settings = claude_home / ".claude/settings.json"
+        claude_settings.parent.mkdir(parents=True)
+        claude_settings.write_text(json.dumps(original_claude_settings))
+
+        claude_payload, _ = _run_bootstrap(
+            hub_root / "dist/claude/core",
+            "claude",
+            {
+                "HOME": str(claude_home),
+                "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+        )
+
+        updated_claude_settings = json.loads(claude_settings.read_text())
+        updated_env = updated_claude_settings["env"]
+        assert updated_claude_settings["theme"] == "dark"
+        assert updated_env["CUSTOM_ENV"] == "1"
+        assert updated_env["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
+        assert updated_env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
+        assert updated_env["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] == "1"
+        assert updated_env["OTEL_LOGS_EXPORTER"] == "otlp"
+        assert updated_env["OTEL_METRICS_EXPORTER"] == "otlp"
+        assert updated_env["OTEL_TRACES_EXPORTER"] == "otlp"
+        assert updated_env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+        assert updated_env["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
+        assert updated_env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
+        assert updated_env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] == "http://127.0.0.1:4318/v1/metrics"
+        assert updated_env["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"
+        assert updated_env["OTEL_LOG_USER_PROMPTS"] == "1"
+        assert updated_env["OTEL_LOG_ASSISTANT_RESPONSES"] == "0"
+        assert updated_env["OTEL_LOG_TOOL_DETAILS"] == "1"
+        assert updated_env["OTEL_LOG_TOOL_CONTENT"] == "1"
+        assert updated_env["OTEL_LOG_RAW_API_BODIES"] == "0"
+        claude_backups = list(claude_settings.parent.glob("settings.json.*.bak"))
+        assert len(claude_backups) == 1
+        assert json.loads(claude_backups[0].read_text()) == original_claude_settings
+        assert claude_payload["status"] == "needs_restart"
+        claude_drift_reports = _json_list(server.check_ins[-1]["drift_reports"], "claude drift_reports")
+        claude_report = _json_mapping(claude_drift_reports[0], "claude drift_reports[0]")
+        assert claude_report["kind"] == "repaired_user_config"
+        assert claude_report["repaired"] is True
+    finally:
+        server.stop()
+
+
+def test_bootstrap_blocks_malformed_managed_codex_config(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        codex_home = tmp_path / "codex-home"
+        codex_config = codex_home / ".codex/config.toml"
+        codex_config.parent.mkdir(parents=True)
+        original_codex_config = (
+            'model = "gpt-5"\n'
+            "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT\n"
+            "[otel]\n"
+            'environment = "prod"\n'
+        )
+        codex_config.write_text(original_codex_config)
+
+        codex_payload, _ = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(codex_home),
+                "CODEX_HOME": str(codex_home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="blocked",
+        )
+
+        assert codex_config.read_text() == original_codex_config
+        assert list(codex_config.parent.glob("config.toml.*.bak")) == []
+        assert codex_payload["status"] == "blocked"
+        drift_reports = _json_list(server.check_ins[-1]["drift_reports"], "drift_reports")
+        first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
+        assert first_drift_report["kind"] == "manual_config_required"
+        assert "malformed" in _json_string(first_drift_report["message"], "drift_reports[0].message")
+    finally:
+        server.stop()
+
+
 def test_build_appends_bootstrap_hook_to_existing_hook_asset(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
