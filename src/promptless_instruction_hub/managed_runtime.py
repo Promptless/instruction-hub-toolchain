@@ -145,11 +145,11 @@ def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
 def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
     if target == "claude":
         hook_command: dict[str, JsonValue] = {
-            "command": f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host claude --quiet',
+            "command": f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host claude',
         }
     else:
         hook_command = {
-            "command": f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host codex --quiet',
+            "command": f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_ENROLLMENT_EXECUTABLE}" --host codex',
         }
 
     # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
@@ -158,6 +158,8 @@ def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
     # Promptless-built static native binary so customer machines do not need Python or uv.
+    # The hook deliberately omits --quiet so each SessionStart surfaces the bootstrap's
+    # status (gate, pending approval, errors); the binary still accepts --quiet for manual runs.
     return {
         "matcher": "startup|resume",
         "hooks": [
