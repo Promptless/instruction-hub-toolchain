@@ -81,9 +81,10 @@ bundled stdlib-only Python script with `python3`.
 When local `PIGS_FLY=True` is set, the dogfood bootstrap uses
 `PROMPTLESS_WORKER_BASE_URL` or the default production worker. It reads the
 worker's public `/healthz` identity, opens the hosted Promptless dashboard start
-URL, and listens on a loopback callback for the approved session proof. It then
-polls the hosted runtime for a one-time per-host credential, caches that
-credential in plugin/user data, and uses the host credential to fetch
+URL, and listens on a loopback callback with a per-attempt state token for the
+approved session proof. It then polls the hosted runtime for a one-time per-host
+credential, caches that credential in plugin/user data, and uses the host
+credential to fetch
 `/v0/host-enrollment/policy?target=...` and post
 `/v0/host-enrollment/check-ins`.
 

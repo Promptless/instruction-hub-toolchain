@@ -313,6 +313,9 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert claude_settings["env"]["OTEL_LOG_ASSISTANT_RESPONSES"] == "0"
 
         assert len(server.session_requests) == 2
+        codex_callback_state = _callback_state(server.session_requests[0]["callback_url"], "codex callback_url")
+        claude_callback_state = _callback_state(server.session_requests[1]["callback_url"], "claude callback_url")
+        assert codex_callback_state != claude_callback_state
         assert server.session_requests[0]["deployment_instance_id"] == "worker-local-1"
         assert server.session_requests[0]["target"] == "codex"
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
@@ -348,6 +351,35 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         claude_effective_config = _json_mapping(server.check_ins[1]["effective_config"], "claude effective_config")
         assert codex_effective_config["collector_metrics_endpoint"] is None
         assert claude_effective_config["collector_metrics_endpoint"] == "http://127.0.0.1:4318/v1/metrics"
+    finally:
+        server.stop()
+
+
+def test_bootstrap_rejects_loopback_callback_with_wrong_state(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer(callback_state_override="attacker-state")
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, _result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "hosted enrollment start request failed with HTTP 403" in str(payload["message"])
+        assert not (home / ".codex/config.toml").exists()
+        assert server.poll_requests == []
+        assert server.policy_requests == []
+        assert server.check_ins == []
     finally:
         server.stop()
 
@@ -831,6 +863,41 @@ def _json_string(value: JsonValue, field_path: str) -> str:
     return value
 
 
+def _callback_state(callback_url_value: JsonValue, field_path: str) -> str:
+    callback_url = _json_string(callback_url_value, field_path)
+    state_values = parse_qs(urlsplit(callback_url).query).get("state")
+    assert state_values is not None and len(state_values) == 1 and state_values[0] != ""
+    return state_values[0]
+
+
+def _url_with_query_params(url: str, params: dict[str, JsonValue]) -> str:
+    parsed = urlsplit(url)
+    query_pairs: list[tuple[str, str]] = []
+    for key, values in parse_qs(parsed.query, keep_blank_values=False).items():
+        query_pairs.extend((key, value) for value in values)
+    for key, value in params.items():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            query_pairs.append((key, value))
+        elif isinstance(value, (int, float, bool)):
+            query_pairs.append((key, str(value)))
+        else:
+            raise AssertionError(f"{key} must be a query scalar")
+    return parsed._replace(query=urlencode(query_pairs)).geturl()
+
+
+def _callback_url_with_state(callback_url: str, state: str) -> str:
+    parsed = urlsplit(callback_url)
+    query_pairs: list[tuple[str, str]] = []
+    for key, values in parse_qs(parsed.query, keep_blank_values=False).items():
+        if key == "state":
+            continue
+        query_pairs.extend((key, value) for value in values)
+    query_pairs.append(("state", state))
+    return parsed._replace(query=urlencode(query_pairs)).geturl()
+
+
 def _write_native_hook_asset(hub_root: Path, hooks: dict[str, JsonValue]) -> None:
     hooks_path = hub_root / "assets/hooks/hooks.json"
     hooks_path.write_text(json.dumps(hooks))
@@ -906,6 +973,7 @@ class _FakeWorkerServer:
         post_response: dict[str, JsonValue] | None = None,
         session_response: dict[str, JsonValue] | None = None,
         session_barrier_count: int = 0,
+        callback_state_override: str | None = None,
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
         self.policy_requests: list[str] = []
@@ -921,6 +989,7 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.session_response = session_response
         _FakeWorkerHandler.session_barrier_count = session_barrier_count
         _FakeWorkerHandler.session_condition = self._session_condition
+        _FakeWorkerHandler.callback_state_override = callback_state_override
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
@@ -945,6 +1014,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     session_barrier_count: ClassVar[int] = 0
     session_condition: ClassVar[threading.Condition | None] = None
     session_requests: ClassVar[list[dict[str, JsonValue]]] = []
+    callback_state_override: ClassVar[str | None] = None
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
@@ -977,8 +1047,9 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.end_headers()
                 return
-            callback_query = urlencode({"status": "approved", **payload})
-            self._redirect(f"{callback_url}?{callback_query}")
+            if self.callback_state_override is not None:
+                callback_url = _callback_url_with_state(callback_url, self.callback_state_override)
+            self._redirect(_url_with_query_params(callback_url, {"status": "approved", **payload}))
             return
         target = parse_qs(parsed.query).get("target")
         if (
