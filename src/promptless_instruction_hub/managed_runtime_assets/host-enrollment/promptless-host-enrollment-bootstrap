@@ -316,9 +316,13 @@ def _resolve_host(host_arg: str) -> Host:
 
 
 def _bootstrap_auth_flow_enabled() -> bool:
-    """Return whether the end-user device has enabled bootstrap auth testing."""
+    """Return whether the end-user device has enabled bootstrap auth testing.
 
-    return os.environ.get(BOOTSTRAP_AUTH_FLAG_ENV) == "True"
+    Accepts any case-insensitive truthy spelling of ``PIGS_FLY`` (``"1"`` or
+    ``"true"``) so the dogfood gate is not tripped by, e.g., ``true`` vs ``True``.
+    """
+
+    return os.environ.get(BOOTSTRAP_AUTH_FLAG_ENV, "").strip().lower() in {"1", "true"}
 
 
 def _plugin_root() -> Path | None:
