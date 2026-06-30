@@ -96,14 +96,12 @@ python3 "${PLUGIN_ROOT}/bin/promptless-host-runtime" ensure --host codex
 python3 "${CLAUDE_PLUGIN_ROOT}/bin/promptless-host-runtime" ensure --host claude
 ```
 
-When local `PIGS_FLY` is set to a truthy value (`1` or `true`,
-case-insensitive), the dogfood runtime's networked commands use
-`PROMPTLESS_WORKER_BASE_URL` or the default production worker. It reads the
-worker's public `/healthz` identity, opens the hosted Promptless dashboard start
-URL, and listens on a loopback callback with a per-attempt state token for the
-approved session proof. It then polls the hosted runtime for a one-time per-host
-credential, caches that credential, and uses the host credential to fetch
-`/v0/host-enrollment/policy?target=...` and post
+The dogfood host runtime uses `PROMPTLESS_WORKER_BASE_URL` or the default
+production worker. It reads the worker's public `/healthz` identity, opens the
+hosted Promptless dashboard start URL, and listens on a loopback callback with a
+per-attempt state token for the approved session proof. It then polls the hosted
+runtime for a one-time per-host credential, caches that credential, and uses the
+host credential to fetch `/v0/host-enrollment/policy?target=...` and post
 `/v0/host-enrollment/check-ins`.
 
 Host enrollment is per host, not per plugin. The credential and pending approval
@@ -119,12 +117,14 @@ state.
 For Claude Code, managed telemetry follows Claude's supported capture paths
 instead of relying on OpenTelemetry SDK attribute-length variables to override
 producer-side truncation. Inline tool content remains Claude-bounded OTel event
-content. When policy enables raw API body capture, the host runtime uses inline
-`OTEL_LOG_RAW_API_BODIES=1` so request/response body events reach the configured
-collector through the standard OTel logs pipeline. Claude's `file:<dir>` mode can
-write untruncated local `body_ref` files, but the runtime must not enable or
-report that mode as ingested until a local collector or uploader publishes those
-files to Promptless.
+content. When policy enables raw API body capture, the host runtime uses
+`OTEL_LOG_RAW_API_BODIES=file:<dir>` under the host-global Promptless state
+directory so Claude writes untruncated local request/response JSON files and
+emits `body_ref` events through the configured OTLP logs pipeline. The runtime
+also enables Claude's enhanced telemetry, OTLP logs/metrics/traces exporters,
+per-signal HTTP/protobuf protocols, detailed beta tracing, prompt logging,
+assistant response logging, tool details, and tool content when policy enables
+those capture categories.
 
 The host runtime has one executable with subcommands. `ensure` is the hook-safe
 path that enrolls when needed, writes local host telemetry config, and posts a
