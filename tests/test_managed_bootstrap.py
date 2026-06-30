@@ -811,6 +811,8 @@ def test_collector_does_not_advance_ledger_when_upload_response_lacks_acceptance
                 "batch_id": "wrong-batch",
                 "policy_version": 7,
                 "raw_artifact_count": 1,
+                "skipped_record_count": 0,
+                "acknowledged_ranges": "filled-by-test",
                 "trace_count": 1,
                 "event_count": 1,
                 "unparsed_record_count": 0,
@@ -823,6 +825,8 @@ def test_collector_does_not_advance_ledger_when_upload_response_lacks_acceptance
                 "batch_id": "filled-by-test",
                 "policy_version": 6,
                 "raw_artifact_count": 1,
+                "skipped_record_count": 0,
+                "acknowledged_ranges": "filled-by-test",
                 "trace_count": 1,
                 "event_count": 1,
                 "unparsed_record_count": 0,
@@ -835,6 +839,8 @@ def test_collector_does_not_advance_ledger_when_upload_response_lacks_acceptance
                 "batch_id": "filled-by-test",
                 "policy_version": 7,
                 "raw_artifact_count": 0,
+                "skipped_record_count": 0,
+                "acknowledged_ranges": "filled-by-test",
                 "trace_count": 1,
                 "event_count": 1,
                 "unparsed_record_count": 0,
@@ -847,6 +853,8 @@ def test_collector_does_not_advance_ledger_when_upload_response_lacks_acceptance
                 "batch_id": "filled-by-test",
                 "policy_version": 7,
                 "raw_artifact_count": 1,
+                "skipped_record_count": 0,
+                "acknowledged_ranges": "filled-by-test",
                 "trace_count": 1,
                 "unparsed_record_count": 0,
             },
@@ -866,6 +874,8 @@ def test_collector_does_not_advance_ledger_when_upload_ack_is_invalid(
     def fill_batch_id(payload: dict[str, JsonValue]) -> None:
         if upload_response.get("batch_id") == "filled-by-test":
             upload_response["batch_id"] = payload["batch_id"]
+        if upload_response.get("acknowledged_ranges") == "filled-by-test":
+            upload_response["acknowledged_ranges"] = _acknowledged_ranges_for_payload(payload)
 
     server = _FakeWorkerServer(
         upload_response=upload_response,
@@ -904,6 +914,186 @@ def test_collector_does_not_advance_ledger_when_upload_ack_is_invalid(
         server.stop()
 
 
+def test_collector_does_not_advance_ledger_when_upload_response_lacks_acknowledged_ranges(
+    tmp_path: Path,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    upload_response: dict[str, JsonValue] = {
+        "accepted": True,
+        "batch_id": "filled-by-test",
+        "policy_version": 7,
+        "raw_artifact_count": 1,
+        "skipped_record_count": 0,
+        "trace_count": 1,
+        "event_count": 1,
+        "unparsed_record_count": 0,
+    }
+
+    def fill_batch_id(payload: dict[str, JsonValue]) -> None:
+        upload_response["batch_id"] = payload["batch_id"]
+
+    server = _FakeWorkerServer(
+        upload_response=upload_response,
+        before_upload_response=fill_batch_id,
+        forward_only_first_install=False,
+    )
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        rollout_path.write_text('{"type":"turn","id":"retry"}\n')
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "acknowledged_ranges must be an array" in str(payload["message"])
+        assert len(server.uploads) == 1
+        ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
+        assert _json_mapping(ledger["sources"], "ledger.sources") == {}
+    finally:
+        server.stop()
+
+
+def test_collector_does_not_advance_ledger_when_upload_acknowledged_ranges_mismatch(
+    tmp_path: Path,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    upload_response: dict[str, JsonValue] = {
+        "accepted": True,
+        "batch_id": "filled-by-test",
+        "policy_version": 7,
+        "raw_artifact_count": 1,
+        "skipped_record_count": 0,
+        "acknowledged_ranges": [],
+        "trace_count": 1,
+        "event_count": 1,
+        "unparsed_record_count": 0,
+    }
+
+    def fill_ack_with_wrong_end_offset(payload: dict[str, JsonValue]) -> None:
+        upload_response["batch_id"] = payload["batch_id"]
+        acknowledged_ranges = _acknowledged_ranges_for_payload(payload)
+        first_range = _json_mapping(acknowledged_ranges[0], "acknowledged_ranges[0]")
+        end_offset = first_range["end_offset"]
+        assert isinstance(end_offset, int)
+        first_range["end_offset"] = end_offset + 1
+        upload_response["acknowledged_ranges"] = acknowledged_ranges
+
+    server = _FakeWorkerServer(
+        upload_response=upload_response,
+        before_upload_response=fill_ack_with_wrong_end_offset,
+        forward_only_first_install=False,
+    )
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        rollout_path.write_text('{"type":"turn","id":"retry"}\n')
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "acknowledged_ranges did not match request" in str(payload["message"])
+        assert len(server.uploads) == 1
+        ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
+        assert _json_mapping(ledger["sources"], "ledger.sources") == {}
+    finally:
+        server.stop()
+
+
+def test_collector_rejects_unexpected_skipped_record_count_without_oversized_request(
+    tmp_path: Path,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    upload_response: dict[str, JsonValue] = {
+        "accepted": True,
+        "batch_id": "filled-by-test",
+        "policy_version": 7,
+        "raw_artifact_count": 1,
+        "skipped_record_count": 1,
+        "acknowledged_ranges": "filled-by-test",
+        "trace_count": 1,
+        "event_count": 1,
+        "unparsed_record_count": 0,
+    }
+
+    def fill_dynamic_response_fields(payload: dict[str, JsonValue]) -> None:
+        upload_response["batch_id"] = payload["batch_id"]
+        upload_response["acknowledged_ranges"] = _acknowledged_ranges_for_payload(payload)
+
+    server = _FakeWorkerServer(
+        upload_response=upload_response,
+        before_upload_response=fill_dynamic_response_fields,
+        forward_only_first_install=False,
+    )
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        ledger_path = plugin_data / "trace-collector-ledger.json"
+        ledger_path.write_text(json.dumps({"schema_version": 1, "sources": {}}))
+
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        rollout_path.write_text('{"type":"turn","id":"retry"}\n')
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "skipped_record_count did not match request" in str(payload["message"])
+        assert len(server.uploads) == 1
+        ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
+        assert _json_mapping(ledger["sources"], "ledger.sources") == {}
+    finally:
+        server.stop()
+
+
 def test_collector_quiet_failure_reports_error_check_in(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
@@ -913,6 +1103,8 @@ def test_collector_quiet_failure_reports_error_check_in(tmp_path: Path) -> None:
         "batch_id": "filled-by-test",
         "policy_version": 7,
         "raw_artifact_count": 0,
+        "skipped_record_count": 0,
+        "acknowledged_ranges": "filled-by-test",
         "trace_count": 1,
         "event_count": 1,
         "unparsed_record_count": 0,
@@ -920,6 +1112,7 @@ def test_collector_quiet_failure_reports_error_check_in(tmp_path: Path) -> None:
 
     def fill_batch_id(payload: dict[str, JsonValue]) -> None:
         upload_response["batch_id"] = payload["batch_id"]
+        upload_response["acknowledged_ranges"] = _acknowledged_ranges_for_payload(payload)
 
     server = _FakeWorkerServer(
         upload_response=upload_response,
@@ -1391,6 +1584,7 @@ def test_collector_does_not_advance_ledger_when_skipped_record_ack_miscounts(tmp
         "policy_version": 7,
         "raw_artifact_count": 0,
         "skipped_record_count": 0,
+        "acknowledged_ranges": "filled-by-test",
         "trace_count": 0,
         "event_count": 0,
         "unparsed_record_count": 0,
@@ -1398,6 +1592,7 @@ def test_collector_does_not_advance_ledger_when_skipped_record_ack_miscounts(tmp
 
     def fill_batch_id(payload: dict[str, JsonValue]) -> None:
         upload_response["batch_id"] = payload["batch_id"]
+        upload_response["acknowledged_ranges"] = _acknowledged_ranges_for_payload(payload)
 
     server = _FakeWorkerServer(
         upload_response=upload_response,
@@ -1920,6 +2115,137 @@ def test_collector_rejects_policy_without_signed_envelope_fields(tmp_path: Path)
         server.stop()
 
 
+def test_collector_rejects_policy_that_disallows_local_trace_reads(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(
+        plugin_permissions_overrides={
+            "allow_local_file_read": False,
+            "allowed_read_roots": [],
+        }
+    )
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        rollout_path.write_text('{"type":"turn","id":"blocked"}\n')
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_DATA": str(plugin_data),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "does not allow local native trace file reads" in str(payload["message"])
+        assert server.check_ins == []
+        assert server.uploads == []
+    finally:
+        server.stop()
+
+
+def test_collector_rejects_policy_with_trace_roots_outside_allowed_read_roots(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(plugin_permissions_overrides={"allowed_read_roots": ["~/.claude"]})
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        rollout_path = home / ".codex/sessions/rollout.jsonl"
+        rollout_path.parent.mkdir(parents=True)
+        rollout_path.write_text('{"type":"turn","id":"blocked"}\n')
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_DATA": str(plugin_data),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "native_roots glob is outside plugin_permissions.allowed_read_roots" in str(payload["message"])
+        assert server.check_ins == []
+        assert server.uploads == []
+    finally:
+        server.stop()
+
+
+def test_collector_rejects_policy_with_disallowed_network_host(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(plugin_permissions_overrides={"allowed_hosts": ["worker.example.com"]})
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_DATA": str(plugin_data),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "host is not allowed by plugin_permissions.allowed_hosts" in str(payload["message"])
+        assert server.check_ins == []
+        assert server.uploads == []
+    finally:
+        server.stop()
+
+
+def test_collector_rejects_policy_above_supported_batch_limit(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(max_batch_bytes=100 * 1024 * 1024 + 1)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+
+        payload, _result = _run_collector(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_DATA": str(plugin_data),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "max_batch_bytes must not exceed" in str(payload["message"])
+        assert server.check_ins == []
+        assert server.uploads == []
+    finally:
+        server.stop()
+
+
 def _run_collector(
     plugin_root: Path,
     host: str,
@@ -2022,6 +2348,25 @@ def _decode_chunk(chunk: dict[str, JsonValue]) -> bytes:
     return gzip.decompress(base64.b64decode(encoded))
 
 
+def _acknowledged_ranges_for_payload(payload: dict[str, JsonValue]) -> list[JsonValue]:
+    chunks = payload.get("chunks")
+    ranges: list[JsonValue] = []
+    if not isinstance(chunks, list):
+        return ranges
+    for chunk_value in chunks:
+        chunk = _json_mapping(chunk_value, "chunk")
+        ranges.append(
+            {
+                "kind": chunk.get("kind"),
+                "source_path_hash": chunk.get("source_path_hash"),
+                "start_offset": chunk.get("start_offset"),
+                "end_offset": chunk.get("end_offset"),
+                "content_sha256": chunk.get("content_sha256"),
+            }
+        )
+    return ranges
+
+
 def _policy_with(
     base_url: str,
     *,
@@ -2030,6 +2375,7 @@ def _policy_with(
     include_in_progress_traces: bool = True,
     max_batch_bytes: int = 1048576,
     capture_policy_overrides: dict[str, str] | None = None,
+    plugin_permissions_overrides: dict[str, JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
     capture_policy: dict[str, JsonValue] = {
         "user_prompts": "full_local_default",
@@ -2041,6 +2387,16 @@ def _policy_with(
     }
     if capture_policy_overrides is not None:
         capture_policy.update(capture_policy_overrides)
+    plugin_permissions: dict[str, JsonValue] = {
+        "write_user_config": True,
+        "repair_user_config": True,
+        "allow_network": True,
+        "allowed_hosts": ["127.0.0.1"],
+        "allow_local_file_read": True,
+        "allowed_read_roots": ["~/.codex", "~/.claude"],
+    }
+    if plugin_permissions_overrides is not None:
+        plugin_permissions.update(plugin_permissions_overrides)
     return {
         "policy": {
             "schema_version": 2,
@@ -2059,12 +2415,7 @@ def _policy_with(
                 "max_batch_bytes": max_batch_bytes,
             },
             "capture_policy": capture_policy,
-            "plugin_permissions": {
-                "allow_network": True,
-                "allowed_hosts": ["127.0.0.1"],
-                "allow_local_file_read": True,
-                "allowed_read_roots": ["~/.codex", "~/.claude"],
-            },
+            "plugin_permissions": plugin_permissions,
             "created_at": "2026-06-26T00:00:00Z",
         },
         "signature": "test-signature",
@@ -2088,6 +2439,7 @@ class _FakeWorkerServer:
         include_in_progress_traces: bool = True,
         max_batch_bytes: int = 1048576,
         capture_policy_overrides: dict[str, str] | None = None,
+        plugin_permissions_overrides: dict[str, JsonValue] | None = None,
     ) -> None:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
@@ -2107,6 +2459,7 @@ class _FakeWorkerServer:
             include_in_progress_traces=include_in_progress_traces,
             max_batch_bytes=max_batch_bytes,
             capture_policy_overrides=capture_policy_overrides,
+            plugin_permissions_overrides=plugin_permissions_overrides,
         )
         _FakeWorkerHandler.check_in_status = check_in_status
         _FakeWorkerHandler.check_in_response = check_in_response
@@ -2261,6 +2614,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             "policy_version": payload.get("policy_version"),
             "raw_artifact_count": raw_artifact_count if status < 400 else 0,
             "skipped_record_count": skipped_record_count if status < 400 else 0,
+            "acknowledged_ranges": _acknowledged_ranges_for_payload(payload) if status < 400 else [],
             "trace_count": raw_artifact_count if status < 400 else 0,
             "event_count": raw_artifact_count if status < 400 else 0,
             "unparsed_record_count": 0,

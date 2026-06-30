@@ -43,6 +43,7 @@ LEDGER_FILE_NAME = "trace-collector-ledger.json"
 HTTP_TIMEOUT_SECONDS = 10
 ENROLLMENT_POLL_DEADLINE_SECONDS = 35
 MAX_STDIN_BYTES = 1024 * 1024
+MAX_TRACE_BATCH_BYTES = 100 * 1024 * 1024
 MAX_UPLOAD_CHUNKS_PER_BATCH = 200
 SOURCE_READ_BLOCK_BYTES = 1024 * 1024
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_TRACE_COLLECTOR_ALLOW_TEST_URL_OVERRIDES"
@@ -141,6 +142,16 @@ class TraceCollectionPolicy:
 
 
 @dataclass(frozen=True)
+class PluginPermissions:
+    """Local read and network permissions granted by the signed worker policy."""
+
+    allow_network: bool
+    allowed_hosts: tuple[str, ...]
+    allow_local_file_read: bool
+    allowed_read_roots: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
 class HostPolicy:
     """Shape-validated worker policy body from a signed-policy response."""
 
@@ -148,6 +159,7 @@ class HostPolicy:
     trace_collection: TraceCollectionPolicy
     enabled_hosts: tuple[Host, ...]
     capture_policy: dict[str, str]
+    plugin_permissions: PluginPermissions
     required_bootstrap_version: Optional[str]
 
 
@@ -250,6 +262,14 @@ def _run(
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
     policy = _validate_signed_policy(signed_policy, host)
     ledger_path = _ledger_path()
+    _require_network_allowed_for_url(check_in_url, policy.plugin_permissions, "host enrollment check-in endpoint")
+    _require_network_allowed_for_url(
+        policy.trace_collection.upload_endpoint,
+        policy.plugin_permissions,
+        "trace_collection.upload_endpoint",
+    )
+    roots = _native_roots_for_host(host, policy.trace_collection)
+    _validate_native_root_permissions(roots, policy.plugin_permissions)
     if _requires_newer_runtime(policy.required_bootstrap_version, metadata.collector_version):
         _post_check_in(
             check_in_url,
@@ -279,7 +299,6 @@ def _run(
     configured_check_in_accepted = False
     try:
         with _ledger_lock(ledger_path):
-            roots = _native_roots_for_host(host, policy.trace_collection)
             ledger = _load_ledger(ledger_path)
             upload_suppression = _trace_upload_suppression(policy, host, lifecycle_event)
             drift_reports = list(ledger.drift_reports)
@@ -299,7 +318,9 @@ def _run(
             )
             configured_check_in_accepted = True
 
-            source_paths = _expand_native_paths(roots)
+            source_paths: tuple[Path, ...] = ()
+            if upload_suppression is None or upload_suppression.advance_ledger_to_current_end:
+                source_paths = _expand_native_paths(roots, policy.plugin_permissions)
             if ledger.recover_to_current_end:
                 _baseline_sources(ledger, source_paths)
                 _save_ledger(ledger)
@@ -316,6 +337,8 @@ def _run(
                 return 0
 
             if ledger.is_new and policy.trace_collection.forward_only_first_install:
+                if not source_paths:
+                    source_paths = _expand_native_paths(roots, policy.plugin_permissions)
                 _baseline_sources(ledger, source_paths)
                 _save_ledger(ledger)
                 _emit({"status": "configured", "host": host, "baseline_only": True, "uploaded_chunks": 0}, quiet=quiet)
@@ -1091,12 +1114,17 @@ def _validate_signed_policy(value: object, host: Host) -> HostPolicy:
     trace_collection = _validate_trace_collection(trace_collection_value, host)
 
     capture_policy = _string_mapping(policy_value.get("capture_policy"), "capture_policy")
+    plugin_permissions_value = _json_mapping(policy_value.get("plugin_permissions"))
+    if plugin_permissions_value is None:
+        raise CollectorError("worker policy is missing plugin_permissions")
+    plugin_permissions = _validate_plugin_permissions(plugin_permissions_value)
     required_bootstrap_version = _string_value(policy_value.get("required_bootstrap_version"))
     return HostPolicy(
         policy_version=policy_version,
         trace_collection=trace_collection,
         enabled_hosts=enabled_hosts,
         capture_policy=capture_policy,
+        plugin_permissions=plugin_permissions,
         required_bootstrap_version=required_bootstrap_version,
     )
 
@@ -1113,6 +1141,10 @@ def _validate_trace_collection(value: dict[str, JsonValue], host: Host) -> Trace
     max_batch_bytes = raw_max_batch_bytes if raw_max_batch_bytes is not None else 10 * 1024 * 1024
     if max_batch_bytes <= 0:
         raise CollectorError("trace_collection.max_batch_bytes must be positive")
+    if max_batch_bytes > MAX_TRACE_BATCH_BYTES:
+        raise CollectorError(
+            f"trace_collection.max_batch_bytes must not exceed {MAX_TRACE_BATCH_BYTES} bytes"
+        )
     native_roots = _native_root_tuple(value.get("native_roots"))
     invalid_root_sources = sorted({root.source for root in native_roots if root.source not in enabled_sources})
     if invalid_root_sources:
@@ -1125,6 +1157,55 @@ def _validate_trace_collection(value: dict[str, JsonValue], host: Host) -> Trace
         max_batch_bytes=max_batch_bytes,
         native_roots=native_roots,
     )
+
+
+def _validate_plugin_permissions(value: dict[str, JsonValue]) -> PluginPermissions:
+    allow_network = _required_bool(value.get("allow_network"), "plugin_permissions.allow_network")
+    allowed_hosts = _string_tuple(value.get("allowed_hosts"), "plugin_permissions.allowed_hosts")
+    if allow_network and not allowed_hosts:
+        raise CollectorError("plugin_permissions.allowed_hosts is required when allow_network is true")
+
+    allow_local_file_read = _required_bool(
+        value.get("allow_local_file_read"),
+        "plugin_permissions.allow_local_file_read",
+    )
+    raw_allowed_read_roots = _string_tuple(
+        value.get("allowed_read_roots"),
+        "plugin_permissions.allowed_read_roots",
+    )
+    if allow_local_file_read and not raw_allowed_read_roots:
+        raise CollectorError("plugin_permissions.allowed_read_roots is required when allow_local_file_read is true")
+    allowed_read_roots = tuple(
+        _resolve_permission_path(root, "plugin_permissions.allowed_read_roots")
+        for root in raw_allowed_read_roots
+    )
+    return PluginPermissions(
+        allow_network=allow_network,
+        allowed_hosts=allowed_hosts,
+        allow_local_file_read=allow_local_file_read,
+        allowed_read_roots=allowed_read_roots,
+    )
+
+
+def _required_bool(value: Optional[JsonValue], field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise CollectorError(f"{field_name} must be a boolean")
+
+
+def _string_tuple(value: Optional[JsonValue], field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise CollectorError(f"{field_name} must be an array")
+    items: list[str] = []
+    for item in value:
+        item_value = _string_value(item)
+        if item_value is None or item_value.strip() == "":
+            raise CollectorError(f"{field_name} must contain only non-empty strings")
+        if item_value not in items:
+            items.append(item_value)
+    return tuple(items)
 
 
 def _host_tuple(value: Optional[JsonValue], field_name: str) -> tuple[Host, ...]:
@@ -1167,15 +1248,77 @@ def _native_roots_for_host(host: Host, policy: TraceCollectionPolicy) -> tuple[N
     return (NativeRoot(source=host, glob_pattern="~/.codex/**/*.jsonl"),)
 
 
-def _expand_native_paths(roots: tuple[NativeRoot, ...]) -> tuple[Path, ...]:
+def _require_network_allowed_for_url(url: str, permissions: PluginPermissions, field_name: str) -> None:
+    if not permissions.allow_network:
+        raise CollectorError(f"worker policy does not allow network access for {field_name}")
+    parsed = urlsplit(url)
+    hostname = parsed.hostname
+    if hostname is None:
+        raise CollectorError(f"{field_name} must include a hostname")
+    if hostname not in permissions.allowed_hosts and parsed.netloc not in permissions.allowed_hosts:
+        raise CollectorError(f"{field_name} host is not allowed by plugin_permissions.allowed_hosts")
+
+
+def _validate_native_root_permissions(roots: tuple[NativeRoot, ...], permissions: PluginPermissions) -> None:
+    if not permissions.allow_local_file_read:
+        raise CollectorError("worker policy does not allow local native trace file reads")
+    for root in roots:
+        glob_prefix = _glob_static_prefix(root.glob_pattern)
+        if not _path_is_allowed_read_path(glob_prefix, permissions.allowed_read_roots):
+            raise CollectorError("trace_collection.native_roots glob is outside plugin_permissions.allowed_read_roots")
+
+
+def _expand_native_paths(roots: tuple[NativeRoot, ...], permissions: PluginPermissions) -> tuple[Path, ...]:
     paths: dict[str, Path] = {}
     for root in roots:
         expanded_pattern = os.path.expandvars(os.path.expanduser(root.glob_pattern))
         for candidate in glob.glob(expanded_pattern, recursive=True):
             path = Path(candidate).expanduser()
-            if path.is_file():
-                paths[str(path)] = path
+            if not path.is_file():
+                continue
+            try:
+                resolved_path = path.resolve(True)
+            except (OSError, RuntimeError):
+                continue
+            if not _path_is_allowed_read_path(resolved_path, permissions.allowed_read_roots):
+                raise CollectorError("native trace file is outside plugin_permissions.allowed_read_roots")
+            paths[str(resolved_path)] = resolved_path
     return tuple(paths[key] for key in sorted(paths))
+
+
+def _glob_static_prefix(glob_pattern: str) -> Path:
+    expanded_pattern = os.path.expandvars(os.path.expanduser(glob_pattern))
+    parts: list[str] = []
+    for part in Path(expanded_pattern).parts:
+        if _path_part_has_glob_magic(part):
+            break
+        parts.append(part)
+    if not parts:
+        raise CollectorError("trace_collection.native_roots glob must include a non-glob path prefix")
+    return _resolve_permission_path(str(Path(*parts)), "trace_collection.native_roots.glob")
+
+
+def _path_part_has_glob_magic(part: str) -> bool:
+    return "*" in part or "?" in part or "[" in part
+
+
+def _resolve_permission_path(raw_path: str, field_name: str) -> Path:
+    expanded_path = os.path.expandvars(os.path.expanduser(raw_path))
+    path = Path(expanded_path)
+    if not path.is_absolute():
+        raise CollectorError(f"{field_name} entries must resolve to absolute paths")
+    return path.resolve(False)
+
+
+def _path_is_allowed_read_path(path: Path, allowed_roots: tuple[Path, ...]) -> bool:
+    resolved_path = path.resolve(False)
+    for root in allowed_roots:
+        try:
+            resolved_path.relative_to(root)
+        except ValueError:
+            continue
+        return True
+    return False
 
 
 def _ledger_path() -> Path:
@@ -1838,14 +1981,75 @@ def _validate_upload_response(
     if raw_artifact_count != expected_raw_artifacts:
         raise CollectorError(f"worker response raw_artifact_count did not match request for {urlsplit(url).path}")
     skipped_record_count = _int_value(response.get("skipped_record_count"))
-    if expected_skipped_records and skipped_record_count != expected_skipped_records:
+    if skipped_record_count != expected_skipped_records:
         raise CollectorError(f"worker response skipped_record_count did not match request for {urlsplit(url).path}")
+    _validate_acknowledged_ranges(response, request, url)
     for field in ("raw_artifact_count", "trace_count", "event_count", "unparsed_record_count"):
         value = _int_value(response.get(field))
         if value is None or value < 0:
             raise CollectorError(f"worker response {field} must be a non-negative integer")
     if skipped_record_count is not None and skipped_record_count < 0:
         raise CollectorError(f"worker response skipped_record_count must be a non-negative integer")
+
+
+def _validate_acknowledged_ranges(
+    response: dict[str, JsonValue],
+    request: dict[str, JsonValue],
+    url: str,
+) -> None:
+    actual_value = response.get("acknowledged_ranges")
+    if not isinstance(actual_value, list):
+        raise CollectorError(f"worker response acknowledged_ranges must be an array for {urlsplit(url).path}")
+    expected_ranges = _expected_acknowledged_ranges(request)
+    if len(actual_value) != len(expected_ranges):
+        raise CollectorError(f"worker response acknowledged_ranges did not match request for {urlsplit(url).path}")
+    for index, expected_range in enumerate(expected_ranges):
+        actual_range = _json_mapping(actual_value[index])
+        if actual_range is None:
+            raise CollectorError(f"worker response acknowledged_ranges did not match request for {urlsplit(url).path}")
+        actual_identity: dict[str, JsonValue] = {
+            "kind": actual_range.get("kind"),
+            "source_path_hash": actual_range.get("source_path_hash"),
+            "start_offset": actual_range.get("start_offset"),
+            "end_offset": actual_range.get("end_offset"),
+            "content_sha256": actual_range.get("content_sha256"),
+        }
+        if actual_identity != expected_range:
+            raise CollectorError(f"worker response acknowledged_ranges did not match request for {urlsplit(url).path}")
+
+
+def _expected_acknowledged_ranges(request: dict[str, JsonValue]) -> list[dict[str, JsonValue]]:
+    request_chunks = request.get("chunks")
+    if not isinstance(request_chunks, list):
+        raise CollectorError("collector upload request chunks must be an array")
+    expected_ranges: list[dict[str, JsonValue]] = []
+    for chunk_value in request_chunks:
+        chunk = _json_mapping(chunk_value)
+        if chunk is None:
+            raise CollectorError("collector upload request chunks must contain objects")
+        kind = _string_value(chunk.get("kind"))
+        source_path_hash = _string_value(chunk.get("source_path_hash"))
+        start_offset = _int_value(chunk.get("start_offset"))
+        end_offset = _int_value(chunk.get("end_offset"))
+        content_sha256 = _string_value(chunk.get("content_sha256"))
+        if (
+            kind is None
+            or source_path_hash is None
+            or start_offset is None
+            or end_offset is None
+            or content_sha256 is None
+        ):
+            raise CollectorError("collector upload request chunk is missing acknowledged range fields")
+        expected_ranges.append(
+            {
+                "kind": kind,
+                "source_path_hash": source_path_hash,
+                "start_offset": start_offset,
+                "end_offset": end_offset,
+                "content_sha256": content_sha256,
+            }
+        )
+    return expected_ranges
 
 
 def _require_accepted_response(response: dict[str, JsonValue], url: str) -> None:

@@ -84,10 +84,10 @@ Action releases are tagged with immutable versions such as `v0.1.0` and a moving
 major pointer such as `v0`. Customer workflows can use `@v0` for minor updates or
 pin to an immutable tag for stricter reproducibility.
 
-## Managed Runtime Trace Collector
+## Managed Runtime Local Trace Collector
 
 The toolchain owns Promptless-managed runtime artifacts that are injected into
-generated customer plugins. The current managed runtime is the native trace
+generated customer plugins. The current managed runtime is the local trace
 collector used by Codex and Claude lifecycle hooks. During dogfood, generated
 hooks invoke the bundled stdlib-only Python script with `python3`.
 
@@ -111,9 +111,11 @@ exactly one drives the single browser approval while the others reuse the result
 or defer to a later session. The per-plugin `CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA`
 directories are intentionally not used for credentials.
 
-The collector shape-validates the signed-policy envelope and native trace
-upload policy, then uploads new complete JSONL ranges from the configured native
-trace roots. It maintains a per-user ledger at
+The collector shape-validates the signed-policy envelope, native trace upload
+policy, and `plugin_permissions` before touching local trace files or posting
+uploads. The policy must explicitly allow the worker hosts and each configured
+native trace root. The collector then uploads new complete JSONL ranges from the
+allowed native trace roots. It maintains a per-user ledger at
 `~/.promptless/instruction-hub/trace-collector-ledger.json`, or at
 `PROMPTLESS_TRACE_COLLECTOR_LEDGER` when set, so successful uploads advance
 monotonically and failed uploads are retried. First install defaults to
@@ -123,8 +125,9 @@ forward-only baselining so historical local traces are not uploaded unless
 Codex hooks run on `SessionStart` and `Stop`; Claude hooks run on
 `SessionStart`, `Stop`, and `SessionEnd`. When policy disables in-progress
 trace uploads, Codex `Stop` and Claude `SessionEnd` are treated as terminal
-events. Upload responses must echo the batch and policy version and confirm all
-raw chunks and oversized-record reports before the ledger advances.
+events. Upload responses must echo the batch and policy version, return the
+expected skipped-record count, and acknowledge the exact source ranges for every
+raw chunk and oversized-record report before the ledger advances.
 
 Before the customer-grade release, replace the Python dogfood script with a
 static native binary built and versioned by Promptless, then bundled into the
