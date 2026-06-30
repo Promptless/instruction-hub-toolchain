@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -25,6 +26,18 @@ HOST_RUNTIME_CHANNEL = "stable"
 HOST_RUNTIME_VERSION = "0.2.1"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
 SUPPORTED_HOST_RUNTIME_TARGETS: tuple[Harness, ...] = ("claude", "codex")
+MISSING_RUNTIME_ROOT_MESSAGE = (
+    "Promptless Instruction Hub hook could not find its plugin root. "
+    "Update the host CLI or reinstall the Promptless plugin."
+)
+MISSING_RUNTIME_FILE_MESSAGE = (
+    "Promptless Instruction Hub hook could not find its managed runtime. "
+    "Reinstall the Promptless plugin."
+)
+MISSING_PYTHON_MESSAGE = (
+    "Promptless Instruction Hub hook could not find python3. "
+    "Install Python 3 or reinstall the Promptless plugin."
+)
 
 _ASSET_ROOT = Path(__file__).parent / "managed_runtime_assets" / HOST_RUNTIME_ASSET_DIR
 _EXECUTABLE_SOURCE = _ASSET_ROOT / HOST_RUNTIME_EXECUTABLE
@@ -144,12 +157,16 @@ def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
 
 def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
     if target == "claude":
+        root_expr = "${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}"
+        host = "claude"
         hook_command: dict[str, JsonValue] = {
-            "command": f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_EXECUTABLE}" ensure --host claude',
+            "command": _host_runtime_hook_command(root_expr=root_expr, host=host),
         }
     else:
+        root_expr = "${PLUGIN_ROOT:-}"
+        host = "codex"
         hook_command = {
-            "command": f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_EXECUTABLE}" ensure --host codex',
+            "command": _host_runtime_hook_command(root_expr=root_expr, host=host),
         }
 
     # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
@@ -173,6 +190,23 @@ def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
             }
         ],
     }
+
+
+def _hook_json_system_message(message: str) -> str:
+    payload = json.dumps({"systemMessage": message}, separators=(",", ":"))
+    return payload.replace('"', '\\"')
+
+
+def _host_runtime_hook_command(*, root_expr: str, host: Harness) -> str:
+    return (
+        f"sh -c 'root={root_expr}; "
+        f'if [ -z "$root" ]; then printf "%s\\n" "{_hook_json_system_message(MISSING_RUNTIME_ROOT_MESSAGE)}"; exit 0; fi; '
+        f'runtime="$root/bin/{HOST_RUNTIME_EXECUTABLE}"; '
+        f'if [ ! -x "$runtime" ]; then printf "%s\\n" "{_hook_json_system_message(MISSING_RUNTIME_FILE_MESSAGE)}"; exit 0; fi; '
+        f'if ! command -v python3 >/dev/null 2>&1; then printf "%s\\n" "{_hook_json_system_message(MISSING_PYTHON_MESSAGE)}"; exit 0; fi; '
+        f'exec python3 "$runtime" ensure --host {host}'
+        "'"
+    )
 
 
 def _write_plugin_manifest(target_root: Path, records: tuple[ManagedRuntimeRecord, ...]) -> None:

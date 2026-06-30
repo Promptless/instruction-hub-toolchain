@@ -88,12 +88,14 @@ pin to an immutable tag for stricter reproducibility.
 
 The toolchain owns Promptless-managed runtime artifacts that must be injected
 into generated customer plugins, including the host runtime used by Codex and
-Claude startup hooks. During dogfood, generated hooks invoke the bundled
-stdlib-only Python script with `python3`:
+Claude startup hooks. During dogfood, generated hooks wrap the bundled
+stdlib-only Python script with shell checks that emit schema-safe startup
+diagnostics when the host cannot resolve the plugin root, runtime file, or
+`python3`:
 
 ```sh
-python3 "${PLUGIN_ROOT}/bin/promptless-host-runtime" ensure --host codex
-python3 "${CLAUDE_PLUGIN_ROOT}/bin/promptless-host-runtime" ensure --host claude
+sh -c 'root=${PLUGIN_ROOT:-}; ...; exec python3 "$root/bin/promptless-host-runtime" ensure --host codex'
+sh -c 'root=${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}; ...; exec python3 "$root/bin/promptless-host-runtime" ensure --host claude'
 ```
 
 The dogfood host runtime uses `PROMPTLESS_WORKER_BASE_URL` or the default

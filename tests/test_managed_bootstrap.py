@@ -17,6 +17,7 @@ import pytest
 from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, validate_json_value
+from promptless_instruction_hub.managed_runtime import MISSING_RUNTIME_ROOT_MESSAGE
 
 HOST_RUNTIME_BIN = "promptless-host-runtime"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
@@ -56,12 +57,47 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         hook = hooks["hooks"]["SessionStart"][0]["hooks"][0]
         if target == "claude":
             hook_command = hook["command"]
-            assert hook_command == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host claude'
+            assert "root=${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}" in hook_command
+            assert 'exec python3 "$runtime" ensure --host claude' in hook_command
         else:
             hook_command = hook["command"]
-            assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host codex'
+            assert "root=${PLUGIN_ROOT:-}" in hook_command
+            assert 'exec python3 "$runtime" ensure --host codex' in hook_command
+        assert hook_command.startswith("sh -c '")
+        assert f'runtime="$root/bin/{HOST_RUNTIME_BIN}"' in hook_command
         assert "--quiet" not in hook_command
         assert hook["timeout"] == 90
+
+        missing_root = subprocess.run(
+            hook_command,
+            shell=True,
+            env=_clean_env(HOME=str(tmp_path / f"{target}-home")),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert missing_root.returncode == 0
+        assert missing_root.stderr == ""
+        assert json.loads(missing_root.stdout) == {"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}
+
+        stub_root = tmp_path / f"{target}-stub-plugin"
+        stub_runtime = stub_root / "bin" / HOST_RUNTIME_BIN
+        stub_runtime.parent.mkdir(parents=True)
+        stub_runtime.write_text('import json, sys\nprint(json.dumps({"argv": sys.argv[1:]}))\n')
+        stub_runtime.chmod(0o755)
+        root_env = "CLAUDE_PLUGIN_ROOT" if target == "claude" else "PLUGIN_ROOT"
+        rooted = subprocess.run(
+            hook_command,
+            shell=True,
+            env=_clean_env(HOME=str(tmp_path / f"{target}-rooted-home"), **{root_env: str(stub_root)}),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert rooted.returncode == 0
+        assert rooted.stderr == ""
+        assert json.loads(rooted.stdout) == {"argv": ["ensure", "--host", target]}
+
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
