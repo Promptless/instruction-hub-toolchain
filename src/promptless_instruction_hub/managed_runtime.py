@@ -18,7 +18,9 @@ RuntimeStatus = Literal["included"]
 HOST_ENROLLMENT_BOOTSTRAP_ID = "host-enrollment-bootstrap"
 HOST_ENROLLMENT_ASSET_DIR = "host-enrollment"
 HOST_ENROLLMENT_EXECUTABLE = "promptless-host-enrollment-bootstrap"
-HOST_ENROLLMENT_HOOK_TIMEOUT_SECONDS = 45
+# Keep this comfortably above the bootstrap poll budget plus session creation,
+# policy fetch, local config write, and check-in network calls.
+HOST_ENROLLMENT_HOOK_TIMEOUT_SECONDS = 90
 HOST_ENROLLMENT_CHANNEL = "stable"
 HOST_ENROLLMENT_VERSION = "0.1.0"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH

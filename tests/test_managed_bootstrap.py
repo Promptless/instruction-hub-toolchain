@@ -44,7 +44,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             hook_command = hook["command"]
             assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host codex --quiet'
         assert "--quiet" in hook_command
-        assert hook["timeout"] == 45
+        assert hook["timeout"] == 90
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
