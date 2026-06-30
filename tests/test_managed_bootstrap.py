@@ -639,11 +639,7 @@ def test_bootstrap_repairs_stale_managed_host_otel_config(tmp_path: Path) -> Non
             ]
         )
         original_codex_config = (
-            'model = "gpt-5"\n\n'
-            f"{stale_codex_block}\n"
-            "[profiles.local]\n"
-            'model = "gpt-5-codex"\n\n'
-            f"{stale_codex_block}"
+            f'model = "gpt-5"\n\n{stale_codex_block}\n[profiles.local]\nmodel = "gpt-5-codex"\n\n{stale_codex_block}'
         )
         codex_home = tmp_path / "codex-home"
         codex_config = codex_home / ".codex/config.toml"
@@ -766,10 +762,7 @@ def test_bootstrap_blocks_malformed_managed_codex_config(tmp_path: Path) -> None
         codex_config = codex_home / ".codex/config.toml"
         codex_config.parent.mkdir(parents=True)
         original_codex_config = (
-            'model = "gpt-5"\n'
-            "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT\n"
-            "[otel]\n"
-            'environment = "prod"\n'
+            'model = "gpt-5"\n# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT\n[otel]\nenvironment = "prod"\n'
         )
         codex_config.write_text(original_codex_config)
 
