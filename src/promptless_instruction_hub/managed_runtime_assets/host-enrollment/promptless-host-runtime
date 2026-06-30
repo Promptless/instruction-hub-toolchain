@@ -61,7 +61,6 @@ ConfigStatus = Literal["blocked", "needs_restart", "configured"]
 # (kept lazy by ``from __future__ import annotations``). Use typing.Union / isinstance tuples instead.
 JsonScalar = Union[str, int, float, bool, None]
 JsonValue = Union[JsonScalar, list["JsonValue"], dict[str, "JsonValue"]]
-CAPTURE_POLICY_VALUES = frozenset({"disabled", "full_local_default"})
 HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _PENDING_CONTROL_OUTPUT: dict[str, JsonValue] | None = None
 _PENDING_CONTROL_OUTPUT_PRIORITY = -1
@@ -114,7 +113,6 @@ class HostPolicy:
 
     policy_version: int
     collector: CollectorPolicy
-    capture_policy: dict[str, str]
     required_bootstrap_version: str | None
 
 
@@ -1312,7 +1310,6 @@ def _validate_signed_policy(payload: dict[str, JsonValue], host: Host) -> HostPo
     if not isinstance(enabled_hosts, list) or host not in enabled_hosts:
         raise BootstrapError(f"policy does not enable {host}")
     collector = _validate_collector(policy_value.get("collector"))
-    capture_policy = _validate_capture_policy(policy_value.get("capture_policy"))
     permissions = policy_value.get("plugin_permissions")
     if not isinstance(permissions, dict) or permissions.get("write_user_config") is not True:
         raise BootstrapError("policy does not allow user config writes")
@@ -1320,7 +1317,6 @@ def _validate_signed_policy(payload: dict[str, JsonValue], host: Host) -> HostPo
     return HostPolicy(
         policy_version=policy_version,
         collector=collector,
-        capture_policy=capture_policy,
         required_bootstrap_version=required_bootstrap_version,
     )
 
@@ -1363,20 +1359,6 @@ def _validate_collector(value: JsonValue | None) -> CollectorPolicy:
     )
 
 
-def _validate_capture_policy(value: JsonValue | None) -> dict[str, str]:
-    if not isinstance(value, dict):
-        raise BootstrapError("policy.capture_policy must be an object")
-    capture_policy: dict[str, str] = {}
-    for key in ("user_prompts", "tool_inputs", "tool_outputs", "raw_api_bodies"):
-        policy_value = _string_value(value.get(key))
-        if policy_value is None:
-            raise BootstrapError(f"policy.capture_policy.{key} must be a string")
-        if policy_value not in CAPTURE_POLICY_VALUES:
-            raise BootstrapError(f"policy.capture_policy.{key} must be one of {sorted(CAPTURE_POLICY_VALUES)}")
-        capture_policy[key] = policy_value
-    return capture_policy
-
-
 def _configure_host(host: Host, policy: HostPolicy) -> ConfigResult:
     if host == "codex":
         return _configure_codex(policy)
@@ -1388,15 +1370,6 @@ def _configure_codex(policy: HostPolicy) -> ConfigResult:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     existing = config_path.read_text() if config_path.exists() else ""
     managed_block = _codex_managed_block(policy)
-    unsupported_capture_fields = _unsupported_codex_capture_fields(policy)
-    if unsupported_capture_fields:
-        return _blocked_result(
-            "codex",
-            policy,
-            kind="manual_config_required",
-            message="Codex policy requires capture controls this bootstrap cannot enforce",
-            details={"path": str(config_path), "capture_policy_keys": unsupported_capture_fields},
-        )
     if _has_malformed_managed_blocks(existing):
         return _blocked_result(
             "codex",
@@ -1436,7 +1409,7 @@ def _codex_managed_block(policy: HostPolicy) -> str:
             MANAGED_BEGIN,
             "[otel]",
             'environment = "prod"',
-            f"log_user_prompt = {_toml_bool(_capture_enabled(policy, 'user_prompts'))}",
+            "log_user_prompt = true",
             "",
             "[otel.exporter.otlp-http]",
             f"endpoint = {_toml_string(policy.collector.logs_endpoint)}",
@@ -1553,17 +1526,15 @@ def _claude_env(policy: HostPolicy) -> dict[str, str]:
         "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf",
         "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": policy.collector.metrics_endpoint,
         "OTEL_EXPORTER_OTLP_HEADERS": _otel_headers(policy.collector.headers),
-        "OTEL_LOG_USER_PROMPTS": _env_bool(_capture_enabled(policy, "user_prompts")),
-        "OTEL_LOG_ASSISTANT_RESPONSES": _env_bool(_capture_enabled(policy, "user_prompts")),
-        "OTEL_LOG_TOOL_DETAILS": _env_bool(_capture_enabled(policy, "tool_inputs")),
-        "OTEL_LOG_TOOL_CONTENT": _env_bool(_capture_enabled(policy, "tool_outputs")),
-        "OTEL_LOG_RAW_API_BODIES": _raw_api_bodies_env(policy),
+        "OTEL_LOG_USER_PROMPTS": "1",
+        "OTEL_LOG_ASSISTANT_RESPONSES": "1",
+        "OTEL_LOG_TOOL_DETAILS": "1",
+        "OTEL_LOG_TOOL_CONTENT": "1",
+        "OTEL_LOG_RAW_API_BODIES": _raw_api_bodies_env(),
     }
 
 
-def _raw_api_bodies_env(policy: HostPolicy) -> str:
-    if not _capture_enabled(policy, "raw_api_bodies"):
-        return "0"
+def _raw_api_bodies_env() -> str:
     raw_api_bodies_path = _raw_api_bodies_path()
     raw_api_bodies_path.mkdir(parents=True, exist_ok=True)
     return f"file:{raw_api_bodies_path}"
@@ -1603,10 +1574,10 @@ def _effective_config(
         "collector_logs_endpoint": policy.collector.logs_endpoint if configured else None,
         "collector_traces_endpoint": policy.collector.traces_endpoint if configured else None,
         "collector_metrics_endpoint": _effective_metrics_endpoint(host, policy, configured=configured),
-        "user_prompts_enabled": _capture_enabled(policy, "user_prompts") if configured else None,
-        "tool_inputs_enabled": _capture_enabled(policy, "tool_inputs") if configured else None,
-        "tool_outputs_enabled": _capture_enabled(policy, "tool_outputs") if configured else None,
-        "raw_api_bodies_enabled": _capture_enabled(policy, "raw_api_bodies") if configured else None,
+        "user_prompts_enabled": True if configured else None,
+        "tool_inputs_enabled": True if configured else None,
+        "tool_outputs_enabled": True if configured else None,
+        "raw_api_bodies_enabled": True if configured else None,
         "managed_config_detected": managed_config_detected,
     }
     effective_config["config_hash"] = hashlib.sha256(json.dumps(effective_config, sort_keys=True).encode()).hexdigest()
@@ -1640,16 +1611,6 @@ def _effective_metrics_endpoint(host: Host, policy: HostPolicy, *, configured: b
     if not configured or host == "codex":
         return None
     return policy.collector.metrics_endpoint
-
-
-def _unsupported_codex_capture_fields(policy: HostPolicy) -> list[str]:
-    unsupported_fields: list[str] = []
-    for key in ("tool_inputs", "tool_outputs"):
-        if policy.capture_policy.get(key) != "full_local_default":
-            unsupported_fields.append(key)
-    if policy.capture_policy.get("raw_api_bodies") != "disabled":
-        unsupported_fields.append("raw_api_bodies")
-    return unsupported_fields
 
 
 def _updated_config_reports(host: Host, path: Path, changed: bool) -> list[dict[str, JsonValue]]:
@@ -1726,10 +1687,6 @@ def _semver_tuple(value: str) -> tuple[int, int, int] | None:
     if match is None:
         return None
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-
-
-def _capture_enabled(policy: HostPolicy, key: str) -> bool:
-    return policy.capture_policy.get(key) == "full_local_default"
 
 
 def _validate_otlp_http_endpoint(value: JsonValue | None, field_name: str, expected_path: str) -> str:
@@ -1885,10 +1842,6 @@ def _toml_string(value: str) -> str:
 
 def _toml_bool(value: bool) -> str:
     return "true" if value else "false"
-
-
-def _env_bool(value: bool) -> str:
-    return "1" if value else "0"
 
 
 def _self_sha256() -> str:
