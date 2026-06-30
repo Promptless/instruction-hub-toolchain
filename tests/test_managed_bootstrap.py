@@ -372,8 +372,14 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"
+        assert claude_settings["env"]["OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT"] == "1073741824"
+        assert claude_settings["env"]["OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT"] == "1073741824"
+        assert claude_settings["env"]["OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT"] == "1073741824"
         assert claude_settings["env"]["OTEL_LOG_USER_PROMPTS"] == "1"
         assert claude_settings["env"]["OTEL_LOG_ASSISTANT_RESPONSES"] == "0"
+        assert claude_settings["env"]["OTEL_LOG_TOOL_DETAILS"] == "1"
+        assert claude_settings["env"]["OTEL_LOG_TOOL_CONTENT"] == "1"
+        assert claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"] == "0"
 
         assert len(server.session_requests) == 2
         codex_callback_state = _callback_state(server.session_requests[0]["callback_url"], "codex callback_url")

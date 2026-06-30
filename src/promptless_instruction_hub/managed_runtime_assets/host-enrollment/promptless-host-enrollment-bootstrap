@@ -47,6 +47,7 @@ STATE_FILE_NAME = "host-enrollment-state.json"
 HTTP_TIMEOUT_SECONDS = 10
 ENROLLMENT_POLL_DEADLINE_SECONDS = 35
 CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
+OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT_BYTES = 1024 * 1024 * 1024
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
 BOOTSTRAP_AUTH_FLAG_ENV = "PIGS_FLY"
 OPEN_BROWSER_ENV = "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER"
@@ -1227,6 +1228,9 @@ def _claude_env(policy: HostPolicy) -> dict[str, str]:
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": policy.collector.traces_endpoint,
         "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": policy.collector.metrics_endpoint,
         "OTEL_EXPORTER_OTLP_HEADERS": _otel_headers(policy.collector.headers),
+        "OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT": str(OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT_BYTES),
+        "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT": str(OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT_BYTES),
+        "OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT": str(OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT_BYTES),
         "OTEL_LOG_USER_PROMPTS": _env_bool(_capture_enabled(policy, "user_prompts")),
         # Claude Code falls back to OTEL_LOG_USER_PROMPTS for assistant responses
         # when unset. Keep responses off until policy exposes an explicit field.
