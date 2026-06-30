@@ -175,22 +175,15 @@ def main() -> int:
     parser.add_argument("--host", choices=("auto", "codex", "claude"), default="auto")
     parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
     args = parser.parse_args()
+    host = _resolve_host(args.host)
     try:
-        return _run(args.host, quiet=args.quiet)
+        return _run(host, quiet=args.quiet)
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
-        _emit(
-            {
-                "status": "error",
-                "host": _host_for_error_report(args.host),
-                "message": _redact_text(str(exc)),
-            },
-            quiet=args.quiet,
-        )
+        _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=args.quiet)
         return 0
 
 
-def _run(host_arg: str, *, quiet: bool) -> int:
-    host = _resolve_host(host_arg)
+def _run(host: Host, *, quiet: bool) -> int:
     # Compute any plugin-update notice independent of the enrollment gate so every install (not
     # just enrolled hosts) learns when the Instruction Hub plugin version changed. Both Claude and
     # Codex render the SessionStart `systemMessage`. The new version is recorded only after the
@@ -351,12 +344,6 @@ def _resolve_host(host_arg: str) -> Host:
     if os.environ.get("CLAUDE_PLUGIN_ROOT"):
         return "claude"
     return "codex"
-
-
-def _host_for_error_report(host_arg: str) -> Host:
-    if host_arg == "codex" or host_arg == "claude":
-        return host_arg
-    return "claude" if os.environ.get("CLAUDE_PLUGIN_ROOT") else "codex"
 
 
 def _bootstrap_auth_flow_enabled() -> bool:
@@ -1149,6 +1136,14 @@ def _configure_codex(policy: HostPolicy) -> ConfigResult:
             message="Codex policy requires capture controls this bootstrap cannot enforce",
             details={"path": str(config_path), "capture_policy_keys": unsupported_capture_fields},
         )
+    if _has_malformed_managed_blocks(existing):
+        return _blocked_result(
+            "codex",
+            policy,
+            kind="manual_config_required",
+            message="Existing Codex managed telemetry markers are malformed",
+            details={"path": str(config_path)},
+        )
     unmanaged_source = _without_managed_block(existing)
     if _has_unmanaged_codex_otel_config(unmanaged_source):
         return _blocked_result(
@@ -1209,9 +1204,17 @@ def _has_unmanaged_codex_otel_config(existing: str) -> bool:
 
 
 def _without_managed_block(existing: str) -> str:
-    if existing.count(MANAGED_BEGIN) != 1 or existing.count(MANAGED_END) != 1:
-        return existing
-    return _managed_block_pattern().sub("", existing, count=1)
+    return _managed_block_pattern().sub("", existing)
+
+
+def _has_malformed_managed_blocks(existing: str) -> bool:
+    begin_count = existing.count(MANAGED_BEGIN)
+    end_count = existing.count(MANAGED_END)
+    if begin_count != end_count:
+        return begin_count > 0 or end_count > 0
+    if begin_count == 0:
+        return False
+    return sum(1 for _ in _managed_block_pattern().finditer(existing)) != begin_count
 
 
 def _managed_block_pattern() -> re.Pattern[str]:
@@ -1268,8 +1271,10 @@ def _read_settings(settings_path: Path) -> dict[str, JsonValue]:
 
 
 def _claude_env(policy: HostPolicy) -> dict[str, str]:
-    # Claude Code supports OTel through settings.json env keys.
-    # https://docs.anthropic.com/en/docs/claude-code/monitoring-usage
+    # Claude Code's inline content attributes are producer-bounded before export. Keep raw API
+    # bodies inline so the hosted collector receives them; file mode needs a separate uploader or
+    # file collector before we can claim those local body_ref files are ingested.
+    # https://code.claude.com/docs/en/monitoring-usage
     return {
         CLAUDE_MANAGED_ENV_MARKER: "1",
         "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
@@ -1390,8 +1395,10 @@ def _updated_config_reports(host: Host, path: Path, changed: bool) -> list[dict[
 
 
 def _replace_managed_block(existing: str, managed_block: str) -> str:
-    if MANAGED_BEGIN in existing and MANAGED_END in existing:
-        return _managed_block_pattern().sub(managed_block, existing, count=1)
+    existing_block = _managed_block_pattern().search(existing)
+    if existing_block is not None:
+        suffix = _managed_block_pattern().sub("", existing[existing_block.end() :])
+        return existing[: existing_block.start()] + managed_block + suffix
     prefix = existing.rstrip()
     if not prefix:
         return managed_block
@@ -1688,14 +1695,20 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
 
     Both Claude and Codex surface a message, and only for outcomes worth showing on a hook that
     runs every startup/resume: a fresh config write, a pending browser approval, a block, or an
-    error. The steady "already configured" and gate-disabled states stay silent so the hook does
-    not banner every session.
+    failure that needs user action. The steady "already configured" and gate-disabled states stay
+    silent so the hook does not banner every session.
     """
 
+    status = payload.get("status")
     host_label = HOST_DISPLAY_NAMES.get(_string_value(payload.get("host")) or "")
+    if status == "error":
+        host_name = host_label.name if host_label is not None else "the agent host"
+        details = _string_value(payload.get("message"))
+        if details:
+            return f"Promptless host enrollment failed for {host_name}: {details}"
+        return f"Promptless host enrollment failed for {host_name}. Check the hook diagnostic output."
     if host_label is None:
         return None
-    status = payload.get("status")
     if status == "needs_restart":
         return f"Promptless telemetry configured for {host_label.name}. Restart {host_label.name} to start telemetry."
     if status == "setup_pending":

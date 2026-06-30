@@ -111,6 +111,16 @@ others reuse the result or defer to a later session. The per-plugin
 `CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA` directories are intentionally not used for this
 state.
 
+For Claude Code, managed telemetry follows Claude's supported capture paths
+instead of relying on OpenTelemetry SDK attribute-length variables to override
+producer-side truncation. Inline tool content remains Claude-bounded OTel event
+content. When policy enables raw API body capture, the bootstrap uses inline
+`OTEL_LOG_RAW_API_BODIES=1` so request/response body events reach the configured
+collector through the standard OTel logs pipeline. Claude's `file:<dir>` mode can
+write untruncated local `body_ref` files, but the bootstrap must not enable or
+report that mode as ingested until a local collector or uploader publishes those
+files to Promptless.
+
 Before the customer-grade release, replace that script with a static native
 binary built and versioned by Promptless, then bundled into the toolchain
 release. Customer Instruction Hub repositories should not need Python, uv, Go,
