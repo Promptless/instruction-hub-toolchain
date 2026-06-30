@@ -928,7 +928,7 @@ def _claude_env(policy: HostPolicy) -> dict[str, str]:
         "OTEL_LOGS_EXPORTER": "otlp",
         "OTEL_METRICS_EXPORTER": "otlp",
         "OTEL_TRACES_EXPORTER": "otlp",
-        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
         "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": policy.collector.logs_endpoint,
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": policy.collector.traces_endpoint,
         "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": policy.collector.metrics_endpoint,
