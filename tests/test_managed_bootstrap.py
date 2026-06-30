@@ -705,6 +705,90 @@ def test_bootstrap_announces_plugin_update_per_host(tmp_path: Path) -> None:
         server.stop()
 
 
+def test_bootstrap_update_notice_tolerates_unreadable_state(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_data = tmp_path / "plugin-data"
+    plugin_data.mkdir()
+    # A corrupt state file must not turn an otherwise gate-disabled SessionStart into an error.
+    (plugin_data / "host-enrollment-state.json").write_text("{ not valid json")
+    home = tmp_path / "home"
+
+    payload, result = _run_bootstrap(
+        hub_root / "dist/codex/core",
+        "codex",
+        {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_DATA": str(plugin_data),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": "https://pig.promptless.ai",
+        },
+        expected_status="disabled",
+        enable_bootstrap=False,
+    )
+
+    assert payload["reason"] == "pigs_fly_not_enabled"
+    assert "systemMessage" not in payload
+    assert result.stderr == ""
+
+
+def test_bootstrap_defers_recording_update_until_notice_surfaces(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root, plugin_version="0.1.0")
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        plugin_data = tmp_path / "plugin-data"
+        plugin_data.mkdir()
+        state_path = plugin_data / "host-enrollment-state.json"
+
+        def claude_env(worker_base_url: str) -> dict[str, str]:
+            return {
+                "HOME": str(tmp_path / "claude-home"),
+                "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-home/.claude"),
+                "PLUGIN_DATA": str(plugin_data),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PROMPTLESS_WORKER_BASE_URL": worker_base_url,
+            }
+
+        def seen_claude_version() -> str:
+            state = json.loads(state_path.read_text())
+            versions = _json_mapping(
+                validate_json_value(state["last_seen_plugin_versions"], "last_seen_plugin_versions"),
+                "last_seen_plugin_versions",
+            )
+            return _json_string(versions["claude"], "last_seen_plugin_versions.claude")
+
+        # A first healthy session records v0.1.0 as seen.
+        _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env(server.base_url))
+        assert seen_claude_version() == "0.1.0"
+
+        # Upgrade, then hit a failing session (unreachable worker): the new version must NOT be
+        # marked seen, because its update notice was never surfaced.
+        build_hub(hub_root, plugin_version="0.2.0")
+        _run_bootstrap(
+            hub_root / "dist/claude/core",
+            "claude",
+            claude_env("http://127.0.0.1:9"),
+            expected_status="error",
+        )
+        assert seen_claude_version() == "0.1.0"
+
+        # The next healthy session still surfaces the one-time update notice and records v0.2.0.
+        recovered, _ = _run_bootstrap(
+            hub_root / "dist/claude/core", "claude", claude_env(server.base_url), expected_status="configured"
+        )
+        recovered_message = _json_string(recovered["systemMessage"], "systemMessage")
+        assert "0.2.0" in recovered_message and "0.1.0" in recovered_message
+        assert seen_claude_version() == "0.2.0"
+    finally:
+        server.stop()
+
+
 def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")

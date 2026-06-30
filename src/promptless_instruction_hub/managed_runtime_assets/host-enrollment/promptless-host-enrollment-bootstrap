@@ -156,12 +156,24 @@ def main() -> int:
 
 def _run(host_arg: str, *, quiet: bool) -> int:
     host = _resolve_host(host_arg)
-    # Surface a plugin-update notice independent of the enrollment gate so every install (not
-    # just enrolled hosts) learns when the Instruction Hub plugin version changed. Both Claude
-    # and Codex render the SessionStart `systemMessage`.
+    # Compute any plugin-update notice independent of the enrollment gate so every install (not
+    # just enrolled hosts) learns when the Instruction Hub plugin version changed. Both Claude and
+    # Codex render the SessionStart `systemMessage`. The new version is recorded only after the
+    # hook output is emitted below, so a later failure re-announces it on the next healthy session.
     plugin_root = _plugin_root()
     metadata = _load_runtime_metadata(plugin_root, host)
-    update_notice = _plugin_update_notice(metadata)
+    pending_update = _pending_plugin_update(metadata)
+    update_notice = pending_update.notice if pending_update is not None else None
+    exit_code = _run_host_enrollment(host, metadata, quiet=quiet, update_notice=update_notice)
+    # Reached only when the host enrollment step returned without raising, i.e. the SessionStart
+    # output (including any update notice) was emitted. A quiet run suppresses that output, so it
+    # does not consume the one-time notice.
+    if pending_update is not None and not quiet:
+        _record_plugin_version_seen(pending_update)
+    return exit_code
+
+
+def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, update_notice: str | None) -> int:
     if not _bootstrap_auth_flow_enabled():
         _emit(
             {"status": "disabled", "reason": "pigs_fly_not_enabled", "host": host},
@@ -226,32 +238,65 @@ def _run(host_arg: str, *, quiet: bool) -> int:
     return 0
 
 
-def _plugin_update_notice(metadata: RuntimeMetadata) -> str | None:
-    """Return a "plugin updated" message when the installed version changed since last seen, else None.
+@dataclass(frozen=True)
+class PendingPluginUpdate:
+    """The installed plugin version to record as seen for a host, with any one-time update notice."""
 
-    The installed version is read from the plugin's managed-runtime manifest each run; the last-seen
-    version is persisted in the host data dir (which survives plugin updates). The message shows once
-    per upgrade. It stays silent on a first install (nothing seen yet) and when the version is unknown,
-    so the rollout of this behavior does not falsely announce an update.
+    target: str
+    version: str
+    notice: str | None
+
+
+def _pending_plugin_update(metadata: RuntimeMetadata) -> PendingPluginUpdate | None:
+    """Return the plugin version to record plus any one-time update notice, or None when there is nothing to do.
+
+    The installed version comes from the plugin's managed-runtime manifest; the last-seen version is
+    read from the host data dir (which survives plugin updates), keyed by host so a data dir shared
+    between Claude and Codex tracks each separately. This is read-only and best-effort: a missing,
+    unwritable, or corrupt data dir must never turn an otherwise healthy or gate-disabled SessionStart
+    into an error, so state I/O and parse failures yield no notice. The notice is None on a first
+    install (nothing seen yet); the version is still returned so the caller can record it.
     """
 
     current_version = metadata.plugin_version
     if current_version == "unknown":
         return None
-    state_path = _state_path()
-    with _state_file_lock(state_path):
-        state = _load_state(state_path)
-        # Key by host so a data dir shared between Claude and Codex tracks each version separately.
-        seen_versions = _json_mapping_or_empty(state.get("last_seen_plugin_versions"))
+    try:
+        state_path = _state_path()
+        with _state_file_lock(state_path):
+            seen_versions = _json_mapping_or_empty(_load_state(state_path).get("last_seen_plugin_versions"))
         last_seen_version = _string_value(seen_versions.get(metadata.target))
-        if last_seen_version == current_version:
-            return None
-        seen_versions[metadata.target] = current_version
-        state["last_seen_plugin_versions"] = seen_versions
-        _write_state(state_path, state)
-    if last_seen_version is None:
+    except (OSError, BootstrapError):
         return None
-    return f"Promptless Instruction Hub updated to v{current_version} (was v{last_seen_version})."
+    if last_seen_version == current_version:
+        return None
+    notice = (
+        None
+        if last_seen_version is None
+        else f"Promptless Instruction Hub updated to v{current_version} (was v{last_seen_version})."
+    )
+    return PendingPluginUpdate(target=metadata.target, version=current_version, notice=notice)
+
+
+def _record_plugin_version_seen(pending: PendingPluginUpdate) -> None:
+    """Persist the installed plugin version as seen for the host, preserving other state.
+
+    Called only after the SessionStart output (including any update notice) has been emitted, so a
+    failure before output leaves the prior version and re-announces next time. Best-effort: state I/O
+    failures are swallowed so recording never breaks a session. Re-reads state under the lock so a
+    credential written by the enrollment step in the same run is preserved.
+    """
+
+    try:
+        state_path = _state_path()
+        with _state_file_lock(state_path):
+            state = _load_state(state_path)
+            seen_versions = _json_mapping_or_empty(state.get("last_seen_plugin_versions"))
+            seen_versions[pending.target] = pending.version
+            state["last_seen_plugin_versions"] = seen_versions
+            _write_state(state_path, state)
+    except (OSError, BootstrapError):
+        return
 
 
 def _resolve_host(host_arg: str) -> Host:
