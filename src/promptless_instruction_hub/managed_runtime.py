@@ -31,12 +31,10 @@ MISSING_RUNTIME_ROOT_MESSAGE = (
     "Update the host CLI or reinstall the Promptless plugin."
 )
 MISSING_RUNTIME_FILE_MESSAGE = (
-    "Promptless Instruction Hub hook could not find its managed runtime. "
-    "Reinstall the Promptless plugin."
+    "Promptless Instruction Hub hook could not find its managed runtime. Reinstall the Promptless plugin."
 )
 MISSING_PYTHON_MESSAGE = (
-    "Promptless Instruction Hub hook could not find python3. "
-    "Install Python 3 or reinstall the Promptless plugin."
+    "Promptless Instruction Hub hook could not find python3. Install Python 3 or reinstall the Promptless plugin."
 )
 
 _ASSET_ROOT = Path(__file__).parent / "managed_runtime_assets" / HOST_RUNTIME_ASSET_DIR
