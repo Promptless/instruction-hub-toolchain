@@ -1682,7 +1682,9 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
 
         advanced_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
         advanced_sources = _json_mapping(advanced_ledger["sources"], "ledger.sources")
-        advanced_source = _json_mapping(advanced_sources[_json_string(chunk["source_path_hash"], "source_path_hash")], "source")
+        advanced_source = _json_mapping(
+            advanced_sources[_json_string(chunk["source_path_hash"], "source_path_hash")], "source"
+        )
         assert advanced_source["end_offset"] == transcript_path.stat().st_size
     finally:
         server.stop()
@@ -1843,6 +1845,7 @@ def _run_runtime_json(
     assert result.stderr == ""
     payload = validate_json_value(json.loads(result.stdout), "runtime command stdout")
     return _json_mapping(payload, "runtime command stdout"), result
+
 
 def _run_collect(
     plugin_root: Path,
@@ -2214,7 +2217,10 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/v0/traces/batches":
             target = parse_qs(parsed.query).get("target")
-            if target not in (["codex"], ["claude"]) or self.headers.get("Authorization") != "Bearer plihost_localcredential":
+            if (
+                target not in (["codex"], ["claude"])
+                or self.headers.get("Authorization") != "Bearer plihost_localcredential"
+            ):
                 self.send_response(401)
                 self.end_headers()
                 return
