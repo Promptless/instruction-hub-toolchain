@@ -4,8 +4,10 @@ import datetime as dt
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -768,6 +770,42 @@ def test_bootstrap_rejects_pending_callback_approval_url_outside_dashboard_route
 
         assert "hosted enrollment start request failed with HTTP 400" in str(payload["message"])
         assert not (home / ".codex/config.toml").exists()
+        assert server.poll_requests == []
+        assert server.policy_requests == []
+        assert server.check_ins == []
+    finally:
+        server.stop()
+
+
+def test_bootstrap_fails_fast_when_browser_pending_callback_rejects_approval_url(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer(pending_approval_url_override="https://attacker.example/instruction-hub/enroll")
+    server.start()
+    try:
+        home = tmp_path / "home"
+        result = subprocess.run(
+            [str(hub_root / "dist/codex/core/bin" / HOST_RUNTIME_BIN), "ensure", "--host", "codex"],
+            env=_clean_env(
+                HOME=str(home),
+                CODEX_HOME=str(home / ".codex"),
+                PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+                PROMPTLESS_WORKER_BASE_URL=server.base_url,
+                PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER="1",
+                BROWSER=_async_urlopen_browser_command(tmp_path / "fake-browser.py"),
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=15,
+        )
+
+        assert result.returncode == 0
+        payload = _assert_session_start_streams(result.stdout, result.stderr, "error")
+        assert payload["message"] == "host enrollment approval URL did not match dashboard enrollment route"
+        assert not (home / ".codex/config.toml").exists()
+        assert len(server.session_requests) == 1
         assert server.poll_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
@@ -1732,6 +1770,32 @@ def _clean_env(**overrides: str) -> dict[str, str]:
     if "PROMPTLESS_WORKER_BASE_URL" in env and "PROMPTLESS_DASHBOARD_BASE_URL" not in env:
         env["PROMPTLESS_DASHBOARD_BASE_URL"] = env["PROMPTLESS_WORKER_BASE_URL"]
     return env
+
+
+def _async_urlopen_browser_command(path: Path) -> str:
+    path.write_text(
+        """
+import subprocess
+import sys
+
+target_url = sys.argv[1]
+subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import sys, urllib.error, urllib.request\\n"
+        "try:\\n"
+        "    urllib.request.urlopen(sys.argv[1], timeout=10).read()\\n"
+        "except urllib.error.HTTPError:\\n"
+        "    pass\\n",
+        target_url,
+    ],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+""".lstrip()
+    )
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(path))} %s"
 
 
 def _json_mapping(value: JsonValue, field_path: str) -> dict[str, JsonValue]:

@@ -1024,9 +1024,12 @@ class _EnrollmentCallbackServer:
                     if len(values) == 1:
                         payload[key] = values[0]
                 if payload.get("status") == "pending":
-                    approval_url = _pending_callback_approval_url(payload, callback_server._routes)
-                    if approval_url is None:
-                        body = b"Promptless enrollment callback rejected approval URL."
+                    try:
+                        approval_url = _validate_pending_callback_approval_url(payload, callback_server._routes)
+                    except BootstrapError as exc:
+                        callback_server._payload = {"status": "error", "message": str(exc)}
+                        callback_server._event.set()
+                        body = f"Promptless enrollment callback rejected approval URL: {exc}".encode()
                         self.send_response(400)
                         self.send_header("Content-Type", "text/plain; charset=utf-8")
                         self.send_header("Content-Length", str(len(body)))
@@ -1057,6 +1060,9 @@ class _EnrollmentCallbackServer:
 
 def _enrollment_session_from_callback(context: EnrollmentContext, payload: dict[str, str]) -> EnrollmentSession:
     status = payload.get("status")
+    if status == "error":
+        message = _non_empty(payload.get("message")) or "host enrollment callback failed"
+        raise BootstrapError(message)
     if status not in {"pending", "approved"}:
         raise BootstrapError("host enrollment callback had invalid status")
     session_id = _non_empty(payload.get("session_id"))
@@ -1083,19 +1089,14 @@ def _enrollment_session_from_callback(context: EnrollmentContext, payload: dict[
     )
 
 
-def _pending_callback_approval_url(payload: dict[str, str], routes: HostedEnrollmentRoutes) -> str | None:
-    if payload.get("status") != "pending":
-        return None
+def _validate_pending_callback_approval_url(payload: dict[str, str], routes: HostedEnrollmentRoutes) -> str:
     approval_url = _non_empty(payload.get("approval_url"))
     if approval_url is None:
-        return None
-    try:
-        parsed = _validate_http_redirect_url(approval_url, "host enrollment approval URL")
-    except BootstrapError:
-        return None
+        raise BootstrapError("host enrollment pending callback missing approval URL")
+    parsed = _validate_http_redirect_url(approval_url, "host enrollment approval URL")
     dashboard_origin = urlsplit(routes.dashboard_base_url)
     if parsed.path != routes.approval_path or not _same_url_origin(parsed, dashboard_origin):
-        return None
+        raise BootstrapError("host enrollment approval URL did not match dashboard enrollment route")
     return approval_url
 
 
