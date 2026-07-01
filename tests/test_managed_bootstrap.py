@@ -18,13 +18,23 @@ from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, validate_json_value
 
-BOOTSTRAP_BIN = "promptless-host-enrollment-bootstrap"
+HOST_RUNTIME_BIN = "promptless-host-runtime"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
+LAST_STATUS_REL_PATH = Path(".promptless/instruction-hub/last-bootstrap-status.json")
+BROWSER_ENROLLMENT_MESSAGE = (
+    "Promptless Instruction Governance telemetry is starting browser-based enrollment. "
+    "Approve the Promptless browser tab to continue."
+)
 
 
 def _host_state_path(home: Path) -> Path:
     """Return the host-global enrollment state file shared by every plugin for one user/home."""
     return home / HOST_STATE_REL_PATH
+
+
+def _last_status_path(home: Path) -> Path:
+    """Return the last host-global bootstrap status file for debugging failed hook runs."""
+    return home / LAST_STATUS_REL_PATH
 
 
 def _assert_no_promptless_directory(root: Path) -> None:
@@ -39,28 +49,28 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
 
     for target in ("codex", "claude"):
         plugin_root = hub_root / "dist" / target / "core"
-        bootstrap_path = plugin_root / "bin" / BOOTSTRAP_BIN
+        bootstrap_path = plugin_root / "bin" / HOST_RUNTIME_BIN
         assert bootstrap_path.exists()
         assert os.access(bootstrap_path, os.X_OK)
         hooks = json.loads((plugin_root / "hooks/hooks.json").read_text())
         hook = hooks["hooks"]["SessionStart"][0]["hooks"][0]
         if target == "claude":
             hook_command = hook["command"]
-            assert hook_command == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host claude'
+            assert hook_command == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host claude'
         else:
             hook_command = hook["command"]
-            assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{BOOTSTRAP_BIN}" --host codex'
+            assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host codex'
         assert "--quiet" not in hook_command
         assert hook["timeout"] == 90
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
-        assert runtime["id"] == "host-enrollment-bootstrap"
+        assert runtime["id"] == "host-runtime"
         assert runtime["status"] == "included"
         assert runtime["target"] == target
-        assert runtime["version"] == "0.1.0"
+        assert runtime["version"] == "0.2.0"
         assert runtime["channel"] == "stable"
-        assert runtime["path"] == f"bin/{BOOTSTRAP_BIN}"
+        assert runtime["path"] == f"bin/{HOST_RUNTIME_BIN}"
         assert len(runtime["sha256"]) == 64
 
     codex_manifest = json.loads((hub_root / "dist/codex/core/.codex-plugin/plugin.json").read_text())
@@ -68,12 +78,149 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
 
     for target in ("cursor", "gemini"):
         plugin_root = hub_root / "dist" / target / "core"
-        assert not (plugin_root / "bin" / BOOTSTRAP_BIN).exists()
+        assert not (plugin_root / "bin" / HOST_RUNTIME_BIN).exists()
         assert not (plugin_root / "hub.managed-runtimes.json").exists()
 
     release_manifest = json.loads((hub_root / "hub.release.json").read_text())
     assert {runtime["target"] for runtime in release_manifest["managed_runtimes"]} == {"codex", "claude"}
     _assert_no_promptless_directory(hub_root)
+
+
+def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    runtime_path = plugin_root / "bin" / HOST_RUNTIME_BIN
+    home = tmp_path / "home"
+
+    missing_command = subprocess.run(
+        [str(runtime_path)],
+        env=_clean_env(HOME=str(home), PLUGIN_ROOT=str(plugin_root)),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert missing_command.returncode == 2
+    assert "usage:" in missing_command.stderr
+
+    payload, _ = _run_runtime_json(
+        plugin_root,
+        ["version", "--json"],
+        {"HOME": str(home), "PLUGIN_ROOT": str(plugin_root)},
+    )
+    assert payload["id"] == "host-runtime"
+    assert payload["name"] == HOST_RUNTIME_BIN
+    assert payload["version"] == "0.2.0"
+    assert payload["channel"] == "stable"
+    assert len(_json_string(payload["sha256"], "sha256")) == 64
+
+    text_version = subprocess.run(
+        [str(runtime_path), "version"],
+        env=_clean_env(HOME=str(home), PLUGIN_ROOT=str(plugin_root)),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert text_version.returncode == 0
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.0\n"
+    assert text_version.stderr == ""
+
+
+def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        enroll_payload, _ = _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        assert enroll_payload["status"] == "enrolled"
+        assert enroll_payload["host"] == "codex"
+        assert enroll_payload["credential_id"] == "22222222-2222-4222-8222-222222222222"
+        assert not (home / ".codex/config.toml").exists()
+        assert len(server.session_requests) == 1
+        assert len(server.poll_requests) == 1
+        assert server.policy_requests == []
+        assert server.check_ins == []
+
+        status_payload, _ = _run_runtime_json(
+            plugin_root,
+            ["status", "--host", "codex"],
+            env,
+        )
+        assert status_payload["status"] == "ok"
+        status_state = _json_mapping(status_payload["state"], "status.state")
+        status_config = _json_mapping(status_payload["config"], "status.config")
+        assert status_state["credential_count"] == 1
+        assert status_state["pending_enrollment_count"] == 0
+        assert status_config["managed_config_detected"] is False
+        assert len(server.session_requests) == 1
+        assert len(server.poll_requests) == 1
+        assert server.policy_requests == []
+        assert server.check_ins == []
+
+        _run_bootstrap(plugin_root, "codex", env)
+        assert (home / ".codex/config.toml").exists()
+        assert len(server.session_requests) == 1
+        assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
+        assert len(server.check_ins) == 1
+
+        configured_status, _ = _run_runtime_json(
+            plugin_root,
+            ["status", "--host", "codex"],
+            env,
+        )
+        configured_state = _json_mapping(configured_status["state"], "configured.state")
+        configured_config = _json_mapping(configured_status["config"], "configured.config")
+        host_instance_id = _json_string(configured_state["host_instance_id"], "host_instance_id")
+        assert configured_state["credential_count"] == 1
+        assert configured_state["last_seen_plugin_version"] == "0.1.0"
+        assert configured_config["managed_config_detected"] is True
+        assert len(server.session_requests) == 1
+        assert len(server.check_ins) == 1
+
+        reset_payload, _ = _run_runtime_json(
+            plugin_root,
+            ["reset", "--host", "codex", "--yes"],
+            env,
+        )
+        assert reset_payload == {
+            "credentials_removed": 1,
+            "host": "codex",
+            "pending_enrollments_removed": 0,
+            "status": "reset",
+        }
+        state_after_reset = json.loads(_host_state_path(home).read_text())
+        assert state_after_reset["host_instance_id"] == host_instance_id
+        assert state_after_reset["last_seen_plugin_versions"] == {"codex": "0.1.0"}
+        assert state_after_reset["credentials"] == {}
+        assert state_after_reset["pending_enrollments"] == {}
+        assert (home / ".codex/config.toml").exists()
+        assert len(server.session_requests) == 1
+        assert len(server.check_ins) == 1
+
+        reset_status, _ = _run_runtime_json(
+            plugin_root,
+            ["status", "--host", "codex"],
+            env,
+        )
+        reset_state = _json_mapping(reset_status["state"], "reset.state")
+        reset_config = _json_mapping(reset_status["config"], "reset.config")
+        assert reset_state["credential_count"] == 0
+        assert reset_state["last_seen_plugin_version"] == "0.1.0"
+        assert reset_config["managed_config_detected"] is True
+    finally:
+        server.stop()
 
 
 def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: Path) -> None:
@@ -83,7 +230,7 @@ def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: 
     home = tmp_path / "home"
 
     result = subprocess.run(
-        [str(hub_root / "dist/codex/core/bin" / BOOTSTRAP_BIN), "--host", "codex"],
+        [str(hub_root / "dist/codex/core/bin" / HOST_RUNTIME_BIN), "ensure", "--host", "codex"],
         env=_clean_env(
             HOME=str(home),
             CODEX_HOME=str(home / ".codex"),
@@ -99,10 +246,17 @@ def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: 
     payload = _assert_session_start_streams(result.stdout, result.stderr, "error")
     message = _json_string(payload["systemMessage"], "systemMessage")
     assert "Promptless host enrollment failed for Codex" in message
+    last_status = _json_mapping(
+        validate_json_value(json.loads(_last_status_path(home).read_text()), "last bootstrap status"),
+        "last bootstrap status",
+    )
+    assert last_status["status"] == "error"
+    assert last_status["host"] == "codex"
+    assert "emitted_at" in last_status
     assert not (home / ".codex/config.toml").exists()
 
     quiet_result = subprocess.run(
-        [str(hub_root / "dist/codex/core/bin" / BOOTSTRAP_BIN), "--host", "codex", "--quiet"],
+        [str(hub_root / "dist/codex/core/bin" / HOST_RUNTIME_BIN), "ensure", "--host", "codex", "--quiet"],
         env=_clean_env(
             HOME=str(home),
             CODEX_HOME=str(home / ".codex"),
@@ -119,7 +273,7 @@ def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: 
     assert quiet_result.stderr == ""
 
 
-def test_bootstrap_requires_local_pigs_fly_flag_before_auth_flow(tmp_path: Path) -> None:
+def test_bootstrap_runs_without_local_dogfood_gate(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
@@ -136,16 +290,22 @@ def test_bootstrap_requires_local_pigs_fly_flag_before_auth_flow(tmp_path: Path)
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
-            expected_status="disabled",
-            enable_bootstrap=False,
         )
 
-        assert payload["reason"] == "pigs_fly_not_enabled"
-        assert result.stdout == ""
-        assert not (home / ".codex/config.toml").exists()
-        assert server.session_requests == []
-        assert server.policy_requests == []
-        assert server.check_ins == []
+        stdout_payload = _json_mapping(validate_json_value(json.loads(result.stdout), "bootstrap stdout"), "stdout")
+        stdout_message = _json_string(stdout_payload["systemMessage"], "systemMessage")
+        assert stdout_message == _json_string(payload["systemMessage"], "systemMessage")
+        assert "Restart Codex" in stdout_message
+        assert any(
+            diagnostic.get("status") == "browser_enrollment_starting"
+            and diagnostic.get("systemMessage") == BROWSER_ENROLLMENT_MESSAGE
+            for diagnostic in _bootstrap_diagnostics(result.stderr)
+        )
+        assert payload["status"] == "needs_restart"
+        assert (home / ".codex/config.toml").exists()
+        assert len(server.session_requests) == 1
+        assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
+        assert len(server.check_ins) == 1
     finally:
         server.stop()
 
@@ -169,79 +329,26 @@ def test_bootstrap_surfaces_browser_open_failure(tmp_path: Path) -> None:
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
                 "PROMPTLESS_DASHBOARD_BASE_URL": "https://app.gopromptless.ai",
             },
-            expected_status="error",
+            expected_status="setup_pending",
         )
 
+        assert payload["reason"] == "browser_launch_failed"
         message = _json_string(payload["systemMessage"], "systemMessage")
-        assert "Promptless host enrollment failed for Claude Code" in message
-        assert "could not open the Promptless enrollment browser" in message
+        assert "Promptless host enrollment could not open a browser for Claude Code" in message
         state = json.loads(_host_state_path(home).read_text())
         assert _json_string(state["host_instance_id"], "host_instance_id").startswith("host-")
         assert "credentials" not in state
         assert "pending_enrollments" not in state
-        assert "last_seen_plugin_versions" not in state
+        seen_versions = _json_mapping(
+            validate_json_value(state["last_seen_plugin_versions"], "last seen plugin versions"),
+            "last seen plugin versions",
+        )
+        assert seen_versions["claude"] == "0.1.0"
         assert server.session_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
     finally:
         server.stop()
-
-
-@pytest.fixture(scope="module")
-def codex_plugin_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Build the generated Codex plugin once for the flag-parsing assertions."""
-
-    hub_root = tmp_path_factory.mktemp("flag-hub") / "hub"
-    init_hub(hub_root)
-    build_hub(hub_root)
-    return hub_root / "dist/codex/core"
-
-
-@pytest.mark.parametrize(
-    ("flag_value", "expected_status"),
-    [
-        ("1", "error"),
-        ("true", "error"),
-        ("True", "error"),
-        ("TRUE", "error"),
-        (" true ", "error"),
-        ("0", "disabled"),
-        ("false", "disabled"),
-        ("", "disabled"),
-        ("2", "disabled"),
-    ],
-)
-def test_bootstrap_flag_accepts_truthy_values(
-    tmp_path: Path,
-    codex_plugin_root: Path,
-    flag_value: str,
-    expected_status: str,
-) -> None:
-    """The dogfood gate accepts case-insensitive ``1``/``true`` and rejects everything else.
-
-    A truthy flag lets the bootstrap proceed past the gate to the worker call, which fails
-    fast against an unreachable worker (``error``). A falsy or unrecognized flag short-circuits
-    before any network contact (``disabled``).
-    """
-
-    home = tmp_path / "home"
-    payload, _ = _run_bootstrap(
-        codex_plugin_root,
-        "codex",
-        {
-            "HOME": str(home),
-            "CODEX_HOME": str(home / ".codex"),
-            "PLUGIN_ROOT": str(codex_plugin_root),
-            "PROMPTLESS_WORKER_BASE_URL": "http://127.0.0.1:9",
-            "PIGS_FLY": flag_value,
-        },
-        expected_status=expected_status,
-        enable_bootstrap=False,
-    )
-
-    if expected_status == "disabled":
-        assert payload["reason"] == "pigs_fly_not_enabled"
-    assert not (home / ".codex/config.toml").exists()
 
 
 def test_bootstrap_persists_host_global_state_file(tmp_path: Path) -> None:
@@ -401,7 +508,7 @@ def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path
     build_hub(hub_root)
     home = tmp_path / "home"
 
-    payload, _ = _run_bootstrap(
+    payload, result = _run_bootstrap(
         hub_root / "dist/codex/core",
         "codex",
         {
@@ -417,6 +524,56 @@ def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path
     assert "worker base URL must use HTTPS unless" in str(payload["message"])
     message = _json_string(payload["systemMessage"], "systemMessage")
     assert "Promptless host enrollment failed for Codex" in message
+    assert result.stdout != ""
+
+
+def test_bootstrap_reports_browser_launch_failure_without_claiming_browser_opened(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, result = _run_bootstrap(
+            hub_root / "dist/claude/core",
+            "claude",
+            {
+                "HOME": str(home),
+                "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_DASHBOARD_BASE_URL": "https://app.gopromptless.ai",
+            },
+            expected_status="setup_pending",
+        )
+
+        assert payload["reason"] == "browser_launch_failed"
+        message = _json_string(payload["systemMessage"], "systemMessage")
+        assert "could not open a browser" in message
+        assert "browser tab that opened" not in message
+        assert _json_string(payload["terminalSequence"], "terminalSequence").startswith("\x1b]777;notify;Promptless;")
+        stdout_payload = _json_mapping(validate_json_value(json.loads(result.stdout), "bootstrap stdout"), "stdout")
+        assert set(stdout_payload) == {"systemMessage", "terminalSequence"}
+        assert stdout_payload["systemMessage"] == message
+        assert stdout_payload["terminalSequence"] == payload["terminalSequence"]
+        last_status = _json_mapping(
+            validate_json_value(json.loads(_last_status_path(home).read_text()), "last bootstrap status"),
+            "last bootstrap status",
+        )
+        assert last_status["status"] == "setup_pending"
+        assert last_status["reason"] == "browser_launch_failed"
+        assert last_status["systemMessage"] == payload["systemMessage"]
+        assert last_status["terminalSequence"] == payload["terminalSequence"]
+        assert "emitted_at" in last_status
+        assert not (home / ".claude/settings.json").exists()
+        assert server.session_requests == []
+        assert server.policy_requests == []
+        assert server.poll_requests == []
+        assert server.check_ins == []
+    finally:
+        server.stop()
 
 
 def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Path) -> None:
@@ -463,20 +620,28 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         claude_settings = json.loads((claude_home / ".claude/settings.json").read_text())
         assert claude_settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
         assert claude_settings["env"]["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] == "1"
+        assert claude_settings["env"]["ENABLE_BETA_TRACING_DETAILED"] == "1"
+        assert claude_settings["env"]["BETA_TRACING_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
         assert claude_settings["env"]["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://127.0.0.1:4318"
+        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_LOGS_PROTOCOL"] == "http/protobuf"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
+        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"] == "http/protobuf"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
+        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"] == "http/protobuf"
+        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] == "http://127.0.0.1:4318/v1/metrics"
         assert claude_settings["env"]["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"
         assert "OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
         assert "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
         assert "OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
         assert claude_settings["env"]["OTEL_LOG_USER_PROMPTS"] == "1"
-        assert claude_settings["env"]["OTEL_LOG_ASSISTANT_RESPONSES"] == "0"
+        assert claude_settings["env"]["OTEL_LOG_ASSISTANT_RESPONSES"] == "1"
         assert claude_settings["env"]["OTEL_LOG_TOOL_DETAILS"] == "1"
         assert claude_settings["env"]["OTEL_LOG_TOOL_CONTENT"] == "1"
-        assert claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"] == "0"
+        assert claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"] == (
+            f"file:{claude_home / '.promptless/instruction-hub/claude-raw-api-bodies'}"
+        )
 
         assert len(server.session_requests) == 2
         codex_callback_state = _callback_state(server.session_requests[0]["callback_url"], "codex callback_url")
@@ -487,7 +652,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
         assert server.session_requests[0]["package_id"] == "core"
-        assert server.session_requests[0]["bootstrap_version"] == "0.1.0"
+        assert server.session_requests[0]["bootstrap_version"] == "0.2.0"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
         assert server.session_requests[0]["pending_callback"] == "1"
         assert server.session_requests[1]["target"] == "claude"
@@ -509,12 +674,18 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "policy_version",
                 "status",
             }
-            assert check_in["bootstrap_version"] == "0.1.0"
+            assert check_in["bootstrap_version"] == "0.2.0"
             assert check_in["plugin_version"] == "0.1.0"
             assert check_in["status"] == "needs_restart"
             assert check_in["needs_restart"] is True
             effective_config = _json_mapping(check_in["effective_config"], "effective_config")
             assert effective_config["configured"] is True
+            assert not {
+                "user_prompts_enabled",
+                "tool_inputs_enabled",
+                "tool_outputs_enabled",
+                "raw_api_bodies_enabled",
+            }.intersection(effective_config)
         codex_effective_config = _json_mapping(server.check_ins[0]["effective_config"], "codex effective_config")
         claude_effective_config = _json_mapping(server.check_ins[1]["effective_config"], "claude effective_config")
         assert codex_effective_config["collector_metrics_endpoint"] is None
@@ -613,44 +784,6 @@ def test_bootstrap_missing_managed_runtime_manifest_uses_default_metadata(tmp_pa
         assert server.check_ins[0]["plugin_version"] == "unknown"
         assert "plugin_id" not in server.check_ins[0]
         assert "package_id" not in server.check_ins[0]
-    finally:
-        server.stop()
-
-
-def test_bootstrap_blocks_unsupported_codex_capture_policy_values(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    build_hub(hub_root)
-    server = _FakeWorkerServer(
-        policy=_policy_with(
-            capture_policy={
-                "user_prompts": "full_local_default",
-                "tool_inputs": "disabled",
-                "tool_outputs": "full_local_default",
-                "raw_api_bodies": "disabled",
-            }
-        )
-    )
-    server.start()
-    try:
-        codex_home = tmp_path / "codex-home"
-        _run_bootstrap(
-            hub_root / "dist/codex/core",
-            "codex",
-            {
-                "HOME": str(codex_home),
-                "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
-            expected_status="blocked",
-        )
-
-        assert not (codex_home / ".codex/config.toml").exists()
-        drift_reports = _json_list(server.check_ins[0]["drift_reports"], "drift_reports")
-        first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
-        details = _json_mapping(first_drift_report["details"], "drift_reports[0].details")
-        assert details["capture_policy_keys"] == ["tool_inputs"]
     finally:
         server.stop()
 
@@ -792,6 +925,8 @@ def test_bootstrap_repairs_stale_managed_host_otel_config(tmp_path: Path) -> Non
                 "PROMPTLESS_MANAGED_HOST_ENROLLMENT": "1",
                 "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
                 "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": False,
+                "ENABLE_BETA_TRACING_DETAILED": "0",
+                "BETA_TRACING_ENDPOINT": "http://stale.local:4318/v1/traces",
                 "OTEL_LOGS_EXPORTER": "none",
                 "OTEL_METRICS_EXPORTER": ["bad"],
                 "OTEL_TRACES_EXPORTER": "none",
@@ -832,19 +967,26 @@ def test_bootstrap_repairs_stale_managed_host_otel_config(tmp_path: Path) -> Non
         assert updated_env["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
         assert updated_env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
         assert updated_env["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] == "1"
+        assert updated_env["ENABLE_BETA_TRACING_DETAILED"] == "1"
+        assert updated_env["BETA_TRACING_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
         assert updated_env["OTEL_LOGS_EXPORTER"] == "otlp"
         assert updated_env["OTEL_METRICS_EXPORTER"] == "otlp"
         assert updated_env["OTEL_TRACES_EXPORTER"] == "otlp"
         assert updated_env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+        assert updated_env["OTEL_EXPORTER_OTLP_LOGS_PROTOCOL"] == "http/protobuf"
         assert updated_env["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
+        assert updated_env["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"] == "http/protobuf"
         assert updated_env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
+        assert updated_env["OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"] == "http/protobuf"
         assert updated_env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] == "http://127.0.0.1:4318/v1/metrics"
         assert updated_env["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"
         assert updated_env["OTEL_LOG_USER_PROMPTS"] == "1"
-        assert updated_env["OTEL_LOG_ASSISTANT_RESPONSES"] == "0"
+        assert updated_env["OTEL_LOG_ASSISTANT_RESPONSES"] == "1"
         assert updated_env["OTEL_LOG_TOOL_DETAILS"] == "1"
         assert updated_env["OTEL_LOG_TOOL_CONTENT"] == "1"
-        assert updated_env["OTEL_LOG_RAW_API_BODIES"] == "0"
+        assert updated_env["OTEL_LOG_RAW_API_BODIES"] == (
+            f"file:{claude_home / '.promptless/instruction-hub/claude-raw-api-bodies'}"
+        )
         claude_backups = list(claude_settings.parent.glob("settings.json.*.bak"))
         assert len(claude_backups) == 1
         assert json.loads(claude_backups[0].read_text()) == original_claude_settings
@@ -917,7 +1059,7 @@ def test_build_appends_bootstrap_hook_to_existing_hook_asset(tmp_path: Path) -> 
     hooks = json.loads((hub_root / "dist/codex/core/hooks/hooks.json").read_text())
     session_start = hooks["hooks"]["SessionStart"]
     assert session_start[0]["hooks"][0]["command"] == "existing-hook"
-    assert f"bin/{BOOTSTRAP_BIN}" in session_start[1]["hooks"][0]["command"]
+    assert f"bin/{HOST_RUNTIME_BIN}" in session_start[1]["hooks"][0]["command"]
 
 
 def test_build_rejects_malformed_existing_hook_asset(tmp_path: Path) -> None:
@@ -1030,15 +1172,11 @@ def test_bootstrap_surfaces_enrollment_message_only_on_change(tmp_path: Path) ->
         server.stop()
 
 
-def test_bootstrap_configures_claude_raw_api_bodies_inline_capture(tmp_path: Path) -> None:
+def test_bootstrap_configures_claude_raw_api_bodies_file_capture(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    policy = _policy_with()
-    capture_policy = _json_mapping(policy["policy"], "policy")["capture_policy"]
-    assert isinstance(capture_policy, dict)
-    capture_policy["raw_api_bodies"] = "full_local_default"
-    server = _FakeWorkerServer(policy=policy)
+    server = _FakeWorkerServer()
     server.start()
     try:
         claude_home = tmp_path / "claude-home"
@@ -1055,10 +1193,13 @@ def test_bootstrap_configures_claude_raw_api_bodies_inline_capture(tmp_path: Pat
         )
 
         claude_settings = json.loads((claude_home / ".claude/settings.json").read_text())
-        assert claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"] == "1"
+        raw_api_bodies_env = _json_string(claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"], "raw API bodies env")
+        assert raw_api_bodies_env.startswith("file:")
+        raw_api_bodies_path = Path(raw_api_bodies_env.removeprefix("file:"))
+        assert raw_api_bodies_path == claude_home / ".promptless/instruction-hub/claude-raw-api-bodies"
         assert claude_settings["env"]["OTEL_LOG_TOOL_CONTENT"] == "1"
         assert "OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
-        assert not (claude_home / ".promptless/instruction-hub/claude-raw-api-bodies").exists()
+        assert raw_api_bodies_path.is_dir()
     finally:
         server.stop()
 
@@ -1081,12 +1222,20 @@ def test_bootstrap_stdout_stays_codex_schema_safe(tmp_path: Path) -> None:
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
-        # Fresh config write surfaces a restart banner: stdout is exactly {"systemMessage": ...}.
-        _, configured_result = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        # Fresh browser enrollment records the start banner in diagnostics but leaves stdout for
+        # the final actionable restart message.
+        configured_payload, configured_result = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
         configured_stdout = _json_mapping(
             validate_json_value(json.loads(configured_result.stdout), "codex stdout"), "codex stdout"
         )
         assert set(configured_stdout) == {"systemMessage"}
+        assert configured_stdout["systemMessage"] == configured_payload["systemMessage"]
+        assert "Restart Codex" in _json_string(configured_stdout["systemMessage"], "systemMessage")
+        assert any(
+            diagnostic.get("status") == "browser_enrollment_starting"
+            and diagnostic.get("systemMessage") == BROWSER_ENROLLMENT_MESSAGE
+            for diagnostic in _bootstrap_diagnostics(configured_result.stderr)
+        )
         for forbidden_key in ("status", "host", "needs_restart", "reason"):
             assert forbidden_key not in configured_stdout
 
@@ -1155,7 +1304,8 @@ def test_bootstrap_update_notice_tolerates_unreadable_state(tmp_path: Path) -> N
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
     home = tmp_path / "home"
-    # A corrupt state file must not turn an otherwise gate-disabled SessionStart into an error.
+    # Without the local dogfood gate, a corrupt host-global state file must surface as a
+    # diagnosable bootstrap error before enrollment proceeds.
     state_path = _host_state_path(home)
     state_path.parent.mkdir(parents=True)
     state_path.write_text("{ not valid json")
@@ -1169,13 +1319,12 @@ def test_bootstrap_update_notice_tolerates_unreadable_state(tmp_path: Path) -> N
             "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
             "PROMPTLESS_WORKER_BASE_URL": "https://pig.promptless.ai",
         },
-        expected_status="disabled",
-        enable_bootstrap=False,
+        expected_status="error",
     )
 
-    assert payload["reason"] == "pigs_fly_not_enabled"
-    assert "systemMessage" not in payload
-    assert result.stdout == ""
+    assert "invalid JSON" in _json_string(payload["message"], "message")
+    assert "Promptless host enrollment failed for Codex" in _json_string(payload["systemMessage"], "systemMessage")
+    assert result.stdout != ""
 
 
 def test_bootstrap_defers_recording_update_until_notice_surfaces(tmp_path: Path) -> None:
@@ -1279,7 +1428,6 @@ def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_pa
         "expired",
         "missing-write-permission",
         "wrong-logs-path",
-        "invalid-capture-value",
     ],
 )
 def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> None:
@@ -1312,7 +1460,7 @@ def test_bootstrap_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> 
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(policy=_policy_with(required_bootstrap_version="0.2.0"))
+    server = _FakeWorkerServer(policy=_policy_with(required_bootstrap_version="0.3.0"))
     server.start()
     try:
         home = tmp_path / "home"
@@ -1365,29 +1513,48 @@ def test_bootstrap_rejects_invalid_check_in_success_response(tmp_path: Path) -> 
 
 # Codex validates SessionStart hook *stdout* against a strict schema (serde deny_unknown_fields) and
 # rejects any key outside continue/stopReason/systemMessage/suppressOutput/hookSpecificOutput with
-# "hook returned invalid session start JSON output". The bootstrap therefore keeps stdout to the
-# user-facing systemMessage alone (empty when silent) and writes its diagnostic status object — the
-# status/host/needs_restart/reason fields Codex would reject — to stderr, which is not parsed.
+# "hook returned invalid session start JSON output". The bootstrap therefore keeps Codex stdout to
+# the user-facing systemMessage alone (empty when silent) and writes its diagnostic status object —
+# the status/host/needs_restart/reason fields Codex would reject — to stderr, which is not parsed.
+# Claude also accepts terminalSequence, so Claude-only runs may include it to trigger a visible
+# terminal notification when the TUI does not render the hook's systemMessage prominently.
 CODEX_SAFE_STDOUT_KEYS = frozenset({"systemMessage"})
+CLAUDE_SAFE_STDOUT_KEYS = frozenset({"systemMessage", "terminalSequence"})
+
+
+def _bootstrap_diagnostics(stderr: str) -> list[dict[str, JsonValue]]:
+    return [
+        _json_mapping(validate_json_value(json.loads(line), "bootstrap diagnostic"), "bootstrap diagnostic")
+        for line in stderr.splitlines()
+        if line.strip()
+    ]
 
 
 def _parse_session_start_streams(stdout: str, stderr: str) -> dict[str, JsonValue]:
-    """Assert the SessionStart hook stream split and return the stderr diagnostic object.
+    """Assert the SessionStart hook stream split and return the final stderr diagnostic object.
 
-    stderr always carries the full diagnostic (status/host/...); stdout carries only the
-    schema-safe systemMessage and stays empty when there is no user-facing message.
+    stderr carries full diagnostics (status/host/...) as JSONL; stdout carries the selected
+    schema-safe systemMessage/terminalSequence object and stays empty when there is no user-facing
+    message.
     """
 
-    diagnostic = _json_mapping(
-        validate_json_value(json.loads(stderr.strip()), "bootstrap diagnostic"), "bootstrap diagnostic"
-    )
+    diagnostics = _bootstrap_diagnostics(stderr)
+    assert diagnostics, "bootstrap emitted no diagnostic status"
+    diagnostic = diagnostics[-1]
     stdout_text = stdout.strip()
     if stdout_text:
         control = _json_mapping(validate_json_value(json.loads(stdout_text), "bootstrap stdout"), "bootstrap stdout")
-        assert set(control) <= CODEX_SAFE_STDOUT_KEYS, f"stdout leaks non-schema keys: {sorted(set(control))}"
-        assert control["systemMessage"] == diagnostic["systemMessage"]
+        control_source = next(
+            (emitted for emitted in diagnostics if all(emitted.get(key) == value for key, value in control.items())),
+            None,
+        )
+        assert control_source is not None, "stdout control output did not match any diagnostic"
+        allowed_keys = CLAUDE_SAFE_STDOUT_KEYS if control_source.get("host") == "claude" else CODEX_SAFE_STDOUT_KEYS
+        assert set(control) <= allowed_keys, f"stdout leaks non-schema keys: {sorted(set(control))}"
     else:
-        assert "systemMessage" not in diagnostic
+        for emitted in diagnostics:
+            assert "systemMessage" not in emitted
+            assert "terminalSequence" not in emitted
     return diagnostic
 
 
@@ -1405,11 +1572,10 @@ def _run_bootstrap(
     env: dict[str, str],
     *,
     expected_status: str = "needs_restart",
-    enable_bootstrap: bool = True,
 ) -> tuple[dict[str, JsonValue], subprocess.CompletedProcess[str]]:
     result = subprocess.run(
-        [str(plugin_root / "bin" / BOOTSTRAP_BIN), "--host", host],
-        env=_clean_env(enable_bootstrap=enable_bootstrap, **env),
+        [str(plugin_root / "bin" / HOST_RUNTIME_BIN), "ensure", "--host", host],
+        env=_clean_env(**env),
         text=True,
         capture_output=True,
         check=False,
@@ -1423,13 +1589,37 @@ def _run_bootstrap(
     return payload, result
 
 
+def _run_runtime_json(
+    plugin_root: Path,
+    args: list[str],
+    env: dict[str, str],
+    *,
+    expected_returncode: int = 0,
+) -> tuple[dict[str, JsonValue], subprocess.CompletedProcess[str]]:
+    result = subprocess.run(
+        [str(plugin_root / "bin" / HOST_RUNTIME_BIN), *args],
+        env=_clean_env(**env),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == expected_returncode
+    assert "plihost_localcredential" not in result.stdout
+    assert "plihost_localcredential" not in result.stderr
+    assert "plihenroll_devicecode" not in result.stdout
+    assert "plihenroll_devicecode" not in result.stderr
+    assert result.stderr == ""
+    payload = validate_json_value(json.loads(result.stdout), "runtime command stdout")
+    return _json_mapping(payload, "runtime command stdout"), result
+
+
 def _start_bootstrap(plugin_root: Path, host: str, env: dict[str, str]) -> subprocess.Popen[str]:
     process_env = _clean_env()
     process_env.update(env)
     if "PROMPTLESS_WORKER_BASE_URL" in process_env and "PROMPTLESS_DASHBOARD_BASE_URL" not in process_env:
         process_env["PROMPTLESS_DASHBOARD_BASE_URL"] = process_env["PROMPTLESS_WORKER_BASE_URL"]
     return subprocess.Popen(
-        [str(plugin_root / "bin" / BOOTSTRAP_BIN), "--host", host],
+        [str(plugin_root / "bin" / HOST_RUNTIME_BIN), "ensure", "--host", host],
         env=process_env,
         text=True,
         stdout=subprocess.PIPE,
@@ -1480,14 +1670,12 @@ def _clone_plugin_with_identity(source_plugin: Path, destination: Path, *, plugi
     return destination
 
 
-def _clean_env(*, enable_bootstrap: bool = True, **overrides: str) -> dict[str, str]:
+def _clean_env(**overrides: str) -> dict[str, str]:
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES": "1",
         "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER": "0",
     }
-    if enable_bootstrap:
-        env["PIGS_FLY"] = "True"
     env.update(overrides)
     if "PROMPTLESS_WORKER_BASE_URL" in env and "PROMPTLESS_DASHBOARD_BASE_URL" not in env:
         env["PROMPTLESS_DASHBOARD_BASE_URL"] = env["PROMPTLESS_WORKER_BASE_URL"]
@@ -1585,7 +1773,6 @@ def _invalid_policy(case: str) -> dict[str, JsonValue]:
     payload = _policy_with()
     policy = _json_mapping(payload["policy"], "policy")
     collector = _json_mapping(policy["collector"], "policy.collector")
-    capture_policy = _json_mapping(policy["capture_policy"], "policy.capture_policy")
     permissions = _json_mapping(policy["plugin_permissions"], "policy.plugin_permissions")
 
     if case == "expired":
@@ -1594,8 +1781,6 @@ def _invalid_policy(case: str) -> dict[str, JsonValue]:
         permissions["write_user_config"] = False
     elif case == "wrong-logs-path":
         collector["otlp_http_logs_endpoint"] = "http://127.0.0.1:4318/not-logs"
-    elif case == "invalid-capture-value":
-        capture_policy["tool_outputs"] = "full"
     else:
         raise AssertionError(f"unhandled invalid policy case: {case}")
     return payload
@@ -1821,17 +2006,11 @@ def _signed_policy() -> dict[str, JsonValue]:
                 "tls": None,
             },
             "enabled_hosts": ["codex", "claude"],
-            "capture_policy": {
-                "user_prompts": "full_local_default",
-                "tool_inputs": "full_local_default",
-                "tool_outputs": "full_local_default",
-                "raw_api_bodies": "disabled",
-            },
             "plugin_permissions": {
                 "write_user_config": True,
                 "repair_user_config": True,
             },
-            "required_bootstrap_version": "0.1.0",
+            "required_bootstrap_version": "0.2.0",
         },
         "signature": "hmac-sha256-v1:test",
         "signed_at": now.isoformat(),
