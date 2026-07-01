@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import getpass
+import glob
+import gzip
 import hashlib
 import json
 import os
@@ -23,7 +26,7 @@ import uuid
 import webbrowser
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO, Literal, Union
@@ -47,16 +50,24 @@ MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_RUNTIME_MANIFEST = Path("hub.managed-runtimes.json")
 STATE_FILE_NAME = "host-enrollment-state.json"
 LAST_STATUS_FILE_NAME = "last-bootstrap-status.json"
+LEDGER_FILE_NAME = "host-runtime-ledger.json"
 RAW_API_BODIES_DIR_NAME = "claude-raw-api-bodies"
 HTTP_TIMEOUT_SECONDS = 10
 ENROLLMENT_CALLBACK_DEADLINE_SECONDS = 300
 ENROLLMENT_POLL_DEADLINE_SECONDS = 35
+MAX_STDIN_BYTES = 1024 * 1024
+MAX_TRACE_BATCH_BYTES = 10 * 1024 * 1024
+MAX_UPLOAD_CHUNKS_PER_BATCH = 200
+SOURCE_READ_BLOCK_BYTES = 1024 * 1024
+IDLE_SESSION_GRACE_SECONDS = 12 * 60 * 60
 CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
 OPEN_BROWSER_ENV = "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER"
 CALLBACK_STATE_PARAM = "state"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
+LifecycleEvent = Literal["session_start", "stop", "session_end", "subagent_stop"]
+SourceEventKind = Literal["jsonl_range", "oversized_record"]
 
 # This bin runs under the host's own python3, which on macOS is the system Python 3.9
 # (/usr/bin/python3). Keep runtime-evaluated unions off the PEP 604 ``X | Y`` form (3.10+): these
@@ -187,10 +198,54 @@ class ConfigResult:
     effective_config: dict[str, JsonValue]
     drift_reports: list[dict[str, JsonValue]]
 
+@dataclass(frozen=True)
+class HookTraceContext:
+    """Trace context supplied by a host lifecycle hook."""
+
+    transcript_path: Path | None
+    agent_transcript_path: Path | None
+    session_id: str | None
+    parent_session_id: str | None
+    agent_id: str | None
+    agent_type: str | None
+
+
+@dataclass(frozen=True)
+class SourceEvent:
+    """A forward-only source-file range or local read error to upload."""
+
+    kind: SourceEventKind
+    path: Path
+    path_hash: str
+    start_offset: int
+    end_offset: int
+    byte_count: int
+    content_sha256: str | None = None
+    content: bytes | None = None
+    oversized_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class UploadBatch:
+    """A native trace upload request plus the source events it acknowledges."""
+
+    request: dict[str, JsonValue]
+    events: tuple[SourceEvent, ...]
+
+
+@dataclass
+class SourceLedger:
+    """Mutable native-source ledger loaded under the host-runtime lock."""
+
+    path: Path
+    is_new: bool
+    sources: dict[str, dict[str, JsonValue]]
+    reset_sources: set[str] = field(default_factory=set)
+    drift_reports: list[dict[str, JsonValue]] = field(default_factory=list)
+
 
 def main(argv: list[str] | None = None) -> int:
     """Run the requested host-runtime command."""
-
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
     if args.command == "version":
@@ -198,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
     host = _resolve_host(args.host)
     if args.command == "ensure":
         return _run_ensure_command(host, quiet=args.quiet)
+    if args.command == "collect":
+        return _run_collect_command(host, lifecycle=args.lifecycle, baseline=args.baseline, quiet=args.quiet)
     if args.command == "status":
         return _run_status_command(host)
     if args.command == "enroll":
@@ -215,6 +272,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ensure_parser = subcommands.add_parser("ensure", help="Enroll if needed and ensure host telemetry config")
     _add_host_argument(ensure_parser)
     ensure_parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
+
+    collect_parser = subcommands.add_parser("collect", help="Upload native trace JSONL changes")
+    _add_host_argument(collect_parser)
+    collect_parser.add_argument(
+        "--lifecycle",
+        choices=("session_start", "stop", "session_end", "subagent_stop"),
+        default=None,
+        help="Host lifecycle event that triggered collection",
+    )
+    collect_parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="On first run, record current source offsets without uploading historical ranges",
+    )
+    collect_parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
 
     status_parser = subcommands.add_parser("status", help="Print local host-runtime status as JSON")
     _add_host_argument(status_parser)
@@ -238,6 +310,17 @@ def _add_host_argument(parser: argparse.ArgumentParser) -> None:
 def _run_ensure_command(host: Host, *, quiet: bool) -> int:
     try:
         return _run_ensure(host, quiet=quiet)
+    except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
+        _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
+        return 0
+    finally:
+        _flush_control_output()
+
+def _run_collect_command(host: Host, *, lifecycle: str | None, baseline: bool, quiet: bool) -> int:
+    try:
+        event = _lifecycle_event(lifecycle)
+        hook_context = _hook_trace_context(_read_hook_context())
+        return _run_collect(host, lifecycle_event=event, hook_context=hook_context, baseline=baseline, quiet=quiet)
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
         _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
         return 0
@@ -405,6 +488,581 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
         update_notice=update_notice,
     )
     return 0
+
+def _run_collect(
+    host: Host,
+    *,
+    lifecycle_event: LifecycleEvent,
+    hook_context: HookTraceContext,
+    baseline: bool,
+    quiet: bool,
+) -> int:
+    plugin_root = _plugin_root()
+    metadata = _load_runtime_metadata(plugin_root, host)
+    worker_base_url = _worker_base_url()
+    dashboard_base_url = _dashboard_base_url()
+    context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+    credential = _cached_host_credential(context)
+    if credential is None:
+        _emit({"status": "trace_upload_skipped", "reason": "not_enrolled", "host": host}, quiet=quiet)
+        return 0
+
+    policy_url = _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
+    try:
+        signed_policy = _get_json(policy_url, credential.value, label="policy response")
+    except BootstrapAuthError:
+        _forget_cached_host_credential(context)
+        _emit({"status": "trace_upload_skipped", "reason": "credential_rejected", "host": host}, quiet=quiet)
+        return 0
+    policy = _validate_signed_policy(signed_policy, host)
+    if _requires_newer_bootstrap(policy.required_bootstrap_version, RUNTIME_VERSION):
+        _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
+        return 0
+
+    source_paths = _collect_source_paths(host, hook_context, lifecycle_event=lifecycle_event)
+    if not source_paths:
+        _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
+        return 0
+
+    upload_url = _worker_url(worker_base_url, f"/v0/traces/batches?{urlencode({'target': host})}")
+    ledger_path = _ledger_path()
+    uploaded_batch_count = 0
+    uploaded_chunk_count = 0
+    with _source_ledger_lock(ledger_path):
+        ledger = _load_source_ledger(ledger_path)
+        if ledger.is_new:
+            _baseline_source_offsets(ledger, source_paths)
+            _write_source_ledger(ledger)
+            _emit(
+                {
+                    "status": "trace_upload_baselined",
+                    "host": host,
+                    "source_count": len(source_paths),
+                    "drift_report_count": len(ledger.drift_reports),
+                },
+                quiet=quiet,
+            )
+            return 0
+        if baseline:
+            ledger.drift_reports.append({"kind": "native_trace_existing_ledger", "baseline": False})
+
+        for batch in _iter_upload_batches(
+            host=host,
+            metadata=metadata,
+            policy=policy,
+            lifecycle_event=lifecycle_event,
+            hook_context=hook_context,
+            ledger=ledger,
+            source_paths=source_paths,
+        ):
+            response = _post_upload_batch(upload_url, credential, policy, batch)
+            _advance_ledger_from_response(ledger, source_paths, response)
+            _write_source_ledger(ledger)
+            uploaded_batch_count += 1
+            uploaded_chunk_count += len(batch.events)
+
+    _emit(
+        {
+            "status": "trace_upload_complete",
+            "host": host,
+            "batch_count": uploaded_batch_count,
+            "chunk_count": uploaded_chunk_count,
+        },
+        quiet=quiet,
+    )
+    return 0
+
+
+def _lifecycle_event(value: str | None) -> LifecycleEvent:
+    if value in {"session_start", "stop", "session_end", "subagent_stop"}:
+        return value
+    return "session_start"
+
+
+def _read_hook_context() -> dict[str, JsonValue]:
+    if sys.stdin.isatty():
+        return {}
+    body = sys.stdin.buffer.read(MAX_STDIN_BYTES + 1)
+    if body == b"":
+        return {}
+    if len(body) > MAX_STDIN_BYTES:
+        raise BootstrapError("hook stdin JSON exceeds maximum supported size")
+    return _decode_json_object(body, "hook stdin")
+
+
+def _hook_trace_context(context: dict[str, JsonValue]) -> HookTraceContext:
+    transcript_path = _optional_hook_path(context.get("transcript_path"))
+    agent_transcript_path = _optional_hook_path(context.get("agent_transcript_path"))
+    return HookTraceContext(
+        transcript_path=transcript_path,
+        agent_transcript_path=agent_transcript_path,
+        session_id=_non_empty(_first_string(context, ("session_id", "conversation_id"))),
+        parent_session_id=_non_empty(_first_string(context, ("parent_session_id", "parent_conversation_id"))),
+        agent_id=_non_empty(_first_string(context, ("agent_id", "subagent_id", "agent_name"))),
+        agent_type=_non_empty(_first_string(context, ("agent_type", "subagent_type"))),
+    )
+
+
+def _optional_hook_path(value: JsonValue | None) -> Path | None:
+    text = _non_empty(_string_value(value))
+    if text is None:
+        return None
+    return Path(text).expanduser()
+
+
+def _first_string(context: dict[str, JsonValue], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = _string_value(context.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _collect_source_paths(
+    host: Host,
+    hook_context: HookTraceContext,
+    *,
+    lifecycle_event: LifecycleEvent,
+) -> tuple[Path, ...]:
+    explicit_paths: list[Path] = []
+    if lifecycle_event == "subagent_stop" and hook_context.agent_transcript_path is not None:
+        explicit_paths.append(hook_context.agent_transcript_path)
+    elif hook_context.transcript_path is not None:
+        explicit_paths.append(hook_context.transcript_path)
+    if hook_context.agent_transcript_path is not None and hook_context.agent_transcript_path not in explicit_paths:
+        explicit_paths.append(hook_context.agent_transcript_path)
+
+    ordered_paths: list[Path] = []
+    seen: set[str] = set()
+    for path in explicit_paths:
+        _append_unique_path(ordered_paths, seen, path)
+    for path in _idle_root_scan_paths(host):
+        _append_unique_path(ordered_paths, seen, path)
+    return tuple(ordered_paths)
+
+
+def _append_unique_path(paths: list[Path], seen: set[str], path: Path) -> None:
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+    except OSError:
+        resolved = path.expanduser().absolute()
+    key = str(resolved)
+    if key in seen:
+        return
+    seen.add(key)
+    paths.append(resolved)
+
+
+def _idle_root_scan_paths(host: Host) -> tuple[Path, ...]:
+    now = time.time()
+    result: list[Path] = []
+    for pattern in _native_trace_globs(host):
+        for raw_path in glob.iglob(pattern, recursive=True):
+            path = Path(raw_path)
+            if not path.is_file():
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if now - mtime < IDLE_SESSION_GRACE_SECONDS:
+                continue
+            result.append(path)
+    return tuple(sorted(result))
+
+
+def _native_trace_globs(host: Host) -> tuple[str, ...]:
+    if host == "claude":
+        return (str(Path.home() / ".claude/projects/**/*.jsonl"),)
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+    return (str(codex_home / "**/*.jsonl"),)
+
+
+def _ledger_path() -> Path:
+    override = _non_empty(os.environ.get("PROMPTLESS_HOST_RUNTIME_LEDGER"))
+    if override is not None:
+        return Path(override).expanduser()
+    return _state_path().with_name(LEDGER_FILE_NAME)
+
+
+@contextmanager
+def _source_ledger_lock(path: Path) -> Iterator[None]:
+    with _state_file_lock(path):
+        yield
+
+
+def _load_source_ledger(path: Path) -> SourceLedger:
+    if not path.exists():
+        return SourceLedger(path=path, is_new=True, sources={})
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        _quarantine_corrupt_ledger(path)
+        return SourceLedger(
+            path=path,
+            is_new=True,
+            sources={},
+            drift_reports=[{"kind": "native_trace_ledger_reset", "reason": "invalid_json"}],
+        )
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        _quarantine_corrupt_ledger(path)
+        return SourceLedger(
+            path=path,
+            is_new=True,
+            sources={},
+            drift_reports=[{"kind": "native_trace_ledger_reset", "reason": "unsupported_schema"}],
+        )
+    sources = value.get("sources")
+    if not isinstance(sources, dict):
+        _quarantine_corrupt_ledger(path)
+        return SourceLedger(
+            path=path,
+            is_new=True,
+            sources={},
+            drift_reports=[{"kind": "native_trace_ledger_reset", "reason": "invalid_sources"}],
+        )
+    valid_sources: dict[str, dict[str, JsonValue]] = {}
+    for raw_key, raw_source in sources.items():
+        key = _string_value(raw_key)
+        source = _json_mapping_or_empty(raw_source if isinstance(raw_source, dict) else None)
+        end_offset = _optional_int_value(source.get("end_offset"))
+        if key is None or len(key) != 64 or end_offset is None or end_offset < 0:
+            continue
+        valid_sources[key] = source
+    return SourceLedger(path=path, is_new=False, sources=valid_sources)
+
+
+def _quarantine_corrupt_ledger(path: Path) -> None:
+    try:
+        if not path.exists():
+            return
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        path.rename(path.with_name(f"{path.name}.corrupt-{timestamp}"))
+    except OSError:
+        return
+
+
+def _write_source_ledger(ledger: SourceLedger) -> None:
+    payload: dict[str, JsonValue] = {
+        "schema_version": 1,
+        "updated_at": _utc_now_iso(),
+        "sources": ledger.sources,
+    }
+    _atomic_write_text(ledger.path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    try:
+        ledger.path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _baseline_source_offsets(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> None:
+    for path in source_paths:
+        try:
+            end_offset = path.stat().st_size
+        except OSError:
+            continue
+        _record_ledger_offset(ledger, path, end_offset)
+
+
+def _iter_upload_batches(
+    *,
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    lifecycle_event: LifecycleEvent,
+    hook_context: HookTraceContext,
+    ledger: SourceLedger,
+    source_paths: tuple[Path, ...],
+) -> Iterator[UploadBatch]:
+    pending_events: list[SourceEvent] = []
+    pending_payloads: list[dict[str, JsonValue]] = []
+    pending_decoded_bytes = 0
+    for event in _iter_source_events(ledger, source_paths):
+        payload = _chunk_payload(event, lifecycle_event)
+        next_decoded_bytes = pending_decoded_bytes + event.byte_count
+        if (
+            pending_payloads
+            and (
+                len(pending_payloads) >= MAX_UPLOAD_CHUNKS_PER_BATCH
+                or next_decoded_bytes > MAX_TRACE_BATCH_BYTES
+            )
+        ):
+            yield _upload_batch(
+                host=host,
+                metadata=metadata,
+                policy=policy,
+                lifecycle_event=lifecycle_event,
+                hook_context=hook_context,
+                events=tuple(pending_events),
+                chunks=tuple(pending_payloads),
+            )
+            pending_events = []
+            pending_payloads = []
+            pending_decoded_bytes = 0
+        pending_events.append(event)
+        pending_payloads.append(payload)
+        pending_decoded_bytes += event.byte_count
+    if pending_events:
+        yield _upload_batch(
+            host=host,
+            metadata=metadata,
+            policy=policy,
+            lifecycle_event=lifecycle_event,
+            hook_context=hook_context,
+            events=tuple(pending_events),
+            chunks=tuple(pending_payloads),
+        )
+
+
+def _iter_source_events(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> Iterator[SourceEvent]:
+    for path in source_paths:
+        path_hash = _path_hash(path)
+        source = ledger.sources.get(path_hash)
+        start_offset = _optional_int_value(source.get("end_offset")) if source is not None else 0
+        if start_offset is None or start_offset < 0:
+            start_offset = 0
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            continue
+        if start_offset > file_size:
+            ledger.drift_reports.append(
+                {
+                    "kind": "native_trace_source_rewound",
+                    "source_path_hash": path_hash,
+                    "previous_end_offset": start_offset,
+                    "current_size": file_size,
+                }
+            )
+            ledger.reset_sources.add(path_hash)
+            start_offset = 0
+        if start_offset == file_size:
+            continue
+        with path.open("rb") as handle:
+            handle.seek(start_offset)
+            while handle.tell() < file_size:
+                record_start = handle.tell()
+                line = handle.readline()
+                if line == b"":
+                    break
+                record_end = handle.tell()
+                if not line.endswith(b"\n"):
+                    break
+                yield _source_event_for_line(path, path_hash, record_start, record_end, line)
+
+
+def _source_event_for_line(path: Path, path_hash: str, start_offset: int, end_offset: int, line: bytes) -> SourceEvent:
+    content_sha256 = hashlib.sha256(line).hexdigest()
+    if len(line) > MAX_TRACE_BATCH_BYTES:
+        return SourceEvent(
+            kind="oversized_record",
+            path=path,
+            path_hash=path_hash,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            byte_count=len(line),
+            content_sha256=content_sha256,
+            oversized_reason="decoded_size",
+        )
+    encoded = _gzip_base64(line)
+    if len(encoded.encode("ascii")) > MAX_TRACE_BATCH_BYTES:
+        return SourceEvent(
+            kind="oversized_record",
+            path=path,
+            path_hash=path_hash,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            byte_count=len(line),
+            content_sha256=content_sha256,
+            oversized_reason="encoded_size",
+        )
+    return SourceEvent(
+        kind="jsonl_range",
+        path=path,
+        path_hash=path_hash,
+        start_offset=start_offset,
+        end_offset=end_offset,
+        byte_count=len(line),
+        content_sha256=content_sha256,
+        content=line,
+    )
+
+
+def _chunk_payload(event: SourceEvent, lifecycle_event: LifecycleEvent) -> dict[str, JsonValue]:
+    if event.content_sha256 is None:
+        raise BootstrapError("source event missing content hash")
+    payload: dict[str, JsonValue] = {
+        "kind": event.kind,
+        "source_path_hash": event.path_hash,
+        "start_offset": event.start_offset,
+        "end_offset": event.end_offset,
+        "content_sha256": event.content_sha256,
+        "lifecycle_event": lifecycle_event,
+    }
+    if event.kind == "oversized_record":
+        payload["byte_count"] = event.byte_count
+        payload["oversized_reason"] = event.oversized_reason or "decoded_size"
+        return payload
+    if event.content is None:
+        raise BootstrapError("jsonl range event missing content")
+    payload["line_count"] = max(1, event.content.count(b"\n"))
+    payload["content_gzip_base64"] = _gzip_base64(event.content)
+    return payload
+
+
+def _gzip_base64(content: bytes) -> str:
+    return base64.b64encode(gzip.compress(content, mtime=0)).decode("ascii")
+
+
+def _upload_batch(
+    *,
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    lifecycle_event: LifecycleEvent,
+    hook_context: HookTraceContext,
+    events: tuple[SourceEvent, ...],
+    chunks: tuple[dict[str, JsonValue], ...],
+) -> UploadBatch:
+    request: dict[str, JsonValue] = {
+        "batch_id": _stable_upload_batch_id(host, policy, events),
+        "source": host,
+        "host": host,
+        "policy_version": policy.policy_version,
+        "collector_version": metadata.bootstrap_version,
+        "plugin_version": metadata.plugin_version,
+        "uploaded_at": _utc_now_iso(),
+        "chunks": list(chunks),
+    }
+    request.update(_native_request_context(hook_context, lifecycle_event))
+    return UploadBatch(request=request, events=events)
+
+
+def _native_request_context(hook_context: HookTraceContext, lifecycle_event: LifecycleEvent) -> dict[str, JsonValue]:
+    session_id = hook_context.session_id
+    parent_session_id = hook_context.parent_session_id
+    agent_id = hook_context.agent_id
+    agent_type = hook_context.agent_type
+    if lifecycle_event == "subagent_stop":
+        if parent_session_id is None:
+            parent_session_id = hook_context.session_id
+            session_id = None
+        if agent_id is None and hook_context.agent_transcript_path is not None:
+            agent_id = _path_hash(hook_context.agent_transcript_path)[:32]
+        if agent_type is None and agent_id is not None:
+            agent_type = "subagent"
+
+    result: dict[str, JsonValue] = {}
+    if session_id is not None:
+        result["session_id"] = session_id
+    if parent_session_id is not None and agent_id is not None:
+        result["parent_session_id"] = parent_session_id
+        result["agent_id"] = agent_id
+        if agent_type is not None:
+            result["agent_type"] = agent_type
+    return result
+
+
+def _stable_upload_batch_id(host: Host, policy: HostPolicy, events: tuple[SourceEvent, ...]) -> str:
+    material = {
+        "host": host,
+        "policy_version": policy.policy_version,
+        "ranges": [
+            {
+                "kind": event.kind,
+                "source_path_hash": event.path_hash,
+                "start_offset": event.start_offset,
+                "end_offset": event.end_offset,
+                "content_sha256": event.content_sha256,
+            }
+            for event in events
+        ],
+    }
+    return "native-" + hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[:48]
+
+
+def _post_upload_batch(
+    upload_url: str,
+    credential: HostCredential,
+    policy: HostPolicy,
+    batch: UploadBatch,
+) -> dict[str, JsonValue]:
+    response = _post_json_response(upload_url, credential.value, batch.request, label="trace batch response")
+    _validate_upload_response(response, policy, batch)
+    return response
+
+
+def _validate_upload_response(response: dict[str, JsonValue], policy: HostPolicy, batch: UploadBatch) -> None:
+    if response.get("accepted") is not True:
+        raise BootstrapError("trace batch response was not accepted")
+    if _string_value(response.get("batch_id")) != _string_value(batch.request.get("batch_id")):
+        raise BootstrapError("trace batch response batch_id did not match upload request")
+    if response.get("policy_version") != policy.policy_version:
+        raise BootstrapError("trace batch response policy_version did not match applied policy")
+    if response.get("unparsed_record_count") != 0:
+        raise BootstrapError("trace batch response reported unparsed records")
+    expected_raw_count = sum(1 for event in batch.events if event.kind == "jsonl_range")
+    if response.get("raw_artifact_count") != expected_raw_count:
+        raise BootstrapError("trace batch response raw_artifact_count did not match upload request")
+    expected_skipped_count = sum(1 for event in batch.events if event.kind == "oversized_record")
+    if response.get("skipped_record_count") != expected_skipped_count:
+        raise BootstrapError("trace batch response skipped_record_count did not match upload request")
+    if response.get("acknowledged_ranges") != _expected_acknowledged_ranges(batch.events):
+        raise BootstrapError("trace batch response acknowledged_ranges did not match upload request")
+
+
+def _advance_ledger_from_response(
+    ledger: SourceLedger,
+    source_paths: tuple[Path, ...],
+    response: dict[str, JsonValue],
+) -> None:
+    paths_by_hash = {_path_hash(path): path for path in source_paths}
+    acknowledged_ranges = response.get("acknowledged_ranges")
+    if not isinstance(acknowledged_ranges, list):
+        raise BootstrapError("trace batch response acknowledged_ranges must be a list")
+    for value in acknowledged_ranges:
+        acknowledged = _json_mapping_or_empty(value)
+        source_path_hash = _string_value(acknowledged.get("source_path_hash"))
+        end_offset = _optional_int_value(acknowledged.get("end_offset"))
+        if source_path_hash is None or end_offset is None:
+            raise BootstrapError("trace batch response acknowledged range is malformed")
+        path = paths_by_hash.get(source_path_hash)
+        if path is None:
+            raise BootstrapError("trace batch response acknowledged unknown source")
+        _record_ledger_offset(ledger, path, end_offset)
+
+
+def _expected_acknowledged_ranges(events: tuple[SourceEvent, ...]) -> list[dict[str, JsonValue]]:
+    return [
+        {
+            "kind": event.kind,
+            "source_path_hash": event.path_hash,
+            "start_offset": event.start_offset,
+            "end_offset": event.end_offset,
+            "content_sha256": event.content_sha256,
+        }
+        for event in events
+        if event.content_sha256 is not None
+    ]
+
+
+def _record_ledger_offset(ledger: SourceLedger, path: Path, end_offset: int) -> None:
+    path_hash = _path_hash(path)
+    existing = _json_mapping_or_empty(ledger.sources.get(path_hash))
+    previous_offset = 0 if path_hash in ledger.reset_sources else (_optional_int_value(existing.get("end_offset")) or 0)
+    ledger.sources[path_hash] = {
+        "path": str(path),
+        "end_offset": max(previous_offset, end_offset),
+        "updated_at": _utc_now_iso(),
+    }
+
+
+def _path_hash(path: Path) -> str:
+    return hashlib.sha256(str(path).encode()).hexdigest()
+
+
+def _utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _status_payload(host: Host) -> dict[str, JsonValue]:

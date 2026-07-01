@@ -93,7 +93,9 @@ stdlib-only Python script with `python3`:
 
 ```sh
 python3 "${PLUGIN_ROOT}/bin/promptless-host-runtime" ensure --host codex
+python3 "${PLUGIN_ROOT}/bin/promptless-host-runtime" collect --host codex --lifecycle stop --quiet
 python3 "${CLAUDE_PLUGIN_ROOT}/bin/promptless-host-runtime" ensure --host claude
+python3 "${CLAUDE_PLUGIN_ROOT}/bin/promptless-host-runtime" collect --host claude --lifecycle session_end --quiet
 ```
 
 The dogfood host runtime uses `PROMPTLESS_WORKER_BASE_URL` or the default
@@ -103,6 +105,17 @@ per-attempt state token for the approved session proof. It then polls the hosted
 runtime for a one-time per-host credential, caches that credential, and uses the
 host credential to fetch `/v0/host-enrollment/policy?target=...` and post
 `/v0/host-enrollment/check-ins`.
+
+The same runtime also uploads native host transcript JSONL ranges to
+`/v0/traces/batches?target=...`. SessionStart hooks run `ensure` and then a
+quiet first-run baseline; terminal lifecycle hooks (`Stop`, Claude
+`SessionEnd`, and `SubagentStop`) run collection only. Collection uses the hook
+stdin `transcript_path` or `agent_transcript_path` first, then scans idle
+host-native transcript roots as a catch-up path. The forward-only ledger lives at
+`~/.promptless/instruction-hub/host-runtime-ledger.json` or
+`PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads are authenticated with the
+same host credential and are gated by the same `enabled_hosts` policy used for
+OTEL config.
 
 Host enrollment is per host, not per plugin. The credential and pending approval
 are cached at a single host-global path (`~/.promptless/instruction-hub/`) and
@@ -128,10 +141,11 @@ those capture categories.
 
 The host runtime has one executable with subcommands. `ensure` is the hook-safe
 path that enrolls when needed, writes local host telemetry config, and posts a
-check-in. `enroll` acquires only the host credential. `status` prints local JSON
-without network, browser, config writes, or check-ins. `reset --yes` clears
-cached host credentials and pending enrollments while preserving the stable host
-id and last-seen plugin versions. `version` reports runtime metadata.
+check-in. `collect` is the non-blocking native JSONL upload path. `enroll`
+acquires only the host credential. `status` prints local JSON without network,
+browser, config writes, or check-ins. `reset --yes` clears cached host
+credentials and pending enrollments while preserving the stable host id and
+last-seen plugin versions. `version` reports runtime metadata.
 
 Before the customer-grade release, replace the dogfood Python implementation
 with a static native binary built and versioned by Promptless, then bundled into

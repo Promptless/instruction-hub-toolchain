@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import datetime as dt
+import gzip
 import json
 import os
 import re
@@ -56,22 +58,39 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert bootstrap_path.exists()
         assert os.access(bootstrap_path, os.X_OK)
         hooks = json.loads((plugin_root / "hooks/hooks.json").read_text())
-        hook = hooks["hooks"]["SessionStart"][0]["hooks"][0]
+        hook_events = hooks["hooks"]
+        expected_events = ("SessionStart", "Stop", "SubagentStop")
         if target == "claude":
-            hook_command = hook["command"]
-            assert hook_command == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host claude'
+            expected_events = ("SessionStart", "Stop", "SessionEnd", "SubagentStop")
+        assert set(hook_events) == set(expected_events)
+        session_start_hook = hook_events["SessionStart"][0]["hooks"][0]
+        if target == "claude":
+            command_prefix = f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}"'
         else:
-            hook_command = hook["command"]
-            assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host codex'
-        assert "--quiet" not in hook_command
+            command_prefix = f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}"'
+        assert session_start_hook["command"] == (
+            f"{command_prefix} ensure --host {target} && "
+            f"{command_prefix} collect --host {target} --lifecycle session_start --baseline --quiet"
+        )
         callback_deadline_match = re.search(
             r"^ENROLLMENT_CALLBACK_DEADLINE_SECONDS = (?P<value>\d+)$",
             bootstrap_path.read_text(),
             re.MULTILINE,
         )
         assert callback_deadline_match is not None
-        assert hook["timeout"] == 390
-        assert hook["timeout"] > int(callback_deadline_match.group("value"))
+        assert session_start_hook["timeout"] == 390
+        assert session_start_hook["timeout"] > int(callback_deadline_match.group("value"))
+        assert hook_events["SessionStart"][0]["matcher"] == "startup|resume"
+        for event_name, lifecycle in (
+            ("Stop", "stop"),
+            ("SessionEnd", "session_end"),
+            ("SubagentStop", "subagent_stop"),
+        ):
+            if event_name not in hook_events:
+                continue
+            hook = hook_events[event_name][0]["hooks"][0]
+            assert hook["command"] == f"{command_prefix} collect --host {target} --lifecycle {lifecycle} --quiet"
+            assert hook["timeout"] == 390
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
@@ -1546,7 +1565,7 @@ def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> N
         server.stop()
 
 
-def test_bootstrap_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> None:
+def test_bootstrap_blocks_when_worker_requires_different_runtime_version(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -1597,6 +1616,131 @@ def test_bootstrap_rejects_invalid_check_in_success_response(tmp_path: Path) -> 
 
         assert "check-in response was not accepted" in str(payload["message"])
         assert len(server.check_ins) == 1
+    finally:
+        server.stop()
+
+
+def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        second_record = b'{"kind":"stop","message":"upload"}\n'
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        assert server.trace_batches == []
+
+        baseline_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        baseline_sources = _json_mapping(baseline_ledger["sources"], "ledger.sources")
+        baseline_source = _json_mapping(next(iter(baseline_sources.values())), "ledger.sources[0]")
+        assert baseline_source["end_offset"] == len(first_record)
+
+        transcript_path.write_bytes(first_record + second_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        assert len(server.trace_batches) == 1
+        batch = server.trace_batches[0]
+        assert batch["source"] == "codex"
+        assert batch["host"] == "codex"
+        assert batch["session_id"] == "codex_session_1"
+        assert batch["policy_version"] == 1
+        assert batch["collector_version"] == "0.2.0"
+        chunks = _json_list(batch["chunks"], "batch.chunks")
+        assert len(chunks) == 1
+        chunk = _json_mapping(chunks[0], "batch.chunks[0]")
+        assert chunk["kind"] == "jsonl_range"
+        assert chunk["start_offset"] == len(first_record)
+        assert chunk["end_offset"] == len(first_record) + len(second_record)
+        assert chunk["lifecycle_event"] == "stop"
+        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_gzip_base64"], "content"))) == second_record
+
+        advanced_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        advanced_sources = _json_mapping(advanced_ledger["sources"], "ledger.sources")
+        advanced_source = _json_mapping(
+            advanced_sources[_json_string(chunk["source_path_hash"], "source_path_hash")], "source"
+        )
+        assert advanced_source["end_offset"] == transcript_path.stat().st_size
+    finally:
+        server.stop()
+
+
+def test_collect_uploads_subagent_transcript_with_parent_identity(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        agent_transcript_path = tmp_path / "codex-subagent.jsonl"
+        first_record = b'{"kind":"agent_start"}\n'
+        second_record = b'{"kind":"agent_stop"}\n'
+        agent_transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "parent_session_1", "transcript_path": str(agent_transcript_path)},
+        )
+        agent_transcript_path.write_bytes(first_record + second_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "subagent_stop", "--quiet"],
+            env,
+            {
+                "session_id": "parent_session_1",
+                "agent_id": "agent_1",
+                "agent_type": "worker",
+                "agent_transcript_path": str(agent_transcript_path),
+            },
+        )
+
+        assert len(server.trace_batches) == 1
+        batch = server.trace_batches[0]
+        assert "session_id" not in batch
+        assert batch["parent_session_id"] == "parent_session_1"
+        assert batch["agent_id"] == "agent_1"
+        assert batch["agent_type"] == "worker"
+        chunk = _json_mapping(_json_list(batch["chunks"], "batch.chunks")[0], "batch.chunks[0]")
+        assert chunk["lifecycle_event"] == "subagent_stop"
+        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_gzip_base64"], "content"))) == second_record
     finally:
         server.stop()
 
@@ -1701,6 +1845,30 @@ def _run_runtime_json(
     assert result.stderr == ""
     payload = validate_json_value(json.loads(result.stdout), "runtime command stdout")
     return _json_mapping(payload, "runtime command stdout"), result
+
+
+def _run_collect(
+    plugin_root: Path,
+    args: list[str],
+    env: dict[str, str],
+    stdin_payload: dict[str, JsonValue],
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        [str(plugin_root / "bin" / HOST_RUNTIME_BIN), *args],
+        env=_clean_env(**env),
+        input=json.dumps(stdin_payload),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "plihost_localcredential" not in result.stdout
+    assert "plihost_localcredential" not in result.stderr
+    assert "plihenroll_devicecode" not in result.stdout
+    assert "plihenroll_devicecode" not in result.stderr
+    assert result.stdout == ""
+    assert result.stderr == ""
+    return result
 
 
 def _start_bootstrap(plugin_root: Path, host: str, env: dict[str, str]) -> subprocess.Popen[str]:
@@ -1928,11 +2096,13 @@ class _FakeWorkerServer:
         self.policy_requests: list[str] = []
         self.poll_requests: list[dict[str, JsonValue]] = []
         self.session_requests: list[dict[str, JsonValue]] = []
+        self.trace_batches: list[dict[str, JsonValue]] = []
         self._session_condition = threading.Condition()
         _FakeWorkerHandler.check_ins = self.check_ins
         _FakeWorkerHandler.policy_requests = self.policy_requests
         _FakeWorkerHandler.poll_requests = self.poll_requests
         _FakeWorkerHandler.session_requests = self.session_requests
+        _FakeWorkerHandler.trace_batches = self.trace_batches
         _FakeWorkerHandler.policy_response = policy or _signed_policy()
         _FakeWorkerHandler.post_response = post_response
         _FakeWorkerHandler.session_response = session_response
@@ -1959,6 +2129,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     check_ins: ClassVar[list[dict[str, JsonValue]]] = []
     policy_requests: ClassVar[list[str]] = []
     poll_requests: ClassVar[list[dict[str, JsonValue]]] = []
+    trace_batches: ClassVar[list[dict[str, JsonValue]]] = []
     policy_response: ClassVar[dict[str, JsonValue]]
     post_response: ClassVar[dict[str, JsonValue] | None]
     session_response: ClassVar[dict[str, JsonValue] | None]
@@ -2027,6 +2198,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self._write_json(self.policy_response)
 
     def do_POST(self) -> None:
+        parsed = urlsplit(self.path)
         if self.path == "/v1/instruction-hub/host-enrollments/sessions/11111111-1111-4111-8111-111111111111/poll":
             payload = self._read_json_request("session poll request")
             if payload.get("device_code") != "plihenroll_devicecode":
@@ -2040,6 +2212,50 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
                     "host_credential": "plihost_localcredential",
                     "credential_id": "22222222-2222-4222-8222-222222222222",
                     "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
+                }
+            )
+            return
+        if parsed.path == "/v0/traces/batches":
+            target = parse_qs(parsed.query).get("target")
+            if (
+                target not in (["codex"], ["claude"])
+                or self.headers.get("Authorization") != "Bearer plihost_localcredential"
+            ):
+                self.send_response(401)
+                self.end_headers()
+                return
+            payload = self._read_json_request("trace batch request")
+            self.trace_batches.append(payload)
+            chunks = _json_list(payload["chunks"], "trace batch chunks")
+            acknowledged_ranges: list[dict[str, JsonValue]] = []
+            raw_artifact_count = 0
+            skipped_record_count = 0
+            for chunk_value in chunks:
+                chunk = _json_mapping(chunk_value, "trace batch chunk")
+                if chunk["kind"] == "jsonl_range":
+                    raw_artifact_count += 1
+                elif chunk["kind"] == "oversized_record":
+                    skipped_record_count += 1
+                acknowledged_ranges.append(
+                    {
+                        "kind": chunk["kind"],
+                        "source_path_hash": chunk["source_path_hash"],
+                        "start_offset": chunk["start_offset"],
+                        "end_offset": chunk["end_offset"],
+                        "content_sha256": chunk["content_sha256"],
+                    }
+                )
+            self._write_json(
+                {
+                    "accepted": True,
+                    "batch_id": payload["batch_id"],
+                    "policy_version": payload["policy_version"],
+                    "raw_artifact_count": raw_artifact_count,
+                    "skipped_record_count": skipped_record_count,
+                    "acknowledged_ranges": acknowledged_ranges,
+                    "trace_count": raw_artifact_count,
+                    "event_count": raw_artifact_count,
+                    "unparsed_record_count": 0,
                 }
             )
             return
