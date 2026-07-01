@@ -198,6 +198,7 @@ def _claude_host_runtime_hook_command() -> dict[str, JsonValue]:
         "args": [
             "-c",
             _python_host_runtime_hook_script(root_envs=("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT"), host="claude"),
+            "${CLAUDE_PLUGIN_ROOT}",
         ],
     }
 
@@ -208,7 +209,8 @@ def _python_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harnes
     missing_file = json.dumps({"systemMessage": MISSING_RUNTIME_FILE_MESSAGE}, separators=(",", ":"))
     return (
         "import os, pathlib, runpy, sys\n"
-        f"root = next((os.environ.get(name) for name in {root_env_names} if os.environ.get(name)), '')\n"
+        "root = next((value for value in sys.argv[1:] if value and not value.startswith('${')), '')\n"
+        f"if not root:\n    root = next((os.environ.get(name) for name in {root_env_names} if os.environ.get(name)), '')\n"
         f"if not root:\n    print({missing_root!r})\n    raise SystemExit(0)\n"
         f"runtime = pathlib.Path(root) / 'bin' / {HOST_RUNTIME_EXECUTABLE!r}\n"
         f"if not runtime.is_file():\n    print({missing_file!r})\n    raise SystemExit(0)\n"

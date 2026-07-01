@@ -98,7 +98,7 @@ managed runtime:
 
 ```sh
 sh -c 'root=${PLUGIN_ROOT:-}; ...; exec python3 "$root/bin/promptless-host-runtime" ensure --host codex'
-python3 -c '... resolve CLAUDE_PLUGIN_ROOT or PLUGIN_ROOT ...; run promptless-host-runtime ensure --host claude'
+python3 -c '... resolve ${CLAUDE_PLUGIN_ROOT} argument or env fallback ...; run promptless-host-runtime ensure --host claude' '${CLAUDE_PLUGIN_ROOT}'
 ```
 
 The dogfood host runtime uses `PROMPTLESS_WORKER_BASE_URL` or the default

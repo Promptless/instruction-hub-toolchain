@@ -77,8 +77,9 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             hook_args = hook["args"]
             assert hook["command"] == "python3"
             assert hook_args[0] == "-c"
-            assert len(hook_args) == 2
+            assert len(hook_args) == 3
             hook_script = hook_args[1]
+            assert hook_args[2] == "${CLAUDE_PLUGIN_ROOT}"
             assert "CLAUDE_PLUGIN_ROOT" in hook_script
             assert "PLUGIN_ROOT" in hook_script
             assert f"pathlib.Path(root) / 'bin' / {HOST_RUNTIME_BIN!r}" in hook_script
@@ -97,8 +98,8 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert json.loads(missing_root.stdout) == {"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}
 
             rooted = subprocess.run(
-                [hook["command"], *hook_args],
-                env=_clean_env(HOME=str(tmp_path / f"{target}-rooted-home"), CLAUDE_PLUGIN_ROOT=str(stub_root)),
+                [hook["command"], hook_args[0], hook_script, str(stub_root)],
+                env=_clean_env(HOME=str(tmp_path / f"{target}-rooted-home")),
                 text=True,
                 capture_output=True,
                 check=False,
