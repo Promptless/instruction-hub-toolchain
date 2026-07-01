@@ -156,16 +156,12 @@ def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
 
 def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
     if target == "claude":
-        root_expr = "${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}"
-        host = "claude"
-        hook_command: dict[str, JsonValue] = {
-            "command": _host_runtime_hook_command(root_expr=root_expr, host=host),
-        }
+        hook_command = _claude_host_runtime_hook_command()
     else:
         root_expr = "${PLUGIN_ROOT:-}"
         host = "codex"
         hook_command = {
-            "command": _host_runtime_hook_command(root_expr=root_expr, host=host),
+            "command": _posix_host_runtime_hook_command(root_expr=root_expr, host=host),
         }
 
     # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
@@ -196,7 +192,32 @@ def _hook_json_system_message(message: str) -> str:
     return payload.replace('"', '\\"')
 
 
-def _host_runtime_hook_command(*, root_expr: str, host: Harness) -> str:
+def _claude_host_runtime_hook_command() -> dict[str, JsonValue]:
+    return {
+        "command": "python3",
+        "args": [
+            "-c",
+            _python_host_runtime_hook_script(root_envs=("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT"), host="claude"),
+        ],
+    }
+
+
+def _python_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness) -> str:
+    root_env_names = repr(root_envs)
+    missing_root = json.dumps({"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}, separators=(",", ":"))
+    missing_file = json.dumps({"systemMessage": MISSING_RUNTIME_FILE_MESSAGE}, separators=(",", ":"))
+    return (
+        "import os, pathlib, runpy, sys\n"
+        f"root = next((os.environ.get(name) for name in {root_env_names} if os.environ.get(name)), '')\n"
+        f"if not root:\n    print({missing_root!r})\n    raise SystemExit(0)\n"
+        f"runtime = pathlib.Path(root) / 'bin' / {HOST_RUNTIME_EXECUTABLE!r}\n"
+        f"if not runtime.is_file():\n    print({missing_file!r})\n    raise SystemExit(0)\n"
+        f"sys.argv = [str(runtime), 'ensure', '--host', {host!r}]\n"
+        "runpy.run_path(str(runtime), run_name='__main__')\n"
+    )
+
+
+def _posix_host_runtime_hook_command(*, root_expr: str, host: Harness) -> str:
     return (
         f"sh -c 'root={root_expr}; "
         f'if [ -z "$root" ]; then printf "%s\\n" "{_hook_json_system_message(MISSING_RUNTIME_ROOT_MESSAGE)}"; exit 0; fi; '

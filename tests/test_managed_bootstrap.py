@@ -58,17 +58,6 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert os.access(bootstrap_path, os.X_OK)
         hooks = json.loads((plugin_root / "hooks/hooks.json").read_text())
         hook = hooks["hooks"]["SessionStart"][0]["hooks"][0]
-        if target == "claude":
-            hook_command = hook["command"]
-            assert "root=${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}" in hook_command
-            assert 'exec python3 "$runtime" ensure --host claude' in hook_command
-        else:
-            hook_command = hook["command"]
-            assert "root=${PLUGIN_ROOT:-}" in hook_command
-            assert 'exec python3 "$runtime" ensure --host codex' in hook_command
-        assert hook_command.startswith("sh -c '")
-        assert f'runtime="$root/bin/{HOST_RUNTIME_BIN}"' in hook_command
-        assert "--quiet" not in hook_command
         callback_deadline_match = re.search(
             r"^ENROLLMENT_CALLBACK_DEADLINE_SECONDS = (?P<value>\d+)$",
             bootstrap_path.read_text(),
@@ -78,32 +67,70 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert hook["timeout"] == 390
         assert hook["timeout"] > int(callback_deadline_match.group("value"))
 
-        missing_root = subprocess.run(
-            hook_command,
-            shell=True,
-            env=_clean_env(HOME=str(tmp_path / f"{target}-home")),
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        assert missing_root.returncode == 0
-        assert missing_root.stderr == ""
-        assert json.loads(missing_root.stdout) == {"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}
-
         stub_root = tmp_path / f"{target}-stub-plugin"
         stub_runtime = stub_root / "bin" / HOST_RUNTIME_BIN
         stub_runtime.parent.mkdir(parents=True)
         stub_runtime.write_text('import json, sys\nprint(json.dumps({"argv": sys.argv[1:]}))\n')
         stub_runtime.chmod(0o755)
-        root_env = "CLAUDE_PLUGIN_ROOT" if target == "claude" else "PLUGIN_ROOT"
-        rooted = subprocess.run(
-            hook_command,
-            shell=True,
-            env=_clean_env(HOME=str(tmp_path / f"{target}-rooted-home"), **{root_env: str(stub_root)}),
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+
+        if target == "claude":
+            hook_args = hook["args"]
+            assert hook["command"] == "python3"
+            assert hook_args[0] == "-c"
+            assert len(hook_args) == 2
+            hook_script = hook_args[1]
+            assert "CLAUDE_PLUGIN_ROOT" in hook_script
+            assert "PLUGIN_ROOT" in hook_script
+            assert f"pathlib.Path(root) / 'bin' / {HOST_RUNTIME_BIN!r}" in hook_script
+            assert "sys.argv = [str(runtime), 'ensure', '--host', 'claude']" in hook_script
+            assert "--quiet" not in hook_script
+
+            missing_root = subprocess.run(
+                [hook["command"], *hook_args],
+                env=_clean_env(HOME=str(tmp_path / f"{target}-home")),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert missing_root.returncode == 0
+            assert missing_root.stderr == ""
+            assert json.loads(missing_root.stdout) == {"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}
+
+            rooted = subprocess.run(
+                [hook["command"], *hook_args],
+                env=_clean_env(HOME=str(tmp_path / f"{target}-rooted-home"), CLAUDE_PLUGIN_ROOT=str(stub_root)),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        else:
+            hook_command = hook["command"]
+            assert "root=${PLUGIN_ROOT:-}" in hook_command
+            assert 'exec python3 "$runtime" ensure --host codex' in hook_command
+            assert hook_command.startswith("sh -c '")
+            assert f'runtime="$root/bin/{HOST_RUNTIME_BIN}"' in hook_command
+            assert "--quiet" not in hook_command
+
+            missing_root = subprocess.run(
+                hook_command,
+                shell=True,
+                env=_clean_env(HOME=str(tmp_path / f"{target}-home")),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert missing_root.returncode == 0
+            assert missing_root.stderr == ""
+            assert json.loads(missing_root.stdout) == {"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}
+
+            rooted = subprocess.run(
+                hook_command,
+                shell=True,
+                env=_clean_env(HOME=str(tmp_path / f"{target}-rooted-home"), PLUGIN_ROOT=str(stub_root)),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
         assert rooted.returncode == 0
         assert rooted.stderr == ""
         assert json.loads(rooted.stdout) == {"argv": ["ensure", "--host", target]}
