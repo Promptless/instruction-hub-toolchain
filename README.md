@@ -92,13 +92,13 @@ Claude startup hooks. During dogfood, generated Codex hooks wrap the bundled
 stdlib-only Python script with shell checks that emit schema-safe startup
 diagnostics when the host cannot resolve the plugin root, runtime file, or
 `python3`. Generated Claude hooks use Claude Code's exec-form hook so Windows
-installs do not need a POSIX shell; an inline Python launcher resolves the
-plugin root and emits the same root/runtime diagnostics before loading the
-managed runtime:
+installs do not need a POSIX shell; an inline Node launcher resolves the plugin
+root, finds a usable Python 3 command, and emits the same root/runtime/python
+diagnostics before loading the managed runtime:
 
 ```sh
 sh -c 'root=${PLUGIN_ROOT:-}; ...; exec python3 "$root/bin/promptless-host-runtime" ensure --host codex'
-python3 -c '... resolve ${CLAUDE_PLUGIN_ROOT} argument or env fallback ...; run promptless-host-runtime ensure --host claude' '${CLAUDE_PLUGIN_ROOT}'
+node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find python3/python/py; run promptless-host-runtime ensure --host claude' '${CLAUDE_PLUGIN_ROOT}'
 ```
 
 The dogfood host runtime uses `PROMPTLESS_WORKER_BASE_URL` or the default
@@ -141,7 +141,7 @@ id and last-seen plugin versions. `version` reports runtime metadata.
 Before the customer-grade release, replace the dogfood Python implementation
 with a static native binary built and versioned by Promptless, then bundled into
 the toolchain release. Customer Instruction Hub repositories should not need
-Python, uv, Go, Rust, curl, jq, or other runtime/build dependencies installed
+Python, Node, uv, Go, Rust, curl, jq, or other runtime/build dependencies installed
 for the hook to run. Customer builds should only consume the already-built
 Promptless artifact that the toolchain copies into plugin `bin/`.
 

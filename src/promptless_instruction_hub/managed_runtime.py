@@ -194,28 +194,47 @@ def _hook_json_system_message(message: str) -> str:
 
 def _claude_host_runtime_hook_command() -> dict[str, JsonValue]:
     return {
-        "command": "python3",
+        "command": "node",
         "args": [
-            "-c",
-            _python_host_runtime_hook_script(root_envs=("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT"), host="claude"),
+            "-e",
+            _node_host_runtime_hook_script(root_envs=("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT"), host="claude"),
             "${CLAUDE_PLUGIN_ROOT}",
         ],
     }
 
 
-def _python_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness) -> str:
-    root_env_names = repr(root_envs)
+def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness) -> str:
+    root_env_names = json.dumps(list(root_envs), separators=(",", ":"))
     missing_root = json.dumps({"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}, separators=(",", ":"))
     missing_file = json.dumps({"systemMessage": MISSING_RUNTIME_FILE_MESSAGE}, separators=(",", ":"))
+    missing_python = json.dumps({"systemMessage": MISSING_PYTHON_MESSAGE}, separators=(",", ":"))
+    python_probe = "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
     return (
-        "import os, pathlib, runpy, sys\n"
-        "root = next((value for value in sys.argv[1:] if value and not value.startswith('${')), '')\n"
-        f"if not root:\n    root = next((os.environ.get(name) for name in {root_env_names} if os.environ.get(name)), '')\n"
-        f"if not root:\n    print({missing_root!r})\n    raise SystemExit(0)\n"
-        f"runtime = pathlib.Path(root) / 'bin' / {HOST_RUNTIME_EXECUTABLE!r}\n"
-        f"if not runtime.is_file():\n    print({missing_file!r})\n    raise SystemExit(0)\n"
-        f"sys.argv = [str(runtime), 'ensure', '--host', {host!r}]\n"
-        "runpy.run_path(str(runtime), run_name='__main__')\n"
+        "const fs = require('fs');\n"
+        "const path = require('path');\n"
+        "const { spawnSync } = require('child_process');\n"
+        f"const rootEnvNames = {root_env_names};\n"
+        "let root = process.argv.slice(1).find((value) => value && !value.startsWith('${')) || '';\n"
+        "for (const name of rootEnvNames) {\n  if (root) break;\n  root = process.env[name] || '';\n}\n"
+        f"if (!root) {{ console.log({missing_root!r}); process.exit(0); }}\n"
+        f"const runtime = path.join(root, 'bin', {HOST_RUNTIME_EXECUTABLE!r});\n"
+        f"if (!fs.existsSync(runtime) || !fs.statSync(runtime).isFile()) {{ console.log({missing_file!r}); process.exit(0); }}\n"
+        f"const pythonProbe = {python_probe!r};\n"
+        f"const runtimeArgs = [runtime, 'ensure', '--host', {host!r}];\n"
+        "const candidates = [\n"
+        "  { command: 'python3', probeArgs: ['-c', pythonProbe], runArgs: runtimeArgs },\n"
+        "  { command: 'python', probeArgs: ['-c', pythonProbe], runArgs: runtimeArgs },\n"
+        "  { command: 'py', probeArgs: ['-3', '-c', pythonProbe], runArgs: ['-3', ...runtimeArgs] },\n"
+        "];\n"
+        "for (const candidate of candidates) {\n"
+        "  const probe = spawnSync(candidate.command, candidate.probeArgs, { stdio: 'ignore' });\n"
+        "  if (probe.error || probe.status !== 0) continue;\n"
+        "  const result = spawnSync(candidate.command, candidate.runArgs, { stdio: 'inherit', env: process.env });\n"
+        "  if (result.error) continue;\n"
+        "  process.exit(result.status === null ? 1 : result.status);\n"
+        "}\n"
+        f"console.log({missing_python!r});\n"
+        "process.exit(0);\n"
     )
 
 

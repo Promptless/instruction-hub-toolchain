@@ -20,7 +20,7 @@ import pytest
 from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, validate_json_value
-from promptless_instruction_hub.managed_runtime import MISSING_RUNTIME_ROOT_MESSAGE
+from promptless_instruction_hub.managed_runtime import MISSING_PYTHON_MESSAGE, MISSING_RUNTIME_ROOT_MESSAGE
 
 HOST_RUNTIME_BIN = "promptless-host-runtime"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
@@ -75,15 +75,16 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
 
         if target == "claude":
             hook_args = hook["args"]
-            assert hook["command"] == "python3"
-            assert hook_args[0] == "-c"
+            assert hook["command"] == "node"
+            assert hook_args[0] == "-e"
             assert len(hook_args) == 3
             hook_script = hook_args[1]
             assert hook_args[2] == "${CLAUDE_PLUGIN_ROOT}"
             assert "CLAUDE_PLUGIN_ROOT" in hook_script
             assert "PLUGIN_ROOT" in hook_script
-            assert f"pathlib.Path(root) / 'bin' / {HOST_RUNTIME_BIN!r}" in hook_script
-            assert "sys.argv = [str(runtime), 'ensure', '--host', 'claude']" in hook_script
+            assert f"path.join(root, 'bin', {HOST_RUNTIME_BIN!r})" in hook_script
+            assert "spawnSync" in hook_script
+            assert MISSING_PYTHON_MESSAGE in hook_script
             assert "--quiet" not in hook_script
 
             missing_root = subprocess.run(
@@ -96,6 +97,19 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert missing_root.returncode == 0
             assert missing_root.stderr == ""
             assert json.loads(missing_root.stdout) == {"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}
+
+            node_path = shutil.which("node")
+            assert node_path is not None
+            missing_python = subprocess.run(
+                [node_path, hook_args[0], hook_script, str(stub_root)],
+                env=_clean_env(HOME=str(tmp_path / f"{target}-missing-python-home"), PATH=""),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert missing_python.returncode == 0
+            assert missing_python.stderr == ""
+            assert json.loads(missing_python.stdout) == {"systemMessage": MISSING_PYTHON_MESSAGE}
 
             rooted = subprocess.run(
                 [hook["command"], hook_args[0], hook_script, str(stub_root)],
