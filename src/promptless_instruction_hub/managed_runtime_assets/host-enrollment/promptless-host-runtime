@@ -40,6 +40,8 @@ RUNTIME_EXECUTABLE = "promptless-host-runtime"
 MANAGED_RUNTIME_ID = "host-runtime"
 DEFAULT_WORKER_BASE_URL = "https://pig.promptless.ai"
 DEFAULT_DASHBOARD_BASE_URL = "https://app.gopromptless.ai"
+HOSTED_ENROLLMENT_START_PATH = "/instruction-hub/enroll/start"
+HOSTED_ENROLLMENT_APPROVAL_PATH = "/instruction-hub/enroll"
 MANAGED_BEGIN = "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_RUNTIME_MANIFEST = Path("hub.managed-runtimes.json")
@@ -128,6 +130,15 @@ class EnrollmentContext:
     host_instance_id: str
     host_label: str
     host_platform: str
+
+
+@dataclass(frozen=True)
+class HostedEnrollmentRoutes:
+    """Dashboard routes used by browser enrollment."""
+
+    dashboard_base_url: str
+    start_path: str
+    approval_path: str
 
 
 @dataclass(frozen=True)
@@ -919,8 +930,9 @@ def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, Jso
 
 
 def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSessionAttempt:
-    with _EnrollmentCallbackServer() as callback_server:
-        start_url = _hosted_enrollment_start_url(context, callback_server.callback_url)
+    routes = _hosted_enrollment_routes(context.dashboard_base_url)
+    with _EnrollmentCallbackServer(routes) as callback_server:
+        start_url = _hosted_enrollment_start_url(context, routes, callback_server.callback_url)
         if not _open_hosted_enrollment_url(start_url):
             return EnrollmentSessionAttempt(session=None, reason="browser_launch_failed")
         callback_payload = callback_server.wait(ENROLLMENT_CALLBACK_DEADLINE_SECONDS)
@@ -929,7 +941,19 @@ def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSessionA
     return EnrollmentSessionAttempt(session=_enrollment_session_from_callback(context, callback_payload))
 
 
-def _hosted_enrollment_start_url(context: EnrollmentContext, callback_url: str) -> str:
+def _hosted_enrollment_routes(dashboard_base_url: str) -> HostedEnrollmentRoutes:
+    return HostedEnrollmentRoutes(
+        dashboard_base_url=dashboard_base_url,
+        start_path=HOSTED_ENROLLMENT_START_PATH,
+        approval_path=HOSTED_ENROLLMENT_APPROVAL_PATH,
+    )
+
+
+def _hosted_enrollment_start_url(
+    context: EnrollmentContext,
+    routes: HostedEnrollmentRoutes,
+    callback_url: str,
+) -> str:
     payload = {
         "callback_url": callback_url,
         "deployment_instance_id": context.deployment_instance_id,
@@ -944,13 +968,14 @@ def _hosted_enrollment_start_url(context: EnrollmentContext, callback_url: str) 
         "host_platform": context.host_platform,
         "pending_callback": "1",
     }
-    return f"{context.dashboard_base_url}/instruction-hub/enroll/start?{urlencode(payload)}"
+    return f"{routes.dashboard_base_url}{routes.start_path}?{urlencode(payload)}"
 
 
 class _EnrollmentCallbackServer:
     """Small loopback server that receives the hosted approval result."""
 
-    def __init__(self) -> None:
+    def __init__(self, routes: HostedEnrollmentRoutes) -> None:
+        self._routes = routes
         self._event = threading.Event()
         self._payload: dict[str, str] | None = None
         self._state = secrets.token_urlsafe(32)
@@ -999,9 +1024,9 @@ class _EnrollmentCallbackServer:
                     if len(values) == 1:
                         payload[key] = values[0]
                 if payload.get("status") == "pending":
-                    approval_url = _pending_callback_approval_url(payload)
+                    approval_url = _pending_callback_approval_url(payload, callback_server._routes)
                     if approval_url is None:
-                        body = b"Promptless enrollment callback missing approval URL."
+                        body = b"Promptless enrollment callback rejected approval URL."
                         self.send_response(400)
                         self.send_header("Content-Type", "text/plain; charset=utf-8")
                         self.send_header("Content-Length", str(len(body)))
@@ -1058,20 +1083,18 @@ def _enrollment_session_from_callback(context: EnrollmentContext, payload: dict[
     )
 
 
-def _pending_callback_approval_url(payload: dict[str, str]) -> str | None:
+def _pending_callback_approval_url(payload: dict[str, str], routes: HostedEnrollmentRoutes) -> str | None:
     if payload.get("status") != "pending":
         return None
     approval_url = _non_empty(payload.get("approval_url"))
     if approval_url is None:
         return None
-    parsed = urlsplit(approval_url)
-    if parsed.scheme not in {"http", "https"} or parsed.netloc == "":
-        return None
-    if parsed.username is not None or parsed.password is not None or parsed.fragment:
-        return None
     try:
-        _validate_worker_transport(parsed, "host enrollment approval URL")
+        parsed = _validate_http_redirect_url(approval_url, "host enrollment approval URL")
     except BootstrapError:
+        return None
+    dashboard_origin = urlsplit(routes.dashboard_base_url)
+    if parsed.path != routes.approval_path or not _same_url_origin(parsed, dashboard_origin):
         return None
     return approval_url
 
@@ -1738,7 +1761,42 @@ def _validate_http_url(value: str, field_name: str) -> SplitResult:
         raise BootstrapError(f"{field_name} must be an absolute HTTP(S) URL")
     if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
         raise BootstrapError(f"{field_name} must not include credentials, query, or fragment")
+    if _url_origin_port(parsed) is None:
+        raise BootstrapError(f"{field_name} must have a valid origin port")
     return parsed
+
+
+def _validate_http_redirect_url(value: str, field_name: str) -> SplitResult:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc == "":
+        raise BootstrapError(f"{field_name} must be an absolute HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None or parsed.fragment:
+        raise BootstrapError(f"{field_name} must not include credentials or fragment")
+    if _url_origin_port(parsed) is None:
+        raise BootstrapError(f"{field_name} must have a valid origin port")
+    return parsed
+
+
+def _same_url_origin(left: SplitResult, right: SplitResult) -> bool:
+    return (
+        left.scheme == right.scheme
+        and left.hostname == right.hostname
+        and _url_origin_port(left) == _url_origin_port(right)
+    )
+
+
+def _url_origin_port(parsed: SplitResult) -> int | None:
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is not None:
+        return port
+    if parsed.scheme == "https":
+        return 443
+    if parsed.scheme == "http":
+        return 80
+    return None
 
 
 def _datetime_value(value: JsonValue | None, field_name: str) -> dt.datetime:

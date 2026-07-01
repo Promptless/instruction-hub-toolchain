@@ -731,6 +731,50 @@ def test_bootstrap_rejects_loopback_callback_with_wrong_state(tmp_path: Path) ->
         server.stop()
 
 
+@pytest.mark.parametrize(
+    ("pending_approval_url_override", "pending_approval_path"),
+    [
+        ("https://attacker.example/instruction-hub/enroll", "/instruction-hub/enroll"),
+        (None, "/attacker/enroll"),
+    ],
+    ids=["wrong-origin", "wrong-path"],
+)
+def test_bootstrap_rejects_pending_callback_approval_url_outside_dashboard_route(
+    tmp_path: Path,
+    pending_approval_url_override: str | None,
+    pending_approval_path: str,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer(
+        pending_approval_url_override=pending_approval_url_override,
+        pending_approval_path=pending_approval_path,
+    )
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, _result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "hosted enrollment start request failed with HTTP 400" in str(payload["message"])
+        assert not (home / ".codex/config.toml").exists()
+        assert server.poll_requests == []
+        assert server.policy_requests == []
+        assert server.check_ins == []
+    finally:
+        server.stop()
+
+
 def test_bootstrap_requires_callback_deployment_instance_id(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -1813,6 +1857,8 @@ class _FakeWorkerServer:
         session_response: dict[str, JsonValue] | None = None,
         session_barrier_count: int = 0,
         callback_state_override: str | None = None,
+        pending_approval_url_override: str | None = None,
+        pending_approval_path: str = "/instruction-hub/enroll",
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
         self.policy_requests: list[str] = []
@@ -1829,6 +1875,8 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.session_barrier_count = session_barrier_count
         _FakeWorkerHandler.session_condition = self._session_condition
         _FakeWorkerHandler.callback_state_override = callback_state_override
+        _FakeWorkerHandler.pending_approval_url_override = pending_approval_url_override
+        _FakeWorkerHandler.pending_approval_path = pending_approval_path
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
@@ -1854,6 +1902,8 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     session_condition: ClassVar[threading.Condition | None] = None
     session_requests: ClassVar[list[dict[str, JsonValue]]] = []
     callback_state_override: ClassVar[str | None] = None
+    pending_approval_url_override: ClassVar[str | None] = None
+    pending_approval_path: ClassVar[str] = "/instruction-hub/enroll"
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
@@ -1876,7 +1926,9 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             self._record_session_request(payload)
             session_response = self._session_response_payload()
             approval_params = {"callback_url": callback_url, **session_response}
-            hosted_approval_url = f"{self._base_url()}/instruction-hub/enroll?{urlencode(approval_params)}"
+            hosted_approval_url = self.pending_approval_url_override or (
+                f"{self._base_url()}{self.pending_approval_path}?{urlencode(approval_params)}"
+            )
             if payload.get("pending_callback") == "1":
                 pending_params = {
                     "status": "pending",
