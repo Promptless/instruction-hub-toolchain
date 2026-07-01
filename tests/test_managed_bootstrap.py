@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -61,7 +62,14 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             hook_command = hook["command"]
             assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host codex'
         assert "--quiet" not in hook_command
-        assert hook["timeout"] == 90
+        callback_deadline_match = re.search(
+            r"^ENROLLMENT_CALLBACK_DEADLINE_SECONDS = (?P<value>\d+)$",
+            bootstrap_path.read_text(),
+            re.MULTILINE,
+        )
+        assert callback_deadline_match is not None
+        assert hook["timeout"] == 390
+        assert hook["timeout"] > int(callback_deadline_match.group("value"))
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
