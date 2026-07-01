@@ -18,9 +18,10 @@ RuntimeStatus = Literal["included"]
 HOST_RUNTIME_ID = "host-runtime"
 HOST_RUNTIME_ASSET_DIR = "host-enrollment"
 HOST_RUNTIME_EXECUTABLE = "promptless-host-runtime"
-# Keep this comfortably above the enrollment poll budget plus session creation,
-# policy fetch, local config write, and check-in network calls.
-HOST_RUNTIME_HOOK_TIMEOUT_SECONDS = 90
+# Keep this above the browser callback deadline plus the follow-up poll,
+# policy fetch, local config write, and check-in network calls. Otherwise the
+# host can kill SessionStart before a resumable pending enrollment is persisted.
+HOST_RUNTIME_HOOK_TIMEOUT_SECONDS = 390
 HOST_RUNTIME_CHANNEL = "stable"
 HOST_RUNTIME_VERSION = "0.2.0"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
@@ -165,9 +166,9 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
     # Promptless-built static native binary so customer machines do not need Python or uv.
-    # SessionStart performs user-visible enrollment and a quiet forward-only baseline. Terminal
-    # lifecycle hooks only upload native JSONL ranges; failures are non-blocking and stay out of
-    # the agent transcript.
+    # SessionStart performs user-visible enrollment, writes config/check-in status, and then runs
+    # a quiet forward-only JSONL baseline. Terminal lifecycle hooks only upload native JSONL
+    # ranges; failures are non-blocking and stay out of the agent transcript.
     hook_entry: dict[str, JsonValue] = {
         "hooks": [
             {
