@@ -63,8 +63,9 @@ MANAGED_RUNTIME_KEYS = frozenset(
 )
 SUPPORT_KEYS = frozenset({"mode", "reason"})
 SUPPORT_MODES = frozenset({"agent-skill", "native", "projected", "unsupported"})
-MANAGED_RUNTIME_IDS = frozenset({"local-trace-collector", "host-enrollment-bootstrap"})
-MANAGED_RUNTIME_VERSIONED_FIELDS = frozenset({"executable", "hook", "path", "sha256"})
+HOST_RUNTIME_ID = "host-runtime"
+LEGACY_HOST_RUNTIME_ID = "host-enrollment-bootstrap"
+PREVIOUS_RELEASE_MANAGED_RUNTIME_IDS = frozenset({HOST_RUNTIME_ID, LEGACY_HOST_RUNTIME_ID})
 
 
 def resolve_publish_plugin_version(
@@ -91,7 +92,6 @@ def resolve_publish_plugin_version(
         previous_manifest,
     )
     current_basis = _build_current_version_basis(validation, plugin_version=previous_version)
-    _validate_managed_runtime_version_bumps(previous_manifest_path, previous_basis, current_basis)
     if previous_basis == current_basis:
         return _max_semver(config_version, previous_version)
     return _max_semver(config_version, _bump_patch(previous_version))
@@ -443,8 +443,9 @@ def _validate_managed_runtimes(manifest_path: Path, runtimes: list[JsonValue], k
         runtime = _require_mapping_value(manifest_path, runtime_value, f"{key_path}[{index}]")
         runtime_path = f"{key_path}[{index}]"
         _require_exact_keys(manifest_path, runtime, runtime_path, MANAGED_RUNTIME_KEYS)
-        if runtime["id"] not in MANAGED_RUNTIME_IDS:
-            msg = f"{manifest_path}: {runtime_path}.id must be a supported managed runtime id"
+        runtime_id = runtime["id"]
+        if not isinstance(runtime_id, str) or runtime_id not in PREVIOUS_RELEASE_MANAGED_RUNTIME_IDS:
+            msg = f"{manifest_path}: {runtime_path}.id must be host-runtime or host-enrollment-bootstrap"
             raise ValueError(msg)
         if runtime["status"] != "included":
             msg = f"{manifest_path}: {runtime_path}.status must be included"
@@ -458,81 +459,11 @@ def _validate_managed_runtimes(manifest_path: Path, runtimes: list[JsonValue], k
             if not isinstance(value, str) or not value:
                 msg = f"{manifest_path}: {runtime_path}.{string_key} must be a non-empty string"
                 raise ValueError(msg)
-        version = runtime["version"]
-        if not isinstance(version, str) or SEMVER_RE.match(version) is None:
-            msg = f"{manifest_path}: {runtime_path}.version must be SemVer"
-            raise ValueError(msg)
         _validate_sha256(
             manifest_path,
             _require_string(manifest_path, runtime, "sha256", display_path=f"{runtime_path}.sha256"),
             f"{runtime_path}.sha256",
         )
-
-
-def _validate_managed_runtime_version_bumps(
-    manifest_path: Path,
-    previous_basis: dict[str, JsonValue],
-    current_basis: dict[str, JsonValue],
-) -> None:
-    previous_runtimes = _managed_runtimes_by_identity(previous_basis)
-    current_runtimes = _managed_runtimes_by_identity(current_basis)
-    for identity, current_runtime in current_runtimes.items():
-        previous_runtime = previous_runtimes.get(identity)
-        if previous_runtime is None:
-            continue
-        artifact_changed = any(
-            current_runtime.get(field) != previous_runtime.get(field) for field in MANAGED_RUNTIME_VERSIONED_FIELDS
-        )
-        if not artifact_changed:
-            continue
-        current_version = _require_runtime_semver(manifest_path, current_runtime, identity, "current")
-        previous_version = _require_runtime_semver(manifest_path, previous_runtime, identity, "previous")
-        if _compare_semver(current_version, previous_version) <= 0:
-            runtime_id, target, package_id = identity
-            msg = (
-                f"{manifest_path}: managed runtime {runtime_id} for {target}/{package_id} changed artifact fields "
-                "without increasing version"
-            )
-            raise ValueError(msg)
-
-
-def _managed_runtimes_by_identity(
-    basis: dict[str, JsonValue],
-) -> dict[tuple[str, str, str], dict[str, JsonValue]]:
-    runtimes = basis.get("managed_runtimes")
-    if not isinstance(runtimes, list):
-        return {}
-    result: dict[tuple[str, str, str], dict[str, JsonValue]] = {}
-    for runtime_value in runtimes:
-        if not isinstance(runtime_value, dict):
-            continue
-        identity = _managed_runtime_identity(runtime_value)
-        if identity is not None:
-            result[identity] = runtime_value
-    return result
-
-
-def _managed_runtime_identity(runtime: dict[str, JsonValue]) -> tuple[str, str, str] | None:
-    runtime_id = runtime.get("id")
-    target = runtime.get("target")
-    package_id = runtime.get("package_id")
-    if not isinstance(runtime_id, str) or not isinstance(target, str) or not isinstance(package_id, str):
-        return None
-    return (runtime_id, target, package_id)
-
-
-def _require_runtime_semver(
-    manifest_path: Path,
-    runtime: dict[str, JsonValue],
-    identity: tuple[str, str, str],
-    label: str,
-) -> str:
-    version = runtime.get("version")
-    if isinstance(version, str) and SEMVER_RE.match(version) is not None:
-        return version
-    runtime_id, target, package_id = identity
-    msg = f"{manifest_path}: {label} managed runtime {runtime_id} for {target}/{package_id} version must be SemVer"
-    raise ValueError(msg)
 
 
 def _require_mapping(

@@ -1,0 +1,2704 @@
+#!/usr/bin/env python3
+"""Configure local agent-host telemetry from a Promptless worker policy."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import getpass
+import glob
+import gzip
+import hashlib
+import json
+import os
+import platform
+import re
+import secrets
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+import webbrowser
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import BinaryIO, Literal, Union
+from urllib.parse import SplitResult, parse_qs, urlencode, urlsplit
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+RUNTIME_VERSION = "0.2.0"
+RUNTIME_CHANNEL = "stable"
+RUNTIME_EXECUTABLE = "promptless-host-runtime"
+MANAGED_RUNTIME_ID = "host-runtime"
+DEFAULT_WORKER_BASE_URL = "https://pig.promptless.ai"
+DEFAULT_DASHBOARD_BASE_URL = "https://app.gopromptless.ai"
+MANAGED_BEGIN = "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT"
+MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
+MANAGED_RUNTIME_MANIFEST = Path("hub.managed-runtimes.json")
+STATE_FILE_NAME = "host-enrollment-state.json"
+LAST_STATUS_FILE_NAME = "last-bootstrap-status.json"
+LEDGER_FILE_NAME = "host-runtime-ledger.json"
+RAW_API_BODIES_DIR_NAME = "claude-raw-api-bodies"
+HTTP_TIMEOUT_SECONDS = 10
+ENROLLMENT_POLL_DEADLINE_SECONDS = 35
+MAX_STDIN_BYTES = 1024 * 1024
+MAX_TRACE_BATCH_BYTES = 10 * 1024 * 1024
+MAX_UPLOAD_CHUNKS_PER_BATCH = 200
+SOURCE_READ_BLOCK_BYTES = 1024 * 1024
+IDLE_SESSION_GRACE_SECONDS = 12 * 60 * 60
+CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
+TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
+OPEN_BROWSER_ENV = "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER"
+CALLBACK_STATE_PARAM = "state"
+Host = Literal["codex", "claude"]
+ConfigStatus = Literal["blocked", "needs_restart", "configured"]
+LifecycleEvent = Literal["session_start", "stop", "session_end", "subagent_stop"]
+SourceEventKind = Literal["jsonl_range", "oversized_record"]
+
+# This bin runs under the host's own python3, which on macOS is the system Python 3.9
+# (/usr/bin/python3). Keep runtime-evaluated unions off the PEP 604 ``X | Y`` form (3.10+): these
+# aliases and the isinstance() in _json_value() are evaluated at import/call time, unlike annotations
+# (kept lazy by ``from __future__ import annotations``). Use typing.Union / isinstance tuples instead.
+JsonScalar = Union[str, int, float, bool, None]
+JsonValue = Union[JsonScalar, list["JsonValue"], dict[str, "JsonValue"]]
+HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_PENDING_CONTROL_OUTPUT: dict[str, JsonValue] | None = None
+_PENDING_CONTROL_OUTPUT_PRIORITY = -1
+_CONTROL_OUTPUT_STATUS_PRIORITY = {
+    "browser_enrollment_starting": 10,
+    "configured": 20,
+    "needs_restart": 80,
+    "setup_pending": 90,
+    "blocked": 100,
+    "error": 110,
+}
+
+
+class BootstrapError(RuntimeError):
+    """Expected non-fatal bootstrap failure."""
+
+
+class BootstrapAuthError(BootstrapError):
+    """Host credential was rejected by the worker."""
+
+
+@dataclass(frozen=True)
+class RuntimeMetadata:
+    """Runtime metadata reported in worker check-ins."""
+
+    bootstrap_version: str
+    bootstrap_channel: str
+    bootstrap_sha256: str
+    toolchain_version: str
+    plugin_id: str
+    plugin_version: str
+    package_id: str
+    target: Host
+
+
+@dataclass(frozen=True)
+class CollectorPolicy:
+    """Validated OTLP collector policy."""
+
+    logs_endpoint: str
+    traces_endpoint: str
+    metrics_endpoint: str
+    grpc_endpoint: str | None
+    headers: dict[str, str]
+
+
+@dataclass(frozen=True)
+class HostPolicy:
+    """Validated worker policy body used by the bootstrap."""
+
+    policy_version: int
+    collector: CollectorPolicy
+    required_bootstrap_version: str | None
+
+
+@dataclass(frozen=True)
+class EnrollmentContext:
+    """Host identity and plugin metadata used by browser enrollment."""
+
+    worker_base_url: str
+    dashboard_base_url: str
+    deployment_instance_id: str
+    metadata: RuntimeMetadata
+    host_instance_id: str
+    host_label: str
+    host_platform: str
+
+
+@dataclass(frozen=True)
+class HostCredential:
+    """Local per-host credential approved through the browser flow."""
+
+    value: str
+    credential_id: str | None
+    deployment_instance_id: str | None
+
+
+@dataclass(frozen=True)
+class EnrollmentAttempt:
+    """Result of trying to obtain a host credential."""
+
+    credential: HostCredential | None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class EnrollmentSession:
+    """Pending browser approval session returned through the local callback."""
+
+    session_id: str
+    deployment_instance_id: str
+    device_code: str
+    poll_url: str
+    expires_at: dt.datetime
+    poll_interval_seconds: int
+
+
+@dataclass(frozen=True)
+class EnrollmentSessionAttempt:
+    """Result of creating or retrieving an enrollment approval session."""
+
+    session: EnrollmentSession | None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ConfigResult:
+    """Host config write result."""
+
+    status: ConfigStatus
+    needs_restart: bool
+    effective_config: dict[str, JsonValue]
+    drift_reports: list[dict[str, JsonValue]]
+
+
+@dataclass(frozen=True)
+class HookTraceContext:
+    """Trace context supplied by a host lifecycle hook."""
+
+    transcript_path: Path | None
+    agent_transcript_path: Path | None
+    session_id: str | None
+    parent_session_id: str | None
+    agent_id: str | None
+    agent_type: str | None
+
+
+@dataclass(frozen=True)
+class SourceEvent:
+    """A forward-only source-file range or local read error to upload."""
+
+    kind: SourceEventKind
+    path: Path
+    path_hash: str
+    start_offset: int
+    end_offset: int
+    byte_count: int
+    content_sha256: str | None = None
+    content: bytes | None = None
+    oversized_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class UploadBatch:
+    """A native trace upload request plus the source events it acknowledges."""
+
+    request: dict[str, JsonValue]
+    events: tuple[SourceEvent, ...]
+
+
+@dataclass
+class SourceLedger:
+    """Mutable native-source ledger loaded under the host-runtime lock."""
+
+    path: Path
+    is_new: bool
+    sources: dict[str, dict[str, JsonValue]]
+    reset_sources: set[str] = field(default_factory=set)
+    drift_reports: list[dict[str, JsonValue]] = field(default_factory=list)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the requested host-runtime command."""
+
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.command == "version":
+        return _run_version_command(json_output=args.json)
+    host = _resolve_host(args.host)
+    if args.command == "ensure":
+        return _run_ensure_command(host, quiet=args.quiet)
+    if args.command == "collect":
+        return _run_collect_command(host, lifecycle=args.lifecycle, baseline=args.baseline, quiet=args.quiet)
+    if args.command == "status":
+        return _run_status_command(host)
+    if args.command == "enroll":
+        return _run_enroll_command(host)
+    if args.command == "reset":
+        return _run_reset_command(host)
+    parser.error(f"unknown command: {args.command}")
+    return 2
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=RUNTIME_EXECUTABLE, description="Promptless host runtime")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    ensure_parser = subcommands.add_parser("ensure", help="Enroll if needed and ensure host telemetry config")
+    _add_host_argument(ensure_parser)
+    ensure_parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
+
+    collect_parser = subcommands.add_parser("collect", help="Upload native trace JSONL changes")
+    _add_host_argument(collect_parser)
+    collect_parser.add_argument(
+        "--lifecycle",
+        choices=("session_start", "stop", "session_end", "subagent_stop"),
+        default=None,
+        help="Host lifecycle event that triggered collection",
+    )
+    collect_parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="On first run, record current source offsets without uploading historical ranges",
+    )
+    collect_parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
+
+    status_parser = subcommands.add_parser("status", help="Print local host-runtime status as JSON")
+    _add_host_argument(status_parser)
+
+    enroll_parser = subcommands.add_parser("enroll", help="Enroll the host credential without editing host config")
+    _add_host_argument(enroll_parser)
+
+    reset_parser = subcommands.add_parser("reset", help="Clear cached host credentials and pending enrollment state")
+    _add_host_argument(reset_parser)
+    reset_parser.add_argument("--yes", action="store_true", required=True, help="Confirm local state reset")
+
+    version_parser = subcommands.add_parser("version", help="Print host-runtime version")
+    version_parser.add_argument("--json", action="store_true", help="Print version metadata as JSON")
+    return parser
+
+
+def _add_host_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--host", choices=("auto", "codex", "claude"), default="auto")
+
+
+def _run_ensure_command(host: Host, *, quiet: bool) -> int:
+    try:
+        return _run_ensure(host, quiet=quiet)
+    except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
+        _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
+        return 0
+    finally:
+        _flush_control_output()
+
+
+def _run_collect_command(host: Host, *, lifecycle: str | None, baseline: bool, quiet: bool) -> int:
+    try:
+        event = _lifecycle_event(lifecycle)
+        hook_context = _hook_trace_context(_read_hook_context())
+        return _run_collect(host, lifecycle_event=event, hook_context=hook_context, baseline=baseline, quiet=quiet)
+    except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
+        _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
+        return 0
+    finally:
+        _flush_control_output()
+
+
+def _run_status_command(host: Host) -> int:
+    try:
+        payload = _status_payload(host)
+    except (BootstrapError, OSError, ValueError) as exc:
+        _emit_command_json({"status": "error", "host": host, "message": _redact_text(str(exc))})
+        return 1
+    _emit_command_json(payload)
+    return 0
+
+
+def _run_enroll_command(host: Host) -> int:
+    try:
+        plugin_root = _plugin_root()
+        metadata = _load_runtime_metadata(plugin_root, host)
+        worker_base_url = _worker_base_url()
+        dashboard_base_url = _dashboard_base_url()
+        context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+        enrollment_attempt = _obtain_host_credential(context, quiet=True)
+        if enrollment_attempt.credential is None:
+            _emit_command_json(
+                {
+                    "status": "setup_pending",
+                    "reason": enrollment_attempt.reason or "approval_pending",
+                    "host": host,
+                }
+            )
+            return 0
+        credential = enrollment_attempt.credential
+        _emit_command_json(
+            {
+                "status": "enrolled",
+                "host": host,
+                "credential_id": credential.credential_id,
+                "deployment_instance_id": credential.deployment_instance_id or context.deployment_instance_id,
+                "host_instance_id": context.host_instance_id,
+            }
+        )
+        return 0
+    except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
+        _emit_command_json({"status": "error", "host": host, "message": _redact_text(str(exc))})
+        return 1
+
+
+def _run_reset_command(host: Host) -> int:
+    try:
+        credentials_removed, pending_removed = _reset_host_state(host)
+    except (BootstrapError, OSError, ValueError) as exc:
+        _emit_command_json({"status": "error", "host": host, "message": _redact_text(str(exc))})
+        return 1
+    _emit_command_json(
+        {
+            "status": "reset",
+            "host": host,
+            "credentials_removed": credentials_removed,
+            "pending_enrollments_removed": pending_removed,
+        }
+    )
+    return 0
+
+
+def _run_version_command(*, json_output: bool) -> int:
+    payload = {
+        "id": MANAGED_RUNTIME_ID,
+        "name": RUNTIME_EXECUTABLE,
+        "version": RUNTIME_VERSION,
+        "channel": RUNTIME_CHANNEL,
+        "sha256": _self_sha256(),
+    }
+    if json_output:
+        _emit_command_json(payload)
+    else:
+        sys.stdout.write(f"{RUNTIME_EXECUTABLE} {RUNTIME_VERSION}\n")
+        sys.stdout.flush()
+    return 0
+
+
+def _run_ensure(host: Host, *, quiet: bool) -> int:
+    # Compute any plugin-update notice before enrollment so every install learns when the
+    # Instruction Hub plugin version changed. Both Claude and Codex render the SessionStart
+    # `systemMessage`. The new version is recorded only after the hook output is emitted below,
+    # so a later failure re-announces it on the next healthy session.
+    plugin_root = _plugin_root()
+    metadata = _load_runtime_metadata(plugin_root, host)
+    pending_update = _pending_plugin_update(metadata)
+    update_notice = pending_update.notice if pending_update is not None else None
+    exit_code = _run_host_enrollment(host, metadata, quiet=quiet, update_notice=update_notice)
+    # Reached only when the host enrollment step returned without raising, i.e. the SessionStart
+    # output (including any update notice) was emitted. A quiet run suppresses that output, so it
+    # does not consume the one-time notice.
+    if pending_update is not None and not quiet:
+        _record_plugin_version_seen(pending_update)
+    return exit_code
+
+
+def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, update_notice: str | None) -> int:
+    worker_base_url = _worker_base_url()
+    dashboard_base_url = _dashboard_base_url()
+    context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+    enrollment_attempt = _obtain_host_credential(context, quiet=quiet)
+    if enrollment_attempt.credential is None:
+        _emit(
+            {
+                "status": "setup_pending",
+                "reason": enrollment_attempt.reason or "approval_pending",
+                "host": host,
+            },
+            quiet=quiet,
+            update_notice=update_notice,
+        )
+        return 0
+    credential = enrollment_attempt.credential
+
+    policy_url = _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
+    check_in_url = _worker_url(worker_base_url, "/v0/host-enrollment/check-ins")
+    try:
+        signed_policy = _get_json(policy_url, credential.value, label="policy response")
+    except BootstrapAuthError:
+        _forget_cached_host_credential(context)
+        enrollment_attempt = _enroll_host_credential(context, quiet=quiet)
+        if enrollment_attempt.credential is None:
+            _emit(
+                {
+                    "status": "setup_pending",
+                    "reason": enrollment_attempt.reason or "approval_pending",
+                    "host": host,
+                },
+                quiet=quiet,
+                update_notice=update_notice,
+            )
+            return 0
+        credential = enrollment_attempt.credential
+        signed_policy = _get_json(policy_url, credential.value, label="policy response")
+    policy = _validate_signed_policy(signed_policy, host)
+    if _requires_newer_bootstrap(policy.required_bootstrap_version, RUNTIME_VERSION):
+        result = _blocked_result(
+            host,
+            policy,
+            kind="bootstrap_upgrade_required",
+            message="Worker policy requires a newer Promptless host runtime",
+            details={
+                "required_bootstrap_version": policy.required_bootstrap_version,
+                "bootstrap_version": RUNTIME_VERSION,
+            },
+        )
+        _post_check_in(check_in_url, credential, host, metadata, policy, result)
+        _emit(
+            {"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host},
+            quiet=quiet,
+            update_notice=update_notice,
+        )
+        return 0
+
+    result = _configure_host(host, policy)
+    _post_check_in(check_in_url, credential, host, metadata, policy, result)
+    _emit(
+        {"status": result.status, "host": host, "needs_restart": result.needs_restart},
+        quiet=quiet,
+        update_notice=update_notice,
+    )
+    return 0
+
+
+def _run_collect(
+    host: Host,
+    *,
+    lifecycle_event: LifecycleEvent,
+    hook_context: HookTraceContext,
+    baseline: bool,
+    quiet: bool,
+) -> int:
+    plugin_root = _plugin_root()
+    metadata = _load_runtime_metadata(plugin_root, host)
+    worker_base_url = _worker_base_url()
+    dashboard_base_url = _dashboard_base_url()
+    context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+    credential = _cached_host_credential(context)
+    if credential is None:
+        _emit({"status": "trace_upload_skipped", "reason": "not_enrolled", "host": host}, quiet=quiet)
+        return 0
+
+    policy_url = _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
+    try:
+        signed_policy = _get_json(policy_url, credential.value, label="policy response")
+    except BootstrapAuthError:
+        _forget_cached_host_credential(context)
+        _emit({"status": "trace_upload_skipped", "reason": "credential_rejected", "host": host}, quiet=quiet)
+        return 0
+    policy = _validate_signed_policy(signed_policy, host)
+    if _requires_newer_bootstrap(policy.required_bootstrap_version, RUNTIME_VERSION):
+        _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
+        return 0
+
+    source_paths = _collect_source_paths(host, hook_context, lifecycle_event=lifecycle_event)
+    if not source_paths:
+        _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
+        return 0
+
+    upload_url = _worker_url(worker_base_url, f"/v0/traces/batches?{urlencode({'target': host})}")
+    ledger_path = _ledger_path()
+    uploaded_batch_count = 0
+    uploaded_chunk_count = 0
+    with _source_ledger_lock(ledger_path):
+        ledger = _load_source_ledger(ledger_path)
+        if ledger.is_new:
+            _baseline_source_offsets(ledger, source_paths)
+            _write_source_ledger(ledger)
+            _emit(
+                {
+                    "status": "trace_upload_baselined",
+                    "host": host,
+                    "source_count": len(source_paths),
+                    "drift_report_count": len(ledger.drift_reports),
+                },
+                quiet=quiet,
+            )
+            return 0
+        if baseline:
+            ledger.drift_reports.append({"kind": "native_trace_existing_ledger", "baseline": False})
+
+        for batch in _iter_upload_batches(
+            host=host,
+            metadata=metadata,
+            policy=policy,
+            lifecycle_event=lifecycle_event,
+            hook_context=hook_context,
+            ledger=ledger,
+            source_paths=source_paths,
+        ):
+            response = _post_upload_batch(upload_url, credential, policy, batch)
+            _advance_ledger_from_response(ledger, source_paths, response)
+            _write_source_ledger(ledger)
+            uploaded_batch_count += 1
+            uploaded_chunk_count += len(batch.events)
+
+    _emit(
+        {
+            "status": "trace_upload_complete",
+            "host": host,
+            "batch_count": uploaded_batch_count,
+            "chunk_count": uploaded_chunk_count,
+        },
+        quiet=quiet,
+    )
+    return 0
+
+
+def _lifecycle_event(value: str | None) -> LifecycleEvent:
+    if value in {"session_start", "stop", "session_end", "subagent_stop"}:
+        return value
+    return "session_start"
+
+
+def _read_hook_context() -> dict[str, JsonValue]:
+    if sys.stdin.isatty():
+        return {}
+    body = sys.stdin.buffer.read(MAX_STDIN_BYTES + 1)
+    if body == b"":
+        return {}
+    if len(body) > MAX_STDIN_BYTES:
+        raise BootstrapError("hook stdin JSON exceeds maximum supported size")
+    return _decode_json_object(body, "hook stdin")
+
+
+def _hook_trace_context(context: dict[str, JsonValue]) -> HookTraceContext:
+    transcript_path = _optional_hook_path(context.get("transcript_path"))
+    agent_transcript_path = _optional_hook_path(context.get("agent_transcript_path"))
+    return HookTraceContext(
+        transcript_path=transcript_path,
+        agent_transcript_path=agent_transcript_path,
+        session_id=_non_empty(_first_string(context, ("session_id", "conversation_id"))),
+        parent_session_id=_non_empty(_first_string(context, ("parent_session_id", "parent_conversation_id"))),
+        agent_id=_non_empty(_first_string(context, ("agent_id", "subagent_id", "agent_name"))),
+        agent_type=_non_empty(_first_string(context, ("agent_type", "subagent_type"))),
+    )
+
+
+def _optional_hook_path(value: JsonValue | None) -> Path | None:
+    text = _non_empty(_string_value(value))
+    if text is None:
+        return None
+    return Path(text).expanduser()
+
+
+def _first_string(context: dict[str, JsonValue], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = _string_value(context.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _collect_source_paths(
+    host: Host,
+    hook_context: HookTraceContext,
+    *,
+    lifecycle_event: LifecycleEvent,
+) -> tuple[Path, ...]:
+    explicit_paths: list[Path] = []
+    if lifecycle_event == "subagent_stop" and hook_context.agent_transcript_path is not None:
+        explicit_paths.append(hook_context.agent_transcript_path)
+    elif hook_context.transcript_path is not None:
+        explicit_paths.append(hook_context.transcript_path)
+    if hook_context.agent_transcript_path is not None and hook_context.agent_transcript_path not in explicit_paths:
+        explicit_paths.append(hook_context.agent_transcript_path)
+
+    ordered_paths: list[Path] = []
+    seen: set[str] = set()
+    for path in explicit_paths:
+        _append_unique_path(ordered_paths, seen, path)
+    for path in _idle_root_scan_paths(host):
+        _append_unique_path(ordered_paths, seen, path)
+    return tuple(ordered_paths)
+
+
+def _append_unique_path(paths: list[Path], seen: set[str], path: Path) -> None:
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+    except OSError:
+        resolved = path.expanduser().absolute()
+    key = str(resolved)
+    if key in seen:
+        return
+    seen.add(key)
+    paths.append(resolved)
+
+
+def _idle_root_scan_paths(host: Host) -> tuple[Path, ...]:
+    now = time.time()
+    result: list[Path] = []
+    for pattern in _native_trace_globs(host):
+        for raw_path in glob.iglob(pattern, recursive=True):
+            path = Path(raw_path)
+            if not path.is_file():
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if now - mtime < IDLE_SESSION_GRACE_SECONDS:
+                continue
+            result.append(path)
+    return tuple(sorted(result))
+
+
+def _native_trace_globs(host: Host) -> tuple[str, ...]:
+    if host == "claude":
+        return (str(Path.home() / ".claude/projects/**/*.jsonl"),)
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+    return (str(codex_home / "**/*.jsonl"),)
+
+
+def _ledger_path() -> Path:
+    override = _non_empty(os.environ.get("PROMPTLESS_HOST_RUNTIME_LEDGER"))
+    if override is not None:
+        return Path(override).expanduser()
+    return _state_path().with_name(LEDGER_FILE_NAME)
+
+
+@contextmanager
+def _source_ledger_lock(path: Path) -> Iterator[None]:
+    with _state_file_lock(path):
+        yield
+
+
+def _load_source_ledger(path: Path) -> SourceLedger:
+    if not path.exists():
+        return SourceLedger(path=path, is_new=True, sources={})
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        _quarantine_corrupt_ledger(path)
+        return SourceLedger(
+            path=path,
+            is_new=True,
+            sources={},
+            drift_reports=[{"kind": "native_trace_ledger_reset", "reason": "invalid_json"}],
+        )
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        _quarantine_corrupt_ledger(path)
+        return SourceLedger(
+            path=path,
+            is_new=True,
+            sources={},
+            drift_reports=[{"kind": "native_trace_ledger_reset", "reason": "unsupported_schema"}],
+        )
+    sources = value.get("sources")
+    if not isinstance(sources, dict):
+        _quarantine_corrupt_ledger(path)
+        return SourceLedger(
+            path=path,
+            is_new=True,
+            sources={},
+            drift_reports=[{"kind": "native_trace_ledger_reset", "reason": "invalid_sources"}],
+        )
+    valid_sources: dict[str, dict[str, JsonValue]] = {}
+    for raw_key, raw_source in sources.items():
+        key = _string_value(raw_key)
+        source = _json_mapping_or_empty(raw_source if isinstance(raw_source, dict) else None)
+        end_offset = _optional_int_value(source.get("end_offset"))
+        if key is None or len(key) != 64 or end_offset is None or end_offset < 0:
+            continue
+        valid_sources[key] = source
+    return SourceLedger(path=path, is_new=False, sources=valid_sources)
+
+
+def _quarantine_corrupt_ledger(path: Path) -> None:
+    try:
+        if not path.exists():
+            return
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        path.rename(path.with_name(f"{path.name}.corrupt-{timestamp}"))
+    except OSError:
+        return
+
+
+def _write_source_ledger(ledger: SourceLedger) -> None:
+    payload: dict[str, JsonValue] = {
+        "schema_version": 1,
+        "updated_at": _utc_now_iso(),
+        "sources": ledger.sources,
+    }
+    _atomic_write_text(ledger.path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    try:
+        ledger.path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _baseline_source_offsets(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> None:
+    for path in source_paths:
+        try:
+            end_offset = path.stat().st_size
+        except OSError:
+            continue
+        _record_ledger_offset(ledger, path, end_offset)
+
+
+def _iter_upload_batches(
+    *,
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    lifecycle_event: LifecycleEvent,
+    hook_context: HookTraceContext,
+    ledger: SourceLedger,
+    source_paths: tuple[Path, ...],
+) -> Iterator[UploadBatch]:
+    pending_events: list[SourceEvent] = []
+    pending_payloads: list[dict[str, JsonValue]] = []
+    pending_decoded_bytes = 0
+    for event in _iter_source_events(ledger, source_paths):
+        payload = _chunk_payload(event, lifecycle_event)
+        next_decoded_bytes = pending_decoded_bytes + event.byte_count
+        if (
+            pending_payloads
+            and (
+                len(pending_payloads) >= MAX_UPLOAD_CHUNKS_PER_BATCH
+                or next_decoded_bytes > MAX_TRACE_BATCH_BYTES
+            )
+        ):
+            yield _upload_batch(
+                host=host,
+                metadata=metadata,
+                policy=policy,
+                lifecycle_event=lifecycle_event,
+                hook_context=hook_context,
+                events=tuple(pending_events),
+                chunks=tuple(pending_payloads),
+            )
+            pending_events = []
+            pending_payloads = []
+            pending_decoded_bytes = 0
+        pending_events.append(event)
+        pending_payloads.append(payload)
+        pending_decoded_bytes += event.byte_count
+    if pending_events:
+        yield _upload_batch(
+            host=host,
+            metadata=metadata,
+            policy=policy,
+            lifecycle_event=lifecycle_event,
+            hook_context=hook_context,
+            events=tuple(pending_events),
+            chunks=tuple(pending_payloads),
+        )
+
+
+def _iter_source_events(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> Iterator[SourceEvent]:
+    for path in source_paths:
+        path_hash = _path_hash(path)
+        source = ledger.sources.get(path_hash)
+        start_offset = _optional_int_value(source.get("end_offset")) if source is not None else 0
+        if start_offset is None or start_offset < 0:
+            start_offset = 0
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            continue
+        if start_offset > file_size:
+            ledger.drift_reports.append(
+                {
+                    "kind": "native_trace_source_rewound",
+                    "source_path_hash": path_hash,
+                    "previous_end_offset": start_offset,
+                    "current_size": file_size,
+                }
+            )
+            ledger.reset_sources.add(path_hash)
+            start_offset = 0
+        if start_offset == file_size:
+            continue
+        with path.open("rb") as handle:
+            handle.seek(start_offset)
+            while handle.tell() < file_size:
+                record_start = handle.tell()
+                line = handle.readline()
+                if line == b"":
+                    break
+                record_end = handle.tell()
+                if not line.endswith(b"\n"):
+                    break
+                yield _source_event_for_line(path, path_hash, record_start, record_end, line)
+
+
+def _source_event_for_line(path: Path, path_hash: str, start_offset: int, end_offset: int, line: bytes) -> SourceEvent:
+    content_sha256 = hashlib.sha256(line).hexdigest()
+    if len(line) > MAX_TRACE_BATCH_BYTES:
+        return SourceEvent(
+            kind="oversized_record",
+            path=path,
+            path_hash=path_hash,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            byte_count=len(line),
+            content_sha256=content_sha256,
+            oversized_reason="decoded_size",
+        )
+    encoded = _gzip_base64(line)
+    if len(encoded.encode("ascii")) > MAX_TRACE_BATCH_BYTES:
+        return SourceEvent(
+            kind="oversized_record",
+            path=path,
+            path_hash=path_hash,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            byte_count=len(line),
+            content_sha256=content_sha256,
+            oversized_reason="encoded_size",
+        )
+    return SourceEvent(
+        kind="jsonl_range",
+        path=path,
+        path_hash=path_hash,
+        start_offset=start_offset,
+        end_offset=end_offset,
+        byte_count=len(line),
+        content_sha256=content_sha256,
+        content=line,
+    )
+
+
+def _chunk_payload(event: SourceEvent, lifecycle_event: LifecycleEvent) -> dict[str, JsonValue]:
+    if event.content_sha256 is None:
+        raise BootstrapError("source event missing content hash")
+    payload: dict[str, JsonValue] = {
+        "kind": event.kind,
+        "source_path_hash": event.path_hash,
+        "start_offset": event.start_offset,
+        "end_offset": event.end_offset,
+        "content_sha256": event.content_sha256,
+        "lifecycle_event": lifecycle_event,
+    }
+    if event.kind == "oversized_record":
+        payload["byte_count"] = event.byte_count
+        payload["oversized_reason"] = event.oversized_reason or "decoded_size"
+        return payload
+    if event.content is None:
+        raise BootstrapError("jsonl range event missing content")
+    payload["line_count"] = max(1, event.content.count(b"\n"))
+    payload["content_gzip_base64"] = _gzip_base64(event.content)
+    return payload
+
+
+def _gzip_base64(content: bytes) -> str:
+    return base64.b64encode(gzip.compress(content, mtime=0)).decode("ascii")
+
+
+def _upload_batch(
+    *,
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    lifecycle_event: LifecycleEvent,
+    hook_context: HookTraceContext,
+    events: tuple[SourceEvent, ...],
+    chunks: tuple[dict[str, JsonValue], ...],
+) -> UploadBatch:
+    request: dict[str, JsonValue] = {
+        "batch_id": _stable_upload_batch_id(host, policy, events),
+        "source": host,
+        "host": host,
+        "policy_version": policy.policy_version,
+        "collector_version": metadata.bootstrap_version,
+        "plugin_version": metadata.plugin_version,
+        "uploaded_at": _utc_now_iso(),
+        "chunks": list(chunks),
+    }
+    request.update(_native_request_context(hook_context, lifecycle_event))
+    return UploadBatch(request=request, events=events)
+
+
+def _native_request_context(hook_context: HookTraceContext, lifecycle_event: LifecycleEvent) -> dict[str, JsonValue]:
+    session_id = hook_context.session_id
+    parent_session_id = hook_context.parent_session_id
+    agent_id = hook_context.agent_id
+    agent_type = hook_context.agent_type
+    if lifecycle_event == "subagent_stop":
+        if parent_session_id is None:
+            parent_session_id = hook_context.session_id
+            session_id = None
+        if agent_id is None and hook_context.agent_transcript_path is not None:
+            agent_id = _path_hash(hook_context.agent_transcript_path)[:32]
+        if agent_type is None and agent_id is not None:
+            agent_type = "subagent"
+
+    result: dict[str, JsonValue] = {}
+    if session_id is not None:
+        result["session_id"] = session_id
+    if parent_session_id is not None and agent_id is not None:
+        result["parent_session_id"] = parent_session_id
+        result["agent_id"] = agent_id
+        if agent_type is not None:
+            result["agent_type"] = agent_type
+    return result
+
+
+def _stable_upload_batch_id(host: Host, policy: HostPolicy, events: tuple[SourceEvent, ...]) -> str:
+    material = {
+        "host": host,
+        "policy_version": policy.policy_version,
+        "ranges": [
+            {
+                "kind": event.kind,
+                "source_path_hash": event.path_hash,
+                "start_offset": event.start_offset,
+                "end_offset": event.end_offset,
+                "content_sha256": event.content_sha256,
+            }
+            for event in events
+        ],
+    }
+    return "native-" + hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[:48]
+
+
+def _post_upload_batch(
+    upload_url: str,
+    credential: HostCredential,
+    policy: HostPolicy,
+    batch: UploadBatch,
+) -> dict[str, JsonValue]:
+    response = _post_json_response(upload_url, credential.value, batch.request, label="trace batch response")
+    _validate_upload_response(response, policy, batch)
+    return response
+
+
+def _validate_upload_response(response: dict[str, JsonValue], policy: HostPolicy, batch: UploadBatch) -> None:
+    if response.get("accepted") is not True:
+        raise BootstrapError("trace batch response was not accepted")
+    if _string_value(response.get("batch_id")) != _string_value(batch.request.get("batch_id")):
+        raise BootstrapError("trace batch response batch_id did not match upload request")
+    if response.get("policy_version") != policy.policy_version:
+        raise BootstrapError("trace batch response policy_version did not match applied policy")
+    if response.get("unparsed_record_count") != 0:
+        raise BootstrapError("trace batch response reported unparsed records")
+    expected_raw_count = sum(1 for event in batch.events if event.kind == "jsonl_range")
+    if response.get("raw_artifact_count") != expected_raw_count:
+        raise BootstrapError("trace batch response raw_artifact_count did not match upload request")
+    expected_skipped_count = sum(1 for event in batch.events if event.kind == "oversized_record")
+    if response.get("skipped_record_count") != expected_skipped_count:
+        raise BootstrapError("trace batch response skipped_record_count did not match upload request")
+    if response.get("acknowledged_ranges") != _expected_acknowledged_ranges(batch.events):
+        raise BootstrapError("trace batch response acknowledged_ranges did not match upload request")
+
+
+def _advance_ledger_from_response(
+    ledger: SourceLedger,
+    source_paths: tuple[Path, ...],
+    response: dict[str, JsonValue],
+) -> None:
+    paths_by_hash = {_path_hash(path): path for path in source_paths}
+    acknowledged_ranges = response.get("acknowledged_ranges")
+    if not isinstance(acknowledged_ranges, list):
+        raise BootstrapError("trace batch response acknowledged_ranges must be a list")
+    for value in acknowledged_ranges:
+        acknowledged = _json_mapping_or_empty(value)
+        source_path_hash = _string_value(acknowledged.get("source_path_hash"))
+        end_offset = _optional_int_value(acknowledged.get("end_offset"))
+        if source_path_hash is None or end_offset is None:
+            raise BootstrapError("trace batch response acknowledged range is malformed")
+        path = paths_by_hash.get(source_path_hash)
+        if path is None:
+            raise BootstrapError("trace batch response acknowledged unknown source")
+        _record_ledger_offset(ledger, path, end_offset)
+
+
+def _expected_acknowledged_ranges(events: tuple[SourceEvent, ...]) -> list[dict[str, JsonValue]]:
+    return [
+        {
+            "kind": event.kind,
+            "source_path_hash": event.path_hash,
+            "start_offset": event.start_offset,
+            "end_offset": event.end_offset,
+            "content_sha256": event.content_sha256,
+        }
+        for event in events
+        if event.content_sha256 is not None
+    ]
+
+
+def _record_ledger_offset(ledger: SourceLedger, path: Path, end_offset: int) -> None:
+    path_hash = _path_hash(path)
+    existing = _json_mapping_or_empty(ledger.sources.get(path_hash))
+    previous_offset = 0 if path_hash in ledger.reset_sources else (_optional_int_value(existing.get("end_offset")) or 0)
+    ledger.sources[path_hash] = {
+        "path": str(path),
+        "end_offset": max(previous_offset, end_offset),
+        "updated_at": _utc_now_iso(),
+    }
+
+
+def _path_hash(path: Path) -> str:
+    return hashlib.sha256(str(path).encode()).hexdigest()
+
+
+def _utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _status_payload(host: Host) -> dict[str, JsonValue]:
+    state_path = _state_path()
+    state = _load_state(state_path)
+    credentials = _credential_statuses_for_host(state, host)
+    pending_counts = _pending_enrollment_counts(state, host)
+    seen_versions = _json_mapping_or_empty(state.get("last_seen_plugin_versions"))
+    return {
+        "status": "ok",
+        "host": host,
+        "runtime": {
+            "id": MANAGED_RUNTIME_ID,
+            "name": RUNTIME_EXECUTABLE,
+            "version": RUNTIME_VERSION,
+            "channel": RUNTIME_CHANNEL,
+            "sha256": _self_sha256(),
+        },
+        "state": {
+            "path": str(state_path),
+            "exists": state_path.exists(),
+            "host_instance_id": _string_value(state.get("host_instance_id")),
+            "credential_count": len(credentials),
+            "credentials": credentials,
+            "pending_enrollment_count": pending_counts[0],
+            "legacy_pending_enrollment_count": pending_counts[1],
+            "last_seen_plugin_version": _string_value(seen_versions.get(host)),
+        },
+        "config": _host_config_status(host),
+    }
+
+
+def _credential_statuses_for_host(state: dict[str, JsonValue], host: Host) -> list[dict[str, JsonValue]]:
+    statuses: list[dict[str, JsonValue]] = []
+    credentials = _json_mapping_or_empty(state.get("credentials"))
+    for credential_value in credentials.values():
+        credential = _json_mapping_or_empty(credential_value)
+        if _string_value(credential.get("target")) != host:
+            continue
+        if _string_value(credential.get("value")) is None:
+            continue
+        statuses.append(
+            {
+                "credential_id": _string_value(credential.get("credential_id")),
+                "deployment_instance_id": _string_value(credential.get("deployment_instance_id")),
+                "worker_base_url": _string_value(credential.get("worker_base_url")),
+                "updated_at": _string_value(credential.get("updated_at")),
+            }
+        )
+    return sorted(statuses, key=lambda item: _string_value(item.get("updated_at")) or "")
+
+
+def _pending_enrollment_counts(state: dict[str, JsonValue], host: Host) -> tuple[int, int]:
+    pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+    host_pending = 0
+    legacy_pending = 0
+    for pending_value in pending_enrollments.values():
+        pending = _json_mapping_or_empty(pending_value)
+        target = _string_value(pending.get("target"))
+        if target == host:
+            host_pending += 1
+        elif target is None:
+            legacy_pending += 1
+    return host_pending, legacy_pending
+
+
+def _host_config_status(host: Host) -> dict[str, JsonValue]:
+    if host == "codex":
+        return _codex_config_status()
+    return _claude_config_status()
+
+
+def _codex_config_status() -> dict[str, JsonValue]:
+    config_path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser() / "config.toml"
+    result: dict[str, JsonValue] = {"path": str(config_path), "exists": config_path.exists()}
+    if not config_path.exists():
+        result["managed_config_detected"] = False
+        return result
+    try:
+        existing = config_path.read_text()
+    except OSError as exc:
+        result["read_error"] = _redact_text(str(exc))
+        result["managed_config_detected"] = False
+        return result
+    malformed = _has_malformed_managed_blocks(existing)
+    result["malformed_managed_config"] = malformed
+    result["managed_config_detected"] = not malformed and _managed_block_pattern().search(existing) is not None
+    return result
+
+
+def _claude_config_status() -> dict[str, JsonValue]:
+    settings_path = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser() / "settings.json"
+    result: dict[str, JsonValue] = {"path": str(settings_path), "exists": settings_path.exists()}
+    if not settings_path.exists():
+        result["managed_config_detected"] = False
+        return result
+    try:
+        settings = json.loads(settings_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        result["read_error"] = _redact_text(str(exc))
+        result["managed_config_detected"] = False
+        return result
+    if not isinstance(settings, dict):
+        result["read_error"] = "settings file is not a JSON object"
+        result["managed_config_detected"] = False
+        return result
+    env = settings.get("env")
+    result["managed_config_detected"] = isinstance(env, dict) and _string_value(env.get(CLAUDE_MANAGED_ENV_MARKER)) == "1"
+    return result
+
+
+def _reset_host_state(host: Host) -> tuple[int, int]:
+    state_path = _state_path()
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        credentials = _json_mapping_or_empty(state.get("credentials"))
+        kept_credentials: dict[str, JsonValue] = {}
+        credentials_removed = 0
+        for key, credential_value in credentials.items():
+            credential = _json_mapping_or_empty(credential_value)
+            if _string_value(credential.get("target")) == host:
+                credentials_removed += 1
+                continue
+            kept_credentials[key] = credential_value
+        state["credentials"] = kept_credentials
+
+        pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+        kept_pending: dict[str, JsonValue] = {}
+        pending_removed = 0
+        for key, pending_value in pending_enrollments.items():
+            pending = _json_mapping_or_empty(pending_value)
+            target = _string_value(pending.get("target"))
+            if target == host or target is None:
+                pending_removed += 1
+                continue
+            kept_pending[key] = pending_value
+        state["pending_enrollments"] = kept_pending
+        _write_state(state_path, state)
+    return credentials_removed, pending_removed
+
+
+def _emit_command_json(payload: dict[str, JsonValue]) -> None:
+    sys.stdout.write(json.dumps(_redact_json(payload), sort_keys=True) + "\n")
+    sys.stdout.flush()
+
+
+@dataclass(frozen=True)
+class PendingPluginUpdate:
+    """The installed plugin version to record as seen for a host, with any one-time update notice."""
+
+    target: str
+    version: str
+    notice: str | None
+
+
+def _pending_plugin_update(metadata: RuntimeMetadata) -> PendingPluginUpdate | None:
+    """Return the plugin version to record plus any one-time update notice, or None when there is nothing to do.
+
+    The installed version comes from the plugin's managed-runtime manifest; the last-seen version is
+    read from the host data dir (which survives plugin updates), keyed by host so a data dir shared
+    between Claude and Codex tracks each separately. This is read-only and best-effort: a missing,
+    unwritable, or corrupt data dir must never turn an otherwise healthy SessionStart into an error,
+    so state I/O and parse failures yield no notice. The notice is None on a first install (nothing
+    seen yet); the version is still returned so the caller can record it.
+    """
+
+    current_version = metadata.plugin_version
+    if current_version == "unknown":
+        return None
+    try:
+        state_path = _state_path()
+        with _state_file_lock(state_path):
+            seen_versions = _json_mapping_or_empty(_load_state(state_path).get("last_seen_plugin_versions"))
+        last_seen_version = _string_value(seen_versions.get(metadata.target))
+    except (OSError, BootstrapError):
+        return None
+    if last_seen_version == current_version:
+        return None
+    notice = (
+        None
+        if last_seen_version is None
+        else f"Promptless Instruction Hub updated to v{current_version} (was v{last_seen_version})."
+    )
+    return PendingPluginUpdate(target=metadata.target, version=current_version, notice=notice)
+
+
+def _record_plugin_version_seen(pending: PendingPluginUpdate) -> None:
+    """Persist the installed plugin version as seen for the host, preserving other state.
+
+    Called only after the SessionStart output (including any update notice) has been emitted, so a
+    failure before output leaves the prior version and re-announces next time. Best-effort: state I/O
+    failures are swallowed so recording never breaks a session. Re-reads state under the lock so a
+    credential written by the enrollment step in the same run is preserved.
+    """
+
+    try:
+        state_path = _state_path()
+        with _state_file_lock(state_path):
+            state = _load_state(state_path)
+            seen_versions = _json_mapping_or_empty(state.get("last_seen_plugin_versions"))
+            seen_versions[pending.target] = pending.version
+            state["last_seen_plugin_versions"] = seen_versions
+            _write_state(state_path, state)
+    except (OSError, BootstrapError):
+        return
+
+
+def _resolve_host(host_arg: str) -> Host:
+    if host_arg == "codex" or host_arg == "claude":
+        return host_arg
+    if os.environ.get("CLAUDE_PLUGIN_ROOT"):
+        return "claude"
+    return "codex"
+
+
+def _plugin_root() -> Path | None:
+    raw_root = os.environ.get("PLUGIN_ROOT") or os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if raw_root is None or raw_root.strip() == "":
+        return None
+    return Path(raw_root).expanduser()
+
+
+def _worker_base_url() -> str:
+    return _normalize_base_url(
+        os.environ.get("PROMPTLESS_WORKER_BASE_URL") or DEFAULT_WORKER_BASE_URL,
+        label="worker base URL",
+    )
+
+
+def _dashboard_base_url() -> str:
+    return _normalize_base_url(
+        os.environ.get("PROMPTLESS_DASHBOARD_BASE_URL") or DEFAULT_DASHBOARD_BASE_URL,
+        label="dashboard base URL",
+    )
+
+
+def _enrollment_context(worker_base_url: str, dashboard_base_url: str, metadata: RuntimeMetadata) -> EnrollmentContext:
+    deployment_instance_id = _worker_deployment_instance_id(worker_base_url)
+    state_path = _state_path()
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        host_instance_id = _host_instance_id(state)
+        if state.get("host_instance_id") != host_instance_id:
+            state["host_instance_id"] = host_instance_id
+            _write_state(state_path, state)
+    return EnrollmentContext(
+        worker_base_url=worker_base_url,
+        dashboard_base_url=dashboard_base_url,
+        deployment_instance_id=deployment_instance_id,
+        metadata=metadata,
+        host_instance_id=host_instance_id,
+        host_label=_host_label(),
+        host_platform=_host_platform(),
+    )
+
+
+def _worker_deployment_instance_id(worker_base_url: str) -> str:
+    response = _get_json(_worker_url(worker_base_url, "/healthz"), None, label="worker health response")
+    deployment_instance_id = _non_empty(_string_value(response.get("deployment_instance_id")))
+    if deployment_instance_id is None:
+        raise BootstrapError("worker health response missing deployment_instance_id")
+    return deployment_instance_id
+
+
+def _state_path() -> Path:
+    # Host enrollment is a per-host concept: one approved credential and one OTel policy cover
+    # every Promptless plugin this user installs from the hub. Persist the state at a single
+    # host-global path so multiple plugins coordinate through one file (and one credential)
+    # instead of each enrolling -- and opening its own browser window -- independently. The
+    # per-plugin CLAUDE_PLUGIN_DATA/PLUGIN_DATA directories are intentionally not used here: the
+    # agent host sets a different one per plugin, which would re-fragment the shared host state.
+    return Path.home() / ".promptless/instruction-hub" / STATE_FILE_NAME
+
+
+def _last_status_path() -> Path:
+    return _state_path().with_name(LAST_STATUS_FILE_NAME)
+
+
+def _raw_api_bodies_path() -> Path:
+    return _state_path().with_name(RAW_API_BODIES_DIR_NAME)
+
+
+def _load_state(path: Path) -> dict[str, JsonValue]:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise BootstrapError(f"host enrollment state is invalid JSON at {path}: {exc.msg}") from exc
+    if not isinstance(value, dict):
+        raise BootstrapError(f"host enrollment state must be a JSON object at {path}")
+    return _json_object(value)
+
+
+def _write_state(path: Path, state: dict[str, JsonValue]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    _atomic_write_text(path, body)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _state_file_lock(path: Path) -> Iterator[None]:
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        _lock_state_file(lock_file)
+        try:
+            yield
+        finally:
+            _unlock_state_file(lock_file)
+
+
+def _lock_state_file(lock_file: BinaryIO) -> None:
+    if os.name == "nt":
+        _ensure_windows_lock_byte(lock_file)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_state_file(lock_file: BinaryIO) -> None:
+    if os.name == "nt":
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _ensure_windows_lock_byte(lock_file: BinaryIO) -> None:
+    lock_file.seek(0)
+    if lock_file.read(1) == b"":
+        lock_file.seek(0)
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
+
+
+@contextmanager
+def _enrollment_leader_lock(context: EnrollmentContext, state_path: Path) -> Iterator[bool]:
+    """Serialize browser-approval enrollment across the plugins that share this host credential.
+
+    Yields ``True`` to the single process that wins the lock (the leader, which opens the one
+    browser approval) and ``False`` to any concurrent process for the same credential (a
+    follower, which must not open a second browser). The lock is scoped to the credential cache
+    key so independent agent hosts (claude vs codex) still enroll in parallel, and it is
+    non-blocking so a follower returns immediately and defers to a later session instead of
+    stacking up behind the leader's approval wait.
+    """
+
+    lock_path = state_path.with_name(f"host-enrollment-{_credential_cache_key(context)}.enroll.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        acquired = _try_lock_state_file(lock_file)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                _unlock_state_file(lock_file)
+
+
+def _try_lock_state_file(lock_file: BinaryIO) -> bool:
+    """Attempt a non-blocking exclusive lock, returning True when acquired and False when held elsewhere."""
+    if os.name == "nt":
+        _ensure_windows_lock_byte(lock_file)
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _host_instance_id(state: dict[str, JsonValue]) -> str:
+    existing = _non_empty(_string_value(state.get("host_instance_id")))
+    if existing is not None:
+        return existing
+    return f"host-{uuid.uuid4().hex}"
+
+
+def _host_label() -> str:
+    username = _non_empty(getpass.getuser()) or "unknown-user"
+    node = _non_empty(platform.node()) or "unknown-host"
+    return _truncate(f"{username}@{node}", 240)
+
+
+def _host_platform() -> str:
+    return _truncate(platform.platform(), 120)
+
+
+def _truncate(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return value[:max_length]
+
+
+def _obtain_host_credential(context: EnrollmentContext, *, quiet: bool) -> EnrollmentAttempt:
+    credential = _cached_host_credential(context)
+    if credential is not None:
+        return EnrollmentAttempt(credential=credential)
+    return _enroll_host_credential(context, quiet=quiet)
+
+
+def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None:
+    state_path = _state_path()
+    state = _load_state(state_path)
+    credentials = _json_mapping_or_empty(state.get("credentials"))
+    cached_credential = _json_mapping_or_empty(credentials.get(_credential_cache_key(context)))
+    credential_value = _string_value(cached_credential.get("value"))
+    credential_id = _string_value(cached_credential.get("credential_id"))
+    deployment_instance_id = _string_value(cached_credential.get("deployment_instance_id"))
+    credential = (
+        HostCredential(
+            value=credential_value,
+            credential_id=credential_id,
+            deployment_instance_id=deployment_instance_id,
+        )
+        if credential_value
+        else None
+    )
+    return credential
+
+
+def _forget_cached_host_credential(context: EnrollmentContext) -> None:
+    state_path = _state_path()
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        credentials = _json_mapping_or_empty(state.get("credentials"))
+        key = _credential_cache_key(context)
+        if key in credentials:
+            del credentials[key]
+            state["credentials"] = credentials
+            _write_state(state_path, state)
+
+
+def _enroll_host_credential(context: EnrollmentContext, *, quiet: bool) -> EnrollmentAttempt:
+    state_path = _state_path()
+    session = _load_pending_enrollment_session(context, state_path)
+    if session is not None:
+        # A pending session already exists (e.g. left by an earlier session start); polling it
+        # opens no browser, so no cross-plugin coordination is needed here.
+        return _complete_host_enrollment(context, state_path, session)
+    # A fresh enrollment opens a browser. Serialize that across every plugin on this host so only
+    # the leader drives the single browser approval; concurrent followers reuse the resulting
+    # credential or defer rather than opening their own browser window.
+    with _enrollment_leader_lock(context, state_path) as is_enrollment_leader:
+        if not is_enrollment_leader:
+            return EnrollmentAttempt(credential=_cached_host_credential(context), reason="enrollment_in_progress")
+        # Re-check under the lock: a previous leader may have just finished enrolling this host.
+        credential = _cached_host_credential(context)
+        if credential is not None:
+            return EnrollmentAttempt(credential=credential)
+        session = _load_pending_enrollment_session(context, state_path)
+        if session is None:
+            _emit({"status": "browser_enrollment_starting", "host": context.metadata.target}, quiet=quiet)
+            created_session = _create_enrollment_session(context)
+            if created_session.session is None:
+                return EnrollmentAttempt(credential=None, reason=created_session.reason or "approval_pending")
+            session, stored_new_session = _store_pending_enrollment(context, state_path, created_session.session)
+            if not stored_new_session:
+                session = _load_pending_enrollment_session(context, state_path) or session
+        return _complete_host_enrollment(context, state_path, session)
+
+
+def _complete_host_enrollment(
+    context: EnrollmentContext,
+    state_path: Path,
+    session: EnrollmentSession,
+) -> EnrollmentAttempt:
+    enrollment_attempt = _poll_enrollment_session(context, session)
+    if enrollment_attempt.credential is None:
+        return enrollment_attempt
+    credential = enrollment_attempt.credential
+    _store_host_credential(context, state_path, credential)
+    return EnrollmentAttempt(credential=credential)
+
+
+def _load_pending_enrollment_session(context: EnrollmentContext, state_path: Path) -> EnrollmentSession | None:
+    with _state_file_lock(state_path):
+        return _pending_enrollment_session(context, _load_state(state_path))
+
+
+def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, JsonValue]) -> EnrollmentSession | None:
+    pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+    session_value = _json_mapping_or_empty(pending_enrollments.get(_credential_cache_key(context)))
+    if not session_value:
+        return None
+    expires_at = _optional_datetime_value(session_value.get("expires_at"), "pending enrollment expires_at")
+    if expires_at is None or expires_at <= dt.datetime.now(dt.timezone.utc):
+        return None
+    session_id = _string_value(session_value.get("session_id"))
+    device_code = _string_value(session_value.get("device_code"))
+    poll_url = _string_value(session_value.get("poll_url"))
+    poll_interval_seconds = _optional_int_value(session_value.get("poll_interval_seconds"))
+    deployment_instance_id = _string_value(session_value.get("deployment_instance_id"))
+    if (
+        session_id is None
+        or deployment_instance_id is None
+        or device_code is None
+        or poll_url is None
+        or poll_interval_seconds is None
+    ):
+        return None
+    if deployment_instance_id != context.deployment_instance_id:
+        return None
+    poll_url_parts = _validate_http_url(poll_url, "pending host enrollment poll URL")
+    _validate_worker_transport(poll_url_parts, "pending host enrollment poll URL")
+    return EnrollmentSession(
+        session_id=session_id,
+        deployment_instance_id=deployment_instance_id,
+        device_code=device_code,
+        poll_url=poll_url,
+        expires_at=expires_at,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+
+
+def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSessionAttempt:
+    with _EnrollmentCallbackServer() as callback_server:
+        start_url = _hosted_enrollment_start_url(context, callback_server.callback_url)
+        if not _open_hosted_enrollment_url(start_url):
+            return EnrollmentSessionAttempt(session=None, reason="browser_launch_failed")
+        callback_payload = callback_server.wait(ENROLLMENT_POLL_DEADLINE_SECONDS)
+    if callback_payload is None:
+        return EnrollmentSessionAttempt(session=None, reason="browser_approval_timeout")
+    return EnrollmentSessionAttempt(session=_enrollment_session_from_callback(context, callback_payload))
+
+
+def _hosted_enrollment_start_url(context: EnrollmentContext, callback_url: str) -> str:
+    payload = {
+        "callback_url": callback_url,
+        "deployment_instance_id": context.deployment_instance_id,
+        "target": context.metadata.target,
+        "plugin_id": context.metadata.plugin_id,
+        "plugin_version": context.metadata.plugin_version,
+        "package_id": context.metadata.package_id,
+        "bootstrap_version": context.metadata.bootstrap_version,
+        "toolchain_version": context.metadata.toolchain_version,
+        "host_instance_id": context.host_instance_id,
+        "host_label": context.host_label,
+        "host_platform": context.host_platform,
+    }
+    return f"{context.dashboard_base_url}/instruction-hub/enroll/start?{urlencode(payload)}"
+
+
+class _EnrollmentCallbackServer:
+    """Small loopback server that receives the hosted approval result."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._payload: dict[str, str] | None = None
+        self._state = secrets.token_urlsafe(32)
+        handler = self._handler()
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        host, port = self._server.server_address
+        callback_query = urlencode({CALLBACK_STATE_PARAM: self._state})
+        self.callback_url = f"http://{host}:{port}/callback?{callback_query}"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self) -> _EnrollmentCallbackServer:
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+    def wait(self, timeout_seconds: float) -> dict[str, str] | None:
+        if not self._event.wait(timeout_seconds):
+            return None
+        return self._payload
+
+    def _handler(self) -> type[BaseHTTPRequestHandler]:
+        callback_server = self
+
+        class CallbackHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                parsed = urlsplit(self.path)
+                if parsed.path != "/callback":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                query = parse_qs(parsed.query, keep_blank_values=False)
+                if query.pop(CALLBACK_STATE_PARAM, []) != [callback_server._state]:
+                    body = b"Promptless enrollment callback rejected."
+                    self.send_response(403)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                payload: dict[str, str] = {}
+                for key, values in query.items():
+                    if len(values) == 1:
+                        payload[key] = values[0]
+                callback_server._payload = payload
+                callback_server._event.set()
+                body = b"Promptless enrollment approved. You can return to your agent."
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        return CallbackHandler
+
+
+def _enrollment_session_from_callback(context: EnrollmentContext, payload: dict[str, str]) -> EnrollmentSession:
+    status = payload.get("status")
+    if status != "approved":
+        raise BootstrapError("host enrollment callback was not approved")
+    session_id = _non_empty(payload.get("session_id"))
+    deployment_instance_id = _non_empty(payload.get("deployment_instance_id"))
+    device_code = _non_empty(payload.get("device_code"))
+    poll_url = _non_empty(payload.get("poll_url"))
+    expires_at = _datetime_value(payload.get("expires_at"), "host enrollment callback expires_at")
+    poll_interval_seconds = _int_string_value(payload.get("poll_interval_seconds"), "host enrollment poll interval")
+    if session_id is None or deployment_instance_id is None or device_code is None or poll_url is None:
+        raise BootstrapError("host enrollment callback missing required fields")
+    if deployment_instance_id != context.deployment_instance_id:
+        raise BootstrapError("host enrollment callback deployment_instance_id did not match worker identity")
+    poll_url_parts = _validate_http_url(poll_url, "host enrollment poll URL")
+    _validate_worker_transport(poll_url_parts, "host enrollment poll URL")
+    if poll_interval_seconds < 1 or poll_interval_seconds > 30:
+        raise BootstrapError("host enrollment poll interval must be between 1 and 30 seconds")
+    return EnrollmentSession(
+        session_id=session_id,
+        deployment_instance_id=deployment_instance_id,
+        device_code=device_code,
+        poll_url=poll_url,
+        expires_at=expires_at,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+
+
+def _store_pending_enrollment(
+    context: EnrollmentContext,
+    state_path: Path,
+    session: EnrollmentSession,
+) -> tuple[EnrollmentSession, bool]:
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        existing_session = _pending_enrollment_session(context, state)
+        if existing_session is not None:
+            return existing_session, False
+        pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+        pending_enrollments[_credential_cache_key(context)] = {
+            "session_id": session.session_id,
+            "deployment_instance_id": session.deployment_instance_id,
+            "device_code": session.device_code,
+            "poll_url": session.poll_url,
+            "expires_at": session.expires_at.isoformat(),
+            "poll_interval_seconds": session.poll_interval_seconds,
+            "target": context.metadata.target,
+            "worker_base_url": context.worker_base_url,
+        }
+        state["pending_enrollments"] = pending_enrollments
+        _write_state(state_path, state)
+        return session, True
+
+
+def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSession) -> EnrollmentAttempt:
+    deadline = time.monotonic() + ENROLLMENT_POLL_DEADLINE_SECONDS
+    while True:
+        response = _post_json_response(
+            session.poll_url,
+            None,
+            {"device_code": session.device_code},
+            label="host enrollment poll response",
+        )
+        status = _string_value(response.get("status"))
+        if status == "approved":
+            host_credential = _string_value(response.get("host_credential"))
+            if host_credential is None:
+                raise BootstrapError("approved host enrollment poll response missing host_credential")
+            return EnrollmentAttempt(
+                credential=HostCredential(
+                    value=host_credential,
+                    credential_id=_string_value(response.get("credential_id")),
+                    deployment_instance_id=session.deployment_instance_id,
+                )
+            )
+        if status in {"expired", "consumed"}:
+            _forget_pending_enrollment(context)
+            return EnrollmentAttempt(credential=None, reason="approval_expired")
+        if status != "pending":
+            raise BootstrapError("host enrollment poll response has invalid status")
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            return EnrollmentAttempt(credential=None, reason="approval_pending")
+        time.sleep(min(float(session.poll_interval_seconds), remaining_seconds))
+
+
+def _store_host_credential(
+    context: EnrollmentContext,
+    state_path: Path,
+    credential: HostCredential,
+) -> None:
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        credentials = _json_mapping_or_empty(state.get("credentials"))
+        credentials[_credential_cache_key(context)] = {
+            "value": credential.value,
+            "credential_id": credential.credential_id,
+            "worker_base_url": context.worker_base_url,
+            "deployment_instance_id": credential.deployment_instance_id,
+            "target": context.metadata.target,
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        state["credentials"] = credentials
+        pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+        pending_enrollments.pop(_credential_cache_key(context), None)
+        state["pending_enrollments"] = pending_enrollments
+        _write_state(state_path, state)
+
+
+def _forget_pending_enrollment(context: EnrollmentContext) -> None:
+    state_path = _state_path()
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+        if pending_enrollments.pop(_credential_cache_key(context), None) is not None:
+            state["pending_enrollments"] = pending_enrollments
+            _write_state(state_path, state)
+
+
+def _credential_cache_key(context: EnrollmentContext) -> str:
+    # Key the credential and pending enrollment on host-level identity only: the worker
+    # deployment and the agent host (claude/codex). Every plugin from the hub on this machine
+    # maps to the same key, so one browser approval enrolls the host once and all of its plugins
+    # reuse the resulting credential. Plugin- and package-scoped fields are deliberately excluded.
+    cache_material = {
+        "deployment_instance_id": context.deployment_instance_id,
+        "target": context.metadata.target,
+        "worker_base_url": context.worker_base_url,
+    }
+    return hashlib.sha256(json.dumps(cache_material, sort_keys=True).encode()).hexdigest()
+
+
+def _open_hosted_enrollment_url(enrollment_url: str) -> bool:
+    if os.environ.get(OPEN_BROWSER_ENV) == "0":
+        if _test_url_overrides_enabled() and _is_loopback_parsed_url(urlsplit(enrollment_url)):
+            _open_loopback_url_for_test(enrollment_url)
+            return True
+        return False
+    try:
+        return webbrowser.open(enrollment_url, new=2, autoraise=True)
+    except webbrowser.Error:
+        return False
+
+
+def _open_loopback_url_for_test(enrollment_url: str) -> None:
+    request = urllib.request.Request(enrollment_url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        raise BootstrapError(f"hosted enrollment start request failed with HTTP {exc.code}") from exc
+
+
+def _worker_url(worker_base_url: str, path: str) -> str:
+    return f"{worker_base_url}{path}"
+
+
+def _load_runtime_metadata(plugin_root: Path | None, host: Host) -> RuntimeMetadata:
+    defaults = RuntimeMetadata(
+        bootstrap_version=RUNTIME_VERSION,
+        bootstrap_channel=RUNTIME_CHANNEL,
+        bootstrap_sha256=_self_sha256(),
+        toolchain_version="unknown",
+        plugin_id="unknown",
+        plugin_version="unknown",
+        package_id="unknown",
+        target=host,
+    )
+    if plugin_root is None:
+        return defaults
+    manifest_path = plugin_root / MANAGED_RUNTIME_MANIFEST
+    if not manifest_path.exists():
+        return defaults
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return defaults
+    if not isinstance(manifest, dict):
+        return defaults
+    runtimes = manifest.get("managed_runtimes")
+    if not isinstance(runtimes, list):
+        return defaults
+    for runtime in runtimes:
+        if not isinstance(runtime, dict):
+            continue
+        if runtime.get("id") != MANAGED_RUNTIME_ID or runtime.get("status") != "included":
+            continue
+        return RuntimeMetadata(
+            bootstrap_version=RUNTIME_VERSION,
+            bootstrap_channel=RUNTIME_CHANNEL,
+            bootstrap_sha256=_self_sha256(),
+            toolchain_version=_string_value(runtime.get("toolchain_version")) or "unknown",
+            plugin_id=_string_value(runtime.get("plugin_id")) or "unknown",
+            plugin_version=_string_value(runtime.get("plugin_version")) or "unknown",
+            package_id=_string_value(runtime.get("package_id")) or "unknown",
+            target=_runtime_target(runtime.get("target"), host),
+        )
+    return defaults
+
+
+def _get_json(url: str, token: str | None, *, label: str) -> dict[str, JsonValue]:
+    headers = _auth_headers(token)
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise BootstrapAuthError(f"{label} request failed with HTTP {exc.code}") from exc
+        raise BootstrapError(f"{label} request failed with HTTP {exc.code}") from exc
+    return _decode_json_object(body, label)
+
+
+def _post_check_in(
+    url: str,
+    credential: HostCredential,
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    result: ConfigResult,
+) -> None:
+    payload = _check_in_payload(host, metadata, policy, result)
+    response_payload = _post_json_response(url, credential.value, payload, label="check-in response")
+    if response_payload.get("accepted") is not True:
+        raise BootstrapError("check-in response was not accepted")
+    response_policy_version = response_payload.get("policy_version")
+    if type(response_policy_version) is not int or response_policy_version != policy.policy_version:
+        raise BootstrapError("check-in response policy version did not match the applied policy")
+
+
+def _post_json_response(
+    url: str,
+    token: str | None,
+    payload: dict[str, JsonValue],
+    *,
+    label: str,
+) -> dict[str, JsonValue]:
+    body = json.dumps(payload, sort_keys=True).encode()
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={**_auth_headers(token), "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            return _decode_json_object(response.read(), label)
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise BootstrapAuthError(f"{label} request failed with HTTP {exc.code}") from exc
+        raise BootstrapError(f"{label} request failed with HTTP {exc.code}") from exc
+
+
+def _auth_headers(token: str | None) -> dict[str, str]:
+    if token is None:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _check_in_payload(
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    result: ConfigResult,
+) -> dict[str, JsonValue]:
+    return {
+        "host": host,
+        "plugin_version": metadata.plugin_version,
+        "policy_version": policy.policy_version,
+        "status": result.status,
+        "needs_restart": result.needs_restart,
+        "effective_config": result.effective_config,
+        "drift_reports": [_redact_json(report) for report in result.drift_reports],
+        "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "bootstrap_version": metadata.bootstrap_version,
+    }
+
+
+def _validate_signed_policy(payload: dict[str, JsonValue], host: Host) -> HostPolicy:
+    policy_value = payload.get("policy")
+    if not isinstance(policy_value, dict):
+        raise BootstrapError("policy response missing policy object")
+    signature = _string_value(payload.get("signature"))
+    if signature is None or re.fullmatch(r"[A-Za-z0-9._-]+:.+", signature) is None:
+        raise BootstrapError("policy response has invalid signature shape")
+    # The dogfood endpoint relies on HTTPS transport authentication; this bootstrap only
+    # shape-checks the hosted policy signature. Before broader customer rollout, hosted
+    # policies should use asymmetric signatures verified here by the static native binary.
+    schema_version = _int_value(policy_value.get("schema_version"), "policy.schema_version")
+    if schema_version != 1:
+        raise BootstrapError("policy.schema_version must be 1")
+    expires_at = _datetime_value(policy_value.get("expires_at"), "policy.expires_at")
+    if expires_at <= dt.datetime.now(dt.timezone.utc):
+        raise BootstrapError("policy has expired")
+    policy_version = _int_value(policy_value.get("policy_version"), "policy.policy_version")
+    enabled_hosts = policy_value.get("enabled_hosts")
+    if not isinstance(enabled_hosts, list) or host not in enabled_hosts:
+        raise BootstrapError(f"policy does not enable {host}")
+    collector = _validate_collector(policy_value.get("collector"))
+    permissions = policy_value.get("plugin_permissions")
+    if not isinstance(permissions, dict) or permissions.get("write_user_config") is not True:
+        raise BootstrapError("policy does not allow user config writes")
+    required_bootstrap_version = _string_value(policy_value.get("required_bootstrap_version"))
+    return HostPolicy(
+        policy_version=policy_version,
+        collector=collector,
+        required_bootstrap_version=required_bootstrap_version,
+    )
+
+
+def _validate_collector(value: JsonValue | None) -> CollectorPolicy:
+    if not isinstance(value, dict):
+        raise BootstrapError("policy.collector must be an object")
+    logs_endpoint = _validate_otlp_http_endpoint(value.get("otlp_http_logs_endpoint"), "collector logs", "/v1/logs")
+    traces_endpoint = _validate_otlp_http_endpoint(
+        value.get("otlp_http_traces_endpoint"), "collector traces", "/v1/traces"
+    )
+    metrics_endpoint = _validate_otlp_http_endpoint(
+        value.get("otlp_http_metrics_endpoint"),
+        "collector metrics",
+        "/v1/metrics",
+    )
+    grpc_endpoint = _string_value(value.get("otlp_grpc_endpoint"))
+    if grpc_endpoint is not None:
+        _validate_http_url(grpc_endpoint, "collector grpc")
+    headers = value.get("headers")
+    if not isinstance(headers, dict) or not headers:
+        raise BootstrapError("policy.collector.headers must contain at least one header")
+    header_map: dict[str, str] = {}
+    for raw_name, raw_header_value in headers.items():
+        name = _string_value(raw_name)
+        header_value = _string_value(raw_header_value)
+        if name is None or header_value is None or not name.strip() or not header_value.strip():
+            raise BootstrapError("collector headers must be non-empty strings")
+        if HEADER_NAME_RE.fullmatch(name) is None:
+            raise BootstrapError("collector header names must be HTTP tokens")
+        if any(char in name + header_value for char in ("\r", "\n", ",")):
+            raise BootstrapError("collector headers must not contain newline or comma characters")
+        header_map[name] = header_value
+    return CollectorPolicy(
+        logs_endpoint=logs_endpoint,
+        traces_endpoint=traces_endpoint,
+        metrics_endpoint=metrics_endpoint,
+        grpc_endpoint=grpc_endpoint,
+        headers=header_map,
+    )
+
+
+def _configure_host(host: Host, policy: HostPolicy) -> ConfigResult:
+    if host == "codex":
+        return _configure_codex(policy)
+    return _configure_claude(policy)
+
+
+def _configure_codex(policy: HostPolicy) -> ConfigResult:
+    config_path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser() / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = config_path.read_text() if config_path.exists() else ""
+    managed_block = _codex_managed_block(policy)
+    if _has_malformed_managed_blocks(existing):
+        return _blocked_result(
+            "codex",
+            policy,
+            kind="manual_config_required",
+            message="Existing Codex managed telemetry markers are malformed",
+            details={"path": str(config_path)},
+        )
+    unmanaged_source = _without_managed_block(existing)
+    if _has_unmanaged_codex_otel_config(unmanaged_source):
+        return _blocked_result(
+            "codex",
+            policy,
+            kind="manual_config_required",
+            message="Existing unmanaged Codex otel config was left unchanged",
+            details={"path": str(config_path)},
+        )
+    updated = _replace_managed_block(existing, managed_block)
+    changed = updated != existing
+    if changed:
+        _write_with_backup(config_path, updated)
+    return ConfigResult(
+        status="needs_restart" if changed else "configured",
+        needs_restart=changed,
+        effective_config=_effective_config("codex", policy, configured=True, managed_config_detected=True),
+        drift_reports=_updated_config_reports("codex", config_path, changed),
+    )
+
+
+def _codex_managed_block(policy: HostPolicy) -> str:
+    # Codex reads user-level ~/.codex/config.toml, or CODEX_HOME/config.toml, for OTel routing keys.
+    # https://developers.openai.com/codex/config-advanced
+    # https://developers.openai.com/codex/config-reference
+    headers = _toml_inline_headers(policy.collector.headers)
+    return "\n".join(
+        [
+            MANAGED_BEGIN,
+            "[otel]",
+            'environment = "prod"',
+            "log_user_prompt = true",
+            "",
+            "[otel.exporter.otlp-http]",
+            f"endpoint = {_toml_string(policy.collector.logs_endpoint)}",
+            'protocol = "binary"',
+            f"headers = {headers}",
+            "",
+            "[otel.trace_exporter.otlp-http]",
+            f"endpoint = {_toml_string(policy.collector.traces_endpoint)}",
+            'protocol = "binary"',
+            f"headers = {headers}",
+            MANAGED_END,
+            "",
+        ]
+    )
+
+
+def _has_unmanaged_codex_otel_config(existing: str) -> bool:
+    return (
+        re.search(r"(?m)^\s*\[otel(?:\]|\.)", existing) is not None
+        or re.search(
+            r"(?m)^\s*otel(?:\s*=|\.)",
+            existing,
+        )
+        is not None
+    )
+
+
+def _without_managed_block(existing: str) -> str:
+    return _managed_block_pattern().sub("", existing)
+
+
+def _has_malformed_managed_blocks(existing: str) -> bool:
+    begin_count = existing.count(MANAGED_BEGIN)
+    end_count = existing.count(MANAGED_END)
+    if begin_count != end_count:
+        return begin_count > 0 or end_count > 0
+    if begin_count == 0:
+        return False
+    return sum(1 for _ in _managed_block_pattern().finditer(existing)) != begin_count
+
+
+def _managed_block_pattern() -> re.Pattern[str]:
+    return re.compile(re.escape(MANAGED_BEGIN) + r".*?" + re.escape(MANAGED_END) + r"\n?", re.DOTALL)
+
+
+def _configure_claude(policy: HostPolicy) -> ConfigResult:
+    settings_path = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser() / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings = _read_settings(settings_path)
+    env = settings.setdefault("env", {})
+    if not isinstance(env, dict):
+        return _blocked_result(
+            "claude",
+            policy,
+            kind="manual_config_required",
+            message="Claude settings env is not an object",
+            details={"path": str(settings_path)},
+        )
+    desired_env = _claude_env(policy)
+    unmanaged_conflicts = _unmanaged_claude_env_conflicts(env, desired_env)
+    if unmanaged_conflicts:
+        return _blocked_result(
+            "claude",
+            policy,
+            kind="manual_config_required",
+            message="Existing unmanaged Claude telemetry env was left unchanged",
+            details={"path": str(settings_path), "env_keys": unmanaged_conflicts},
+        )
+    current_settings = json.dumps(settings, sort_keys=True)
+    env.update(desired_env)
+    changed = json.dumps(settings, sort_keys=True) != current_settings
+    updated_settings = json.dumps(settings, indent=2, sort_keys=True) + "\n"
+    if changed:
+        _write_with_backup(settings_path, updated_settings)
+    return ConfigResult(
+        status="needs_restart" if changed else "configured",
+        needs_restart=changed,
+        effective_config=_effective_config("claude", policy, configured=True, managed_config_detected=True),
+        drift_reports=_updated_config_reports("claude", settings_path, changed),
+    )
+
+
+def _read_settings(settings_path: Path) -> dict[str, JsonValue]:
+    if not settings_path.exists():
+        return {}
+    try:
+        value = json.loads(settings_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise BootstrapError(f"Claude settings are invalid JSON at {settings_path}: {exc.msg}") from exc
+    if not isinstance(value, dict):
+        raise BootstrapError(f"Claude settings must be a JSON object at {settings_path}")
+    return value
+
+
+def _claude_env(policy: HostPolicy) -> dict[str, str]:
+    # Claude Code's inline content attributes are producer-bounded before export. File-mode raw API
+    # bodies preserve full request/response JSON locally and emit body_ref events through OTLP.
+    # https://code.claude.com/docs/en/monitoring-usage
+    return {
+        CLAUDE_MANAGED_ENV_MARKER: "1",
+        "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+        "ENABLE_BETA_TRACING_DETAILED": "1",
+        "BETA_TRACING_ENDPOINT": policy.collector.traces_endpoint,
+        "OTEL_LOGS_EXPORTER": "otlp",
+        "OTEL_METRICS_EXPORTER": "otlp",
+        "OTEL_TRACES_EXPORTER": "otlp",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": _otlp_http_base_endpoint(policy.collector.traces_endpoint),
+        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": "http/protobuf",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": policy.collector.logs_endpoint,
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": policy.collector.traces_endpoint,
+        "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": policy.collector.metrics_endpoint,
+        "OTEL_EXPORTER_OTLP_HEADERS": _otel_headers(policy.collector.headers),
+        "OTEL_LOG_USER_PROMPTS": "1",
+        "OTEL_LOG_ASSISTANT_RESPONSES": "1",
+        "OTEL_LOG_TOOL_DETAILS": "1",
+        "OTEL_LOG_TOOL_CONTENT": "1",
+        "OTEL_LOG_RAW_API_BODIES": _raw_api_bodies_env(),
+    }
+
+
+def _raw_api_bodies_env() -> str:
+    raw_api_bodies_path = _raw_api_bodies_path()
+    raw_api_bodies_path.mkdir(parents=True, exist_ok=True)
+    return f"file:{raw_api_bodies_path}"
+
+
+def _otlp_http_base_endpoint(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _unmanaged_claude_env_conflicts(env: dict[object, object], desired_env: dict[str, str]) -> list[str]:
+    if _string_value(env.get(CLAUDE_MANAGED_ENV_MARKER)) == "1":
+        return []
+    conflicts: list[str] = []
+    for key in sorted(desired_env):
+        if key == CLAUDE_MANAGED_ENV_MARKER:
+            continue
+        existing = env.get(key)
+        if existing is None:
+            continue
+        if isinstance(existing, str) and existing == "":
+            continue
+        conflicts.append(key)
+    return conflicts
+
+
+def _effective_config(
+    host: Host,
+    policy: HostPolicy,
+    *,
+    configured: bool,
+    managed_config_detected: bool,
+) -> dict[str, JsonValue]:
+    effective_config: dict[str, JsonValue] = {
+        "host": host,
+        "configured": configured,
+        "collector_logs_endpoint": policy.collector.logs_endpoint if configured else None,
+        "collector_traces_endpoint": policy.collector.traces_endpoint if configured else None,
+        "collector_metrics_endpoint": _effective_metrics_endpoint(host, policy, configured=configured),
+        "managed_config_detected": managed_config_detected,
+    }
+    effective_config["config_hash"] = hashlib.sha256(json.dumps(effective_config, sort_keys=True).encode()).hexdigest()
+    return effective_config
+
+
+def _blocked_result(
+    host: Host,
+    policy: HostPolicy,
+    *,
+    kind: str,
+    message: str,
+    details: dict[str, JsonValue],
+) -> ConfigResult:
+    return ConfigResult(
+        status="blocked",
+        needs_restart=False,
+        effective_config=_effective_config(host, policy, configured=False, managed_config_detected=False),
+        drift_reports=[
+            {
+                "kind": kind,
+                "message": message,
+                "repaired": False,
+                "details": details,
+            }
+        ],
+    )
+
+
+def _effective_metrics_endpoint(host: Host, policy: HostPolicy, *, configured: bool) -> str | None:
+    if not configured or host == "codex":
+        return None
+    return policy.collector.metrics_endpoint
+
+
+def _updated_config_reports(host: Host, path: Path, changed: bool) -> list[dict[str, JsonValue]]:
+    if not changed:
+        return []
+    return [
+        {
+            "kind": "repaired_user_config",
+            "message": f"Updated user-level {host} telemetry config",
+            "repaired": True,
+            "details": {"path": str(path)},
+        }
+    ]
+
+
+def _replace_managed_block(existing: str, managed_block: str) -> str:
+    existing_block = _managed_block_pattern().search(existing)
+    if existing_block is not None:
+        suffix = _managed_block_pattern().sub("", existing[existing_block.end() :])
+        return existing[: existing_block.start()] + managed_block + suffix
+    prefix = existing.rstrip()
+    if not prefix:
+        return managed_block
+    return prefix + "\n\n" + managed_block
+
+
+def _write_with_backup(path: Path, contents: str) -> None:
+    if path.exists():
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        shutil.copy2(path, path.with_name(f"{path.name}.{timestamp}.bak"))
+    _atomic_write_text(path, contents)
+
+
+def _atomic_write_text(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name != "posix":
+        return
+    directory_descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def _requires_newer_bootstrap(required: str | None, current: str) -> bool:
+    if required is None:
+        return False
+    return required != current
+
+
+def _validate_otlp_http_endpoint(value: JsonValue | None, field_name: str, expected_path: str) -> str:
+    endpoint = _string_value(value)
+    if endpoint is None:
+        raise BootstrapError(f"{field_name} endpoint must be a string")
+    parsed = _validate_http_url(endpoint, field_name)
+    if parsed.path != expected_path:
+        raise BootstrapError(f"{field_name} endpoint must use path {expected_path}")
+    return endpoint
+
+
+def _validate_http_url(value: str, field_name: str) -> SplitResult:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc == "":
+        raise BootstrapError(f"{field_name} must be an absolute HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise BootstrapError(f"{field_name} must not include credentials, query, or fragment")
+    return parsed
+
+
+def _datetime_value(value: JsonValue | None, field_name: str) -> dt.datetime:
+    text = _string_value(value)
+    if text is None:
+        raise BootstrapError(f"{field_name} must be an ISO timestamp")
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise BootstrapError(f"{field_name} must be an ISO timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise BootstrapError(f"{field_name} must include a timezone")
+    return parsed
+
+
+def _optional_datetime_value(value: JsonValue | None, field_name: str) -> dt.datetime | None:
+    if value is None:
+        return None
+    return _datetime_value(value, field_name)
+
+
+def _int_value(value: JsonValue | None, field_name: str) -> int:
+    if type(value) is not int:
+        raise BootstrapError(f"{field_name} must be an integer")
+    return value
+
+
+def _int_string_value(value: str | None, field_name: str) -> int:
+    if value is None:
+        raise BootstrapError(f"{field_name} must be an integer")
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise BootstrapError(f"{field_name} must be an integer") from exc
+
+
+def _optional_int_value(value: JsonValue | None) -> int | None:
+    if type(value) is not int:
+        return None
+    return value
+
+
+def _decode_json_object(body: bytes, label: str) -> dict[str, JsonValue]:
+    try:
+        value = json.loads(body.decode())
+    except json.JSONDecodeError as exc:
+        raise BootstrapError(f"{label} is invalid JSON: {exc.msg}") from exc
+    if not isinstance(value, dict):
+        raise BootstrapError(f"{label} must be a JSON object")
+    return _json_object(value)
+
+
+def _json_object(value: dict[object, object]) -> dict[str, JsonValue]:
+    result: dict[str, JsonValue] = {}
+    for key, child in value.items():
+        if not isinstance(key, str):
+            raise BootstrapError("JSON object contains a non-string key")
+        result[key] = _json_value(child)
+    return result
+
+
+def _json_value(value: object) -> JsonValue:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_json_value(child) for child in value]
+    if isinstance(value, dict):
+        return _json_object(value)
+    raise BootstrapError(f"unsupported JSON value: {type(value).__name__}")
+
+
+def _json_mapping_or_empty(value: JsonValue | None) -> dict[str, JsonValue]:
+    if not isinstance(value, dict):
+        return {}
+    return value
+
+
+def _normalize_base_url(value: str, *, label: str) -> str:
+    normalized = value.rstrip("/")
+    parsed = _validate_http_url(normalized, label)
+    _validate_worker_transport(parsed, label)
+    if parsed.path not in {"", "/"}:
+        raise BootstrapError(f"{label} must not include a path")
+    return normalized
+
+
+def _test_url_overrides_enabled() -> bool:
+    return os.environ.get(TEST_URL_OVERRIDE_ENV) == "1"
+
+
+def _is_loopback_parsed_url(parsed: SplitResult) -> bool:
+    host = parsed.hostname
+    return host in {"localhost", "127.0.0.1", "::1"}
+
+
+def _validate_worker_transport(parsed: SplitResult, field_name: str) -> None:
+    if parsed.scheme == "https":
+        return
+    if _test_url_overrides_enabled() and _is_loopback_parsed_url(parsed):
+        return
+    raise BootstrapError(f"{field_name} must use HTTPS unless {TEST_URL_OVERRIDE_ENV}=1 and the host is loopback")
+
+
+def _string_value(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _runtime_target(value: object, fallback: Host) -> Host:
+    if value == "codex" or value == "claude":
+        return value
+    return fallback
+
+
+def _non_empty(value: str | None) -> str | None:
+    if value is None or value.strip() == "":
+        return None
+    return value
+
+
+def _otel_headers(headers: dict[str, str]) -> str:
+    return ",".join(f"{name}={value}" for name, value in sorted(headers.items()))
+
+
+def _toml_inline_headers(headers: dict[str, str]) -> str:
+    values = ", ".join(f"{_toml_string(name)} = {_toml_string(value)}" for name, value in sorted(headers.items()))
+    return "{ " + values + " }"
+
+
+def _toml_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def _toml_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _self_sha256() -> str:
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def _emit(
+    payload: dict[str, JsonValue],
+    *,
+    quiet: bool = False,
+    update_notice: str | None = None,
+) -> None:
+    if quiet:
+        return
+    # SessionStart hook output contract. Codex validates the hook's *stdout* against a strict schema
+    # (serde deny_unknown_fields): only continue/stopReason/systemMessage/suppressOutput/
+    # hookSpecificOutput are accepted, and any extra key makes Codex reject the whole object with
+    # "hook returned invalid session start JSON output". Claude Code ignores unrecognized fields, but
+    # Codex does not. So Codex stdout carries only the user-facing systemMessage — and nothing at
+    # all when there is no message, which Codex treats as success. Claude stdout may also carry
+    # terminalSequence for a terminal-level notification. The full diagnostic status object
+    # (status/host/needs_restart/reason) still goes to stderr, which neither host parses as hook
+    # control output.
+    # https://developers.openai.com/codex/hooks  https://code.claude.com/docs/en/hooks
+    message = " ".join(text for text in (update_notice, _enrollment_user_message(payload)) if text is not None)
+    terminal_sequence = _terminal_sequence(payload, message)
+    diagnostic = dict(payload)
+    if message:
+        diagnostic["systemMessage"] = message
+    if terminal_sequence is not None:
+        diagnostic["terminalSequence"] = terminal_sequence
+    _write_last_status(diagnostic)
+    sys.stderr.write(json.dumps(_redact_json(diagnostic), sort_keys=True) + "\n")
+    sys.stderr.flush()
+    if message or terminal_sequence is not None:
+        control: dict[str, JsonValue] = {}
+        if message:
+            control["systemMessage"] = message
+        if terminal_sequence is not None:
+            control["terminalSequence"] = terminal_sequence
+        # Keep stdout to one hook-control object, but let terminal outcomes replace the
+        # preliminary browser-start banner before the process exits.
+        _queue_control_output(payload, control)
+
+
+def _queue_control_output(payload: dict[str, JsonValue], control: dict[str, JsonValue]) -> None:
+    global _PENDING_CONTROL_OUTPUT, _PENDING_CONTROL_OUTPUT_PRIORITY
+
+    if _PENDING_CONTROL_OUTPUT == control:
+        return
+    priority = _control_output_priority(payload)
+    if _PENDING_CONTROL_OUTPUT is None or priority >= _PENDING_CONTROL_OUTPUT_PRIORITY:
+        _PENDING_CONTROL_OUTPUT = dict(control)
+        _PENDING_CONTROL_OUTPUT_PRIORITY = priority
+
+
+def _flush_control_output() -> None:
+    global _PENDING_CONTROL_OUTPUT, _PENDING_CONTROL_OUTPUT_PRIORITY
+
+    if _PENDING_CONTROL_OUTPUT is None:
+        return
+    sys.stdout.write(json.dumps(_redact_json(_PENDING_CONTROL_OUTPUT), sort_keys=True) + "\n")
+    sys.stdout.flush()
+    _PENDING_CONTROL_OUTPUT = None
+    _PENDING_CONTROL_OUTPUT_PRIORITY = -1
+
+
+def _control_output_priority(payload: dict[str, JsonValue]) -> int:
+    status = _string_value(payload.get("status"))
+    if status is None:
+        return 0
+    return _CONTROL_OUTPUT_STATUS_PRIORITY.get(status, 0)
+
+
+def _write_last_status(diagnostic: dict[str, JsonValue]) -> None:
+    payload = dict(diagnostic)
+    payload["emitted_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    try:
+        path = _last_status_path()
+        _atomic_write_text(path, json.dumps(_redact_json(payload), indent=2, sort_keys=True) + "\n")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except OSError:
+        return
+
+
+@dataclass(frozen=True)
+class HostDisplay:
+    """Human-facing host name and user config path used in SessionStart messages."""
+
+    name: str
+    config_path: str
+
+
+HOST_DISPLAY_NAMES: dict[str, HostDisplay] = {
+    "claude": HostDisplay(name="Claude Code", config_path="~/.claude/settings.json"),
+    "codex": HostDisplay(name="Codex", config_path="~/.codex/config.toml"),
+}
+
+
+def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
+    """Return a user-facing enrollment-status message for the host, or None to stay silent.
+
+    Both Claude and Codex surface a message, and only for outcomes worth showing on a hook that
+    runs every startup/resume: a fresh config write, a pending browser approval, a block, or an
+    failure that needs user action. The steady "already configured" state stays silent so the hook
+    does not banner every session.
+    """
+
+    status = payload.get("status")
+    host_label = HOST_DISPLAY_NAMES.get(_string_value(payload.get("host")) or "")
+    if status == "error":
+        host_name = host_label.name if host_label is not None else "the agent host"
+        details = _string_value(payload.get("message"))
+        if details:
+            return f"Promptless host enrollment failed for {host_name}: {details}"
+        return f"Promptless host enrollment failed for {host_name}. Check the hook diagnostic output."
+    if host_label is None:
+        return None
+    if status == "browser_enrollment_starting":
+        return (
+            "Promptless Instruction Governance telemetry is starting browser-based enrollment. "
+            "Approve the Promptless browser tab to continue."
+        )
+    if status == "needs_restart":
+        return f"Promptless telemetry configured for {host_label.name}. Restart {host_label.name} to start telemetry."
+    if status == "setup_pending":
+        reason = payload.get("reason")
+        if reason == "browser_launch_failed":
+            return (
+                f"Promptless host enrollment could not open a browser for {host_label.name}. "
+                "Restart from a desktop session with browser access, then approve the Promptless enrollment prompt. "
+                "Details were saved to ~/.promptless/instruction-hub/last-bootstrap-status.json."
+            )
+        if reason == "browser_approval_timeout":
+            return (
+                f"Promptless host enrollment did not receive browser approval before timing out. "
+                f"Restart {host_label.name} and approve the Promptless enrollment prompt."
+            )
+        if reason == "enrollment_in_progress":
+            return (
+                "Promptless host enrollment is already running in another installed Promptless plugin. "
+                f"Finish that approval, then restart {host_label.name}."
+            )
+        if reason == "approval_expired":
+            return f"Promptless host enrollment approval expired. Restart {host_label.name} to request a fresh approval."
+        return (
+            "Promptless host enrollment is awaiting browser approval. "
+            f"Approve in the browser tab that opened, then restart {host_label.name}."
+        )
+    if status == "error":
+        message = _string_value(payload.get("message")) or "unknown error"
+        return (
+            f"Promptless host enrollment failed for {host_label.name}: {message}. "
+            "Details were saved to ~/.promptless/instruction-hub/last-bootstrap-status.json."
+        )
+    if status == "blocked":
+        if payload.get("reason") == "bootstrap_upgrade_required":
+            return "Promptless host enrollment is blocked: a newer Promptless host runtime is required."
+        return (
+            "Promptless host enrollment is blocked: existing telemetry settings were left unchanged. "
+            f"Review {host_label.config_path}."
+        )
+    return None
+
+
+def _terminal_sequence(payload: dict[str, JsonValue], message: str) -> str | None:
+    if not message or payload.get("host") != "claude":
+        return None
+    status = payload.get("status")
+    if status not in {"blocked", "browser_enrollment_starting", "error", "needs_restart", "setup_pending"}:
+        return None
+    body = _terminal_notification_body(payload)
+    return f"\033]777;notify;Promptless;{body}\007"
+
+
+def _terminal_notification_body(payload: dict[str, JsonValue]) -> str:
+    status = payload.get("status")
+    if status == "error":
+        return "Host enrollment failed"
+    if status == "blocked":
+        return "Host enrollment needs review"
+    if status == "needs_restart":
+        return "Telemetry configured; restart Claude Code"
+    return "Host enrollment needs approval"
+
+
+def _redact_json(value: JsonValue) -> JsonValue:
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, list):
+        return [_redact_json(child) for child in value]
+    if isinstance(value, dict):
+        redacted: dict[str, JsonValue] = {}
+        for key, child in value.items():
+            if key.lower() in {"authorization", "device_code", "host_credential", "token"}:
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = _redact_json(child)
+        return redacted
+    return value
+
+
+def _redact_text(value: str) -> str:
+    redacted = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", value)
+    redacted = re.sub(r"plihost_[A-Za-z0-9._~+/=-]+", "plihost_<redacted>", redacted)
+    return re.sub(r"plihenroll_[A-Za-z0-9._~+/=-]+", "plihenroll_<redacted>", redacted)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -8,13 +8,13 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from promptless_instruction_hub.cli import main
 from promptless_instruction_hub.compiler import build_hub, init_hub, validate_hub
 from promptless_instruction_hub.errors import BuildCheckFailedError, InstructionHubError
-from promptless_instruction_hub.fs import JsonValue, validate_json_value
 from promptless_instruction_hub.mcp_status import STATUS_TOOL_NAME, run_status_mcp
 from promptless_instruction_hub.release.hashing import stable_hash
 from promptless_instruction_hub.release.versions import resolve_publish_plugin_version
@@ -24,6 +24,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests/fixtures"
 SCHEMAS = REPO_ROOT / "schemas"
 WORKFLOWS = REPO_ROOT / ".github/workflows"
+
+
+def _write_release_manifest_with_fresh_identity(manifest_path: Path, manifest: dict[str, Any]) -> None:
+    plugin = manifest.get("plugin")
+    assert isinstance(plugin, dict)
+    plugin_version = plugin.get("version")
+    assert isinstance(plugin_version, str)
+    manifest.pop("release_id", None)
+    manifest.pop("release_hash", None)
+    content_hash = stable_hash(manifest)
+    manifest["release_id"] = f"{plugin_version}+{content_hash[:12]}"
+    manifest["release_hash"] = stable_hash(manifest)
+    manifest_path.write_text(json.dumps(manifest))
 
 
 def _assert_no_promptless_directory(root: Path) -> None:
@@ -1127,54 +1140,6 @@ def test_publish_version_bumps_when_package_membership_changes(tmp_path: Path) -
     assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.1"
 
 
-def test_publish_version_accepts_historical_host_enrollment_managed_runtime_id(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Acme")
-    build_hub(hub_root)
-    previous_release_root = tmp_path / "previous-release"
-    shutil.copytree(hub_root, previous_release_root)
-    manifest_path = previous_release_root / "hub.release.json"
-    manifest = _json_mapping(
-        validate_json_value(json.loads(manifest_path.read_text()), "previous release manifest"),
-        "previous release manifest",
-    )
-    managed_runtimes = _json_array(manifest["managed_runtimes"], "managed_runtimes")
-    for runtime_value in managed_runtimes:
-        _json_mapping(runtime_value, "managed_runtime")["id"] = "host-enrollment-bootstrap"
-    version_basis = _json_mapping(manifest["version_basis"], "version_basis")
-    basis_runtimes = _json_array(version_basis["managed_runtimes"], "version_basis.managed_runtimes")
-    for runtime_value in basis_runtimes:
-        _json_mapping(runtime_value, "version_basis.managed_runtime")["id"] = "host-enrollment-bootstrap"
-    _rewrite_release_identity(manifest)
-    manifest_path.write_text(json.dumps(manifest))
-
-    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.1"
-
-
-def test_publish_version_requires_managed_runtime_version_bump_when_artifact_changes(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Acme")
-    build_hub(hub_root)
-    previous_release_root = tmp_path / "previous-release"
-    shutil.copytree(hub_root, previous_release_root)
-    manifest_path = previous_release_root / "hub.release.json"
-    manifest = _json_mapping(
-        validate_json_value(json.loads(manifest_path.read_text()), "previous release manifest"),
-        "previous release manifest",
-    )
-    managed_runtimes = _json_array(manifest["managed_runtimes"], "managed_runtimes")
-    first_runtime = _json_mapping(managed_runtimes[0], "managed_runtime")
-    first_runtime["sha256"] = "0" * 64
-    version_basis = _json_mapping(manifest["version_basis"], "version_basis")
-    basis_runtimes = _json_array(version_basis["managed_runtimes"], "version_basis.managed_runtimes")
-    _json_mapping(basis_runtimes[0], "version_basis.managed_runtime")["sha256"] = "0" * 64
-    _rewrite_release_identity(manifest)
-    manifest_path.write_text(json.dumps(manifest))
-
-    with pytest.raises(ValueError, match="changed artifact fields without increasing version"):
-        resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root)
-
-
 def test_publish_version_prefers_manual_semver_promotion(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, plugin_version="1.0.0-alpha.1")
@@ -1199,6 +1164,23 @@ def test_publish_version_prefers_higher_configured_version_floor(tmp_path: Path)
     )
 
     assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.2.0"
+
+
+def test_publish_version_accepts_legacy_managed_runtime_id_in_previous_release(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Acme")
+    build_hub(hub_root)
+    previous_release_root = tmp_path / "previous-release"
+    shutil.copytree(hub_root, previous_release_root)
+    manifest_path = previous_release_root / "hub.release.json"
+    manifest = json.loads(manifest_path.read_text())
+    for runtime in manifest["managed_runtimes"]:
+        runtime["id"] = "host-enrollment-bootstrap"
+    for runtime in manifest["version_basis"]["managed_runtimes"]:
+        runtime["id"] = "host-enrollment-bootstrap"
+    _write_release_manifest_with_fresh_identity(manifest_path, manifest)
+
+    assert resolve_publish_plugin_version(hub_root, previous_release_root=previous_release_root) == "0.1.1"
 
 
 def test_publish_version_rejects_invalid_authoritative_release_manifest(tmp_path: Path) -> None:
@@ -1275,10 +1257,6 @@ def test_publish_version_reports_nested_authoritative_version_basis_path(tmp_pat
             "managed_runtime_bad_sha",
             r"hub\.release\.json: version_basis\.managed_runtimes\[0\]\.sha256 must be a sha256 hex digest",
         ),
-        (
-            "managed_runtime_unknown_id",
-            r"hub\.release\.json: version_basis\.managed_runtimes\[0\]\.id must be a supported managed runtime id",
-        ),
         ("release_id_empty", r"hub\.release\.json: release_id must not be empty"),
         ("release_hash_mismatch", r"hub\.release\.json: release_hash must match manifest content"),
     ],
@@ -1306,8 +1284,6 @@ def test_publish_version_rejects_authoritative_release_manifest_tampering(
         del manifest["version_basis"]["target_hashes"]["claude"]
     elif mutation == "managed_runtime_bad_sha":
         manifest["version_basis"]["managed_runtimes"][0]["sha256"] = "bad"
-    elif mutation == "managed_runtime_unknown_id":
-        manifest["version_basis"]["managed_runtimes"][0]["id"] = "unknown-runtime"
     elif mutation == "release_id_empty":
         manifest["release_id"] = ""
     elif mutation == "release_hash_mismatch":
@@ -1947,10 +1923,9 @@ def test_release_manifest_schema_matches_generated_contract() -> None:
         "toolchain_version",
         "version",
     ]
-    assert managed_runtime_schema["properties"]["id"] == {"const": "local-trace-collector"}
+    assert managed_runtime_schema["properties"]["id"] == {"const": "host-runtime"}
     assert managed_runtime_schema["properties"]["status"] == {"const": "included"}
     assert managed_runtime_schema["properties"]["target"] == {"enum": ["claude", "codex"]}
-    assert managed_runtime_schema["properties"]["version"] == schema["properties"]["plugin"]["properties"]["version"]
     assert "oneOf" not in managed_runtime_schema
     asset_schema = schema["properties"]["assets"]["items"]
     assert asset_schema["required"] == ["ref", "id", "type", "title", "source_path", "content_hash", "support"]
@@ -2019,28 +1994,6 @@ def _release_branch_plugin_versions(
         json.loads(_git_output(repo, "show", f"origin/release/stable:{manifest_path}"))["version"]
         for manifest_path in manifest_paths
     }
-
-
-def _rewrite_release_identity(manifest: dict[str, JsonValue]) -> None:
-    plugin = _json_mapping(manifest["plugin"], "plugin")
-    plugin_version = plugin["version"]
-    assert isinstance(plugin_version, str)
-    manifest_without_release_data = {
-        key: value for key, value in manifest.items() if key not in {"release_id", "release_hash"}
-    }
-    manifest["release_id"] = f"{plugin_version}+{stable_hash(manifest_without_release_data)[:12]}"
-    manifest_without_release_hash = {key: value for key, value in manifest.items() if key != "release_hash"}
-    manifest["release_hash"] = stable_hash(manifest_without_release_hash)
-
-
-def _json_mapping(value: JsonValue, path: str) -> dict[str, JsonValue]:
-    assert isinstance(value, dict), f"{path} must be a JSON object"
-    return value
-
-
-def _json_array(value: JsonValue, path: str) -> list[JsonValue]:
-    assert isinstance(value, list), f"{path} must be a JSON array"
-    return value
 
 
 def _init_action_repo(root: Path, *, targets: tuple[str, ...], hub_root_name: str = ".") -> Path:

@@ -84,56 +84,77 @@ Action releases are tagged with immutable versions such as `v0.1.0` and a moving
 major pointer such as `v0`. Customer workflows can use `@v0` for minor updates or
 pin to an immutable tag for stricter reproducibility.
 
-## Managed Runtime Local Trace Collector
+## Managed Host Runtime
 
-The toolchain owns Promptless-managed runtime artifacts that are injected into
-generated customer plugins. The current managed runtime is the local trace
-collector used by Codex and Claude lifecycle hooks. During dogfood, generated
-hooks invoke the bundled stdlib-only Python script with `python3`.
+The toolchain owns Promptless-managed runtime artifacts that must be injected
+into generated customer plugins, including the host runtime used by Codex and
+Claude startup hooks. During dogfood, generated hooks invoke the bundled
+stdlib-only Python script with `python3`:
 
-When local `PIGS_FLY` is set to a truthy value (`1` or `true`,
-case-insensitive), the dogfood collector uses `PROMPTLESS_WORKER_BASE_URL`,
-`INSTRUCTION_HUB_WORKER_BASE_URL`, or the default production worker. It reads
-the worker's public `/healthz` identity, opens the hosted Promptless dashboard
-start URL, and listens on a loopback callback with a per-attempt state token for
-the approved session proof. It then polls the hosted runtime for a per-host
-credential, caches that credential, and uses the host credential to fetch
-`/v0/host-enrollment/policy?target=...`, post `/v0/host-enrollment/check-ins`,
-and upload native trace batches.
+```sh
+python3 "${PLUGIN_ROOT}/bin/promptless-host-runtime" ensure --host codex
+python3 "${PLUGIN_ROOT}/bin/promptless-host-runtime" collect --host codex --lifecycle stop --quiet
+python3 "${CLAUDE_PLUGIN_ROOT}/bin/promptless-host-runtime" ensure --host claude
+python3 "${CLAUDE_PLUGIN_ROOT}/bin/promptless-host-runtime" collect --host claude --lifecycle session_end --quiet
+```
+
+The dogfood host runtime uses `PROMPTLESS_WORKER_BASE_URL` or the default
+production worker. It reads the worker's public `/healthz` identity, opens the
+hosted Promptless dashboard start URL, and listens on a loopback callback with a
+per-attempt state token for the approved session proof. It then polls the hosted
+runtime for a one-time per-host credential, caches that credential, and uses the
+host credential to fetch `/v0/host-enrollment/policy?target=...` and post
+`/v0/host-enrollment/check-ins`.
+
+The same runtime also uploads native host transcript JSONL ranges to
+`/v0/traces/batches?target=...`. SessionStart hooks run `ensure` and then a
+quiet first-run baseline; terminal lifecycle hooks (`Stop`, Claude
+`SessionEnd`, and `SubagentStop`) run collection only. Collection uses the hook
+stdin `transcript_path` or `agent_transcript_path` first, then scans idle
+host-native transcript roots as a catch-up path. The forward-only ledger lives at
+`~/.promptless/instruction-hub/host-runtime-ledger.json` or
+`PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads are authenticated with the
+same host credential and are gated by the same `enabled_hosts` policy used for
+OTEL config.
 
 Host enrollment is per host, not per plugin. The credential and pending approval
 are cached at a single host-global path (`~/.promptless/instruction-hub/`) and
-keyed on the worker base URL, worker deployment instance, and agent host
-(claude/codex), so every Promptless plugin a user installs from the hub shares
-one credential for the same worker deployment. A non-blocking, per-credential
-enrollment-leader lock ensures that when multiple plugins start at once,
-exactly one drives the single browser approval while the others reuse the result
-or defer to a later session. The per-plugin `CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA`
-directories are intentionally not used for credentials.
+keyed only on the worker deployment and agent host (claude/codex), so every
+Promptless plugin a user installs from the hub shares one credential. A
+non-blocking, per-credential enrollment-leader lock ensures that when multiple
+plugins start at once, exactly one drives the single browser approval while the
+others reuse the result or defer to a later session. The per-plugin
+`CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA` directories are intentionally not used for this
+state.
 
-The collector shape-validates the signed-policy envelope, native trace upload
-policy, and `plugin_permissions` before touching local trace files or posting
-uploads. The policy must explicitly allow the worker hosts and each configured
-native trace root. The collector then uploads new complete JSONL ranges from the
-allowed native trace roots. It maintains a per-user ledger at
-`~/.promptless/instruction-hub/trace-collector-ledger.json`, or at
-`PROMPTLESS_TRACE_COLLECTOR_LEDGER` when set, so successful uploads advance
-monotonically and failed uploads are retried. First install defaults to
-forward-only baselining so historical local traces are not uploaded unless
-`trace_collection.forward_only_first_install` is false.
+For Claude Code, managed telemetry follows Claude's supported capture paths
+instead of relying on OpenTelemetry SDK attribute-length variables to override
+producer-side truncation. Inline tool content remains Claude-bounded OTel event
+content. When policy enables raw API body capture, the host runtime uses
+`OTEL_LOG_RAW_API_BODIES=file:<dir>` under the host-global Promptless state
+directory so Claude writes untruncated local request/response JSON files and
+emits `body_ref` events through the configured OTLP logs pipeline. The runtime
+also enables Claude's enhanced telemetry, OTLP logs/metrics/traces exporters,
+per-signal HTTP/protobuf protocols, detailed beta tracing, prompt logging,
+assistant response logging, tool details, and tool content when policy enables
+those capture categories.
 
-Codex hooks run on `SessionStart` and `Stop`; Claude hooks run on
-`SessionStart`, `Stop`, and `SessionEnd`. When policy disables in-progress
-trace uploads, Codex `Stop` and Claude `SessionEnd` are treated as terminal
-events. Upload responses must echo the batch and policy version, return the
-expected skipped-record count, and acknowledge the exact source ranges for every
-raw chunk and oversized-record report before the ledger advances.
+The host runtime has one executable with subcommands. `ensure` is the hook-safe
+path that enrolls when needed, writes local host telemetry config, and posts a
+check-in. `collect` is the non-blocking native JSONL upload path. `enroll`
+acquires only the host credential. `status` prints local JSON without network,
+browser, config writes, or check-ins. `reset --yes` clears cached host
+credentials and pending enrollments while preserving the stable host id and
+last-seen plugin versions. `version` reports runtime metadata.
 
-Before the customer-grade release, replace the Python dogfood script with a
-static native binary built and versioned by Promptless, then bundled into the
-toolchain release. Customer Instruction Hub repositories should not need Python,
-uv, Go, Rust, curl, jq, or other runtime/build dependencies installed for the
-hook to run. Customer builds should only consume the already-built Promptless
-artifact that the toolchain copies into plugin `bin/`. The customer-grade
-binary must verify the asymmetric hosted-policy signature with a pinned
-Promptless public key before trusting the policy body.
+Before the customer-grade release, replace the dogfood Python implementation
+with a static native binary built and versioned by Promptless, then bundled into
+the toolchain release. Customer Instruction Hub repositories should not need
+Python, uv, Go, Rust, curl, jq, or other runtime/build dependencies installed
+for the hook to run. Customer builds should only consume the already-built
+Promptless artifact that the toolchain copies into plugin `bin/`.
+
+The dogfood runtime trusts the authenticated TLS worker response and validates
+only the hosted policy shape. The customer-grade static binary must verify an
+asymmetric hosted-policy signature with a pinned Promptless public key before it
+writes local host telemetry config.
