@@ -109,13 +109,22 @@ host credential to fetch `/v0/host-enrollment/policy?target=...` and post
 The same runtime also uploads native host transcript JSONL ranges to
 `/v0/traces/batches?target=...`. SessionStart hooks run `ensure` and then a
 quiet first-run baseline; terminal lifecycle hooks (`Stop`, Claude
-`SessionEnd`, and `SubagentStop`) run collection only. Collection uses the hook
-stdin `transcript_path` or `agent_transcript_path` first, then scans idle
-host-native transcript roots as a catch-up path. The forward-only ledger lives at
-`~/.promptless/instruction-hub/host-runtime-ledger.json` or
+`SessionEnd`, and `SubagentStop`) run collection only. Collection uses hook stdin
+transcript references first, accepting snake_case, camelCase, and nested
+`session`/`transcript`/`agent` shapes from Codex- and Claude-style hooks, then
+scans idle host-native transcript roots as a catch-up path. The forward-only
+ledger lives at `~/.promptless/instruction-hub/host-runtime-ledger.json` or
 `PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads are authenticated with the
 same host credential and are gated by the same `enabled_hosts` policy used for
 OTEL config.
+
+Quiet collection stays hook-safe: it never writes status JSON to stdout, and it
+fails open if the ledger lock is busy or the collection deadline expires.
+Support diagnostics are written as bounded, redacted JSONL at
+`~/.promptless/instruction-hub/host-runtime-diagnostics.jsonl` with `0600`
+permissions and without transcript content, tool inputs, or credentials. The
+default collection deadline is 25 seconds and can be overridden with
+`PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS` for support and tests.
 
 Host enrollment is per host, not per plugin. The credential and pending approval
 are cached at a single host-global path (`~/.promptless/instruction-hub/`) and
