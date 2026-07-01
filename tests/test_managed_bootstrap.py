@@ -84,6 +84,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert "PLUGIN_ROOT" in hook_script
             assert f"path.join(root, 'bin', {HOST_RUNTIME_BIN!r})" in hook_script
             assert "spawnSync" in hook_script
+            assert "sys.version_info >= (3, 9)" in hook_script
             assert MISSING_PYTHON_MESSAGE in hook_script
             assert "--quiet" not in hook_script
 

@@ -208,7 +208,7 @@ def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness)
     missing_root = json.dumps({"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}, separators=(",", ":"))
     missing_file = json.dumps({"systemMessage": MISSING_RUNTIME_FILE_MESSAGE}, separators=(",", ":"))
     missing_python = json.dumps({"systemMessage": MISSING_PYTHON_MESSAGE}, separators=(",", ":"))
-    python_probe = "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+    python_probe = "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"
     return (
         "const fs = require('fs');\n"
         "const path = require('path');\n"
