@@ -3,8 +3,11 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -61,7 +64,14 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             hook_command = hook["command"]
             assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host codex'
         assert "--quiet" not in hook_command
-        assert hook["timeout"] == 90
+        callback_deadline_match = re.search(
+            r"^ENROLLMENT_CALLBACK_DEADLINE_SECONDS = (?P<value>\d+)$",
+            bootstrap_path.read_text(),
+            re.MULTILINE,
+        )
+        assert callback_deadline_match is not None
+        assert hook["timeout"] == 390
+        assert hook["timeout"] > int(callback_deadline_match.group("value"))
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
@@ -654,7 +664,9 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert server.session_requests[0]["package_id"] == "core"
         assert server.session_requests[0]["bootstrap_version"] == "0.2.0"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
+        assert server.session_requests[0]["pending_callback"] == "1"
         assert server.session_requests[1]["target"] == "claude"
+        assert server.session_requests[1]["pending_callback"] == "1"
         assert server.policy_requests == [
             "/v0/host-enrollment/policy?target=codex",
             "/v0/host-enrollment/policy?target=claude",
@@ -714,6 +726,86 @@ def test_bootstrap_rejects_loopback_callback_with_wrong_state(tmp_path: Path) ->
 
         assert "hosted enrollment start request failed with HTTP 403" in str(payload["message"])
         assert not (home / ".codex/config.toml").exists()
+        assert server.poll_requests == []
+        assert server.policy_requests == []
+        assert server.check_ins == []
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize(
+    ("pending_approval_url_override", "pending_approval_path"),
+    [
+        ("https://attacker.example/instruction-hub/enroll", "/instruction-hub/enroll"),
+        (None, "/attacker/enroll"),
+    ],
+    ids=["wrong-origin", "wrong-path"],
+)
+def test_bootstrap_rejects_pending_callback_approval_url_outside_dashboard_route(
+    tmp_path: Path,
+    pending_approval_url_override: str | None,
+    pending_approval_path: str,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer(
+        pending_approval_url_override=pending_approval_url_override,
+        pending_approval_path=pending_approval_path,
+    )
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, _result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
+
+        assert "hosted enrollment start request failed with HTTP 400" in str(payload["message"])
+        assert not (home / ".codex/config.toml").exists()
+        assert server.poll_requests == []
+        assert server.policy_requests == []
+        assert server.check_ins == []
+    finally:
+        server.stop()
+
+
+def test_bootstrap_fails_fast_when_browser_pending_callback_rejects_approval_url(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer(pending_approval_url_override="https://attacker.example/instruction-hub/enroll")
+    server.start()
+    try:
+        home = tmp_path / "home"
+        result = subprocess.run(
+            [str(hub_root / "dist/codex/core/bin" / HOST_RUNTIME_BIN), "ensure", "--host", "codex"],
+            env=_clean_env(
+                HOME=str(home),
+                CODEX_HOME=str(home / ".codex"),
+                PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+                PROMPTLESS_WORKER_BASE_URL=server.base_url,
+                PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER="1",
+                BROWSER=_async_urlopen_browser_command(tmp_path / "fake-browser.py"),
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=15,
+        )
+
+        assert result.returncode == 0
+        payload = _assert_session_start_streams(result.stdout, result.stderr, "error")
+        assert payload["message"] == "host enrollment approval URL did not match dashboard enrollment route"
+        assert not (home / ".codex/config.toml").exists()
+        assert len(server.session_requests) == 1
         assert server.poll_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
@@ -1680,6 +1772,32 @@ def _clean_env(**overrides: str) -> dict[str, str]:
     return env
 
 
+def _async_urlopen_browser_command(path: Path) -> str:
+    path.write_text(
+        """
+import subprocess
+import sys
+
+target_url = sys.argv[1]
+subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import sys, urllib.error, urllib.request\\n"
+        "try:\\n"
+        "    urllib.request.urlopen(sys.argv[1], timeout=10).read()\\n"
+        "except urllib.error.HTTPError:\\n"
+        "    pass\\n",
+        target_url,
+    ],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+""".lstrip()
+    )
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(path))} %s"
+
+
 def _json_mapping(value: JsonValue, field_path: str) -> dict[str, JsonValue]:
     assert isinstance(value, dict), f"{field_path} must be a JSON object"
     return value
@@ -1803,6 +1921,8 @@ class _FakeWorkerServer:
         session_response: dict[str, JsonValue] | None = None,
         session_barrier_count: int = 0,
         callback_state_override: str | None = None,
+        pending_approval_url_override: str | None = None,
+        pending_approval_path: str = "/instruction-hub/enroll",
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
         self.policy_requests: list[str] = []
@@ -1819,6 +1939,8 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.session_barrier_count = session_barrier_count
         _FakeWorkerHandler.session_condition = self._session_condition
         _FakeWorkerHandler.callback_state_override = callback_state_override
+        _FakeWorkerHandler.pending_approval_url_override = pending_approval_url_override
+        _FakeWorkerHandler.pending_approval_path = pending_approval_path
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
@@ -1844,6 +1966,8 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     session_condition: ClassVar[threading.Condition | None] = None
     session_requests: ClassVar[list[dict[str, JsonValue]]] = []
     callback_state_override: ClassVar[str | None] = None
+    pending_approval_url_override: ClassVar[str | None] = None
+    pending_approval_path: ClassVar[str] = "/instruction-hub/enroll"
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
@@ -1866,7 +1990,17 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             self._record_session_request(payload)
             session_response = self._session_response_payload()
             approval_params = {"callback_url": callback_url, **session_response}
-            hosted_approval_url = f"{self._base_url()}/instruction-hub/enroll?{urlencode(approval_params)}"
+            hosted_approval_url = self.pending_approval_url_override or (
+                f"{self._base_url()}{self.pending_approval_path}?{urlencode(approval_params)}"
+            )
+            if payload.get("pending_callback") == "1":
+                pending_params = {
+                    "status": "pending",
+                    "approval_url": hosted_approval_url,
+                    **session_response,
+                }
+                self._redirect(_url_with_query_params(callback_url, pending_params))
+                return
             self._redirect(hosted_approval_url)
             return
         if parsed.path == "/instruction-hub/enroll":
