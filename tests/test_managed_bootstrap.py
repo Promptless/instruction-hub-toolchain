@@ -356,12 +356,21 @@ def test_bootstrap_runs_without_local_dogfood_gate(tmp_path: Path) -> None:
         server.stop()
 
 
-def test_bootstrap_welcomes_internal_promptless_user_once(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "identity_location",
+    ["envelope", "policy"],
+    ids=["identity-envelope", "identity-policy"],
+)
+def test_bootstrap_welcomes_internal_promptless_user_once(tmp_path: Path, identity_location: str) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
     internal_policy = _policy_with()
-    internal_policy["user_email"] = "Adit@GoPromptless.AI"
+    if identity_location == "envelope":
+        internal_policy["user_email"] = "Adit@GoPromptless.AI"
+    else:
+        policy_body = _json_mapping(internal_policy["policy"], "policy")
+        policy_body["user_email"] = "Adit@GoPromptless.AI"
     server = _FakeWorkerServer(policy=internal_policy)
     server.start()
     try:

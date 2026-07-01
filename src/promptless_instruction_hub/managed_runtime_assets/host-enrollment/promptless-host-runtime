@@ -538,7 +538,9 @@ def _claude_config_status() -> dict[str, JsonValue]:
         result["managed_config_detected"] = False
         return result
     env = settings.get("env")
-    result["managed_config_detected"] = isinstance(env, dict) and _string_value(env.get(CLAUDE_MANAGED_ENV_MARKER)) == "1"
+    result["managed_config_detected"] = (
+        isinstance(env, dict) and _string_value(env.get(CLAUDE_MANAGED_ENV_MARKER)) == "1"
+    )
     return result
 
 
@@ -904,7 +906,7 @@ def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None
 
 
 def _credential_with_identity(credential: HostCredential, payload: dict[str, JsonValue]) -> HostCredential:
-    if credential.internal_promptless_user or not _is_internal_promptless_identity(payload):
+    if credential.internal_promptless_user or not _policy_response_has_internal_promptless_identity(payload):
         return credential
     return HostCredential(
         value=credential.value,
@@ -2027,6 +2029,13 @@ def _is_internal_promptless_identity(payload: dict[str, JsonValue]) -> bool:
     return payload.get("internal_promptless_user") is True or _is_internal_promptless_email(_identity_email(payload))
 
 
+def _policy_response_has_internal_promptless_identity(payload: dict[str, JsonValue]) -> bool:
+    if _is_internal_promptless_identity(payload):
+        return True
+    policy = _json_mapping_or_empty(payload.get("policy"))
+    return bool(policy) and _is_internal_promptless_identity(policy)
+
+
 def _normalize_email(value: str | None) -> str | None:
     if value is None:
         return None
@@ -2226,7 +2235,9 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
                 f"Finish that approval, then restart {host_label.name}."
             )
         if reason == "approval_expired":
-            return f"Promptless host enrollment approval expired. Restart {host_label.name} to request a fresh approval."
+            return (
+                f"Promptless host enrollment approval expired. Restart {host_label.name} to request a fresh approval."
+            )
         return (
             "Promptless host enrollment is awaiting browser approval. "
             f"Approve in the browser tab that opened, then restart {host_label.name}."
