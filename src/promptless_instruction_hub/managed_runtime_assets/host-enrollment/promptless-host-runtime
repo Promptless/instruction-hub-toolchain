@@ -50,19 +50,23 @@ MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_RUNTIME_MANIFEST = Path("hub.managed-runtimes.json")
 STATE_FILE_NAME = "host-enrollment-state.json"
 LAST_STATUS_FILE_NAME = "last-bootstrap-status.json"
+DIAGNOSTIC_LOG_FILE_NAME = "host-runtime-diagnostics.jsonl"
 LEDGER_FILE_NAME = "host-runtime-ledger.json"
 RAW_API_BODIES_DIR_NAME = "claude-raw-api-bodies"
 HTTP_TIMEOUT_SECONDS = 10
 ENROLLMENT_CALLBACK_DEADLINE_SECONDS = 300
 ENROLLMENT_POLL_DEADLINE_SECONDS = 35
+COLLECT_DEADLINE_SECONDS = 25.0
 MAX_STDIN_BYTES = 1024 * 1024
 MAX_TRACE_BATCH_BYTES = 10 * 1024 * 1024
 MAX_UPLOAD_CHUNKS_PER_BATCH = 200
+MAX_DIAGNOSTIC_LOG_BYTES = 512 * 1024
 SOURCE_READ_BLOCK_BYTES = 1024 * 1024
 IDLE_SESSION_GRACE_SECONDS = 12 * 60 * 60
 CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
 OPEN_BROWSER_ENV = "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER"
+COLLECT_DEADLINE_ENV = "PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS"
 CALLBACK_STATE_PARAM = "state"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
@@ -94,6 +98,10 @@ class BootstrapError(RuntimeError):
 
 class BootstrapAuthError(BootstrapError):
     """Host credential was rejected by the worker."""
+
+
+class CollectDeadlineExceeded(BootstrapError):
+    """Native trace collection exceeded its hook-safe runtime budget."""
 
 
 @dataclass(frozen=True)
@@ -321,6 +329,9 @@ def _run_collect_command(host: Host, *, lifecycle: str | None, baseline: bool, q
         event = _lifecycle_event(lifecycle)
         hook_context = _hook_trace_context(_read_hook_context())
         return _run_collect(host, lifecycle_event=event, hook_context=hook_context, baseline=baseline, quiet=quiet)
+    except CollectDeadlineExceeded:
+        _emit({"status": "trace_upload_skipped", "reason": "collection_deadline_exceeded", "host": host}, quiet=quiet)
+        return 0
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
         _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
         return 0
@@ -497,11 +508,13 @@ def _run_collect(
     baseline: bool,
     quiet: bool,
 ) -> int:
+    deadline = _collect_deadline()
     plugin_root = _plugin_root()
     metadata = _load_runtime_metadata(plugin_root, host)
     worker_base_url = _worker_base_url()
     dashboard_base_url = _dashboard_base_url()
     context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+    _ensure_collect_deadline(deadline)
     credential = _cached_host_credential(context)
     if credential is None:
         _emit({"status": "trace_upload_skipped", "reason": "not_enrolled", "host": host}, quiet=quiet)
@@ -519,7 +532,8 @@ def _run_collect(
         _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
         return 0
 
-    source_paths = _collect_source_paths(host, hook_context, lifecycle_event=lifecycle_event)
+    _ensure_collect_deadline(deadline)
+    source_paths = _collect_source_paths(host, hook_context, lifecycle_event=lifecycle_event, deadline=deadline)
     if not source_paths:
         _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
         return 0
@@ -528,7 +542,10 @@ def _run_collect(
     ledger_path = _ledger_path()
     uploaded_batch_count = 0
     uploaded_chunk_count = 0
-    with _source_ledger_lock(ledger_path):
+    with _source_ledger_lock(ledger_path) as lock_acquired:
+        if not lock_acquired:
+            _emit({"status": "trace_upload_skipped", "reason": "ledger_lock_busy", "host": host}, quiet=quiet)
+            return 0
         ledger = _load_source_ledger(ledger_path)
         if ledger.is_new:
             _baseline_source_offsets(ledger, source_paths)
@@ -554,6 +571,7 @@ def _run_collect(
             hook_context=hook_context,
             ledger=ledger,
             source_paths=source_paths,
+            deadline=deadline,
         ):
             response = _post_upload_batch(upload_url, credential, policy, batch)
             _advance_ledger_from_response(ledger, source_paths, response)
@@ -591,15 +609,48 @@ def _read_hook_context() -> dict[str, JsonValue]:
 
 
 def _hook_trace_context(context: dict[str, JsonValue]) -> HookTraceContext:
-    transcript_path = _optional_hook_path(context.get("transcript_path"))
-    agent_transcript_path = _optional_hook_path(context.get("agent_transcript_path"))
+    transcript_path = _optional_hook_path(
+        _first_context_value(context, ("transcript_path", "transcriptPath", "transcript.path"))
+    )
+    agent_transcript_path = _optional_hook_path(
+        _first_context_value(
+            context,
+            (
+                "agent_transcript_path",
+                "agentTranscriptPath",
+                "agent.transcript_path",
+                "agent.transcriptPath",
+            ),
+        )
+    )
     return HookTraceContext(
         transcript_path=transcript_path,
         agent_transcript_path=agent_transcript_path,
-        session_id=_non_empty(_first_string(context, ("session_id", "conversation_id"))),
-        parent_session_id=_non_empty(_first_string(context, ("parent_session_id", "parent_conversation_id"))),
-        agent_id=_non_empty(_first_string(context, ("agent_id", "subagent_id", "agent_name"))),
-        agent_type=_non_empty(_first_string(context, ("agent_type", "subagent_type"))),
+        session_id=_non_empty(
+            _first_string(context, ("session_id", "sessionId", "conversation_id", "conversationId", "session.id"))
+        ),
+        parent_session_id=_non_empty(
+            _first_string(
+                context,
+                (
+                    "parent_session_id",
+                    "parentSessionId",
+                    "parent_conversation_id",
+                    "parentConversationId",
+                    "parent_session.id",
+                    "parentSession.id",
+                ),
+            )
+        ),
+        agent_id=_non_empty(
+            _first_string(
+                context,
+                ("agent_id", "agentId", "subagent_id", "subagentId", "agent_name", "agentName", "agent.id"),
+            )
+        ),
+        agent_type=_non_empty(
+            _first_string(context, ("agent_type", "agentType", "subagent_type", "subagentType", "agent.type"))
+        ),
     )
 
 
@@ -612,10 +663,31 @@ def _optional_hook_path(value: JsonValue | None) -> Path | None:
 
 def _first_string(context: dict[str, JsonValue], keys: tuple[str, ...]) -> str | None:
     for key in keys:
-        value = _string_value(context.get(key))
+        value = _non_empty(_string_value(_context_value(context, key)))
         if value is not None:
             return value
     return None
+
+
+def _first_context_value(context: dict[str, JsonValue], keys: tuple[str, ...]) -> JsonValue | None:
+    for key in keys:
+        value = _context_value(context, key)
+        if isinstance(value, str) and _non_empty(value) is None:
+            continue
+        if value is not None:
+            return value
+    return None
+
+
+def _context_value(context: dict[str, JsonValue], key: str) -> JsonValue | None:
+    if "." not in key:
+        return context.get(key)
+    value: JsonValue | None = context
+    for part in key.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
 
 
 def _collect_source_paths(
@@ -623,6 +695,7 @@ def _collect_source_paths(
     hook_context: HookTraceContext,
     *,
     lifecycle_event: LifecycleEvent,
+    deadline: float,
 ) -> tuple[Path, ...]:
     explicit_paths: list[Path] = []
     if lifecycle_event == "subagent_stop" and hook_context.agent_transcript_path is not None:
@@ -635,8 +708,10 @@ def _collect_source_paths(
     ordered_paths: list[Path] = []
     seen: set[str] = set()
     for path in explicit_paths:
+        _ensure_collect_deadline(deadline)
         _append_unique_path(ordered_paths, seen, path)
-    for path in _idle_root_scan_paths(host):
+    for path in _idle_root_scan_paths(host, deadline=deadline):
+        _ensure_collect_deadline(deadline)
         _append_unique_path(ordered_paths, seen, path)
     return tuple(ordered_paths)
 
@@ -653,11 +728,12 @@ def _append_unique_path(paths: list[Path], seen: set[str], path: Path) -> None:
     paths.append(resolved)
 
 
-def _idle_root_scan_paths(host: Host) -> tuple[Path, ...]:
+def _idle_root_scan_paths(host: Host, *, deadline: float) -> tuple[Path, ...]:
     now = time.time()
     result: list[Path] = []
     for pattern in _native_trace_globs(host):
         for raw_path in glob.iglob(pattern, recursive=True):
+            _ensure_collect_deadline(deadline)
             path = Path(raw_path)
             if not path.is_file():
                 continue
@@ -686,9 +762,16 @@ def _ledger_path() -> Path:
 
 
 @contextmanager
-def _source_ledger_lock(path: Path) -> Iterator[None]:
-    with _state_file_lock(path):
-        yield
+def _source_ledger_lock(path: Path) -> Iterator[bool]:
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        acquired = _try_lock_state_file(lock_file)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                _unlock_state_file(lock_file)
 
 
 def _load_source_ledger(path: Path) -> SourceLedger:
@@ -773,11 +856,13 @@ def _iter_upload_batches(
     hook_context: HookTraceContext,
     ledger: SourceLedger,
     source_paths: tuple[Path, ...],
+    deadline: float,
 ) -> Iterator[UploadBatch]:
     pending_events: list[SourceEvent] = []
     pending_payloads: list[dict[str, JsonValue]] = []
     pending_decoded_bytes = 0
     for event in _iter_source_events(ledger, source_paths):
+        _ensure_collect_deadline(deadline)
         payload = _chunk_payload(event, lifecycle_event)
         next_decoded_bytes = pending_decoded_bytes + event.byte_count
         if (
@@ -1065,6 +1150,23 @@ def _utc_now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _collect_deadline() -> float:
+    raw_value = _non_empty(os.environ.get(COLLECT_DEADLINE_ENV))
+    if raw_value is None:
+        seconds = COLLECT_DEADLINE_SECONDS
+    else:
+        try:
+            seconds = max(0.0, float(raw_value))
+        except ValueError:
+            seconds = COLLECT_DEADLINE_SECONDS
+    return time.monotonic() + seconds
+
+
+def _ensure_collect_deadline(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise CollectDeadlineExceeded("native trace collection exceeded deadline")
+
+
 def _status_payload(host: Host) -> dict[str, JsonValue]:
     state_path = _state_path()
     state = _load_state(state_path)
@@ -1339,6 +1441,10 @@ def _state_path() -> Path:
 
 def _last_status_path() -> Path:
     return _state_path().with_name(LAST_STATUS_FILE_NAME)
+
+
+def _diagnostic_log_path() -> Path:
+    return _state_path().with_name(DIAGNOSTIC_LOG_FILE_NAME)
 
 
 def _raw_api_bodies_path() -> Path:
@@ -2604,8 +2710,6 @@ def _emit(
     quiet: bool = False,
     update_notice: str | None = None,
 ) -> None:
-    if quiet:
-        return
     # SessionStart hook output contract. Codex validates the hook's *stdout* against a strict schema
     # (serde deny_unknown_fields): only continue/stopReason/systemMessage/suppressOutput/
     # hookSpecificOutput are accepted, and any extra key makes Codex reject the whole object with
@@ -2623,6 +2727,9 @@ def _emit(
         diagnostic["systemMessage"] = message
     if terminal_sequence is not None:
         diagnostic["terminalSequence"] = terminal_sequence
+    _write_diagnostic_log(diagnostic)
+    if quiet:
+        return
     _write_last_status(diagnostic)
     sys.stderr.write(json.dumps(_redact_json(diagnostic), sort_keys=True) + "\n")
     sys.stderr.flush()
@@ -2672,6 +2779,30 @@ def _write_last_status(diagnostic: dict[str, JsonValue]) -> None:
     try:
         path = _last_status_path()
         _atomic_write_text(path, json.dumps(_redact_json(payload), indent=2, sort_keys=True) + "\n")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except OSError:
+        return
+
+
+def _write_diagnostic_log(diagnostic: dict[str, JsonValue]) -> None:
+    payload = dict(diagnostic)
+    payload["emitted_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    try:
+        path = _diagnostic_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(_redact_json(payload), sort_keys=True) + "\n"
+        if path.exists() and path.stat().st_size + len(line.encode("utf-8")) > MAX_DIAGNOSTIC_LOG_BYTES:
+            rotated_path = path.with_name(f"{path.name}.1")
+            try:
+                rotated_path.unlink()
+            except FileNotFoundError:
+                pass
+            path.replace(rotated_path)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
         try:
             path.chmod(0o600)
         except OSError:
