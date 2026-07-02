@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import shlex
 import shutil
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -23,9 +25,34 @@ HOST_RUNTIME_EXECUTABLE = "promptless-host-runtime"
 # host can kill SessionStart before a resumable pending enrollment is persisted.
 HOST_RUNTIME_HOOK_TIMEOUT_SECONDS = 390
 HOST_RUNTIME_CHANNEL = "stable"
-HOST_RUNTIME_VERSION = "0.2.0"
+HOST_RUNTIME_VERSION = "0.2.1"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
 SUPPORTED_HOST_RUNTIME_TARGETS: tuple[Harness, ...] = ("claude", "codex")
+MISSING_RUNTIME_ROOT_MESSAGE = (
+    "Promptless Instruction Hub hook could not find its plugin root. "
+    "Update the host CLI or reinstall the Promptless plugin."
+)
+MISSING_RUNTIME_FILE_MESSAGE = (
+    "Promptless Instruction Hub hook could not find its managed runtime. Reinstall the Promptless plugin."
+)
+UNREADABLE_RUNTIME_FILE_MESSAGE = (
+    "Promptless Instruction Hub hook found its managed runtime, but it is not readable. "
+    "Reinstall the Promptless plugin."
+)
+MISSING_PYTHON_MESSAGE = (
+    "Promptless Instruction Hub hook could not find Python 3.9 or newer. "
+    "Install Python 3.9+ or reinstall the Promptless plugin."
+)
+UNSUPPORTED_PYTHON_MESSAGE = (
+    "Promptless Instruction Hub hook found Python, but none are Python 3.9 or newer. "
+    "Install Python 3.9+ or reinstall the Promptless plugin."
+)
+BROKEN_PYTHON_MESSAGE = (
+    "Promptless Instruction Hub hook could not start a usable Python 3.9 or newer interpreter. "
+    "Reinstall the Promptless plugin."
+)
+PYTHON_MIN_VERSION = (3, 9)
+PYTHON_VERSION_PROBE = f"import sys; raise SystemExit(0 if sys.version_info >= {PYTHON_MIN_VERSION!r} else 2)"
 
 _ASSET_ROOT = Path(__file__).parent / "managed_runtime_assets" / HOST_RUNTIME_ASSET_DIR
 _EXECUTABLE_SOURCE = _ASSET_ROOT / HOST_RUNTIME_EXECUTABLE
@@ -145,12 +172,12 @@ def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
 
 def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
     if target == "claude":
-        hook_command: dict[str, JsonValue] = {
-            "command": f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_EXECUTABLE}" ensure --host claude',
-        }
+        hook_command = _claude_host_runtime_hook_command()
     else:
+        root_expr = "${PLUGIN_ROOT:-}"
+        host = "codex"
         hook_command = {
-            "command": f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_EXECUTABLE}" ensure --host codex',
+            "command": _posix_host_runtime_hook_command(root_expr=root_expr, host=host),
         }
 
     # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
@@ -174,6 +201,115 @@ def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
             }
         ],
     }
+
+
+def _system_message_json(message: str) -> str:
+    return json.dumps({"systemMessage": message}, separators=(",", ":"))
+
+
+def _hook_json_system_message(message: str) -> str:
+    return _system_message_json(message).replace('"', '\\"')
+
+
+def _claude_host_runtime_hook_command() -> dict[str, JsonValue]:
+    return {
+        "command": "node",
+        "args": [
+            "-e",
+            _node_host_runtime_hook_script(root_envs=("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT"), host="claude"),
+            "${CLAUDE_PLUGIN_ROOT}",
+        ],
+    }
+
+
+def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness) -> str:
+    root_env_names = json.dumps(list(root_envs), separators=(",", ":"))
+    missing_root = _system_message_json(MISSING_RUNTIME_ROOT_MESSAGE)
+    missing_file = _system_message_json(MISSING_RUNTIME_FILE_MESSAGE)
+    unreadable_file = _system_message_json(UNREADABLE_RUNTIME_FILE_MESSAGE)
+    missing_python = _system_message_json(MISSING_PYTHON_MESSAGE)
+    unsupported_python = _system_message_json(UNSUPPORTED_PYTHON_MESSAGE)
+    broken_python = _system_message_json(BROKEN_PYTHON_MESSAGE)
+    return (
+        "const fs = require('fs');\n"
+        "const path = require('path');\n"
+        "const { spawnSync } = require('child_process');\n"
+        f"const rootEnvNames = {root_env_names};\n"
+        "let root = process.argv.slice(1).find((value) => value && !value.startsWith('${')) || '';\n"
+        "for (const name of rootEnvNames) {\n  if (root) break;\n  root = process.env[name] || '';\n}\n"
+        f"if (!root) {{ console.log({missing_root!r}); process.exit(0); }}\n"
+        f"const runtime = path.join(root, 'bin', {HOST_RUNTIME_EXECUTABLE!r});\n"
+        "let runtimeStat;\n"
+        f"try {{ runtimeStat = fs.statSync(runtime); }} catch (error) {{ console.log({missing_file!r}); process.exit(0); }}\n"
+        f"if (!runtimeStat.isFile()) {{ console.log({missing_file!r}); process.exit(0); }}\n"
+        f"try {{ fs.accessSync(runtime, fs.constants.R_OK); }} catch (error) {{ console.log({unreadable_file!r}); process.exit(0); }}\n"
+        f"const pythonProbe = {PYTHON_VERSION_PROBE!r};\n"
+        f"const runtimeArgs = [runtime, 'ensure', '--host', {host!r}];\n"
+        "const candidates = [\n"
+        "  { command: 'python3', probeArgs: ['-c', pythonProbe], runArgs: runtimeArgs },\n"
+        "  { command: 'python', probeArgs: ['-c', pythonProbe], runArgs: runtimeArgs },\n"
+        "  { command: 'py', probeArgs: ['-3', '-c', pythonProbe], runArgs: ['-3', ...runtimeArgs] },\n"
+        "];\n"
+        "let sawUnsupportedPython = false;\n"
+        "let sawBrokenPython = false;\n"
+        "for (const candidate of candidates) {\n"
+        "  const probe = spawnSync(candidate.command, candidate.probeArgs, { stdio: 'ignore' });\n"
+        "  if (probe.error) {\n"
+        "    if (probe.error.code !== 'ENOENT') sawBrokenPython = true;\n"
+        "    continue;\n"
+        "  }\n"
+        "  if (probe.status !== 0) {\n"
+        "    if (probe.status === 2) sawUnsupportedPython = true;\n"
+        "    else sawBrokenPython = true;\n"
+        "    continue;\n"
+        "  }\n"
+        "  const result = spawnSync(candidate.command, candidate.runArgs, { stdio: 'inherit', env: process.env });\n"
+        "  if (result.error) {\n"
+        "    sawBrokenPython = true;\n"
+        "    continue;\n"
+        "  }\n"
+        "  process.exit(result.status === null ? 1 : result.status);\n"
+        "}\n"
+        f"if (sawUnsupportedPython) console.log({unsupported_python!r});\n"
+        f"else if (sawBrokenPython) console.log({broken_python!r});\n"
+        f"else console.log({missing_python!r});\n"
+        "process.exit(0);\n"
+    )
+
+
+def _posix_host_runtime_hook_command(*, root_expr: str, host: Harness) -> str:
+    script = (
+        f"root={root_expr}; "
+        f'if [ -z "$root" ]; then {_posix_emit_system_message(MISSING_RUNTIME_ROOT_MESSAGE)}; exit 0; fi; '
+        f'runtime="$root/bin/{HOST_RUNTIME_EXECUTABLE}"; '
+        f'if [ ! -f "$runtime" ]; then {_posix_emit_system_message(MISSING_RUNTIME_FILE_MESSAGE)}; exit 0; fi; '
+        f'if [ ! -r "$runtime" ]; then {_posix_emit_system_message(UNREADABLE_RUNTIME_FILE_MESSAGE)}; exit 0; fi; '
+        f'probe="{PYTHON_VERSION_PROBE}"; '
+        "python_cmd=; python_arg=; unsupported_python=0; broken_python=0; "
+        "for candidate in python3 python; do "
+        'if ! command -v "$candidate" >/dev/null 2>&1; then continue; fi; '
+        '"$candidate" -c "$probe" >/dev/null 2>&1; status=$?; '
+        'if [ "$status" -eq 0 ]; then python_cmd="$candidate"; break; fi; '
+        'if [ "$status" -eq 2 ]; then unsupported_python=1; else broken_python=1; fi; '
+        "done; "
+        'if [ -z "$python_cmd" ] && command -v py >/dev/null 2>&1; then '
+        'py -3 -c "$probe" >/dev/null 2>&1; status=$?; '
+        'if [ "$status" -eq 0 ]; then python_cmd=py; python_arg=-3; '
+        'elif [ "$status" -eq 2 ]; then unsupported_python=1; else broken_python=1; fi; '
+        "fi; "
+        'if [ -z "$python_cmd" ]; then '
+        f'if [ "$unsupported_python" -eq 1 ]; then {_posix_emit_system_message(UNSUPPORTED_PYTHON_MESSAGE)}; '
+        f'elif [ "$broken_python" -eq 1 ]; then {_posix_emit_system_message(BROKEN_PYTHON_MESSAGE)}; '
+        f"else {_posix_emit_system_message(MISSING_PYTHON_MESSAGE)}; fi; "
+        "exit 0; fi; "
+        f'if [ -n "$python_arg" ]; then exec "$python_cmd" "$python_arg" "$runtime" ensure --host {host}; fi; '
+        f'exec "$python_cmd" "$runtime" ensure --host {host}'
+    )
+    return f"sh -c {shlex.quote(script)}"
+
+
+def _posix_emit_system_message(message: str) -> str:
+    return f'printf "%s\\n" "{_hook_json_system_message(message)}"'
 
 
 def _write_plugin_manifest(target_root: Path, records: tuple[ManagedRuntimeRecord, ...]) -> None:
