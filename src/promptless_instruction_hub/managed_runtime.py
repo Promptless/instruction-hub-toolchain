@@ -203,9 +203,12 @@ def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
     }
 
 
+def _system_message_json(message: str) -> str:
+    return json.dumps({"systemMessage": message}, separators=(",", ":"))
+
+
 def _hook_json_system_message(message: str) -> str:
-    payload = json.dumps({"systemMessage": message}, separators=(",", ":"))
-    return payload.replace('"', '\\"')
+    return _system_message_json(message).replace('"', '\\"')
 
 
 def _claude_host_runtime_hook_command() -> dict[str, JsonValue]:
@@ -221,12 +224,12 @@ def _claude_host_runtime_hook_command() -> dict[str, JsonValue]:
 
 def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness) -> str:
     root_env_names = json.dumps(list(root_envs), separators=(",", ":"))
-    missing_root = json.dumps({"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}, separators=(",", ":"))
-    missing_file = json.dumps({"systemMessage": MISSING_RUNTIME_FILE_MESSAGE}, separators=(",", ":"))
-    unreadable_file = json.dumps({"systemMessage": UNREADABLE_RUNTIME_FILE_MESSAGE}, separators=(",", ":"))
-    missing_python = json.dumps({"systemMessage": MISSING_PYTHON_MESSAGE}, separators=(",", ":"))
-    unsupported_python = json.dumps({"systemMessage": UNSUPPORTED_PYTHON_MESSAGE}, separators=(",", ":"))
-    broken_python = json.dumps({"systemMessage": BROKEN_PYTHON_MESSAGE}, separators=(",", ":"))
+    missing_root = _system_message_json(MISSING_RUNTIME_ROOT_MESSAGE)
+    missing_file = _system_message_json(MISSING_RUNTIME_FILE_MESSAGE)
+    unreadable_file = _system_message_json(UNREADABLE_RUNTIME_FILE_MESSAGE)
+    missing_python = _system_message_json(MISSING_PYTHON_MESSAGE)
+    unsupported_python = _system_message_json(UNSUPPORTED_PYTHON_MESSAGE)
+    broken_python = _system_message_json(BROKEN_PYTHON_MESSAGE)
     return (
         "const fs = require('fs');\n"
         "const path = require('path');\n"

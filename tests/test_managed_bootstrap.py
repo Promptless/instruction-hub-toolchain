@@ -51,6 +51,20 @@ def _assert_no_promptless_directory(root: Path) -> None:
     assert list(root.rglob(".promptless")) == []
 
 
+def _assert_hook_output(result: subprocess.CompletedProcess[str], expected: object) -> None:
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert json.loads(result.stdout) == expected
+
+
+def _assert_hook_system_message(result: subprocess.CompletedProcess[str], message: str) -> None:
+    _assert_hook_output(result, {"systemMessage": message})
+
+
+def _assert_hook_argv(result: subprocess.CompletedProcess[str], target: str) -> None:
+    _assert_hook_output(result, {"argv": ["ensure", "--host", target]})
+
+
 def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -108,9 +122,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 capture_output=True,
                 check=False,
             )
-            assert missing_root.returncode == 0
-            assert missing_root.stderr == ""
-            assert json.loads(missing_root.stdout) == {"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}
+            _assert_hook_system_message(missing_root, MISSING_RUNTIME_ROOT_MESSAGE)
 
             missing_runtime = subprocess.run(
                 [node_path, hook_args[0], hook_script, str(missing_runtime_root)],
@@ -119,9 +131,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 capture_output=True,
                 check=False,
             )
-            assert missing_runtime.returncode == 0
-            assert missing_runtime.stderr == ""
-            assert json.loads(missing_runtime.stdout) == {"systemMessage": MISSING_RUNTIME_FILE_MESSAGE}
+            _assert_hook_system_message(missing_runtime, MISSING_RUNTIME_FILE_MESSAGE)
 
             missing_python = subprocess.run(
                 [node_path, hook_args[0], hook_script, str(stub_root)],
@@ -130,9 +140,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 capture_output=True,
                 check=False,
             )
-            assert missing_python.returncode == 0
-            assert missing_python.stderr == ""
-            assert json.loads(missing_python.stdout) == {"systemMessage": MISSING_PYTHON_MESSAGE}
+            _assert_hook_system_message(missing_python, MISSING_PYTHON_MESSAGE)
 
             unsupported_python_bin = tmp_path / f"{target}-unsupported-python-bin"
             unsupported_python_bin.mkdir()
@@ -148,14 +156,12 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 capture_output=True,
                 check=False,
             )
-            assert unsupported_python.returncode == 0
-            assert unsupported_python.stderr == ""
-            assert json.loads(unsupported_python.stdout) == {"systemMessage": UNSUPPORTED_PYTHON_MESSAGE}
+            _assert_hook_system_message(unsupported_python, UNSUPPORTED_PYTHON_MESSAGE)
 
             fallback_python_bin = tmp_path / f"{target}-fallback-python-bin"
             fallback_python_bin.mkdir()
             _write_shell_script(fallback_python_bin / "python3", "exit 2")
-            _write_shell_script(fallback_python_bin / "python", f'exec {shlex.quote(sys.executable)} "$@"')
+            _write_python_forwarder(fallback_python_bin / "python")
             fallback_python = subprocess.run(
                 [node_path, hook_args[0], hook_script, str(stub_root)],
                 env=_clean_env(HOME=str(tmp_path / f"{target}-fallback-python-home"), PATH=str(fallback_python_bin)),
@@ -163,9 +169,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 capture_output=True,
                 check=False,
             )
-            assert fallback_python.returncode == 0
-            assert fallback_python.stderr == ""
-            assert json.loads(fallback_python.stdout) == {"argv": ["ensure", "--host", target]}
+            _assert_hook_argv(fallback_python, target)
 
             env_rooted = subprocess.run(
                 [node_path, *hook_args],
@@ -174,9 +178,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 capture_output=True,
                 check=False,
             )
-            assert env_rooted.returncode == 0
-            assert env_rooted.stderr == ""
-            assert json.loads(env_rooted.stdout) == {"argv": ["ensure", "--host", target]}
+            _assert_hook_argv(env_rooted, target)
 
             rooted = subprocess.run(
                 [hook["command"], hook_args[0], hook_script, str(stub_root)],
@@ -202,9 +204,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 capture_output=True,
                 check=False,
             )
-            assert missing_root.returncode == 0
-            assert missing_root.stderr == ""
-            assert json.loads(missing_root.stdout) == {"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}
+            _assert_hook_system_message(missing_root, MISSING_RUNTIME_ROOT_MESSAGE)
 
             missing_runtime = subprocess.run(
                 hook_command,
@@ -217,16 +217,14 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 capture_output=True,
                 check=False,
             )
-            assert missing_runtime.returncode == 0
-            assert missing_runtime.stderr == ""
-            assert json.loads(missing_runtime.stdout) == {"systemMessage": MISSING_RUNTIME_FILE_MESSAGE}
+            _assert_hook_system_message(missing_runtime, MISSING_RUNTIME_FILE_MESSAGE)
 
             fallback_python_bin = tmp_path / f"{target}-fallback-python-bin"
             fallback_python_bin.mkdir()
             sh_path = shutil.which("sh") or "/bin/sh"
             _write_shell_script(fallback_python_bin / "sh", f'exec {shlex.quote(sh_path)} "$@"')
             _write_shell_script(fallback_python_bin / "python3", "exit 2")
-            _write_shell_script(fallback_python_bin / "python", f'exec {shlex.quote(sys.executable)} "$@"')
+            _write_python_forwarder(fallback_python_bin / "python")
             fallback_python = subprocess.run(
                 shlex.split(hook_command),
                 env=_clean_env(
@@ -238,9 +236,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 capture_output=True,
                 check=False,
             )
-            assert fallback_python.returncode == 0
-            assert fallback_python.stderr == ""
-            assert json.loads(fallback_python.stdout) == {"argv": ["ensure", "--host", target]}
+            _assert_hook_argv(fallback_python, target)
 
             rooted = subprocess.run(
                 hook_command,
@@ -250,9 +246,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 capture_output=True,
                 check=False,
             )
-        assert rooted.returncode == 0
-        assert rooted.stderr == ""
-        assert json.loads(rooted.stdout) == {"argv": ["ensure", "--host", target]}
+        _assert_hook_argv(rooted, target)
 
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
@@ -2157,6 +2151,10 @@ def _clean_env(**overrides: str) -> dict[str, str]:
 def _write_shell_script(path: Path, body: str) -> None:
     path.write_text(f"#!/bin/sh\n{body}\n")
     path.chmod(0o755)
+
+
+def _write_python_forwarder(path: Path) -> None:
+    _write_shell_script(path, f'exec {shlex.quote(sys.executable)} "$@"')
 
 
 def _credential_cache_key(*, worker_base_url: str, target: str) -> str:
