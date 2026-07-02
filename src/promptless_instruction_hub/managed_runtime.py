@@ -18,12 +18,11 @@ RuntimeStatus = Literal["included"]
 HOST_RUNTIME_ID = "host-runtime"
 HOST_RUNTIME_ASSET_DIR = "host-enrollment"
 HOST_RUNTIME_EXECUTABLE = "promptless-host-runtime"
-# Keep this above the browser callback deadline plus the follow-up poll,
-# policy fetch, local config write, and check-in network calls. Otherwise the
-# host can kill SessionStart before a resumable pending enrollment is persisted.
+# Keep this above device-session creation, hosted approval polling, credential
+# registration, policy fetch, local config write, and check-in network calls.
 HOST_RUNTIME_HOOK_TIMEOUT_SECONDS = 390
 HOST_RUNTIME_CHANNEL = "stable"
-HOST_RUNTIME_VERSION = "0.2.0"
+HOST_RUNTIME_VERSION = "0.3.0"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
 SUPPORTED_HOST_RUNTIME_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 

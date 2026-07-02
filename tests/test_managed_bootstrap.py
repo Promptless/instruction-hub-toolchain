@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
-import re
 import shlex
 import shutil
 import subprocess
 import sys
 import threading
 import tomllib
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -64,21 +65,17 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             hook_command = hook["command"]
             assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host codex'
         assert "--quiet" not in hook_command
-        callback_deadline_match = re.search(
-            r"^ENROLLMENT_CALLBACK_DEADLINE_SECONDS = (?P<value>\d+)$",
-            bootstrap_path.read_text(),
-            re.MULTILINE,
-        )
-        assert callback_deadline_match is not None
+        bootstrap_source = bootstrap_path.read_text()
+        assert "ENROLLMENT_CALLBACK_DEADLINE_SECONDS" not in bootstrap_source
+        assert "ThreadingHTTPServer" not in bootstrap_source
         assert hook["timeout"] == 390
-        assert hook["timeout"] > int(callback_deadline_match.group("value"))
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
         assert runtime["id"] == "host-runtime"
         assert runtime["status"] == "included"
         assert runtime["target"] == target
-        assert runtime["version"] == "0.2.0"
+        assert runtime["version"] == "0.3.0"
         assert runtime["channel"] == "stable"
         assert runtime["path"] == f"bin/{HOST_RUNTIME_BIN}"
         assert len(runtime["sha256"]) == 64
@@ -121,7 +118,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     )
     assert payload["id"] == "host-runtime"
     assert payload["name"] == HOST_RUNTIME_BIN
-    assert payload["version"] == "0.2.0"
+    assert payload["version"] == "0.3.0"
     assert payload["channel"] == "stable"
     assert len(_json_string(payload["sha256"], "sha256")) == 64
 
@@ -133,7 +130,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert text_version.returncode == 0
-    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.0\n"
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.3.0\n"
     assert text_version.stderr == ""
 
 
@@ -324,7 +321,9 @@ def test_bootstrap_surfaces_browser_open_failure(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeWorkerServer(
+        approval_url_override="https://app.gopromptless.ai/instruction-hub/enroll?approval_token=plihenroll_approvalcode"
+    )
     server.start()
     try:
         home = tmp_path / "home"
@@ -348,13 +347,27 @@ def test_bootstrap_surfaces_browser_open_failure(tmp_path: Path) -> None:
         state = json.loads(_host_state_path(home).read_text())
         assert _json_string(state["host_instance_id"], "host_instance_id").startswith("host-")
         assert "credentials" not in state
-        assert "pending_enrollments" not in state
+        pending_enrollments = _json_mapping(
+            validate_json_value(state["pending_enrollments"], "pending enrollments"),
+            "pending enrollments",
+        )
+        assert len(pending_enrollments) == 1
+        pending_session = _json_mapping(next(iter(pending_enrollments.values())), "pending enrollment")
+        assert pending_session["deployment_instance_id"] == "worker-local-1"
+        assert pending_session["device_code"] == "plihenroll_devicecode"
+        assert _json_string(pending_session["approval_url"], "approval_url").startswith(
+            "https://app.gopromptless.ai/instruction-hub/enroll?"
+        )
+        assert _json_string(pending_session["staged_credential"], "staged_credential").startswith("plihost_")
+        assert pending_session["browser_opened"] is False
         seen_versions = _json_mapping(
             validate_json_value(state["last_seen_plugin_versions"], "last seen plugin versions"),
             "last seen plugin versions",
         )
         assert seen_versions["claude"] == "0.1.0"
-        assert server.session_requests == []
+        assert len(server.session_requests) == 1
+        assert server.poll_requests == []
+        assert server.credential_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
     finally:
@@ -541,7 +554,9 @@ def test_bootstrap_reports_browser_launch_failure_without_claiming_browser_opene
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeWorkerServer(
+        approval_url_override="https://app.gopromptless.ai/instruction-hub/enroll?approval_token=plihenroll_approvalcode"
+    )
     server.start()
     try:
         home = tmp_path / "home"
@@ -578,9 +593,21 @@ def test_bootstrap_reports_browser_launch_failure_without_claiming_browser_opene
         assert last_status["terminalSequence"] == payload["terminalSequence"]
         assert "emitted_at" in last_status
         assert not (home / ".claude/settings.json").exists()
-        assert server.session_requests == []
+        pending_enrollments = _json_mapping(
+            validate_json_value(
+                json.loads(_host_state_path(home).read_text())["pending_enrollments"],
+                "pending enrollments",
+            ),
+            "pending enrollments",
+        )
+        assert len(pending_enrollments) == 1
+        pending_session = _json_mapping(next(iter(pending_enrollments.values())), "pending enrollment")
+        assert pending_session["browser_opened"] is False
+        assert _json_string(pending_session["staged_credential"], "staged_credential").startswith("plihost_")
+        assert len(server.session_requests) == 1
         assert server.policy_requests == []
         assert server.poll_requests == []
+        assert server.credential_requests == []
         assert server.check_ins == []
     finally:
         server.stop()
@@ -654,19 +681,26 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         )
 
         assert len(server.session_requests) == 2
-        codex_callback_state = _callback_state(server.session_requests[0]["callback_url"], "codex callback_url")
-        claude_callback_state = _callback_state(server.session_requests[1]["callback_url"], "claude callback_url")
-        assert codex_callback_state != claude_callback_state
         assert server.session_requests[0]["deployment_instance_id"] == "worker-local-1"
         assert server.session_requests[0]["target"] == "codex"
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
         assert server.session_requests[0]["package_id"] == "core"
-        assert server.session_requests[0]["bootstrap_version"] == "0.2.0"
+        assert server.session_requests[0]["bootstrap_version"] == "0.3.0"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
-        assert server.session_requests[0]["pending_callback"] == "1"
         assert server.session_requests[1]["target"] == "claude"
-        assert server.session_requests[1]["pending_callback"] == "1"
+        for session_request in server.session_requests:
+            assert "callback_url" not in session_request
+            assert "pending_callback" not in session_request
+        assert len(server.credential_requests) == 2
+        assert server.credential_requests[0]["credential_hash"] != server.credential_requests[1]["credential_hash"]
+        for credential_request in server.credential_requests:
+            assert credential_request["device_code"] == "plihenroll_devicecode"
+            credential_hash = _json_string(credential_request["credential_hash"], "credential_hash")
+            assert len(credential_hash) == 64
+            int(credential_hash, 16)
+            assert _json_string(credential_request["credential_prefix"], "credential_prefix").startswith("plihost_")
+            assert "host_credential" not in credential_request
         assert server.policy_requests == [
             "/v0/host-enrollment/policy?target=codex",
             "/v0/host-enrollment/policy?target=claude",
@@ -684,7 +718,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "policy_version",
                 "status",
             }
-            assert check_in["bootstrap_version"] == "0.2.0"
+            assert check_in["bootstrap_version"] == "0.3.0"
             assert check_in["plugin_version"] == "0.1.0"
             assert check_in["status"] == "needs_restart"
             assert check_in["needs_restart"] is True
@@ -704,15 +738,15 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         server.stop()
 
 
-def test_bootstrap_rejects_loopback_callback_with_wrong_state(tmp_path: Path) -> None:
+def test_bootstrap_creates_device_session_without_callback_handoff(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(callback_state_override="attacker-state")
+    server = _FakeWorkerServer()
     server.start()
     try:
         home = tmp_path / "home"
-        payload, _result = _run_bootstrap(
+        _run_bootstrap(
             hub_root / "dist/codex/core",
             "codex",
             {
@@ -721,37 +755,39 @@ def test_bootstrap_rejects_loopback_callback_with_wrong_state(tmp_path: Path) ->
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
-            expected_status="error",
         )
 
-        assert "hosted enrollment start request failed with HTTP 403" in str(payload["message"])
-        assert not (home / ".codex/config.toml").exists()
-        assert server.poll_requests == []
-        assert server.policy_requests == []
-        assert server.check_ins == []
+        assert (home / ".codex/config.toml").exists()
+        assert len(server.session_requests) == 1
+        assert "callback_url" not in server.session_requests[0]
+        assert "pending_callback" not in server.session_requests[0]
+        assert len(server.poll_requests) == 1
+        assert len(server.credential_requests) == 1
+        assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
+        assert len(server.check_ins) == 1
     finally:
         server.stop()
 
 
 @pytest.mark.parametrize(
-    ("pending_approval_url_override", "pending_approval_path"),
+    ("approval_url_override", "approval_path"),
     [
         ("https://attacker.example/instruction-hub/enroll", "/instruction-hub/enroll"),
         (None, "/attacker/enroll"),
     ],
     ids=["wrong-origin", "wrong-path"],
 )
-def test_bootstrap_rejects_pending_callback_approval_url_outside_dashboard_route(
+def test_bootstrap_rejects_device_session_approval_url_outside_dashboard_route(
     tmp_path: Path,
-    pending_approval_url_override: str | None,
-    pending_approval_path: str,
+    approval_url_override: str | None,
+    approval_path: str,
 ) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
     server = _FakeWorkerServer(
-        pending_approval_url_override=pending_approval_url_override,
-        pending_approval_path=pending_approval_path,
+        approval_url_override=approval_url_override,
+        approval_path=approval_path,
     )
     server.start()
     try:
@@ -768,20 +804,22 @@ def test_bootstrap_rejects_pending_callback_approval_url_outside_dashboard_route
             expected_status="error",
         )
 
-        assert "hosted enrollment start request failed with HTTP 400" in str(payload["message"])
+        assert "host enrollment approval URL did not match dashboard enrollment route" in str(payload["message"])
         assert not (home / ".codex/config.toml").exists()
+        assert len(server.session_requests) == 1
         assert server.poll_requests == []
+        assert server.credential_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
     finally:
         server.stop()
 
 
-def test_bootstrap_fails_fast_when_browser_pending_callback_rejects_approval_url(tmp_path: Path) -> None:
+def test_bootstrap_fails_fast_when_browser_opening_rejects_device_approval_url(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(pending_approval_url_override="https://attacker.example/instruction-hub/enroll")
+    server = _FakeWorkerServer(approval_url_override="https://attacker.example/instruction-hub/enroll")
     server.start()
     try:
         home = tmp_path / "home"
@@ -807,13 +845,14 @@ def test_bootstrap_fails_fast_when_browser_pending_callback_rejects_approval_url
         assert not (home / ".codex/config.toml").exists()
         assert len(server.session_requests) == 1
         assert server.poll_requests == []
+        assert server.credential_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
     finally:
         server.stop()
 
 
-def test_bootstrap_requires_callback_deployment_instance_id(tmp_path: Path) -> None:
+def test_bootstrap_requires_device_session_approval_url(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -821,7 +860,7 @@ def test_bootstrap_requires_callback_deployment_instance_id(tmp_path: Path) -> N
         session_response={
             "session_id": "11111111-1111-4111-8111-111111111111",
             "device_code": "plihenroll_devicecode",
-            "poll_url": "https://api.gopromptless.ai/v1/instruction-hub/host-enrollments/sessions/11111111-1111-4111-8111-111111111111/poll",
+            "approval_url": None,
             "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
             "poll_interval_seconds": 1,
         }
@@ -841,8 +880,11 @@ def test_bootstrap_requires_callback_deployment_instance_id(tmp_path: Path) -> N
             expected_status="error",
         )
 
-        assert "host enrollment callback missing required fields" in str(payload["message"])
+        assert "host enrollment session response missing required fields" in str(payload["message"])
         assert not (home / ".codex/config.toml").exists()
+        assert len(server.session_requests) == 1
+        assert server.poll_requests == []
+        assert server.credential_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
     finally:
@@ -1550,7 +1592,7 @@ def test_bootstrap_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> 
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(policy=_policy_with(required_bootstrap_version="0.3.0"))
+    server = _FakeWorkerServer(policy=_policy_with(required_bootstrap_version="0.4.0"))
     server.start()
     try:
         home = tmp_path / "home"
@@ -1813,41 +1855,6 @@ def _json_string(value: JsonValue, field_path: str) -> str:
     return value
 
 
-def _callback_state(callback_url_value: JsonValue, field_path: str) -> str:
-    callback_url = _json_string(callback_url_value, field_path)
-    state_values = parse_qs(urlsplit(callback_url).query).get("state")
-    assert state_values is not None and len(state_values) == 1 and state_values[0] != ""
-    return state_values[0]
-
-
-def _url_with_query_params(url: str, params: dict[str, JsonValue]) -> str:
-    parsed = urlsplit(url)
-    query_pairs: list[tuple[str, str]] = []
-    for key, values in parse_qs(parsed.query, keep_blank_values=False).items():
-        query_pairs.extend((key, value) for value in values)
-    for key, value in params.items():
-        if value is None:
-            continue
-        if isinstance(value, str):
-            query_pairs.append((key, value))
-        elif isinstance(value, (int, float, bool)):
-            query_pairs.append((key, str(value)))
-        else:
-            raise AssertionError(f"{key} must be a query scalar")
-    return parsed._replace(query=urlencode(query_pairs)).geturl()
-
-
-def _callback_url_with_state(callback_url: str, state: str) -> str:
-    parsed = urlsplit(callback_url)
-    query_pairs: list[tuple[str, str]] = []
-    for key, values in parse_qs(parsed.query, keep_blank_values=False).items():
-        if key == "state":
-            continue
-        query_pairs.extend((key, value) for value in values)
-    query_pairs.append(("state", state))
-    return parsed._replace(query=urlencode(query_pairs)).geturl()
-
-
 def _write_native_hook_asset(hub_root: Path, hooks: dict[str, JsonValue]) -> None:
     hooks_path = hub_root / "assets/hooks/hooks.json"
     hooks_path.write_text(json.dumps(hooks))
@@ -1904,8 +1911,6 @@ def _invalid_policy(case: str) -> dict[str, JsonValue]:
 
 def _session_response() -> dict[str, JsonValue]:
     return {
-        "session_id": "11111111-1111-4111-8111-111111111111",
-        "deployment_instance_id": "worker-local-1",
         "device_code": "plihenroll_devicecode",
         "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
         "poll_interval_seconds": 1,
@@ -1920,16 +1925,18 @@ class _FakeWorkerServer:
         post_response: dict[str, JsonValue] | None = None,
         session_response: dict[str, JsonValue] | None = None,
         session_barrier_count: int = 0,
-        callback_state_override: str | None = None,
-        pending_approval_url_override: str | None = None,
-        pending_approval_path: str = "/instruction-hub/enroll",
+        approval_url_override: str | None = None,
+        approval_path: str = "/instruction-hub/enroll",
+        poll_status: str = "approved",
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
+        self.credential_requests: list[dict[str, JsonValue]] = []
         self.policy_requests: list[str] = []
         self.poll_requests: list[dict[str, JsonValue]] = []
         self.session_requests: list[dict[str, JsonValue]] = []
         self._session_condition = threading.Condition()
         _FakeWorkerHandler.check_ins = self.check_ins
+        _FakeWorkerHandler.credential_requests = self.credential_requests
         _FakeWorkerHandler.policy_requests = self.policy_requests
         _FakeWorkerHandler.poll_requests = self.poll_requests
         _FakeWorkerHandler.session_requests = self.session_requests
@@ -1938,9 +1945,12 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.session_response = session_response
         _FakeWorkerHandler.session_barrier_count = session_barrier_count
         _FakeWorkerHandler.session_condition = self._session_condition
-        _FakeWorkerHandler.callback_state_override = callback_state_override
-        _FakeWorkerHandler.pending_approval_url_override = pending_approval_url_override
-        _FakeWorkerHandler.pending_approval_path = pending_approval_path
+        _FakeWorkerHandler.approval_url_override = approval_url_override
+        _FakeWorkerHandler.approval_path = approval_path
+        _FakeWorkerHandler.poll_status = poll_status
+        _FakeWorkerHandler.session_device_codes = {}
+        _FakeWorkerHandler.session_credential_hashes = {}
+        _FakeWorkerHandler.registered_credential_hashes = set()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
@@ -1957,6 +1967,7 @@ class _FakeWorkerServer:
 
 class _FakeWorkerHandler(BaseHTTPRequestHandler):
     check_ins: ClassVar[list[dict[str, JsonValue]]] = []
+    credential_requests: ClassVar[list[dict[str, JsonValue]]] = []
     policy_requests: ClassVar[list[str]] = []
     poll_requests: ClassVar[list[dict[str, JsonValue]]] = []
     policy_response: ClassVar[dict[str, JsonValue]]
@@ -1965,9 +1976,12 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     session_barrier_count: ClassVar[int] = 0
     session_condition: ClassVar[threading.Condition | None] = None
     session_requests: ClassVar[list[dict[str, JsonValue]]] = []
-    callback_state_override: ClassVar[str | None] = None
-    pending_approval_url_override: ClassVar[str | None] = None
-    pending_approval_path: ClassVar[str] = "/instruction-hub/enroll"
+    approval_url_override: ClassVar[str | None] = None
+    approval_path: ClassVar[str] = "/instruction-hub/enroll"
+    poll_status: ClassVar[str] = "approved"
+    session_device_codes: ClassVar[dict[str, str]] = {}
+    session_credential_hashes: ClassVar[dict[str, str]] = {}
+    registered_credential_hashes: ClassVar[set[str]] = set()
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
@@ -1980,45 +1994,14 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
                 }
             )
             return
-        if parsed.path == "/instruction-hub/enroll/start":
-            payload = self._single_value_query_payload(parsed.query)
-            callback_url = _json_string(payload.get("callback_url"), "callback_url")
-            if callback_url is None:
-                self.send_response(400)
-                self.end_headers()
-                return
-            self._record_session_request(payload)
-            session_response = self._session_response_payload()
-            approval_params = {"callback_url": callback_url, **session_response}
-            hosted_approval_url = self.pending_approval_url_override or (
-                f"{self._base_url()}{self.pending_approval_path}?{urlencode(approval_params)}"
-            )
-            if payload.get("pending_callback") == "1":
-                pending_params = {
-                    "status": "pending",
-                    "approval_url": hosted_approval_url,
-                    **session_response,
-                }
-                self._redirect(_url_with_query_params(callback_url, pending_params))
-                return
-            self._redirect(hosted_approval_url)
-            return
         if parsed.path == "/instruction-hub/enroll":
-            payload = self._single_value_query_payload(parsed.query)
-            callback_url = _json_string(payload.pop("callback_url", None), "callback_url")
-            if callback_url is None:
-                self.send_response(400)
-                self.end_headers()
-                return
-            if self.callback_state_override is not None:
-                callback_url = _callback_url_with_state(callback_url, self.callback_state_override)
-            self._redirect(_url_with_query_params(callback_url, {"status": "approved", **payload}))
+            self._write_json({"status": "approved"})
             return
         target = parse_qs(parsed.query).get("target")
         if (
             parsed.path != "/v0/host-enrollment/policy"
             or target not in (["codex"], ["claude"])
-            or self.headers.get("Authorization") != "Bearer plihost_localcredential"
+            or not self._authorized_host_credential()
         ):
             self.send_response(401)
             self.end_headers()
@@ -2027,17 +2010,55 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self._write_json(self.policy_response)
 
     def do_POST(self) -> None:
-        if self.path == "/v1/instruction-hub/host-enrollments/sessions/11111111-1111-4111-8111-111111111111/poll":
+        parsed = urlsplit(self.path)
+        if parsed.path == "/v1/instruction-hub/host-enrollments/device-sessions":
+            payload = self._read_json_request("session request")
+            response_payload = self._session_response_payload()
+            self._record_session_request(payload)
+            self._write_json(response_payload)
+            return
+        session_id = self._session_id_from_path(parsed.path, "poll")
+        if session_id is not None:
             payload = self._read_json_request("session poll request")
-            if payload.get("device_code") != "plihenroll_devicecode":
+            if payload.get("device_code") != self.session_device_codes.get(session_id):
                 self.send_response(401)
                 self.end_headers()
                 return
             self.poll_requests.append(payload)
             self._write_json(
                 {
-                    "status": "approved",
-                    "host_credential": "plihost_localcredential",
+                    "status": self.poll_status,
+                    "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
+                }
+            )
+            return
+        session_id = self._session_id_from_path(parsed.path, "credential")
+        if session_id is not None:
+            payload = self._read_json_request("credential registration request")
+            if payload.get("device_code") != self.session_device_codes.get(session_id):
+                self.send_response(401)
+                self.end_headers()
+                return
+            credential_hash = _json_string(payload.get("credential_hash"), "credential_hash")
+            self.credential_requests.append(payload)
+            existing_hash = self.session_credential_hashes.get(session_id)
+            if existing_hash is None:
+                self.session_credential_hashes[session_id] = credential_hash
+                self.registered_credential_hashes.add(credential_hash)
+            elif existing_hash != credential_hash:
+                self._write_json(
+                    {
+                        "detail": {
+                            "code": "instruction_hub_host_enrollment_credential_conflict",
+                            "message": "Host enrollment session already registered a different credential",
+                        }
+                    },
+                    status=409,
+                )
+                return
+            self._write_json(
+                {
+                    "status": "consumed",
                     "credential_id": "22222222-2222-4222-8222-222222222222",
                     "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
                 }
@@ -2045,7 +2066,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             return
         if (
             self.path != "/v0/host-enrollment/check-ins"
-            or self.headers.get("Authorization") != "Bearer plihost_localcredential"
+            or not self._authorized_host_credential()
         ):
             self.send_response(401)
             self.end_headers()
@@ -2065,31 +2086,30 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _redirect(self, location: str) -> None:
-        self.send_response(302)
-        self.send_header("Location", location)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
     def _base_url(self) -> str:
         host, port = self.server.server_address
         return f"http://{host}:{port}"
 
     def _session_response_payload(self) -> dict[str, JsonValue]:
         payload = dict(self.session_response or _session_response())
+        payload.setdefault("session_id", str(uuid.uuid4()))
         payload.setdefault(
-            "poll_url",
-            f"{self._base_url()}/v1/instruction-hub/host-enrollments/sessions/11111111-1111-4111-8111-111111111111/poll",
+            "approval_url",
+            self.approval_url_override
+            or f"{self._base_url()}{self.approval_path}?approval_token=plihenroll_approvalcode",
         )
+        session_id = _json_string(payload["session_id"], "session_id")
+        device_code = _json_string(payload["device_code"], "device_code")
+        self.session_device_codes[session_id] = device_code
         return payload
 
-    def _single_value_query_payload(self, query: str) -> dict[str, JsonValue]:
-        parsed_query = parse_qs(query, keep_blank_values=False)
-        payload: dict[str, JsonValue] = {}
-        for key, values in parsed_query.items():
-            if len(values) == 1:
-                payload[key] = values[0]
-        return payload
+    def _session_id_from_path(self, path: str, endpoint: str) -> str | None:
+        prefix = "/v1/instruction-hub/host-enrollments/sessions/"
+        suffix = f"/{endpoint}"
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            return None
+        session_id = path[len(prefix) : -len(suffix)]
+        return session_id if session_id in self.session_device_codes else None
 
     def _read_json_request(self, label: str) -> dict[str, JsonValue]:
         length = int(self.headers["Content-Length"])
@@ -2109,6 +2129,14 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
                 condition.notify_all()
                 return
             condition.wait_for(lambda: len(self.session_requests) >= self.session_barrier_count, timeout=10)
+
+    def _authorized_host_credential(self) -> bool:
+        auth = self.headers.get("Authorization") or ""
+        prefix = "Bearer "
+        if not auth.startswith(prefix):
+            return False
+        token = auth[len(prefix) :]
+        return hashlib.sha256(token.encode()).hexdigest() in self.registered_credential_hashes
 
 
 def _signed_policy() -> dict[str, JsonValue]:
