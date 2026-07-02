@@ -67,7 +67,7 @@ INTERNAL_PROMPTLESS_WELCOME_MESSAGE = "\n".join(
         "     `-._,        /",
         "        )-)_/--( > ",
         "       ''''  ''''",
-        "welcome propmtless pigfooder.",
+        "welcome promptless pigfooder.",
     ]
 )
 Host = Literal["codex", "claude"]
@@ -399,9 +399,9 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
             return 0
         credential = enrollment_attempt.credential
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
-    credential = _credential_with_identity(credential, signed_policy)
-    _store_internal_promptless_identity(context, credential)
     policy = _validate_signed_policy(signed_policy, host)
+    credential = _credential_with_policy_identity(credential, signed_policy)
+    _store_internal_promptless_identity(context, credential)
     if _requires_newer_bootstrap(policy.required_bootstrap_version, RUNTIME_VERSION):
         result = _blocked_result(
             host,
@@ -675,7 +675,8 @@ def _has_stored_internal_promptless_identity() -> bool:
             state = _load_state(state_path)
             credentials = _json_mapping_or_empty(state.get("credentials"))
             return any(
-                _is_internal_promptless_identity(_json_mapping_or_empty(value)) for value in credentials.values()
+                _stored_credential_has_internal_promptless_identity(_json_mapping_or_empty(value))
+                for value in credentials.values()
             )
     except (OSError, BootstrapError):
         return False
@@ -897,7 +898,7 @@ def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None
             value=credential_value,
             credential_id=credential_id,
             deployment_instance_id=deployment_instance_id,
-            internal_promptless_user=_is_internal_promptless_identity(cached_credential),
+            internal_promptless_user=_stored_credential_has_internal_promptless_identity(cached_credential),
         )
         if credential_value
         else None
@@ -905,7 +906,7 @@ def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None
     return credential
 
 
-def _credential_with_identity(credential: HostCredential, payload: dict[str, JsonValue]) -> HostCredential:
+def _credential_with_policy_identity(credential: HostCredential, payload: dict[str, JsonValue]) -> HostCredential:
     if credential.internal_promptless_user or not _policy_response_has_internal_promptless_identity(payload):
         return credential
     return HostCredential(
@@ -1246,7 +1247,7 @@ def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSess
                     value=host_credential,
                     credential_id=_string_value(response.get("credential_id")),
                     deployment_instance_id=session.deployment_instance_id,
-                    internal_promptless_user=_is_internal_promptless_identity(response),
+                    internal_promptless_user=_worker_response_has_internal_promptless_identity(response),
                 )
             )
         if status in {"expired", "consumed"}:
@@ -2025,15 +2026,19 @@ def _identity_email(payload: dict[str, JsonValue]) -> str | None:
     return None
 
 
-def _is_internal_promptless_identity(payload: dict[str, JsonValue]) -> bool:
+def _stored_credential_has_internal_promptless_identity(payload: dict[str, JsonValue]) -> bool:
+    return payload.get("internal_promptless_user") is True
+
+
+def _worker_response_has_internal_promptless_identity(payload: dict[str, JsonValue]) -> bool:
     return payload.get("internal_promptless_user") is True or _is_internal_promptless_email(_identity_email(payload))
 
 
 def _policy_response_has_internal_promptless_identity(payload: dict[str, JsonValue]) -> bool:
-    if _is_internal_promptless_identity(payload):
+    if _worker_response_has_internal_promptless_identity(payload):
         return True
     policy = _json_mapping_or_empty(payload.get("policy"))
-    return bool(policy) and _is_internal_promptless_identity(policy)
+    return bool(policy) and _worker_response_has_internal_promptless_identity(policy)
 
 
 def _normalize_email(value: str | None) -> str | None:

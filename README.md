@@ -89,16 +89,17 @@ pin to an immutable tag for stricter reproducibility.
 The toolchain owns Promptless-managed runtime artifacts that must be injected
 into generated customer plugins, including the host runtime used by Codex and
 Claude startup hooks. During dogfood, generated Codex hooks wrap the bundled
-stdlib-only Python script with shell checks that emit schema-safe startup
-diagnostics when the host cannot resolve the plugin root, runtime file, or
-`python3`. Generated Claude hooks use Claude Code's exec-form hook so Windows
-installs do not need a POSIX shell; an inline Node launcher resolves the plugin
-root, finds a usable Python 3 command, and emits the same root/runtime/python
-diagnostics before loading the managed runtime:
+stdlib-only Python script with POSIX shell checks that emit schema-safe startup
+diagnostics when the host cannot resolve the plugin root, a readable runtime
+file, or Python 3.9+. Generated Claude hooks use Claude Code's exec-form hook so
+Windows installs do not need a POSIX shell; Node must be available to start the
+inline launcher, which then resolves the plugin root, finds a usable Python 3.9+
+interpreter, and emits the same root/runtime/python diagnostics before loading
+the managed runtime:
 
 ```sh
-sh -c 'root=${PLUGIN_ROOT:-}; ...; exec python3 "$root/bin/promptless-host-runtime" ensure --host codex'
-node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find python3/python/py; run promptless-host-runtime ensure --host claude' '${CLAUDE_PLUGIN_ROOT}'
+sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; exec "$python_cmd" ... promptless-host-runtime ensure --host codex'
+node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find Python 3.9+; run promptless-host-runtime ensure --host claude' '${CLAUDE_PLUGIN_ROOT}'
 ```
 
 The dogfood host runtime uses `PROMPTLESS_WORKER_BASE_URL` or the default
@@ -136,7 +137,8 @@ path that enrolls when needed, writes local host telemetry config, and posts a
 check-in. `enroll` acquires only the host credential. `status` prints local JSON
 without network, browser, config writes, or check-ins. `reset --yes` clears
 cached host credentials and pending enrollments while preserving the stable host
-id and last-seen plugin versions. `version` reports runtime metadata.
+id, last-seen plugin versions, and one-time internal welcome marker. `version`
+reports runtime metadata.
 
 Before the customer-grade release, replace the dogfood Python implementation
 with a static native binary built and versioned by Promptless, then bundled into

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -34,9 +35,24 @@ MISSING_RUNTIME_ROOT_MESSAGE = (
 MISSING_RUNTIME_FILE_MESSAGE = (
     "Promptless Instruction Hub hook could not find its managed runtime. Reinstall the Promptless plugin."
 )
-MISSING_PYTHON_MESSAGE = (
-    "Promptless Instruction Hub hook could not find python3. Install Python 3 or reinstall the Promptless plugin."
+UNREADABLE_RUNTIME_FILE_MESSAGE = (
+    "Promptless Instruction Hub hook found its managed runtime, but it is not readable. "
+    "Reinstall the Promptless plugin."
 )
+MISSING_PYTHON_MESSAGE = (
+    "Promptless Instruction Hub hook could not find Python 3.9 or newer. "
+    "Install Python 3.9+ or reinstall the Promptless plugin."
+)
+UNSUPPORTED_PYTHON_MESSAGE = (
+    "Promptless Instruction Hub hook found Python, but none are Python 3.9 or newer. "
+    "Install Python 3.9+ or reinstall the Promptless plugin."
+)
+BROKEN_PYTHON_MESSAGE = (
+    "Promptless Instruction Hub hook could not start a usable Python 3.9 or newer interpreter. "
+    "Reinstall the Promptless plugin."
+)
+PYTHON_MIN_VERSION = (3, 9)
+PYTHON_VERSION_PROBE = f"import sys; raise SystemExit(0 if sys.version_info >= {PYTHON_MIN_VERSION!r} else 2)"
 
 _ASSET_ROOT = Path(__file__).parent / "managed_runtime_assets" / HOST_RUNTIME_ASSET_DIR
 _EXECUTABLE_SOURCE = _ASSET_ROOT / HOST_RUNTIME_EXECUTABLE
@@ -207,8 +223,10 @@ def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness)
     root_env_names = json.dumps(list(root_envs), separators=(",", ":"))
     missing_root = json.dumps({"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}, separators=(",", ":"))
     missing_file = json.dumps({"systemMessage": MISSING_RUNTIME_FILE_MESSAGE}, separators=(",", ":"))
+    unreadable_file = json.dumps({"systemMessage": UNREADABLE_RUNTIME_FILE_MESSAGE}, separators=(",", ":"))
     missing_python = json.dumps({"systemMessage": MISSING_PYTHON_MESSAGE}, separators=(",", ":"))
-    python_probe = "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"
+    unsupported_python = json.dumps({"systemMessage": UNSUPPORTED_PYTHON_MESSAGE}, separators=(",", ":"))
+    broken_python = json.dumps({"systemMessage": BROKEN_PYTHON_MESSAGE}, separators=(",", ":"))
     return (
         "const fs = require('fs');\n"
         "const path = require('path');\n"
@@ -218,36 +236,77 @@ def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness)
         "for (const name of rootEnvNames) {\n  if (root) break;\n  root = process.env[name] || '';\n}\n"
         f"if (!root) {{ console.log({missing_root!r}); process.exit(0); }}\n"
         f"const runtime = path.join(root, 'bin', {HOST_RUNTIME_EXECUTABLE!r});\n"
-        f"if (!fs.existsSync(runtime) || !fs.statSync(runtime).isFile()) {{ console.log({missing_file!r}); process.exit(0); }}\n"
-        f"const pythonProbe = {python_probe!r};\n"
+        "let runtimeStat;\n"
+        f"try {{ runtimeStat = fs.statSync(runtime); }} catch (error) {{ console.log({missing_file!r}); process.exit(0); }}\n"
+        f"if (!runtimeStat.isFile()) {{ console.log({missing_file!r}); process.exit(0); }}\n"
+        f"try {{ fs.accessSync(runtime, fs.constants.R_OK); }} catch (error) {{ console.log({unreadable_file!r}); process.exit(0); }}\n"
+        f"const pythonProbe = {PYTHON_VERSION_PROBE!r};\n"
         f"const runtimeArgs = [runtime, 'ensure', '--host', {host!r}];\n"
         "const candidates = [\n"
         "  { command: 'python3', probeArgs: ['-c', pythonProbe], runArgs: runtimeArgs },\n"
         "  { command: 'python', probeArgs: ['-c', pythonProbe], runArgs: runtimeArgs },\n"
         "  { command: 'py', probeArgs: ['-3', '-c', pythonProbe], runArgs: ['-3', ...runtimeArgs] },\n"
         "];\n"
+        "let sawUnsupportedPython = false;\n"
+        "let sawBrokenPython = false;\n"
         "for (const candidate of candidates) {\n"
         "  const probe = spawnSync(candidate.command, candidate.probeArgs, { stdio: 'ignore' });\n"
-        "  if (probe.error || probe.status !== 0) continue;\n"
+        "  if (probe.error) {\n"
+        "    if (probe.error.code !== 'ENOENT') sawBrokenPython = true;\n"
+        "    continue;\n"
+        "  }\n"
+        "  if (probe.status !== 0) {\n"
+        "    if (probe.status === 2) sawUnsupportedPython = true;\n"
+        "    else sawBrokenPython = true;\n"
+        "    continue;\n"
+        "  }\n"
         "  const result = spawnSync(candidate.command, candidate.runArgs, { stdio: 'inherit', env: process.env });\n"
-        "  if (result.error) continue;\n"
+        "  if (result.error) {\n"
+        "    sawBrokenPython = true;\n"
+        "    continue;\n"
+        "  }\n"
         "  process.exit(result.status === null ? 1 : result.status);\n"
         "}\n"
-        f"console.log({missing_python!r});\n"
+        f"if (sawUnsupportedPython) console.log({unsupported_python!r});\n"
+        f"else if (sawBrokenPython) console.log({broken_python!r});\n"
+        f"else console.log({missing_python!r});\n"
         "process.exit(0);\n"
     )
 
 
 def _posix_host_runtime_hook_command(*, root_expr: str, host: Harness) -> str:
-    return (
-        f"sh -c 'root={root_expr}; "
-        f'if [ -z "$root" ]; then printf "%s\\n" "{_hook_json_system_message(MISSING_RUNTIME_ROOT_MESSAGE)}"; exit 0; fi; '
+    script = (
+        f"root={root_expr}; "
+        f'if [ -z "$root" ]; then {_posix_emit_system_message(MISSING_RUNTIME_ROOT_MESSAGE)}; exit 0; fi; '
         f'runtime="$root/bin/{HOST_RUNTIME_EXECUTABLE}"; '
-        f'if [ ! -x "$runtime" ]; then printf "%s\\n" "{_hook_json_system_message(MISSING_RUNTIME_FILE_MESSAGE)}"; exit 0; fi; '
-        f'if ! command -v python3 >/dev/null 2>&1; then printf "%s\\n" "{_hook_json_system_message(MISSING_PYTHON_MESSAGE)}"; exit 0; fi; '
-        f'exec python3 "$runtime" ensure --host {host}'
-        "'"
+        f'if [ ! -f "$runtime" ]; then {_posix_emit_system_message(MISSING_RUNTIME_FILE_MESSAGE)}; exit 0; fi; '
+        f'if [ ! -r "$runtime" ]; then {_posix_emit_system_message(UNREADABLE_RUNTIME_FILE_MESSAGE)}; exit 0; fi; '
+        f'probe="{PYTHON_VERSION_PROBE}"; '
+        "python_cmd=; python_arg=; unsupported_python=0; broken_python=0; "
+        "for candidate in python3 python; do "
+        'if ! command -v "$candidate" >/dev/null 2>&1; then continue; fi; '
+        '"$candidate" -c "$probe" >/dev/null 2>&1; status=$?; '
+        'if [ "$status" -eq 0 ]; then python_cmd="$candidate"; break; fi; '
+        'if [ "$status" -eq 2 ]; then unsupported_python=1; else broken_python=1; fi; '
+        "done; "
+        'if [ -z "$python_cmd" ] && command -v py >/dev/null 2>&1; then '
+        'py -3 -c "$probe" >/dev/null 2>&1; status=$?; '
+        'if [ "$status" -eq 0 ]; then python_cmd=py; python_arg=-3; '
+        'elif [ "$status" -eq 2 ]; then unsupported_python=1; else broken_python=1; fi; '
+        "fi; "
+        'if [ -z "$python_cmd" ]; then '
+        f'if [ "$unsupported_python" -eq 1 ]; then {_posix_emit_system_message(UNSUPPORTED_PYTHON_MESSAGE)}; '
+        f'elif [ "$broken_python" -eq 1 ]; then {_posix_emit_system_message(BROKEN_PYTHON_MESSAGE)}; '
+        f"else {_posix_emit_system_message(MISSING_PYTHON_MESSAGE)}; fi; "
+        "exit 0; fi; "
+        f'if [ -n "$python_arg" ]; then exec "$python_cmd" "$python_arg" "$runtime" ensure --host {host}; fi; '
+        f'exec "$python_cmd" "$runtime" ensure --host {host}'
     )
+    return f"sh -c {shlex.quote(script)}"
+
+
+def _posix_emit_system_message(message: str) -> str:
+    return f'printf "%s\\n" "{_hook_json_system_message(message)}"'
 
 
 def _write_plugin_manifest(target_root: Path, records: tuple[ManagedRuntimeRecord, ...]) -> None:

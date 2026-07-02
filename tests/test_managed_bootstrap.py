@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -20,7 +21,12 @@ import pytest
 from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, validate_json_value
-from promptless_instruction_hub.managed_runtime import MISSING_PYTHON_MESSAGE, MISSING_RUNTIME_ROOT_MESSAGE
+from promptless_instruction_hub.managed_runtime import (
+    MISSING_PYTHON_MESSAGE,
+    MISSING_RUNTIME_FILE_MESSAGE,
+    MISSING_RUNTIME_ROOT_MESSAGE,
+    UNSUPPORTED_PYTHON_MESSAGE,
+)
 
 HOST_RUNTIME_BIN = "promptless-host-runtime"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
@@ -71,7 +77,10 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         stub_runtime = stub_root / "bin" / HOST_RUNTIME_BIN
         stub_runtime.parent.mkdir(parents=True)
         stub_runtime.write_text('import json, sys\nprint(json.dumps({"argv": sys.argv[1:]}))\n')
-        stub_runtime.chmod(0o755)
+        stub_runtime.chmod(0o644)
+
+        missing_runtime_root = tmp_path / f"{target}-missing-runtime-plugin"
+        missing_runtime_root.mkdir()
 
         if target == "claude":
             hook_args = hook["args"]
@@ -86,7 +95,11 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert "spawnSync" in hook_script
             assert "sys.version_info >= (3, 9)" in hook_script
             assert MISSING_PYTHON_MESSAGE in hook_script
+            assert UNSUPPORTED_PYTHON_MESSAGE in hook_script
             assert "--quiet" not in hook_script
+
+            node_path = shutil.which("node")
+            assert node_path is not None
 
             missing_root = subprocess.run(
                 [hook["command"], *hook_args],
@@ -99,8 +112,17 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert missing_root.stderr == ""
             assert json.loads(missing_root.stdout) == {"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}
 
-            node_path = shutil.which("node")
-            assert node_path is not None
+            missing_runtime = subprocess.run(
+                [node_path, hook_args[0], hook_script, str(missing_runtime_root)],
+                env=_clean_env(HOME=str(tmp_path / f"{target}-missing-runtime-home")),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert missing_runtime.returncode == 0
+            assert missing_runtime.stderr == ""
+            assert json.loads(missing_runtime.stdout) == {"systemMessage": MISSING_RUNTIME_FILE_MESSAGE}
+
             missing_python = subprocess.run(
                 [node_path, hook_args[0], hook_script, str(stub_root)],
                 env=_clean_env(HOME=str(tmp_path / f"{target}-missing-python-home"), PATH=""),
@@ -112,6 +134,50 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert missing_python.stderr == ""
             assert json.loads(missing_python.stdout) == {"systemMessage": MISSING_PYTHON_MESSAGE}
 
+            unsupported_python_bin = tmp_path / f"{target}-unsupported-python-bin"
+            unsupported_python_bin.mkdir()
+            _write_shell_script(unsupported_python_bin / "python3", "exit 2")
+            _write_shell_script(unsupported_python_bin / "python", "exit 2")
+            unsupported_python = subprocess.run(
+                [node_path, hook_args[0], hook_script, str(stub_root)],
+                env=_clean_env(
+                    HOME=str(tmp_path / f"{target}-unsupported-python-home"),
+                    PATH=str(unsupported_python_bin),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert unsupported_python.returncode == 0
+            assert unsupported_python.stderr == ""
+            assert json.loads(unsupported_python.stdout) == {"systemMessage": UNSUPPORTED_PYTHON_MESSAGE}
+
+            fallback_python_bin = tmp_path / f"{target}-fallback-python-bin"
+            fallback_python_bin.mkdir()
+            _write_shell_script(fallback_python_bin / "python3", "exit 2")
+            _write_shell_script(fallback_python_bin / "python", f'exec {shlex.quote(sys.executable)} "$@"')
+            fallback_python = subprocess.run(
+                [node_path, hook_args[0], hook_script, str(stub_root)],
+                env=_clean_env(HOME=str(tmp_path / f"{target}-fallback-python-home"), PATH=str(fallback_python_bin)),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert fallback_python.returncode == 0
+            assert fallback_python.stderr == ""
+            assert json.loads(fallback_python.stdout) == {"argv": ["ensure", "--host", target]}
+
+            env_rooted = subprocess.run(
+                [node_path, *hook_args],
+                env=_clean_env(HOME=str(tmp_path / f"{target}-env-rooted-home"), CLAUDE_PLUGIN_ROOT=str(stub_root)),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert env_rooted.returncode == 0
+            assert env_rooted.stderr == ""
+            assert json.loads(env_rooted.stdout) == {"argv": ["ensure", "--host", target]}
+
             rooted = subprocess.run(
                 [hook["command"], hook_args[0], hook_script, str(stub_root)],
                 env=_clean_env(HOME=str(tmp_path / f"{target}-rooted-home")),
@@ -122,9 +188,10 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         else:
             hook_command = hook["command"]
             assert "root=${PLUGIN_ROOT:-}" in hook_command
-            assert 'exec python3 "$runtime" ensure --host codex' in hook_command
+            assert 'exec "$python_cmd" "$runtime" ensure --host codex' in hook_command
             assert hook_command.startswith("sh -c '")
             assert f'runtime="$root/bin/{HOST_RUNTIME_BIN}"' in hook_command
+            assert '[ ! -r "$runtime" ]' in hook_command
             assert "--quiet" not in hook_command
 
             missing_root = subprocess.run(
@@ -138,6 +205,42 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert missing_root.returncode == 0
             assert missing_root.stderr == ""
             assert json.loads(missing_root.stdout) == {"systemMessage": MISSING_RUNTIME_ROOT_MESSAGE}
+
+            missing_runtime = subprocess.run(
+                hook_command,
+                shell=True,
+                env=_clean_env(
+                    HOME=str(tmp_path / f"{target}-missing-runtime-home"),
+                    PLUGIN_ROOT=str(missing_runtime_root),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert missing_runtime.returncode == 0
+            assert missing_runtime.stderr == ""
+            assert json.loads(missing_runtime.stdout) == {"systemMessage": MISSING_RUNTIME_FILE_MESSAGE}
+
+            fallback_python_bin = tmp_path / f"{target}-fallback-python-bin"
+            fallback_python_bin.mkdir()
+            sh_path = shutil.which("sh") or "/bin/sh"
+            _write_shell_script(fallback_python_bin / "sh", f'exec {shlex.quote(sh_path)} "$@"')
+            _write_shell_script(fallback_python_bin / "python3", "exit 2")
+            _write_shell_script(fallback_python_bin / "python", f'exec {shlex.quote(sys.executable)} "$@"')
+            fallback_python = subprocess.run(
+                shlex.split(hook_command),
+                env=_clean_env(
+                    HOME=str(tmp_path / f"{target}-fallback-python-home"),
+                    PATH=str(fallback_python_bin),
+                    PLUGIN_ROOT=str(stub_root),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert fallback_python.returncode == 0
+            assert fallback_python.stderr == ""
+            assert json.loads(fallback_python.stdout) == {"argv": ["ensure", "--host", target]}
 
             rooted = subprocess.run(
                 hook_command,
@@ -427,7 +530,7 @@ def test_bootstrap_welcomes_internal_promptless_user_once(tmp_path: Path, identi
 
         first_payload, first_result = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
         first_message = _json_string(first_payload["systemMessage"], "systemMessage")
-        assert "welcome propmtless pigfooder." in first_message
+        assert "welcome promptless pigfooder." in first_message
         assert ",-,------," in first_message
         assert "Restart Codex" in first_message
         first_stdout = _json_mapping(
@@ -459,6 +562,128 @@ def test_bootstrap_welcomes_internal_promptless_user_once(tmp_path: Path, identi
             "host state",
         )
         assert second_state["internal_promptless_welcome_shown_at"] == shown_at
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize(
+    ("identity_location", "email"),
+    [
+        ("envelope", "customer@example.com"),
+        ("policy", "customer@example.com"),
+        ("envelope", "adit @gopromptless.ai"),
+    ],
+    ids=["external-envelope", "external-policy", "malformed-envelope"],
+)
+def test_bootstrap_ignores_non_internal_worker_identity(
+    tmp_path: Path,
+    identity_location: str,
+    email: str,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    policy = _policy_with()
+    if identity_location == "envelope":
+        policy["user_email"] = email
+    else:
+        policy_body = _json_mapping(policy["policy"], "policy")
+        policy_body["user_email"] = email
+    server = _FakeWorkerServer(policy=policy)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
+        message = _json_string(payload["systemMessage"], "systemMessage")
+        assert "welcome promptless pigfooder." not in message
+
+        state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        assert "internal_promptless_welcome_shown_at" not in state
+        credentials = _json_mapping(state["credentials"], "credentials")
+        credential = _json_mapping(next(iter(credentials.values())), "credential")
+        assert "internal_promptless_user" not in credential
+    finally:
+        server.stop()
+
+
+def test_cached_credential_trusts_only_persisted_internal_flag(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_root = hub_root / "dist/codex/core"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        state_path = _host_state_path(home)
+        state = _json_mapping(validate_json_value(json.loads(state_path.read_text()), "host state"), "host state")
+        credentials = _json_mapping(state["credentials"], "credentials")
+        credential_key = _credential_cache_key(worker_base_url=server.base_url, target="codex")
+        credential = _json_mapping(credentials[credential_key], "credential")
+        credential["user_email"] = "adit@gopromptless.ai"
+        credential.pop("internal_promptless_user", None)
+        state_path.write_text(json.dumps(state))
+
+        payload, _ = _run_bootstrap(plugin_root, "codex", env)
+        message = _json_string(payload["systemMessage"], "systemMessage")
+        assert "welcome promptless pigfooder." not in message
+
+        updated_state = _json_mapping(
+            validate_json_value(json.loads(state_path.read_text()), "updated host state"),
+            "updated host state",
+        )
+        assert "internal_promptless_welcome_shown_at" not in updated_state
+        updated_credentials = _json_mapping(updated_state["credentials"], "updated credentials")
+        updated_credential = _json_mapping(updated_credentials[credential_key], "updated credential")
+        assert "internal_promptless_user" not in updated_credential
+    finally:
+        server.stop()
+
+
+def test_bootstrap_welcomes_internal_promptless_user_from_poll_response(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(poll_response=_approved_poll_response(user_email="Adit@GoPromptless.AI"))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
+        message = _json_string(payload["systemMessage"], "systemMessage")
+        assert "welcome promptless pigfooder." in message
+
+        state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        credentials = _json_mapping(state["credentials"], "credentials")
+        credential = _json_mapping(next(iter(credentials.values())), "credential")
+        assert credential["internal_promptless_user"] is True
     finally:
         server.stop()
 
@@ -1667,23 +1892,37 @@ def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> N
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(policy=_invalid_policy(case))
+    invalid_policy = _invalid_policy(case)
+    invalid_policy["user_email"] = "Adit@GoPromptless.AI"
+    server = _FakeWorkerServer(policy=invalid_policy)
     server.start()
     try:
         home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
         _run_bootstrap(
             hub_root / "dist/codex/core",
             "codex",
-            {
-                "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
+            env,
             expected_status="error",
         )
 
         assert not (home / ".codex/config.toml").exists()
+        state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        assert "internal_promptless_welcome_shown_at" not in state
+        credentials = _json_mapping(state["credentials"], "credentials")
+        credential = _json_mapping(
+            credentials[_credential_cache_key(worker_base_url=server.base_url, target="codex")],
+            "credential",
+        )
+        assert "internal_promptless_user" not in credential
         assert server.check_ins == []
     finally:
         server.stop()
@@ -1915,6 +2154,20 @@ def _clean_env(**overrides: str) -> dict[str, str]:
     return env
 
 
+def _write_shell_script(path: Path, body: str) -> None:
+    path.write_text(f"#!/bin/sh\n{body}\n")
+    path.chmod(0o755)
+
+
+def _credential_cache_key(*, worker_base_url: str, target: str) -> str:
+    cache_material = {
+        "deployment_instance_id": "worker-local-1",
+        "target": target,
+        "worker_base_url": worker_base_url,
+    }
+    return hashlib.sha256(json.dumps(cache_material, sort_keys=True).encode()).hexdigest()
+
+
 def _async_urlopen_browser_command(path: Path) -> str:
     path.write_text(
         """
@@ -2055,11 +2308,23 @@ def _session_response() -> dict[str, JsonValue]:
     }
 
 
+def _approved_poll_response(**updates: JsonValue) -> dict[str, JsonValue]:
+    payload: dict[str, JsonValue] = {
+        "status": "approved",
+        "host_credential": "plihost_localcredential",
+        "credential_id": "22222222-2222-4222-8222-222222222222",
+        "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
+    }
+    payload.update(updates)
+    return payload
+
+
 class _FakeWorkerServer:
     def __init__(
         self,
         *,
         policy: dict[str, JsonValue] | None = None,
+        poll_response: dict[str, JsonValue] | None = None,
         post_response: dict[str, JsonValue] | None = None,
         session_response: dict[str, JsonValue] | None = None,
         session_barrier_count: int = 0,
@@ -2077,6 +2342,7 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.poll_requests = self.poll_requests
         _FakeWorkerHandler.session_requests = self.session_requests
         _FakeWorkerHandler.policy_response = policy or _signed_policy()
+        _FakeWorkerHandler.poll_response = poll_response
         _FakeWorkerHandler.post_response = post_response
         _FakeWorkerHandler.session_response = session_response
         _FakeWorkerHandler.session_barrier_count = session_barrier_count
@@ -2103,6 +2369,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     policy_requests: ClassVar[list[str]] = []
     poll_requests: ClassVar[list[dict[str, JsonValue]]] = []
     policy_response: ClassVar[dict[str, JsonValue]]
+    poll_response: ClassVar[dict[str, JsonValue] | None]
     post_response: ClassVar[dict[str, JsonValue] | None]
     session_response: ClassVar[dict[str, JsonValue] | None]
     session_barrier_count: ClassVar[int] = 0
@@ -2177,14 +2444,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             self.poll_requests.append(payload)
-            self._write_json(
-                {
-                    "status": "approved",
-                    "host_credential": "plihost_localcredential",
-                    "credential_id": "22222222-2222-4222-8222-222222222222",
-                    "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
-                }
-            )
+            self._write_json(dict(self.poll_response or _approved_poll_response()))
             return
         if (
             self.path != "/v0/host-enrollment/check-ins"
