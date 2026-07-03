@@ -68,7 +68,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         bootstrap_source = bootstrap_path.read_text()
         assert "ENROLLMENT_CALLBACK_DEADLINE_SECONDS" not in bootstrap_source
         assert "ThreadingHTTPServer" not in bootstrap_source
-        assert hook["timeout"] == 390
+        assert hook["timeout"] == 150
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
@@ -139,7 +139,7 @@ def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
     plugin_root = hub_root / "dist/codex/core"
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         home = tmp_path / "home"
@@ -147,7 +147,7 @@ def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:
             "HOME": str(home),
             "CODEX_HOME": str(home / ".codex"),
             "PLUGIN_ROOT": str(plugin_root),
-            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
         }
 
         enroll_payload, _ = _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
@@ -156,7 +156,8 @@ def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:
         assert enroll_payload["credential_id"] == "22222222-2222-4222-8222-222222222222"
         assert not (home / ".codex/config.toml").exists()
         assert len(server.session_requests) == 1
-        assert len(server.poll_requests) == 1
+        assert len(server.credential_requests) == 1
+        assert server.poll_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
 
@@ -172,7 +173,8 @@ def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:
         assert status_state["pending_enrollment_count"] == 0
         assert status_config["managed_config_detected"] is False
         assert len(server.session_requests) == 1
-        assert len(server.poll_requests) == 1
+        assert len(server.credential_requests) == 1
+        assert server.poll_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
 
@@ -284,7 +286,7 @@ def test_bootstrap_runs_without_local_dogfood_gate(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         home = tmp_path / "home"
@@ -295,7 +297,7 @@ def test_bootstrap_runs_without_local_dogfood_gate(tmp_path: Path) -> None:
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
 
@@ -311,17 +313,21 @@ def test_bootstrap_runs_without_local_dogfood_gate(tmp_path: Path) -> None:
         assert payload["status"] == "needs_restart"
         assert (home / ".codex/config.toml").exists()
         assert len(server.session_requests) == 1
+        assert server.poll_requests == []
+        assert server.worker_not_found_requests == []
         assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
         assert len(server.check_ins) == 1
     finally:
         server.stop()
 
 
-def test_bootstrap_surfaces_browser_open_failure(tmp_path: Path) -> None:
+def test_bootstrap_surfaces_browser_open_disabled(tmp_path: Path) -> None:
+    # PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER=0 with a non-loopback approval URL must surface
+    # its own reason (distinct from a failed browser launch) that names the env var.
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
-    server = _FakeWorkerServer(
+    server = _FakeControlPlane(
         approval_url_override="https://app.gopromptless.ai/instruction-hub/enroll?approval_token=plihenroll_approvalcode"
     )
     server.start()
@@ -335,15 +341,16 @@ def test_bootstrap_surfaces_browser_open_failure(tmp_path: Path) -> None:
                 "CLAUDE_CONFIG_DIR": str(home / ".claude"),
                 "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
                 "PROMPTLESS_DASHBOARD_BASE_URL": "https://app.gopromptless.ai",
             },
             expected_status="setup_pending",
         )
 
-        assert payload["reason"] == "browser_launch_failed"
+        assert payload["reason"] == "browser_open_disabled"
         message = _json_string(payload["systemMessage"], "systemMessage")
-        assert "Promptless host enrollment could not open a browser for Claude Code" in message
+        assert "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER" in message
+        assert "promptless-host-runtime enroll" in message
         state = json.loads(_host_state_path(home).read_text())
         assert _json_string(state["host_instance_id"], "host_instance_id").startswith("host-")
         assert "credentials" not in state
@@ -360,6 +367,8 @@ def test_bootstrap_surfaces_browser_open_failure(tmp_path: Path) -> None:
         )
         assert _json_string(pending_session["staged_credential"], "staged_credential").startswith("plihost_")
         assert pending_session["browser_opened"] is False
+        assert "poll_url" not in pending_session
+        assert "credential_url" not in pending_session
         seen_versions = _json_mapping(
             validate_json_value(state["last_seen_plugin_versions"], "last seen plugin versions"),
             "last seen plugin versions",
@@ -378,7 +387,7 @@ def test_bootstrap_persists_host_global_state_file(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         home = tmp_path / "home"
@@ -392,7 +401,7 @@ def test_bootstrap_persists_host_global_state_file(tmp_path: Path) -> None:
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(tmp_path / "plugin-data"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
 
@@ -412,7 +421,7 @@ def test_bootstrap_concurrent_hosts_preserve_shared_state_file(tmp_path: Path) -
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(session_barrier_count=2)
+    server = _FakeControlPlane(session_barrier_count=2)
     server.start()
     codex_process: subprocess.Popen[str] | None = None
     claude_process: subprocess.Popen[str] | None = None
@@ -427,7 +436,7 @@ def test_bootstrap_concurrent_hosts_preserve_shared_state_file(tmp_path: Path) -
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
         claude_process = _start_bootstrap(
@@ -438,7 +447,7 @@ def test_bootstrap_concurrent_hosts_preserve_shared_state_file(tmp_path: Path) -
                 "CLAUDE_CONFIG_DIR": str(home / ".claude"),
                 "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
 
@@ -472,7 +481,7 @@ def test_bootstrap_concurrent_same_host_plugins_enroll_once(tmp_path: Path) -> N
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     dev_process: subprocess.Popen[str] | None = None
     ops_process: subprocess.Popen[str] | None = None
@@ -494,7 +503,7 @@ def test_bootstrap_concurrent_same_host_plugins_enroll_once(tmp_path: Path) -> N
                 "CLAUDE_CONFIG_DIR": str(home / ".claude"),
                 "PLUGIN_ROOT": str(plugin_root),
                 "CLAUDE_PLUGIN_ROOT": str(plugin_root),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             }
 
         dev_process = _start_bootstrap(dev_plugin, "claude", claude_plugin_env(dev_plugin))
@@ -554,9 +563,9 @@ def test_bootstrap_reports_browser_launch_failure_without_claiming_browser_opene
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(
-        approval_url_override="https://app.gopromptless.ai/instruction-hub/enroll?approval_token=plihenroll_approvalcode"
-    )
+    # The loopback browser-open fails (the hosted approval page answers HTTP 500), which the
+    # runtime reports as a failed browser launch without marking the session's browser opened.
+    server = _FakeControlPlane(approval_http_statuses=[500])
     server.start()
     try:
         home = tmp_path / "home"
@@ -568,8 +577,7 @@ def test_bootstrap_reports_browser_launch_failure_without_claiming_browser_opene
                 "CLAUDE_CONFIG_DIR": str(home / ".claude"),
                 "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-                "PROMPTLESS_DASHBOARD_BASE_URL": "https://app.gopromptless.ai",
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
             expected_status="setup_pending",
         )
@@ -617,7 +625,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         codex_home = tmp_path / "codex-home"
@@ -628,7 +636,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
         codex_config = (codex_home / ".codex/config.toml").read_text()
@@ -637,7 +645,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert 'endpoint = "http://127.0.0.1:4318/v1/traces"' in codex_config
         assert codex_config.count('protocol = "binary"') == 2
         assert "metrics_exporter" not in codex_config
-        assert "plihost_localcredential" not in codex_config
+        assert "plihost_" not in codex_config
         codex_otel = tomllib.loads(codex_config)["otel"]
         assert codex_otel["exporter"]["otlp-http"]["protocol"] == "binary"
         assert codex_otel["trace_exporter"]["otlp-http"]["protocol"] == "binary"
@@ -651,7 +659,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
                 "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
         claude_settings = json.loads((claude_home / ".claude/settings.json").read_text())
@@ -692,6 +700,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         for session_request in server.session_requests:
             assert "callback_url" not in session_request
             assert "pending_callback" not in session_request
+        assert server.poll_requests == []
         assert len(server.credential_requests) == 2
         assert server.credential_requests[0]["credential_hash"] != server.credential_requests[1]["credential_hash"]
         for credential_request in server.credential_requests:
@@ -742,7 +751,7 @@ def test_bootstrap_creates_device_session_without_callback_handoff(tmp_path: Pat
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         home = tmp_path / "home"
@@ -753,7 +762,7 @@ def test_bootstrap_creates_device_session_without_callback_handoff(tmp_path: Pat
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
 
@@ -761,10 +770,307 @@ def test_bootstrap_creates_device_session_without_callback_handoff(tmp_path: Pat
         assert len(server.session_requests) == 1
         assert "callback_url" not in server.session_requests[0]
         assert "pending_callback" not in server.session_requests[0]
-        assert len(server.poll_requests) == 1
+        assert server.poll_requests == []
         assert len(server.credential_requests) == 1
+        assert server.worker_not_found_requests == []
         assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
         assert len(server.check_ins) == 1
+    finally:
+        server.stop()
+
+
+def test_bootstrap_resumes_pending_enrollment_across_runs(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    # Run 1's loopback browser-open fails (HTTP 500 from the approval page); run 2 must resume
+    # the persisted session, open the one approval page, and register the same staged credential.
+    server = _FakeControlPlane(approval_http_statuses=[500])
+    server.start()
+    try:
+        home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
+        }
+
+        first_payload, _ = _run_bootstrap(
+            hub_root / "dist/codex/core", "codex", env, expected_status="setup_pending"
+        )
+        assert first_payload["reason"] == "browser_launch_failed"
+        first_state = json.loads(_host_state_path(home).read_text())
+        pending_enrollments = _json_mapping(
+            validate_json_value(first_state["pending_enrollments"], "pending enrollments"),
+            "pending enrollments",
+        )
+        assert len(pending_enrollments) == 1
+        pending_session = _json_mapping(next(iter(pending_enrollments.values())), "pending enrollment")
+        assert pending_session["browser_opened"] is False
+        assert "poll_url" not in pending_session
+        assert "credential_url" not in pending_session
+        staged_credential = _json_string(pending_session["staged_credential"], "staged_credential")
+        assert len(server.session_requests) == 1
+        assert server.credential_requests == []
+        assert server.approval_opens == []
+
+        second_payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
+
+        assert second_payload["status"] == "needs_restart"
+        # The pending session was resumed: exactly one device session was ever created, the
+        # second run opened the one approval page, and the legacy poll endpoint was never hit.
+        assert len(server.session_requests) == 1
+        assert len(server.approval_opens) == 1
+        assert server.poll_requests == []
+        registered_hash = _json_string(server.credential_requests[-1]["credential_hash"], "credential_hash")
+        assert registered_hash == hashlib.sha256(staged_credential.encode()).hexdigest()
+        second_state = json.loads(_host_state_path(home).read_text())
+        credentials = _json_mapping(validate_json_value(second_state["credentials"], "credentials"), "credentials")
+        stored_credential = _json_mapping(next(iter(credentials.values())), "stored credential")
+        assert stored_credential["value"] == staged_credential
+        assert second_state["pending_enrollments"] == {}
+    finally:
+        server.stop()
+
+
+def test_bootstrap_pending_credential_response_retains_session(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeControlPlane(credential_responses=["pending"] * 8)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, _ = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
+                "PROMPTLESS_HOST_ENROLLMENT_POLL_DEADLINE_SECONDS": "1",
+            },
+            expected_status="setup_pending",
+        )
+
+        assert payload["reason"] == "approval_pending"
+        assert "promptless-host-runtime enroll" in _json_string(payload["systemMessage"], "systemMessage")
+        state = json.loads(_host_state_path(home).read_text())
+        pending_enrollments = _json_mapping(
+            validate_json_value(state["pending_enrollments"], "pending enrollments"),
+            "pending enrollments",
+        )
+        assert len(pending_enrollments) == 1
+        pending_session = _json_mapping(next(iter(pending_enrollments.values())), "pending enrollment")
+        assert pending_session["browser_opened"] is True
+        assert len(server.session_requests) == 1
+        assert len(server.credential_requests) >= 1
+        assert server.poll_requests == []
+    finally:
+        server.stop()
+
+
+def test_bootstrap_expired_credential_response_forgets_pending(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeControlPlane(credential_responses=["expired"])
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, _ = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
+            },
+            expected_status="setup_pending",
+        )
+
+        assert payload["reason"] == "approval_expired"
+        state = json.loads(_host_state_path(home).read_text())
+        assert state["pending_enrollments"] == {}
+        assert "credentials" not in state
+        assert len(server.credential_requests) == 1
+        assert server.poll_requests == []
+    finally:
+        server.stop()
+
+
+def test_bootstrap_credential_conflict_restarts_with_fresh_session(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    # The first registration answers HTTP 409 (a different credential already registered);
+    # the next run must start a brand-new session with a freshly staged credential.
+    server = _FakeControlPlane(credential_responses=[409])
+    server.start()
+    try:
+        home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
+        }
+
+        first_payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", env, expected_status="setup_pending")
+        assert first_payload["reason"] == "credential_conflict"
+        assert "promptless-host-runtime enroll" in _json_string(first_payload["systemMessage"], "systemMessage")
+        state = json.loads(_host_state_path(home).read_text())
+        assert state["pending_enrollments"] == {}
+        assert len(server.session_requests) == 1
+        assert len(server.credential_requests) == 1
+
+        second_payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
+
+        assert second_payload["status"] == "needs_restart"
+        assert len(server.session_requests) == 2
+        first_hash = _json_string(server.credential_requests[0]["credential_hash"], "credential_hash")
+        second_hash = _json_string(server.credential_requests[-1]["credential_hash"], "credential_hash")
+        assert first_hash != second_hash
+        assert server.poll_requests == []
+    finally:
+        server.stop()
+
+
+def test_bootstrap_transient_credential_errors_retain_pending(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    # HTTP 500 responses retry until the wait deadline and keep the pending session for the
+    # next run instead of discarding it or surfacing a hard error.
+    server = _FakeControlPlane(credential_responses=[500] * 12)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        payload, _ = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
+                "PROMPTLESS_HOST_ENROLLMENT_POLL_DEADLINE_SECONDS": "2",
+            },
+            expected_status="setup_pending",
+        )
+
+        assert payload["reason"] == "approval_pending"
+        assert len(server.credential_requests) >= 2
+        state = json.loads(_host_state_path(home).read_text())
+        pending_enrollments = _json_mapping(
+            validate_json_value(state["pending_enrollments"], "pending enrollments"),
+            "pending enrollments",
+        )
+        assert len(pending_enrollments) == 1
+        assert server.poll_requests == []
+    finally:
+        server.stop()
+
+
+def test_bootstrap_never_leaks_credential_material(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeControlPlane()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        _, result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
+            },
+        )
+
+        state = json.loads(_host_state_path(home).read_text())
+        credentials = _json_mapping(validate_json_value(state["credentials"], "credentials"), "credentials")
+        stored_credential = _json_mapping(next(iter(credentials.values())), "stored credential")
+        credential_value = _json_string(stored_credential["value"], "stored credential value")
+        assert credential_value.startswith("plihost_")
+        credential_hash = hashlib.sha256(credential_value.encode()).hexdigest()
+        last_status_text = _last_status_path(home).read_text()
+        for output in (result.stdout, result.stderr, last_status_text):
+            assert credential_value not in output
+            assert credential_hash not in output
+    finally:
+        server.stop()
+
+
+def test_bootstrap_reuses_legacy_credential_without_reenrollment(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeControlPlane()
+    server.start()
+    try:
+        # Pre-seed the state file with a 0.2.0-format credential entry under the same cache key
+        # ({deployment_instance_id, target, worker_base_url} sha256). The 0.3.0 runtime must use
+        # it as-is: config written with that credential and zero enrollment traffic.
+        home = tmp_path / "home"
+        legacy_credential = "plihost_legacy0credential0value"
+        cache_key = hashlib.sha256(
+            json.dumps(
+                {
+                    "deployment_instance_id": "worker-local-1",
+                    "target": "codex",
+                    "worker_base_url": server.worker_base_url,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        state_path = _host_state_path(home)
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "credentials": {
+                        cache_key: {
+                            "value": legacy_credential,
+                            "credential_id": "legacy-credential-id",
+                            "deployment_instance_id": "worker-local-1",
+                            "worker_base_url": server.worker_base_url,
+                        }
+                    }
+                }
+            )
+        )
+        server.registered_credential_hashes.add(hashlib.sha256(legacy_credential.encode()).hexdigest())
+
+        payload, _ = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
+            },
+        )
+
+        assert payload["status"] == "needs_restart"
+        assert (home / ".codex/config.toml").exists()
+        assert server.session_requests == []
+        assert server.credential_requests == []
+        assert server.poll_requests == []
+        assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
+        assert len(server.check_ins) == 1
+        state = json.loads(state_path.read_text())
+        credentials = _json_mapping(validate_json_value(state["credentials"], "credentials"), "credentials")
+        stored_credential = _json_mapping(credentials[cache_key], "stored credential")
+        assert stored_credential["value"] == legacy_credential
+        assert stored_credential["credential_id"] == "legacy-credential-id"
     finally:
         server.stop()
 
@@ -785,7 +1091,7 @@ def test_bootstrap_rejects_device_session_approval_url_outside_dashboard_route(
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(
+    server = _FakeControlPlane(
         approval_url_override=approval_url_override,
         approval_path=approval_path,
     )
@@ -799,7 +1105,7 @@ def test_bootstrap_rejects_device_session_approval_url_outside_dashboard_route(
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
             expected_status="error",
         )
@@ -819,7 +1125,7 @@ def test_bootstrap_fails_fast_when_browser_opening_rejects_device_approval_url(t
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(approval_url_override="https://attacker.example/instruction-hub/enroll")
+    server = _FakeControlPlane(approval_url_override="https://attacker.example/instruction-hub/enroll")
     server.start()
     try:
         home = tmp_path / "home"
@@ -829,7 +1135,7 @@ def test_bootstrap_fails_fast_when_browser_opening_rejects_device_approval_url(t
                 HOME=str(home),
                 CODEX_HOME=str(home / ".codex"),
                 PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
-                PROMPTLESS_WORKER_BASE_URL=server.base_url,
+                PROMPTLESS_WORKER_BASE_URL=server.worker_base_url,
                 PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER="1",
                 BROWSER=_async_urlopen_browser_command(tmp_path / "fake-browser.py"),
             ),
@@ -856,7 +1162,7 @@ def test_bootstrap_requires_device_session_approval_url(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(
+    server = _FakeControlPlane(
         session_response={
             "session_id": "11111111-1111-4111-8111-111111111111",
             "device_code": "plihenroll_devicecode",
@@ -875,7 +1181,7 @@ def test_bootstrap_requires_device_session_approval_url(tmp_path: Path) -> None:
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
             expected_status="error",
         )
@@ -897,7 +1203,7 @@ def test_bootstrap_missing_managed_runtime_manifest_uses_default_metadata(tmp_pa
     build_hub(hub_root)
     plugin_root = hub_root / "dist/codex/core"
     (plugin_root / "hub.managed-runtimes.json").unlink()
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         home = tmp_path / "home"
@@ -908,7 +1214,7 @@ def test_bootstrap_missing_managed_runtime_manifest_uses_default_metadata(tmp_pa
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(plugin_root),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
 
@@ -924,7 +1230,7 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         codex_home = tmp_path / "codex-home"
@@ -940,7 +1246,7 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
 
@@ -964,7 +1270,7 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
                 "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
 
@@ -984,7 +1290,7 @@ def test_bootstrap_repairs_stale_managed_host_otel_config(tmp_path: Path) -> Non
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         managed_begin = "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT"
@@ -1024,7 +1330,7 @@ def test_bootstrap_repairs_stale_managed_host_otel_config(tmp_path: Path) -> Non
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
 
@@ -1088,7 +1394,7 @@ def test_bootstrap_repairs_stale_managed_host_otel_config(tmp_path: Path) -> Non
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
                 "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
 
@@ -1135,7 +1441,7 @@ def test_bootstrap_blocks_malformed_managed_codex_config(tmp_path: Path) -> None
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         codex_home = tmp_path / "codex-home"
@@ -1153,7 +1459,7 @@ def test_bootstrap_blocks_malformed_managed_codex_config(tmp_path: Path) -> None
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
             expected_status="blocked",
         )
@@ -1207,7 +1513,7 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         codex_home = tmp_path / "codex-home"
@@ -1222,7 +1528,7 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
             expected_status="blocked",
         )
@@ -1244,7 +1550,7 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
                 "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
             expected_status="blocked",
         )
@@ -1263,7 +1569,7 @@ def test_bootstrap_surfaces_enrollment_message_only_on_change(tmp_path: Path) ->
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         claude_home = tmp_path / "claude-home"
@@ -1272,7 +1578,7 @@ def test_bootstrap_surfaces_enrollment_message_only_on_change(tmp_path: Path) ->
             "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
             "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
             "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
         }
 
         # Fresh config write surfaces a restart prompt naming the host; the steady state is silent.
@@ -1291,7 +1597,7 @@ def test_bootstrap_surfaces_enrollment_message_only_on_change(tmp_path: Path) ->
             "HOME": str(codex_home),
             "CODEX_HOME": str(codex_home / ".codex"),
             "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
         }
         first_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
         codex_message = _json_string(first_codex["systemMessage"], "systemMessage")
@@ -1308,7 +1614,7 @@ def test_bootstrap_configures_claude_raw_api_bodies_file_capture(tmp_path: Path)
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         claude_home = tmp_path / "claude-home"
@@ -1320,7 +1626,7 @@ def test_bootstrap_configures_claude_raw_api_bodies_file_capture(tmp_path: Path)
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
                 "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
         )
 
@@ -1344,14 +1650,14 @@ def test_bootstrap_stdout_stays_codex_schema_safe(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         codex_env = {
             "HOME": str(tmp_path / "codex-home"),
             "CODEX_HOME": str(tmp_path / "codex-home/.codex"),
             "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
         }
 
         # Fresh browser enrollment records the start banner in diagnostics but leaves stdout for
@@ -1384,7 +1690,7 @@ def test_bootstrap_announces_plugin_update_per_host(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root, plugin_version="0.1.0")
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         claude_env = {
@@ -1392,13 +1698,13 @@ def test_bootstrap_announces_plugin_update_per_host(tmp_path: Path) -> None:
             "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-home/.claude"),
             "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
             "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
         }
         codex_env = {
             "HOME": str(tmp_path / "codex-home"),
             "CODEX_HOME": str(tmp_path / "codex-home/.codex"),
             "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
         }
 
         # First install on each host records the version silently (an install is not an update),
@@ -1463,7 +1769,7 @@ def test_bootstrap_defers_recording_update_until_notice_surfaces(tmp_path: Path)
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root, plugin_version="0.1.0")
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         state_path = _host_state_path(tmp_path / "claude-home")
@@ -1486,7 +1792,7 @@ def test_bootstrap_defers_recording_update_until_notice_surfaces(tmp_path: Path)
             return _json_string(versions["claude"], "last_seen_plugin_versions.claude")
 
         # A first healthy session records v0.1.0 as seen.
-        _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env(server.base_url))
+        _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env(server.worker_base_url))
         assert seen_claude_version() == "0.1.0"
 
         # Upgrade, then hit a failing session (unreachable worker): the new version must NOT be
@@ -1502,7 +1808,7 @@ def test_bootstrap_defers_recording_update_until_notice_surfaces(tmp_path: Path)
 
         # The next healthy session still surfaces the one-time update notice and records v0.2.0.
         recovered, _ = _run_bootstrap(
-            hub_root / "dist/claude/core", "claude", claude_env(server.base_url), expected_status="configured"
+            hub_root / "dist/claude/core", "claude", claude_env(server.worker_base_url), expected_status="configured"
         )
         recovered_message = _json_string(recovered["systemMessage"], "systemMessage")
         assert "0.2.0" in recovered_message and "0.1.0" in recovered_message
@@ -1515,7 +1821,7 @@ def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_pa
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer()
+    server = _FakeControlPlane()
     server.start()
     try:
         codex_home = tmp_path / "codex-home"
@@ -1523,7 +1829,7 @@ def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_pa
             "HOME": str(codex_home),
             "CODEX_HOME": str(codex_home / ".codex"),
             "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
         }
         _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
         _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env, expected_status="configured")
@@ -1536,7 +1842,7 @@ def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_pa
             "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
             "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
             "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
         }
         _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
         settings_path = claude_home / ".claude/settings.json"
@@ -1566,7 +1872,7 @@ def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> N
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(policy=_invalid_policy(case))
+    server = _FakeControlPlane(policy=_invalid_policy(case))
     server.start()
     try:
         home = tmp_path / "home"
@@ -1577,7 +1883,7 @@ def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> N
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
             expected_status="error",
         )
@@ -1592,7 +1898,7 @@ def test_bootstrap_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> 
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(policy=_policy_with(required_bootstrap_version="0.4.0"))
+    server = _FakeControlPlane(policy=_policy_with(required_bootstrap_version="0.4.0"))
     server.start()
     try:
         home = tmp_path / "home"
@@ -1603,7 +1909,7 @@ def test_bootstrap_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> 
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
             expected_status="blocked",
         )
@@ -1621,7 +1927,7 @@ def test_bootstrap_rejects_invalid_check_in_success_response(tmp_path: Path) -> 
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeWorkerServer(post_response={"accepted": False, "policy_version": 1})
+    server = _FakeControlPlane(post_response={"accepted": False, "policy_version": 1})
     server.start()
     try:
         home = tmp_path / "home"
@@ -1632,7 +1938,7 @@ def test_bootstrap_rejects_invalid_check_in_success_response(tmp_path: Path) -> 
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
             },
             expected_status="error",
         )
@@ -1713,8 +2019,6 @@ def _run_bootstrap(
         check=False,
     )
     assert result.returncode == 0
-    assert "plihost_localcredential" not in result.stdout
-    assert "plihost_localcredential" not in result.stderr
     assert "plihenroll_devicecode" not in result.stdout
     assert "plihenroll_devicecode" not in result.stderr
     payload = _assert_session_start_streams(result.stdout, result.stderr, expected_status)
@@ -1736,8 +2040,6 @@ def _run_runtime_json(
         check=False,
     )
     assert result.returncode == expected_returncode
-    assert "plihost_localcredential" not in result.stdout
-    assert "plihost_localcredential" not in result.stderr
     assert "plihenroll_devicecode" not in result.stdout
     assert "plihenroll_devicecode" not in result.stderr
     assert result.stderr == ""
@@ -1746,13 +2048,9 @@ def _run_runtime_json(
 
 
 def _start_bootstrap(plugin_root: Path, host: str, env: dict[str, str]) -> subprocess.Popen[str]:
-    process_env = _clean_env()
-    process_env.update(env)
-    if "PROMPTLESS_WORKER_BASE_URL" in process_env and "PROMPTLESS_DASHBOARD_BASE_URL" not in process_env:
-        process_env["PROMPTLESS_DASHBOARD_BASE_URL"] = process_env["PROMPTLESS_WORKER_BASE_URL"]
     return subprocess.Popen(
         [str(plugin_root / "bin" / HOST_RUNTIME_BIN), "ensure", "--host", host],
-        env=process_env,
+        env=_clean_env(**env),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1782,8 +2080,6 @@ def _read_any_bootstrap_status(process: subprocess.Popen[str]) -> dict[str, Json
         stdout, stderr = process.communicate()
         pytest.fail(f"bootstrap timed out with stdout={stdout!r} stderr={stderr!r}")
     assert process.returncode == 0
-    assert "plihost_localcredential" not in stdout
-    assert "plihost_localcredential" not in stderr
     assert "plihenroll_devicecode" not in stdout
     assert "plihenroll_devicecode" not in stderr
     return _parse_session_start_streams(stdout, stderr)
@@ -1802,6 +2098,9 @@ def _clone_plugin_with_identity(source_plugin: Path, destination: Path, *, plugi
     return destination
 
 
+_ACTIVE_CONTROL_PLANE: _FakeControlPlane | None = None
+
+
 def _clean_env(**overrides: str) -> dict[str, str]:
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -1809,8 +2108,16 @@ def _clean_env(**overrides: str) -> dict[str, str]:
         "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER": "0",
     }
     env.update(overrides)
-    if "PROMPTLESS_WORKER_BASE_URL" in env and "PROMPTLESS_DASHBOARD_BASE_URL" not in env:
-        env["PROMPTLESS_DASHBOARD_BASE_URL"] = env["PROMPTLESS_WORKER_BASE_URL"]
+    if "PROMPTLESS_WORKER_BASE_URL" in env:
+        # Device-flow enrollment and its approval page live on the api server, so both the API
+        # and dashboard bases default there whenever a test overrides the worker base.
+        api_default = (
+            _ACTIVE_CONTROL_PLANE.api_base_url
+            if _ACTIVE_CONTROL_PLANE is not None
+            else env["PROMPTLESS_WORKER_BASE_URL"]
+        )
+        env.setdefault("PROMPTLESS_API_BASE_URL", api_default)
+        env.setdefault("PROMPTLESS_DASHBOARD_BASE_URL", env["PROMPTLESS_API_BASE_URL"])
     return env
 
 
@@ -1917,7 +2224,21 @@ def _session_response() -> dict[str, JsonValue]:
     }
 
 
-class _FakeWorkerServer:
+_FAKE_CREDENTIAL_ID = "22222222-2222-4222-8222-222222222222"
+
+
+class _FakeControlPlane:
+    """Fake worker + public API server pair backing the device-flow enrollment tests.
+
+    The worker server mirrors the production ALB: it serves /healthz, the host-enrollment
+    policy, and check-ins, and answers every /v1/instruction-hub/* path with a bare 404 so a
+    client that regresses to targeting enrollment at the worker base fails loudly. The api
+    server owns the device-flow endpoints: device-session creation, the register-as-poll
+    credential endpoint, the hosted approval page fetched by the loopback browser-open, and
+    the legacy poll endpoint, which answers 404 while counting calls so tests can assert the
+    client never polls.
+    """
+
     def __init__(
         self,
         *,
@@ -1927,153 +2248,65 @@ class _FakeWorkerServer:
         session_barrier_count: int = 0,
         approval_url_override: str | None = None,
         approval_path: str = "/instruction-hub/enroll",
-        poll_status: str = "approved",
+        credential_responses: list[str | int] | None = None,
+        approval_http_statuses: list[int] | None = None,
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
         self.credential_requests: list[dict[str, JsonValue]] = []
         self.policy_requests: list[str] = []
         self.poll_requests: list[dict[str, JsonValue]] = []
         self.session_requests: list[dict[str, JsonValue]] = []
-        self._session_condition = threading.Condition()
-        _FakeWorkerHandler.check_ins = self.check_ins
-        _FakeWorkerHandler.credential_requests = self.credential_requests
-        _FakeWorkerHandler.policy_requests = self.policy_requests
-        _FakeWorkerHandler.poll_requests = self.poll_requests
-        _FakeWorkerHandler.session_requests = self.session_requests
-        _FakeWorkerHandler.policy_response = policy or _signed_policy()
-        _FakeWorkerHandler.post_response = post_response
-        _FakeWorkerHandler.session_response = session_response
-        _FakeWorkerHandler.session_barrier_count = session_barrier_count
-        _FakeWorkerHandler.session_condition = self._session_condition
-        _FakeWorkerHandler.approval_url_override = approval_url_override
-        _FakeWorkerHandler.approval_path = approval_path
-        _FakeWorkerHandler.poll_status = poll_status
-        _FakeWorkerHandler.session_device_codes = {}
-        _FakeWorkerHandler.session_credential_hashes = {}
-        _FakeWorkerHandler.registered_credential_hashes = set()
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
-        host, port = self._server.server_address
-        self.base_url = f"http://{host}:{port}"
-        self._thread = threading.Thread(target=self._server.serve_forever)
+        self.worker_not_found_requests: list[str] = []
+        self.approval_opens: list[str] = []
+        self.policy_response = policy or _signed_policy()
+        self.post_response = post_response
+        self.session_response = session_response
+        self.session_barrier_count = session_barrier_count
+        self.session_condition = threading.Condition()
+        self.approval_url_override = approval_url_override
+        self.approval_path = approval_path
+        # Scriptable credential endpoint: each entry answers one call, either as a body status
+        # ("pending"/"approved"/"expired"/"consumed") or a forced HTTP status (int, e.g. 409 or
+        # 500). An exhausted script falls back to the register-as-poll default semantics.
+        self.credential_responses: list[str | int] = list(credential_responses or [])
+        # Forced HTTP statuses for the hosted approval page, consumed one per GET, so tests can
+        # fail the loopback browser-open on one run and let a later run succeed.
+        self.approval_http_statuses: list[int] = list(approval_http_statuses or [])
+        self.session_device_codes: dict[str, str] = {}
+        self.session_credential_hashes: dict[str, str] = {}
+        self.approved_sessions: set[str] = set()
+        self.registered_credential_hashes: set[str] = set()
+        self.lock = threading.Lock()
+        _FakeWorkerHandler.plane = self
+        _FakeApiHandler.plane = self
+        self._worker_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
+        self._api_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeApiHandler)
+        worker_host, worker_port = self._worker_server.server_address
+        api_host, api_port = self._api_server.server_address
+        self.worker_base_url = f"http://{worker_host}:{worker_port}"
+        self.api_base_url = f"http://{api_host}:{api_port}"
+        self._worker_thread = threading.Thread(target=self._worker_server.serve_forever)
+        self._api_thread = threading.Thread(target=self._api_server.serve_forever)
 
     def start(self) -> None:
-        self._thread.start()
+        global _ACTIVE_CONTROL_PLANE
+        _ACTIVE_CONTROL_PLANE = self
+        self._worker_thread.start()
+        self._api_thread.start()
 
     def stop(self) -> None:
-        self._server.shutdown()
-        self._server.server_close()
-        self._thread.join(timeout=5)
+        global _ACTIVE_CONTROL_PLANE
+        for http_server in (self._worker_server, self._api_server):
+            http_server.shutdown()
+            http_server.server_close()
+        for thread in (self._worker_thread, self._api_thread):
+            thread.join(timeout=5)
+        if _ACTIVE_CONTROL_PLANE is self:
+            _ACTIVE_CONTROL_PLANE = None
 
 
-class _FakeWorkerHandler(BaseHTTPRequestHandler):
-    check_ins: ClassVar[list[dict[str, JsonValue]]] = []
-    credential_requests: ClassVar[list[dict[str, JsonValue]]] = []
-    policy_requests: ClassVar[list[str]] = []
-    poll_requests: ClassVar[list[dict[str, JsonValue]]] = []
-    policy_response: ClassVar[dict[str, JsonValue]]
-    post_response: ClassVar[dict[str, JsonValue] | None]
-    session_response: ClassVar[dict[str, JsonValue] | None]
-    session_barrier_count: ClassVar[int] = 0
-    session_condition: ClassVar[threading.Condition | None] = None
-    session_requests: ClassVar[list[dict[str, JsonValue]]] = []
-    approval_url_override: ClassVar[str | None] = None
-    approval_path: ClassVar[str] = "/instruction-hub/enroll"
-    poll_status: ClassVar[str] = "approved"
-    session_device_codes: ClassVar[dict[str, str]] = {}
-    session_credential_hashes: ClassVar[dict[str, str]] = {}
-    registered_credential_hashes: ClassVar[set[str]] = set()
-
-    def do_GET(self) -> None:
-        parsed = urlsplit(self.path)
-        if parsed.path == "/healthz":
-            self._write_json(
-                {
-                    "status": "ok",
-                    "deployment_instance_id": "worker-local-1",
-                    "worker_version": "0.1.0-test",
-                }
-            )
-            return
-        if parsed.path == "/instruction-hub/enroll":
-            self._write_json({"status": "approved"})
-            return
-        target = parse_qs(parsed.query).get("target")
-        if (
-            parsed.path != "/v0/host-enrollment/policy"
-            or target not in (["codex"], ["claude"])
-            or not self._authorized_host_credential()
-        ):
-            self.send_response(401)
-            self.end_headers()
-            return
-        self.policy_requests.append(self.path)
-        self._write_json(self.policy_response)
-
-    def do_POST(self) -> None:
-        parsed = urlsplit(self.path)
-        if parsed.path == "/v1/instruction-hub/host-enrollments/device-sessions":
-            payload = self._read_json_request("session request")
-            response_payload = self._session_response_payload()
-            self._record_session_request(payload)
-            self._write_json(response_payload)
-            return
-        session_id = self._session_id_from_path(parsed.path, "poll")
-        if session_id is not None:
-            payload = self._read_json_request("session poll request")
-            if payload.get("device_code") != self.session_device_codes.get(session_id):
-                self.send_response(401)
-                self.end_headers()
-                return
-            self.poll_requests.append(payload)
-            self._write_json(
-                {
-                    "status": self.poll_status,
-                    "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
-                }
-            )
-            return
-        session_id = self._session_id_from_path(parsed.path, "credential")
-        if session_id is not None:
-            payload = self._read_json_request("credential registration request")
-            if payload.get("device_code") != self.session_device_codes.get(session_id):
-                self.send_response(401)
-                self.end_headers()
-                return
-            credential_hash = _json_string(payload.get("credential_hash"), "credential_hash")
-            self.credential_requests.append(payload)
-            existing_hash = self.session_credential_hashes.get(session_id)
-            if existing_hash is None:
-                self.session_credential_hashes[session_id] = credential_hash
-                self.registered_credential_hashes.add(credential_hash)
-            elif existing_hash != credential_hash:
-                self._write_json(
-                    {
-                        "detail": {
-                            "code": "instruction_hub_host_enrollment_credential_conflict",
-                            "message": "Host enrollment session already registered a different credential",
-                        }
-                    },
-                    status=409,
-                )
-                return
-            self._write_json(
-                {
-                    "status": "consumed",
-                    "credential_id": "22222222-2222-4222-8222-222222222222",
-                    "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
-                }
-            )
-            return
-        if (
-            self.path != "/v0/host-enrollment/check-ins"
-            or not self._authorized_host_credential()
-        ):
-            self.send_response(401)
-            self.end_headers()
-            return
-        payload = self._read_json_request("check-in request")
-        self.check_ins.append(payload)
-        self._write_json(self.post_response or {"accepted": True, "policy_version": 1})
+class _ControlPlaneHandler(BaseHTTPRequestHandler):
+    plane: ClassVar[_FakeControlPlane]
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -2086,30 +2319,12 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _base_url(self) -> str:
-        host, port = self.server.server_address
-        return f"http://{host}:{port}"
-
-    def _session_response_payload(self) -> dict[str, JsonValue]:
-        payload = dict(self.session_response or _session_response())
-        payload.setdefault("session_id", str(uuid.uuid4()))
-        payload.setdefault(
-            "approval_url",
-            self.approval_url_override
-            or f"{self._base_url()}{self.approval_path}?approval_token=plihenroll_approvalcode",
-        )
-        session_id = _json_string(payload["session_id"], "session_id")
-        device_code = _json_string(payload["device_code"], "device_code")
-        self.session_device_codes[session_id] = device_code
-        return payload
-
-    def _session_id_from_path(self, path: str, endpoint: str) -> str | None:
-        prefix = "/v1/instruction-hub/host-enrollments/sessions/"
-        suffix = f"/{endpoint}"
-        if not path.startswith(prefix) or not path.endswith(suffix):
-            return None
-        session_id = path[len(prefix) : -len(suffix)]
-        return session_id if session_id in self.session_device_codes else None
+    def _write_plain(self, body: bytes, *, status: int) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _read_json_request(self, label: str) -> dict[str, JsonValue]:
         length = int(self.headers["Content-Length"])
@@ -2118,17 +2333,53 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             label,
         )
 
-    def _record_session_request(self, payload: dict[str, JsonValue]) -> None:
-        condition = self.session_condition
-        if condition is None or self.session_barrier_count <= 1:
-            self.session_requests.append(payload)
+
+class _FakeWorkerHandler(_ControlPlaneHandler):
+    def do_GET(self) -> None:
+        parsed = urlsplit(self.path)
+        if parsed.path.startswith("/v1/instruction-hub/"):
+            self._write_worker_not_found()
             return
-        with condition:
-            self.session_requests.append(payload)
-            if len(self.session_requests) >= self.session_barrier_count:
-                condition.notify_all()
-                return
-            condition.wait_for(lambda: len(self.session_requests) >= self.session_barrier_count, timeout=10)
+        if parsed.path == "/healthz":
+            self._write_json(
+                {
+                    "status": "ok",
+                    "deployment_instance_id": "worker-local-1",
+                    "worker_version": "0.1.0-test",
+                }
+            )
+            return
+        target = parse_qs(parsed.query).get("target")
+        if (
+            parsed.path != "/v0/host-enrollment/policy"
+            or target not in (["codex"], ["claude"])
+            or not self._authorized_host_credential()
+        ):
+            self.send_response(401)
+            self.end_headers()
+            return
+        self.plane.policy_requests.append(self.path)
+        self._write_json(self.plane.policy_response)
+
+    def do_POST(self) -> None:
+        parsed = urlsplit(self.path)
+        if parsed.path.startswith("/v1/instruction-hub/"):
+            self._write_worker_not_found()
+            return
+        if self.path != "/v0/host-enrollment/check-ins" or not self._authorized_host_credential():
+            self.send_response(401)
+            self.end_headers()
+            return
+        payload = self._read_json_request("check-in request")
+        self.plane.check_ins.append(payload)
+        self._write_json(self.plane.post_response or {"accepted": True, "policy_version": 1})
+
+    def _write_worker_not_found(self) -> None:
+        # The production worker ALB answers /v1/instruction-hub/* with a bare 404; a client
+        # that regresses to enrolling against the worker base must fail loudly instead of
+        # finding a helpful fake endpoint here.
+        self.plane.worker_not_found_requests.append(self.path)
+        self._write_plain(b"not found", status=404)
 
     def _authorized_host_credential(self) -> bool:
         auth = self.headers.get("Authorization") or ""
@@ -2136,7 +2387,158 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         if not auth.startswith(prefix):
             return False
         token = auth[len(prefix) :]
-        return hashlib.sha256(token.encode()).hexdigest() in self.registered_credential_hashes
+        return hashlib.sha256(token.encode()).hexdigest() in self.plane.registered_credential_hashes
+
+
+class _FakeApiHandler(_ControlPlaneHandler):
+    def do_GET(self) -> None:
+        parsed = urlsplit(self.path)
+        plane = self.plane
+        if parsed.path == "/instruction-hub/enroll":
+            with plane.lock:
+                forced_status = plane.approval_http_statuses.pop(0) if plane.approval_http_statuses else None
+                if forced_status is None:
+                    plane.approval_opens.append(self.path)
+                    plane.approved_sessions.update(plane.session_device_codes)
+            if forced_status is not None:
+                self._write_plain(b"approval unavailable", status=forced_status)
+                return
+            self._write_json({"status": "approved"})
+            return
+        self._write_json({"detail": "not found"}, status=404)
+
+    def do_POST(self) -> None:
+        parsed = urlsplit(self.path)
+        if parsed.path == "/v1/instruction-hub/host-enrollments/device-sessions":
+            payload = self._read_json_request("session request")
+            response_payload = self._session_response_payload()
+            self._record_session_request(payload)
+            self._write_json(response_payload)
+            return
+        poll_session_id = _enrollment_session_id_from_path(parsed.path, "poll")
+        if poll_session_id is not None:
+            # The device-flow server has no poll endpoint. Count the call so tests can assert
+            # the client never polls, and answer 404 like the production router.
+            self.plane.poll_requests.append(self._read_json_request("session poll request"))
+            self._write_json({"detail": "not found"}, status=404)
+            return
+        credential_session_id = _enrollment_session_id_from_path(parsed.path, "credential")
+        if credential_session_id is not None:
+            self._handle_credential(credential_session_id)
+            return
+        self._write_json({"detail": "not found"}, status=404)
+
+    def _handle_credential(self, session_id: str) -> None:
+        plane = self.plane
+        payload = self._read_json_request("credential registration request")
+        with plane.lock:
+            plane.credential_requests.append(payload)
+            expected_device_code = plane.session_device_codes.get(session_id)
+        if expected_device_code is None:
+            self._write_json(
+                {"detail": {"code": "instruction_hub_host_enrollment_session_not_found"}},
+                status=404,
+            )
+            return
+        if payload.get("device_code") != expected_device_code:
+            self.send_response(401)
+            self.end_headers()
+            return
+        with plane.lock:
+            scripted = plane.credential_responses.pop(0) if plane.credential_responses else None
+        if isinstance(scripted, int):
+            self._write_forced_credential_status(scripted)
+            return
+        if scripted in ("pending", "approved", "expired"):
+            self._write_json({"status": scripted, "expires_at": _future_expiry()})
+            return
+        if scripted is None and session_id not in plane.approved_sessions:
+            # Register-as-poll: an unapproved session passes its approval state through.
+            self._write_json({"status": "pending", "expires_at": _future_expiry()})
+            return
+        credential_hash = _json_string(payload.get("credential_hash"), "credential_hash")
+        with plane.lock:
+            existing_hash = plane.session_credential_hashes.get(session_id)
+            conflict = existing_hash is not None and existing_hash != credential_hash
+            if not conflict:
+                # First registration wins; a same-hash retry is idempotent.
+                plane.session_credential_hashes[session_id] = credential_hash
+                plane.registered_credential_hashes.add(credential_hash)
+        if conflict:
+            self._write_json(
+                {
+                    "detail": {
+                        "code": "instruction_hub_host_enrollment_credential_conflict",
+                        "message": "Host enrollment session already registered a different credential",
+                    }
+                },
+                status=409,
+            )
+            return
+        self._write_json(
+            {
+                "status": "consumed",
+                "credential_id": _FAKE_CREDENTIAL_ID,
+                "expires_at": _future_expiry(),
+            }
+        )
+
+    def _write_forced_credential_status(self, status: int) -> None:
+        if status == 409:
+            self._write_json(
+                {"detail": {"code": "instruction_hub_host_enrollment_credential_conflict"}},
+                status=409,
+            )
+            return
+        if status == 410:
+            self._write_json(
+                {"detail": {"code": "instruction_hub_host_enrollment_credential_revoked"}},
+                status=410,
+            )
+            return
+        # Transient failures answer a non-JSON body to exercise best-effort error parsing.
+        self._write_plain(b"internal error", status=status)
+
+    def _session_response_payload(self) -> dict[str, JsonValue]:
+        plane = self.plane
+        payload = dict(plane.session_response or _session_response())
+        payload.setdefault("session_id", str(uuid.uuid4()))
+        payload.setdefault(
+            "approval_url",
+            plane.approval_url_override
+            or f"{plane.api_base_url}{plane.approval_path}?approval_token=plihenroll_approvalcode",
+        )
+        session_id = _json_string(payload["session_id"], "session_id")
+        device_code = _json_string(payload["device_code"], "device_code")
+        with plane.lock:
+            plane.session_device_codes[session_id] = device_code
+        return payload
+
+    def _record_session_request(self, payload: dict[str, JsonValue]) -> None:
+        plane = self.plane
+        condition = plane.session_condition
+        if plane.session_barrier_count <= 1:
+            plane.session_requests.append(payload)
+            return
+        with condition:
+            plane.session_requests.append(payload)
+            if len(plane.session_requests) >= plane.session_barrier_count:
+                condition.notify_all()
+                return
+            condition.wait_for(lambda: len(plane.session_requests) >= plane.session_barrier_count, timeout=10)
+
+
+def _enrollment_session_id_from_path(path: str, endpoint: str) -> str | None:
+    prefix = "/v1/instruction-hub/host-enrollments/sessions/"
+    suffix = f"/{endpoint}"
+    if not path.startswith(prefix) or not path.endswith(suffix):
+        return None
+    session_id = path[len(prefix) : -len(suffix)]
+    return session_id or None
+
+
+def _future_expiry() -> str:
+    return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat()
 
 
 def _signed_policy() -> dict[str, JsonValue]:

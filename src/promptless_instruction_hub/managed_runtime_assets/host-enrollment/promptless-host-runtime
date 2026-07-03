@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import BinaryIO, Literal, Union
+from typing import BinaryIO, Literal, NoReturn, Union
 from urllib.parse import SplitResult, urlencode, urlsplit
 
 if os.name == "nt":
@@ -37,6 +37,7 @@ RUNTIME_CHANNEL = "stable"
 RUNTIME_EXECUTABLE = "promptless-host-runtime"
 MANAGED_RUNTIME_ID = "host-runtime"
 DEFAULT_WORKER_BASE_URL = "https://pig.promptless.ai"
+DEFAULT_API_BASE_URL = "https://api.gopromptless.ai"
 DEFAULT_DASHBOARD_BASE_URL = "https://app.gopromptless.ai"
 HOSTED_ENROLLMENT_APPROVAL_PATH = "/instruction-hub/enroll"
 MANAGED_BEGIN = "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT"
@@ -53,6 +54,7 @@ HOST_CREDENTIAL_DISPLAY_SUFFIX_CHARS = 8
 CLAUDE_MANAGED_ENV_MARKER = "PROMPTLESS_MANAGED_HOST_ENROLLMENT"
 TEST_URL_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES"
 OPEN_BROWSER_ENV = "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER"
+POLL_DEADLINE_OVERRIDE_ENV = "PROMPTLESS_HOST_ENROLLMENT_POLL_DEADLINE_SECONDS"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
 
@@ -81,6 +83,15 @@ class BootstrapError(RuntimeError):
 
 class BootstrapAuthError(BootstrapError):
     """Host credential was rejected by the worker."""
+
+
+class BootstrapHttpError(BootstrapError):
+    """Non-auth HTTP failure carrying the response status and any structured error code."""
+
+    def __init__(self, message: str, *, http_status: int, detail_code: str | None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.detail_code = detail_code
 
 
 @dataclass(frozen=True)
@@ -123,6 +134,7 @@ class EnrollmentContext:
 
     worker_base_url: str
     dashboard_base_url: str
+    api_base_url: str
     deployment_instance_id: str
     metadata: RuntimeMetadata
     host_instance_id: str
@@ -155,7 +167,6 @@ class EnrollmentSession:
     deployment_instance_id: str
     device_code: str
     approval_url: str
-    poll_url: str
     credential_url: str
     staged_credential: str
     expires_at: dt.datetime
@@ -246,7 +257,8 @@ def _run_enroll_command(host: Host) -> int:
         metadata = _load_runtime_metadata(plugin_root, host)
         worker_base_url = _worker_base_url()
         dashboard_base_url = _dashboard_base_url()
-        context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+        api_base_url = _api_base_url()
+        context = _enrollment_context(worker_base_url, dashboard_base_url, api_base_url, metadata)
         enrollment_attempt = _obtain_host_credential(context, quiet=True)
         if enrollment_attempt.credential is None:
             _emit_command_json(
@@ -327,7 +339,8 @@ def _run_ensure(host: Host, *, quiet: bool) -> int:
 def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, update_notice: str | None) -> int:
     worker_base_url = _worker_base_url()
     dashboard_base_url = _dashboard_base_url()
-    context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+    api_base_url = _api_base_url()
+    context = _enrollment_context(worker_base_url, dashboard_base_url, api_base_url, metadata)
     enrollment_attempt = _obtain_host_credential(context, quiet=quiet)
     if enrollment_attempt.credential is None:
         _emit(
@@ -571,7 +584,7 @@ def _pending_plugin_update(metadata: RuntimeMetadata) -> PendingPluginUpdate | N
     notice = (
         None
         if last_seen_version is None
-        else f"Promptless Instruction Hub updated to v{current_version} (was v{last_seen_version})."
+        else f"Promptless Instruction Governance updated to v{current_version} (was v{last_seen_version})."
     )
     return PendingPluginUpdate(target=metadata.target, version=current_version, notice=notice)
 
@@ -626,7 +639,19 @@ def _dashboard_base_url() -> str:
     )
 
 
-def _enrollment_context(worker_base_url: str, dashboard_base_url: str, metadata: RuntimeMetadata) -> EnrollmentContext:
+def _api_base_url() -> str:
+    return _normalize_base_url(
+        os.environ.get("PROMPTLESS_API_BASE_URL") or DEFAULT_API_BASE_URL,
+        label="API base URL",
+    )
+
+
+def _enrollment_context(
+    worker_base_url: str,
+    dashboard_base_url: str,
+    api_base_url: str,
+    metadata: RuntimeMetadata,
+) -> EnrollmentContext:
     deployment_instance_id = _worker_deployment_instance_id(worker_base_url)
     state_path = _state_path()
     with _state_file_lock(state_path):
@@ -638,6 +663,7 @@ def _enrollment_context(worker_base_url: str, dashboard_base_url: str, metadata:
     return EnrollmentContext(
         worker_base_url=worker_base_url,
         dashboard_base_url=dashboard_base_url,
+        api_base_url=api_base_url,
         deployment_instance_id=deployment_instance_id,
         metadata=metadata,
         host_instance_id=host_instance_id,
@@ -833,18 +859,11 @@ def _forget_cached_host_credential(context: EnrollmentContext) -> None:
 
 
 def _enroll_host_credential(context: EnrollmentContext, *, quiet: bool) -> EnrollmentAttempt:
+    # The whole enrollment flow -- resuming a pending session included -- runs under the
+    # leader lock so only one process per host credential drives the single browser approval
+    # and the register-driven approval wait. Concurrent followers reuse the resulting
+    # credential or defer to a later session rather than opening their own browser window.
     state_path = _state_path()
-    session = _load_pending_enrollment_session(context, state_path)
-    if session is not None:
-        # A pending session already exists (e.g. left by an earlier session start); polling it
-        # opens no browser once the hosted approval URL has already been launched.
-        session, open_reason = _open_pending_enrollment_browser_if_needed(context, state_path, session, quiet=quiet)
-        if session is None:
-            return EnrollmentAttempt(credential=None, reason=open_reason or "browser_launch_failed")
-        return _complete_host_enrollment(context, state_path, session)
-    # A fresh enrollment opens a browser. Serialize that across every plugin on this host so only
-    # the leader drives the single browser approval; concurrent followers reuse the resulting
-    # credential or defer rather than opening their own browser window.
     with _enrollment_leader_lock(context, state_path) as is_enrollment_leader:
         if not is_enrollment_leader:
             return EnrollmentAttempt(credential=_cached_host_credential(context), reason="enrollment_in_progress")
@@ -858,9 +877,12 @@ def _enroll_host_credential(context: EnrollmentContext, *, quiet: bool) -> Enrol
             session, stored_new_session = _store_pending_enrollment(context, state_path, created_session)
             if not stored_new_session:
                 session = _load_pending_enrollment_session(context, state_path) or session
-            session, open_reason = _open_pending_enrollment_browser_if_needed(context, state_path, session, quiet=quiet)
-            if session is None:
-                return EnrollmentAttempt(credential=None, reason=open_reason or "browser_launch_failed")
+        # Both fresh and resumed sessions open the hosted approval page when no earlier run
+        # managed to launch it, so a pending session left by a failed browser launch still
+        # reaches the user on the next session start.
+        session, open_reason = _open_pending_enrollment_browser_if_needed(context, state_path, session, quiet=quiet)
+        if session is None:
+            return EnrollmentAttempt(credential=None, reason=open_reason or "browser_launch_failed")
         return _complete_host_enrollment(context, state_path, session)
 
 
@@ -869,7 +891,7 @@ def _complete_host_enrollment(
     state_path: Path,
     session: EnrollmentSession,
 ) -> EnrollmentAttempt:
-    enrollment_attempt = _poll_enrollment_session(context, session)
+    enrollment_attempt = _await_enrollment_credential(context, session)
     if enrollment_attempt.credential is None:
         return enrollment_attempt
     credential = enrollment_attempt.credential
@@ -887,14 +909,24 @@ def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, Jso
     session_value = _json_mapping_or_empty(pending_enrollments.get(_credential_cache_key(context)))
     if not session_value:
         return None
+    try:
+        return _rehydrated_enrollment_session(context, session_value)
+    except BootstrapError:
+        # A malformed persisted entry (bad timestamp or URL) must not wedge every session
+        # start; discard it so the next run begins a fresh enrollment instead.
+        return None
+
+
+def _rehydrated_enrollment_session(
+    context: EnrollmentContext,
+    session_value: dict[str, JsonValue],
+) -> EnrollmentSession | None:
     expires_at = _optional_datetime_value(session_value.get("expires_at"), "pending enrollment expires_at")
     if expires_at is None or expires_at <= dt.datetime.now(dt.timezone.utc):
         return None
     session_id = _string_value(session_value.get("session_id"))
     device_code = _string_value(session_value.get("device_code"))
     approval_url = _string_value(session_value.get("approval_url"))
-    poll_url = _string_value(session_value.get("poll_url"))
-    credential_url = _string_value(session_value.get("credential_url"))
     staged_credential = _string_value(session_value.get("staged_credential"))
     poll_interval_seconds = _optional_int_value(session_value.get("poll_interval_seconds"))
     deployment_instance_id = _string_value(session_value.get("deployment_instance_id"))
@@ -904,27 +936,25 @@ def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, Jso
         or deployment_instance_id is None
         or device_code is None
         or approval_url is None
-        or poll_url is None
-        or credential_url is None
         or staged_credential is None
         or poll_interval_seconds is None
     ):
+        return None
+    if poll_interval_seconds < 1 or poll_interval_seconds > 30:
         return None
     if deployment_instance_id != context.deployment_instance_id:
         return None
     if not staged_credential.startswith(HOST_CREDENTIAL_PREFIX):
         return None
     _validate_hosted_enrollment_approval_url(context, approval_url)
-    poll_url_parts = _validate_http_url(poll_url, "pending host enrollment poll URL")
-    _validate_worker_transport(poll_url_parts, "pending host enrollment poll URL")
-    credential_url_parts = _validate_http_url(credential_url, "pending host enrollment credential URL")
-    _validate_worker_transport(credential_url_parts, "pending host enrollment credential URL")
+    # Derive the credential URL from the current API base instead of trusting a persisted URL,
+    # so state written by an older runtime (or edited by hand) cannot redirect registration.
+    credential_url = _enrollment_credential_url(context.api_base_url, session_id)
     return EnrollmentSession(
         session_id=session_id,
         deployment_instance_id=deployment_instance_id,
         device_code=device_code,
         approval_url=approval_url,
-        poll_url=poll_url,
         credential_url=credential_url,
         staged_credential=staged_credential,
         expires_at=expires_at,
@@ -935,7 +965,7 @@ def _pending_enrollment_session(context: EnrollmentContext, state: dict[str, Jso
 
 def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSession:
     staged_credential = _generate_host_credential()
-    session_url = _worker_url(context.worker_base_url, "/v1/instruction-hub/host-enrollments/device-sessions")
+    session_url = _worker_url(context.api_base_url, "/v1/instruction-hub/host-enrollments/device-sessions")
     payload = {
         "deployment_instance_id": context.deployment_instance_id,
         "target": context.metadata.target,
@@ -957,18 +987,7 @@ def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSession:
     if session_id is None or device_code is None or approval_url is None:
         raise BootstrapError("host enrollment session response missing required fields")
     _validate_hosted_enrollment_approval_url(context, approval_url)
-    poll_url = _worker_url(
-        context.worker_base_url,
-        f"/v1/instruction-hub/host-enrollments/sessions/{session_id}/poll",
-    )
-    credential_url = _worker_url(
-        context.worker_base_url,
-        f"/v1/instruction-hub/host-enrollments/sessions/{session_id}/credential",
-    )
-    poll_url_parts = _validate_http_url(poll_url, "host enrollment poll URL")
-    _validate_worker_transport(poll_url_parts, "host enrollment poll URL")
-    credential_url_parts = _validate_http_url(credential_url, "host enrollment credential URL")
-    _validate_worker_transport(credential_url_parts, "host enrollment credential URL")
+    credential_url = _enrollment_credential_url(context.api_base_url, session_id)
     if poll_interval_seconds < 1 or poll_interval_seconds > 30:
         raise BootstrapError("host enrollment poll interval must be between 1 and 30 seconds")
     return EnrollmentSession(
@@ -976,13 +995,22 @@ def _create_enrollment_session(context: EnrollmentContext) -> EnrollmentSession:
         deployment_instance_id=context.deployment_instance_id,
         device_code=device_code,
         approval_url=approval_url,
-        poll_url=poll_url,
         credential_url=credential_url,
         staged_credential=staged_credential,
         expires_at=expires_at,
         poll_interval_seconds=poll_interval_seconds,
         browser_opened=False,
     )
+
+
+def _enrollment_credential_url(api_base_url: str, session_id: str) -> str:
+    credential_url = _worker_url(
+        api_base_url,
+        f"/v1/instruction-hub/host-enrollments/sessions/{session_id}/credential",
+    )
+    credential_url_parts = _validate_http_url(credential_url, "host enrollment credential URL")
+    _validate_worker_transport(credential_url_parts, "host enrollment credential URL")
+    return credential_url
 
 
 def _validate_hosted_enrollment_approval_url(context: EnrollmentContext, approval_url: str) -> None:
@@ -1003,13 +1031,13 @@ def _store_pending_enrollment(
         if existing_session is not None:
             return existing_session, False
         pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
+        # The credential URL is deliberately not persisted: it is re-derived from the API base
+        # at rehydrate so stale or tampered state cannot redirect credential registration.
         pending_enrollments[_credential_cache_key(context)] = {
             "session_id": session.session_id,
             "deployment_instance_id": session.deployment_instance_id,
             "device_code": session.device_code,
             "approval_url": session.approval_url,
-            "poll_url": session.poll_url,
-            "credential_url": session.credential_url,
             "staged_credential": session.staged_credential,
             "expires_at": session.expires_at.isoformat(),
             "poll_interval_seconds": session.poll_interval_seconds,
@@ -1032,8 +1060,10 @@ def _open_pending_enrollment_browser_if_needed(
     if session.browser_opened:
         return session, None
     _emit({"status": "browser_enrollment_starting", "host": context.metadata.target}, quiet=quiet)
-    if not _open_hosted_enrollment_url(session.approval_url):
-        return None, "browser_launch_failed"
+    open_failure_reason = _open_hosted_enrollment_url(session.approval_url)
+    if open_failure_reason is not None:
+        # browser_opened stays unset so a later session retries the launch.
+        return None, open_failure_reason
     return _mark_pending_enrollment_browser_opened(context, state_path, session), None
 
 
@@ -1055,60 +1085,80 @@ def _mark_pending_enrollment_browser_opened(
     return replace(session, browser_opened=True)
 
 
-def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSession) -> EnrollmentAttempt:
-    deadline = time.monotonic() + ENROLLMENT_POLL_DEADLINE_SECONDS
+def _await_enrollment_credential(context: EnrollmentContext, session: EnrollmentSession) -> EnrollmentAttempt:
+    """Register the staged credential against the hosted session, waiting for browser approval.
+
+    The credential endpoint doubles as the approval poll: unapproved sessions answer "pending"
+    (or, defensively, "approved") and the request is retried until the local wait deadline,
+    while approved sessions register the staged credential hash and answer "consumed".
+    Transient failures (HTTP 5xx and network errors) also retry until the deadline so one flaky
+    request does not lose the pending session; conflict, revocation, and unknown-session
+    responses drop the pending session so the next run enrolls fresh.
+    """
+
+    deadline = time.monotonic() + _enrollment_poll_deadline_seconds()
     while True:
-        response = _post_json_response(
-            session.poll_url,
-            None,
-            {"device_code": session.device_code},
-            label="host enrollment poll response",
-        )
-        status = _string_value(response.get("status"))
-        if status == "approved":
-            return _register_enrollment_credential(context, session)
-        if status == "consumed":
-            return _register_enrollment_credential(context, session)
-        if status == "expired":
-            _forget_pending_enrollment(context)
-            return EnrollmentAttempt(credential=None, reason="approval_expired")
-        if status != "pending":
-            raise BootstrapError("host enrollment poll response has invalid status")
+        try:
+            response: dict[str, JsonValue] | None = _post_json_response(
+                session.credential_url,
+                None,
+                {
+                    "device_code": session.device_code,
+                    "credential_hash": _hash_host_credential(session.staged_credential),
+                    "credential_prefix": _host_credential_prefix(session.staged_credential),
+                },
+                label="host enrollment credential registration response",
+            )
+        except BootstrapHttpError as exc:
+            if exc.http_status in {409, 410}:
+                # The session already holds a different credential or was revoked. Forget the
+                # pending session so the next run starts over with a fresh session and a
+                # freshly staged credential.
+                _forget_pending_enrollment(context)
+                return EnrollmentAttempt(credential=None, reason="credential_conflict")
+            if exc.http_status == 404:
+                _forget_pending_enrollment(context)
+                return EnrollmentAttempt(credential=None, reason="approval_expired")
+            if exc.http_status < 500:
+                raise
+            response = None
+        except urllib.error.URLError:
+            response = None
+        if response is not None:
+            status = _string_value(response.get("status"))
+            if status == "consumed":
+                credential_id = _string_value(response.get("credential_id"))
+                if credential_id is None:
+                    raise BootstrapError(
+                        "consumed host enrollment credential registration response missing credential_id"
+                    )
+                return EnrollmentAttempt(
+                    credential=HostCredential(
+                        value=session.staged_credential,
+                        credential_id=credential_id,
+                        deployment_instance_id=session.deployment_instance_id,
+                    )
+                )
+            if status == "expired":
+                _forget_pending_enrollment(context)
+                return EnrollmentAttempt(credential=None, reason="approval_expired")
+            if status not in {"pending", "approved"}:
+                raise BootstrapError("host enrollment credential registration response has invalid status")
         remaining_seconds = deadline - time.monotonic()
         if remaining_seconds <= 0:
             return EnrollmentAttempt(credential=None, reason="approval_pending")
         time.sleep(min(float(session.poll_interval_seconds), remaining_seconds))
 
 
-def _register_enrollment_credential(context: EnrollmentContext, session: EnrollmentSession) -> EnrollmentAttempt:
-    response = _post_json_response(
-        session.credential_url,
-        None,
-        {
-            "device_code": session.device_code,
-            "credential_hash": _hash_host_credential(session.staged_credential),
-            "credential_prefix": _host_credential_prefix(session.staged_credential),
-        },
-        label="host enrollment credential registration response",
-    )
-    status = _string_value(response.get("status"))
-    if status == "consumed":
-        credential_id = _string_value(response.get("credential_id"))
-        if credential_id is None:
-            raise BootstrapError("consumed host enrollment credential registration response missing credential_id")
-        return EnrollmentAttempt(
-            credential=HostCredential(
-                value=session.staged_credential,
-                credential_id=credential_id,
-                deployment_instance_id=session.deployment_instance_id,
-            )
-        )
-    if status == "pending":
-        return EnrollmentAttempt(credential=None, reason="approval_pending")
-    if status == "expired":
-        _forget_pending_enrollment(context)
-        return EnrollmentAttempt(credential=None, reason="approval_expired")
-    raise BootstrapError("host enrollment credential registration response has invalid status")
+def _enrollment_poll_deadline_seconds() -> float:
+    if _test_url_overrides_enabled():
+        override = os.environ.get(POLL_DEADLINE_OVERRIDE_ENV)
+        if override is not None:
+            try:
+                return float(override)
+            except ValueError:
+                pass
+    return float(ENROLLMENT_POLL_DEADLINE_SECONDS)
 
 
 def _store_host_credential(
@@ -1172,25 +1222,29 @@ def _host_credential_prefix(credential: str) -> str:
     return f"{HOST_CREDENTIAL_PREFIX}{suffix[:HOST_CREDENTIAL_DISPLAY_SUFFIX_CHARS]}"
 
 
-def _open_hosted_enrollment_url(enrollment_url: str) -> bool:
+def _open_hosted_enrollment_url(enrollment_url: str) -> str | None:
+    """Open the hosted approval URL, returning None on success or a setup_pending reason."""
+
     if os.environ.get(OPEN_BROWSER_ENV) == "0":
         if _test_url_overrides_enabled() and _is_loopback_parsed_url(urlsplit(enrollment_url)):
-            _open_loopback_url_for_test(enrollment_url)
-            return True
-        return False
+            return None if _open_loopback_url_for_test(enrollment_url) else "browser_launch_failed"
+        return "browser_open_disabled"
     try:
-        return webbrowser.open(enrollment_url, new=2, autoraise=True)
+        opened = webbrowser.open(enrollment_url, new=2, autoraise=True)
     except webbrowser.Error:
-        return False
+        return "browser_launch_failed"
+    return None if opened else "browser_launch_failed"
 
 
-def _open_loopback_url_for_test(enrollment_url: str) -> None:
+def _open_loopback_url_for_test(enrollment_url: str) -> bool:
     request = urllib.request.Request(enrollment_url, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             response.read()
-    except urllib.error.HTTPError as exc:
-        raise BootstrapError(f"hosted enrollment approval request failed with HTTP {exc.code}") from exc
+    except urllib.error.URLError:
+        # Mirror a real browser-launch failure so the pending session is kept and retried.
+        return False
+    return True
 
 
 def _worker_url(worker_base_url: str, path: str) -> str:
@@ -1247,10 +1301,37 @@ def _get_json(url: str, token: str | None, *, label: str) -> dict[str, JsonValue
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             body = response.read()
     except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403}:
-            raise BootstrapAuthError(f"{label} request failed with HTTP {exc.code}") from exc
-        raise BootstrapError(f"{label} request failed with HTTP {exc.code}") from exc
+        _raise_bootstrap_http_error(exc, label)
     return _decode_json_object(body, label)
+
+
+def _raise_bootstrap_http_error(exc: urllib.error.HTTPError, label: str) -> NoReturn:
+    if exc.code in {401, 403}:
+        raise BootstrapAuthError(f"{label} request failed with HTTP {exc.code}") from exc
+    raise BootstrapHttpError(
+        f"{label} request failed with HTTP {exc.code}",
+        http_status=exc.code,
+        detail_code=_http_error_detail_code(exc),
+    ) from exc
+
+
+def _http_error_detail_code(exc: urllib.error.HTTPError) -> str | None:
+    """Best-effort structured code from a JSON error body shaped {"detail": {"code": ...}}."""
+
+    try:
+        body = exc.read()
+    except OSError:
+        return None
+    try:
+        value = json.loads(body.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    detail = value.get("detail")
+    if not isinstance(detail, dict):
+        return None
+    return _string_value(detail.get("code"))
 
 
 def _post_check_in(
@@ -1288,9 +1369,7 @@ def _post_json_response(
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             return _decode_json_object(response.read(), label)
     except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403}:
-            raise BootstrapAuthError(f"{label} request failed with HTTP {exc.code}") from exc
-        raise BootstrapError(f"{label} request failed with HTTP {exc.code}") from exc
+        _raise_bootstrap_http_error(exc, label)
 
 
 def _auth_headers(token: str | None) -> dict[str, str]:
@@ -2029,10 +2108,17 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
                 "Restart from a desktop session with browser access, then approve the Promptless enrollment prompt. "
                 "Details were saved to ~/.promptless/instruction-hub/last-bootstrap-status.json."
             )
-        if reason == "browser_approval_timeout":
+        if reason == "browser_open_disabled":
             return (
-                f"Promptless host enrollment did not receive browser approval before timing out. "
-                f"Restart {host_label.name} and approve the Promptless enrollment prompt."
+                f"Promptless host enrollment browser launch is disabled by {OPEN_BROWSER_ENV}=0. "
+                f"Unset {OPEN_BROWSER_ENV} and restart {host_label.name}, "
+                "or run `promptless-host-runtime enroll` from a browser-capable session."
+            )
+        if reason == "credential_conflict":
+            return (
+                "Promptless host enrollment could not register this host's credential because the "
+                "approval session was already used or revoked. Enrollment starts fresh next time: "
+                f"restart {host_label.name} or run `promptless-host-runtime enroll`."
             )
         if reason == "enrollment_in_progress":
             return (
@@ -2043,7 +2129,8 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
             return f"Promptless host enrollment approval expired. Restart {host_label.name} to request a fresh approval."
         return (
             "Promptless host enrollment is awaiting browser approval. "
-            f"Approve in the browser tab that opened, then restart {host_label.name}."
+            f"Approve in the browser tab that opened, then restart {host_label.name} "
+            "(or run `promptless-host-runtime enroll` to finish manually)."
         )
     if status == "error":
         message = _string_value(payload.get("message")) or "unknown error"
