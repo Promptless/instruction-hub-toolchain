@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import datetime as dt
+import gzip
 import json
 import os
 import re
@@ -9,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import threading
-import tomllib
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
@@ -24,6 +26,7 @@ from promptless_instruction_hub.fs import JsonValue, validate_json_value
 HOST_RUNTIME_BIN = "promptless-host-runtime"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
 LAST_STATUS_REL_PATH = Path(".promptless/instruction-hub/last-bootstrap-status.json")
+DIAGNOSTIC_LOG_REL_PATH = Path(".promptless/instruction-hub/host-runtime-diagnostics.jsonl")
 BROWSER_ENROLLMENT_MESSAGE = (
     "Promptless Instruction Governance telemetry is starting browser-based enrollment. "
     "Approve the Promptless browser tab to continue."
@@ -38,6 +41,11 @@ def _host_state_path(home: Path) -> Path:
 def _last_status_path(home: Path) -> Path:
     """Return the last host-global bootstrap status file for debugging failed hook runs."""
     return home / LAST_STATUS_REL_PATH
+
+
+def _diagnostic_log_path(home: Path) -> Path:
+    """Return the redacted host-global hook diagnostic log."""
+    return home / DIAGNOSTIC_LOG_REL_PATH
 
 
 def _assert_no_promptless_directory(root: Path) -> None:
@@ -56,22 +64,39 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert bootstrap_path.exists()
         assert os.access(bootstrap_path, os.X_OK)
         hooks = json.loads((plugin_root / "hooks/hooks.json").read_text())
-        hook = hooks["hooks"]["SessionStart"][0]["hooks"][0]
+        hook_events = hooks["hooks"]
+        expected_events = ("SessionStart", "Stop", "SubagentStop")
         if target == "claude":
-            hook_command = hook["command"]
-            assert hook_command == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host claude'
+            expected_events = ("SessionStart", "Stop", "SessionEnd", "SubagentStop")
+        assert set(hook_events) == set(expected_events)
+        session_start_hook = hook_events["SessionStart"][0]["hooks"][0]
+        if target == "claude":
+            command_prefix = f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}"'
         else:
-            hook_command = hook["command"]
-            assert hook_command == f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}" ensure --host codex'
-        assert "--quiet" not in hook_command
+            command_prefix = f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}"'
+        assert session_start_hook["command"] == (
+            f"{command_prefix} ensure --host {target} && "
+            f"{command_prefix} collect --host {target} --lifecycle session_start --baseline --quiet"
+        )
         callback_deadline_match = re.search(
             r"^ENROLLMENT_CALLBACK_DEADLINE_SECONDS = (?P<value>\d+)$",
             bootstrap_path.read_text(),
             re.MULTILINE,
         )
         assert callback_deadline_match is not None
-        assert hook["timeout"] == 390
-        assert hook["timeout"] > int(callback_deadline_match.group("value"))
+        assert session_start_hook["timeout"] == 390
+        assert session_start_hook["timeout"] > int(callback_deadline_match.group("value"))
+        assert hook_events["SessionStart"][0]["matcher"] == "startup|resume"
+        for event_name, lifecycle in (
+            ("Stop", "stop"),
+            ("SessionEnd", "session_end"),
+            ("SubagentStop", "subagent_stop"),
+        ):
+            if event_name not in hook_events:
+                continue
+            hook = hook_events[event_name][0]["hooks"][0]
+            assert hook["command"] == f"{command_prefix} collect --host {target} --lifecycle {lifecycle} --quiet"
+            assert hook["timeout"] == 390
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
@@ -180,7 +205,7 @@ def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:
         assert server.check_ins == []
 
         _run_bootstrap(plugin_root, "codex", env)
-        assert (home / ".codex/config.toml").exists()
+        assert not (home / ".codex/config.toml").exists()
         assert len(server.session_requests) == 1
         assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
         assert len(server.check_ins) == 1
@@ -195,7 +220,7 @@ def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:
         host_instance_id = _json_string(configured_state["host_instance_id"], "host_instance_id")
         assert configured_state["credential_count"] == 1
         assert configured_state["last_seen_plugin_version"] == "0.1.0"
-        assert configured_config["managed_config_detected"] is True
+        assert configured_config["managed_config_detected"] is False
         assert len(server.session_requests) == 1
         assert len(server.check_ins) == 1
 
@@ -215,7 +240,7 @@ def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:
         assert state_after_reset["last_seen_plugin_versions"] == {"codex": "0.1.0"}
         assert state_after_reset["credentials"] == {}
         assert state_after_reset["pending_enrollments"] == {}
-        assert (home / ".codex/config.toml").exists()
+        assert not (home / ".codex/config.toml").exists()
         assert len(server.session_requests) == 1
         assert len(server.check_ins) == 1
 
@@ -228,7 +253,7 @@ def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:
         reset_config = _json_mapping(reset_status["config"], "reset.config")
         assert reset_state["credential_count"] == 0
         assert reset_state["last_seen_plugin_version"] == "0.1.0"
-        assert reset_config["managed_config_detected"] is True
+        assert reset_config["managed_config_detected"] is False
     finally:
         server.stop()
 
@@ -302,17 +327,13 @@ def test_bootstrap_runs_without_local_dogfood_gate(tmp_path: Path) -> None:
             },
         )
 
-        stdout_payload = _json_mapping(validate_json_value(json.loads(result.stdout), "bootstrap stdout"), "stdout")
-        stdout_message = _json_string(stdout_payload["systemMessage"], "systemMessage")
-        assert stdout_message == _json_string(payload["systemMessage"], "systemMessage")
-        assert "Restart Codex" in stdout_message
         assert any(
             diagnostic.get("status") == "browser_enrollment_starting"
             and diagnostic.get("systemMessage") == BROWSER_ENROLLMENT_MESSAGE
             for diagnostic in _bootstrap_diagnostics(result.stderr)
         )
-        assert payload["status"] == "needs_restart"
-        assert (home / ".codex/config.toml").exists()
+        assert payload["status"] == "configured"
+        assert not (home / ".codex/config.toml").exists()
         assert len(server.session_requests) == 1
         assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
         assert len(server.check_ins) == 1
@@ -604,16 +625,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
-        codex_config = (codex_home / ".codex/config.toml").read_text()
-        assert "BEGIN PROMPTLESS MANAGED HOST ENROLLMENT" in codex_config
-        assert 'endpoint = "http://127.0.0.1:4318/v1/logs"' in codex_config
-        assert 'endpoint = "http://127.0.0.1:4318/v1/traces"' in codex_config
-        assert codex_config.count('protocol = "binary"') == 2
-        assert "metrics_exporter" not in codex_config
-        assert "plihost_localcredential" not in codex_config
-        codex_otel = tomllib.loads(codex_config)["otel"]
-        assert codex_otel["exporter"]["otlp-http"]["protocol"] == "binary"
-        assert codex_otel["trace_exporter"]["otlp-http"]["protocol"] == "binary"
+        assert not (codex_home / ".codex/config.toml").exists()
 
         claude_home = tmp_path / "claude-home"
         _run_bootstrap(
@@ -627,31 +639,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
-        claude_settings = json.loads((claude_home / ".claude/settings.json").read_text())
-        assert claude_settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
-        assert claude_settings["env"]["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] == "1"
-        assert claude_settings["env"]["ENABLE_BETA_TRACING_DETAILED"] == "1"
-        assert claude_settings["env"]["BETA_TRACING_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
-        assert claude_settings["env"]["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
-        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
-        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://127.0.0.1:4318"
-        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_LOGS_PROTOCOL"] == "http/protobuf"
-        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
-        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"] == "http/protobuf"
-        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
-        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"] == "http/protobuf"
-        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] == "http://127.0.0.1:4318/v1/metrics"
-        assert claude_settings["env"]["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"
-        assert "OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
-        assert "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
-        assert "OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
-        assert claude_settings["env"]["OTEL_LOG_USER_PROMPTS"] == "1"
-        assert claude_settings["env"]["OTEL_LOG_ASSISTANT_RESPONSES"] == "1"
-        assert claude_settings["env"]["OTEL_LOG_TOOL_DETAILS"] == "1"
-        assert claude_settings["env"]["OTEL_LOG_TOOL_CONTENT"] == "1"
-        assert claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"] == (
-            f"file:{claude_home / '.promptless/instruction-hub/claude-raw-api-bodies'}"
-        )
+        assert not (claude_home / ".claude/settings.json").exists()
 
         assert len(server.session_requests) == 2
         codex_callback_state = _callback_state(server.session_requests[0]["callback_url"], "codex callback_url")
@@ -686,20 +674,30 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
             }
             assert check_in["bootstrap_version"] == "0.2.0"
             assert check_in["plugin_version"] == "0.1.0"
-            assert check_in["status"] == "needs_restart"
-            assert check_in["needs_restart"] is True
+            assert check_in["status"] == "configured"
+            assert check_in["needs_restart"] is False
+            assert check_in["drift_reports"] == []
             effective_config = _json_mapping(check_in["effective_config"], "effective_config")
+            assert set(effective_config) == {
+                "host",
+                "configured",
+                "trace_upload_endpoint",
+                "native_root_count",
+                "source_ledger_path",
+                "managed_config_detected",
+                "config_hash",
+            }
             assert effective_config["configured"] is True
-            assert not {
-                "user_prompts_enabled",
-                "tool_inputs_enabled",
-                "tool_outputs_enabled",
-                "raw_api_bodies_enabled",
-            }.intersection(effective_config)
+            assert effective_config["managed_config_detected"] is False
+            assert effective_config["trace_upload_endpoint"] == f"{server.base_url}/v0/traces/batches"
+            assert effective_config["native_root_count"] == 1
+            assert _json_string(effective_config["source_ledger_path"], "source_ledger_path").endswith(
+                "host-runtime-ledger.json"
+            )
         codex_effective_config = _json_mapping(server.check_ins[0]["effective_config"], "codex effective_config")
         claude_effective_config = _json_mapping(server.check_ins[1]["effective_config"], "claude effective_config")
-        assert codex_effective_config["collector_metrics_endpoint"] is None
-        assert claude_effective_config["collector_metrics_endpoint"] == "http://127.0.0.1:4318/v1/metrics"
+        assert codex_effective_config["host"] == "codex"
+        assert claude_effective_config["host"] == "claude"
     finally:
         server.stop()
 
@@ -870,7 +868,7 @@ def test_bootstrap_missing_managed_runtime_manifest_uses_default_metadata(tmp_pa
             },
         )
 
-        assert (home / ".codex/config.toml").exists()
+        assert not (home / ".codex/config.toml").exists()
         assert server.check_ins[0]["plugin_version"] == "unknown"
         assert "plugin_id" not in server.check_ins[0]
         assert "package_id" not in server.check_ins[0]
@@ -888,7 +886,11 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
         codex_home = tmp_path / "codex-home"
         codex_config = codex_home / ".codex/config.toml"
         codex_config.parent.mkdir(parents=True)
-        original_codex_config = 'model = "gpt-5"\n[profiles.local]\nmodel = "gpt-5-codex"\n'
+        managed_block = (
+            '# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT\n[otel]\nenvironment = "prod"\n'
+            "# END PROMPTLESS MANAGED HOST ENROLLMENT\n"
+        )
+        original_codex_config = f'model = "gpt-5"\n[profiles.local]\nmodel = "gpt-5-codex"\n\n{managed_block}'
         codex_config.write_text(original_codex_config)
 
         _run_bootstrap(
@@ -900,9 +902,13 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
+            expected_status="needs_restart",
         )
 
-        assert original_codex_config.rstrip() in codex_config.read_text()
+        updated_codex_config = codex_config.read_text()
+        assert 'model = "gpt-5"' in updated_codex_config
+        assert "[profiles.local]" in updated_codex_config
+        assert "PROMPTLESS MANAGED HOST ENROLLMENT" not in updated_codex_config
         codex_backups = list(codex_config.parent.glob("config.toml.*.bak"))
         assert len(codex_backups) == 1
         assert codex_backups[0].read_text() == original_codex_config
@@ -911,7 +917,10 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
         claude_home = tmp_path / "claude-home"
         claude_settings = claude_home / ".claude/settings.json"
         claude_settings.parent.mkdir(parents=True)
-        original_claude_settings = {"env": {"CUSTOM_ENV": "1"}, "theme": "dark"}
+        original_claude_settings = {
+            "env": {"CUSTOM_ENV": "1", "PROMPTLESS_MANAGED_HOST_ENROLLMENT": "1", "OTEL_LOGS_EXPORTER": "otlp"},
+            "theme": "dark",
+        }
         claude_settings.write_text(json.dumps(original_claude_settings))
 
         _run_bootstrap(
@@ -924,12 +933,12 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
+            expected_status="needs_restart",
         )
 
         updated_claude_settings = json.loads(claude_settings.read_text())
         assert updated_claude_settings["theme"] == "dark"
-        assert updated_claude_settings["env"]["CUSTOM_ENV"] == "1"
-        assert updated_claude_settings["env"]["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
+        assert updated_claude_settings["env"] == {"CUSTOM_ENV": "1"}
         claude_backups = list(claude_settings.parent.glob("settings.json.*.bak"))
         assert len(claude_backups) == 1
         assert json.loads(claude_backups[0].read_text()) == original_claude_settings
@@ -938,7 +947,7 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
         server.stop()
 
 
-def test_bootstrap_repairs_stale_managed_host_otel_config(tmp_path: Path) -> None:
+def test_bootstrap_removes_managed_host_otel_config(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -956,11 +965,6 @@ def test_bootstrap_repairs_stale_managed_host_otel_config(tmp_path: Path) -> Non
                 "",
                 "[otel.exporter.otlp-http]",
                 'endpoint = "http://stale.local:4318/v1/logs"',
-                'protocol = "json"',
-                'headers = { Authorization = "Bearer stale-token" }',
-                "",
-                "[otel.trace_exporter.otlp-http]",
-                'endpoint = "http://stale.local:4318/v1/traces"',
                 'protocol = "json"',
                 'headers = { Authorization = "Bearer stale-token" }',
                 managed_end,
@@ -984,51 +988,40 @@ def test_bootstrap_repairs_stale_managed_host_otel_config(tmp_path: Path) -> Non
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
+            expected_status="needs_restart",
         )
 
         updated_codex_config = codex_config.read_text()
-        assert updated_codex_config.count(managed_begin) == 1
-        assert updated_codex_config.count(managed_end) == 1
+        assert managed_begin not in updated_codex_config
+        assert managed_end not in updated_codex_config
+        assert "otel" not in updated_codex_config
+        assert "stale.local" not in updated_codex_config
         assert 'model = "gpt-5"' in updated_codex_config
         assert "[profiles.local]" in updated_codex_config
-        assert "stale.local" not in updated_codex_config
-        assert 'endpoint = "http://127.0.0.1:4318/v1/logs"' in updated_codex_config
-        assert 'endpoint = "http://127.0.0.1:4318/v1/traces"' in updated_codex_config
-        assert updated_codex_config.count('protocol = "binary"') == 2
-        codex_otel = tomllib.loads(updated_codex_config)["otel"]
-        assert codex_otel["environment"] == "prod"
-        assert codex_otel["log_user_prompt"] is True
-        assert codex_otel["exporter"]["otlp-http"]["headers"] == {"Authorization": "Bearer otlp-token"}
-        assert codex_otel["trace_exporter"]["otlp-http"]["headers"] == {"Authorization": "Bearer otlp-token"}
         codex_backups = list(codex_config.parent.glob("config.toml.*.bak"))
         assert len(codex_backups) == 1
         assert codex_backups[0].read_text() == original_codex_config
         assert codex_payload["status"] == "needs_restart"
-        codex_drift_reports = _json_list(server.check_ins[-1]["drift_reports"], "codex drift_reports")
+        assert "removed" in _json_string(codex_payload["systemMessage"], "systemMessage").lower()
+        codex_check_in = server.check_ins[-1]
+        codex_effective_config = _json_mapping(codex_check_in["effective_config"], "codex effective_config")
+        assert codex_effective_config["managed_config_detected"] is True
+        codex_drift_reports = _json_list(codex_check_in["drift_reports"], "codex drift_reports")
         codex_report = _json_mapping(codex_drift_reports[0], "codex drift_reports[0]")
-        assert codex_report["kind"] == "repaired_user_config"
+        assert codex_report["kind"] == "removed_managed_config"
         assert codex_report["repaired"] is True
 
         original_claude_settings = {
             "env": {
                 "CUSTOM_ENV": "1",
                 "PROMPTLESS_MANAGED_HOST_ENROLLMENT": "1",
-                "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
-                "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": False,
-                "ENABLE_BETA_TRACING_DETAILED": "0",
+                "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+                "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+                "ENABLE_BETA_TRACING_DETAILED": "1",
                 "BETA_TRACING_ENDPOINT": "http://stale.local:4318/v1/traces",
-                "OTEL_LOGS_EXPORTER": "none",
+                "OTEL_LOGS_EXPORTER": "otlp",
                 "OTEL_METRICS_EXPORTER": ["bad"],
-                "OTEL_TRACES_EXPORTER": "none",
-                "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
-                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://stale.local:4318/v1/logs",
-                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://stale.local:4318/v1/traces",
-                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://stale.local:4318/v1/metrics",
                 "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer stale-token",
-                "OTEL_LOG_USER_PROMPTS": "0",
-                "OTEL_LOG_ASSISTANT_RESPONSES": "1",
-                "OTEL_LOG_TOOL_DETAILS": {"bad": "type"},
-                "OTEL_LOG_TOOL_CONTENT": "0",
                 "OTEL_LOG_RAW_API_BODIES": "1",
             },
             "theme": "dark",
@@ -1048,42 +1041,20 @@ def test_bootstrap_repairs_stale_managed_host_otel_config(tmp_path: Path) -> Non
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
+            expected_status="needs_restart",
         )
 
         updated_claude_settings = json.loads(claude_settings.read_text())
-        updated_env = updated_claude_settings["env"]
         assert updated_claude_settings["theme"] == "dark"
-        assert updated_env["CUSTOM_ENV"] == "1"
-        assert updated_env["PROMPTLESS_MANAGED_HOST_ENROLLMENT"] == "1"
-        assert updated_env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
-        assert updated_env["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] == "1"
-        assert updated_env["ENABLE_BETA_TRACING_DETAILED"] == "1"
-        assert updated_env["BETA_TRACING_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
-        assert updated_env["OTEL_LOGS_EXPORTER"] == "otlp"
-        assert updated_env["OTEL_METRICS_EXPORTER"] == "otlp"
-        assert updated_env["OTEL_TRACES_EXPORTER"] == "otlp"
-        assert updated_env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
-        assert updated_env["OTEL_EXPORTER_OTLP_LOGS_PROTOCOL"] == "http/protobuf"
-        assert updated_env["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "http://127.0.0.1:4318/v1/logs"
-        assert updated_env["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"] == "http/protobuf"
-        assert updated_env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == "http://127.0.0.1:4318/v1/traces"
-        assert updated_env["OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"] == "http/protobuf"
-        assert updated_env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] == "http://127.0.0.1:4318/v1/metrics"
-        assert updated_env["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer otlp-token"
-        assert updated_env["OTEL_LOG_USER_PROMPTS"] == "1"
-        assert updated_env["OTEL_LOG_ASSISTANT_RESPONSES"] == "1"
-        assert updated_env["OTEL_LOG_TOOL_DETAILS"] == "1"
-        assert updated_env["OTEL_LOG_TOOL_CONTENT"] == "1"
-        assert updated_env["OTEL_LOG_RAW_API_BODIES"] == (
-            f"file:{claude_home / '.promptless/instruction-hub/claude-raw-api-bodies'}"
-        )
+        assert updated_claude_settings["env"] == {"CUSTOM_ENV": "1"}
         claude_backups = list(claude_settings.parent.glob("settings.json.*.bak"))
         assert len(claude_backups) == 1
         assert json.loads(claude_backups[0].read_text()) == original_claude_settings
         assert claude_payload["status"] == "needs_restart"
-        claude_drift_reports = _json_list(server.check_ins[-1]["drift_reports"], "claude drift_reports")
+        claude_check_in = server.check_ins[-1]
+        claude_drift_reports = _json_list(claude_check_in["drift_reports"], "claude drift_reports")
         claude_report = _json_mapping(claude_drift_reports[0], "claude drift_reports[0]")
-        assert claude_report["kind"] == "repaired_user_config"
+        assert claude_report["kind"] == "removed_managed_config"
         assert claude_report["repaired"] is True
     finally:
         server.stop()
@@ -1161,7 +1132,7 @@ def test_build_rejects_malformed_existing_hook_asset(tmp_path: Path) -> None:
         build_hub(hub_root)
 
 
-def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
+def test_bootstrap_leaves_unmanaged_host_config_untouched(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -1173,7 +1144,7 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
         codex_config.parent.mkdir(parents=True)
         codex_config.write_text('[otel]\nenvironment = "local"\n')
 
-        codex_payload, _ = _run_bootstrap(
+        _run_bootstrap(
             hub_root / "dist/codex/core",
             "codex",
             {
@@ -1182,19 +1153,18 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
                 "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
-            expected_status="blocked",
         )
 
         assert codex_config.read_text() == '[otel]\nenvironment = "local"\n'
-        assert server.check_ins[-1]["status"] == "blocked"
-        assert "blocked" in _json_string(codex_payload["systemMessage"], "systemMessage").lower()
+        assert list(codex_config.parent.glob("config.toml.*.bak")) == []
+        assert server.check_ins[-1]["status"] == "configured"
 
         claude_home = tmp_path / "claude-home"
         claude_settings = claude_home / ".claude/settings.json"
         claude_settings.parent.mkdir(parents=True)
         claude_settings.write_text('{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"Authorization=Bearer customer-token"}}\n')
 
-        claude_payload, _ = _run_bootstrap(
+        _run_bootstrap(
             hub_root / "dist/claude/core",
             "claude",
             {
@@ -1204,15 +1174,14 @@ def test_bootstrap_preserves_unmanaged_host_config(tmp_path: Path) -> None:
                 "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
-            expected_status="blocked",
         )
 
         assert (
             claude_settings.read_text()
             == '{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"Authorization=Bearer customer-token"}}\n'
         )
-        assert server.check_ins[-1]["status"] == "blocked"
-        assert "blocked" in _json_string(claude_payload["systemMessage"], "systemMessage").lower()
+        assert list(claude_settings.parent.glob("settings.json.*.bak")) == []
+        assert server.check_ins[-1]["status"] == "configured"
     finally:
         server.stop()
 
@@ -1225,6 +1194,9 @@ def test_bootstrap_surfaces_enrollment_message_only_on_change(tmp_path: Path) ->
     server.start()
     try:
         claude_home = tmp_path / "claude-home"
+        claude_settings = claude_home / ".claude/settings.json"
+        claude_settings.parent.mkdir(parents=True)
+        claude_settings.write_text(json.dumps({"env": {"PROMPTLESS_MANAGED_HOST_ENROLLMENT": "1"}}))
         claude_env = {
             "HOME": str(claude_home),
             "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
@@ -1233,36 +1205,44 @@ def test_bootstrap_surfaces_enrollment_message_only_on_change(tmp_path: Path) ->
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
-        # Fresh config write surfaces a restart prompt naming the host; the steady state is silent.
-        first_claude, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
+        # Removing legacy managed config surfaces a restart prompt naming the host; the
+        # steady state is silent.
+        first_claude, _ = _run_bootstrap(
+            hub_root / "dist/claude/core", "claude", claude_env, expected_status="needs_restart"
+        )
         claude_message = _json_string(first_claude["systemMessage"], "systemMessage")
         assert "Claude Code" in claude_message
-        assert "to start telemetry" in claude_message
+        assert "removed" in claude_message.lower()
 
-        steady_claude, _ = _run_bootstrap(
-            hub_root / "dist/claude/core", "claude", claude_env, expected_status="configured"
-        )
+        steady_claude, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
         assert "systemMessage" not in steady_claude
 
         codex_home = tmp_path / "codex-home"
+        codex_config = codex_home / ".codex/config.toml"
+        codex_config.parent.mkdir(parents=True)
+        codex_config.write_text(
+            "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT\n[otel]\n# END PROMPTLESS MANAGED HOST ENROLLMENT\n"
+        )
         codex_env = {
             "HOME": str(codex_home),
             "CODEX_HOME": str(codex_home / ".codex"),
             "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
-        first_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        first_codex, _ = _run_bootstrap(
+            hub_root / "dist/codex/core", "codex", codex_env, expected_status="needs_restart"
+        )
         codex_message = _json_string(first_codex["systemMessage"], "systemMessage")
         assert "Codex" in codex_message
-        assert "to start telemetry" in codex_message
+        assert "removed" in codex_message.lower()
 
-        steady_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env, expected_status="configured")
+        steady_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
         assert "systemMessage" not in steady_codex
     finally:
         server.stop()
 
 
-def test_bootstrap_configures_claude_raw_api_bodies_file_capture(tmp_path: Path) -> None:
+def test_bootstrap_writes_no_host_config_on_fresh_hosts(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -1282,14 +1262,8 @@ def test_bootstrap_configures_claude_raw_api_bodies_file_capture(tmp_path: Path)
             },
         )
 
-        claude_settings = json.loads((claude_home / ".claude/settings.json").read_text())
-        raw_api_bodies_env = _json_string(claude_settings["env"]["OTEL_LOG_RAW_API_BODIES"], "raw API bodies env")
-        assert raw_api_bodies_env.startswith("file:")
-        raw_api_bodies_path = Path(raw_api_bodies_env.removeprefix("file:"))
-        assert raw_api_bodies_path == claude_home / ".promptless/instruction-hub/claude-raw-api-bodies"
-        assert claude_settings["env"]["OTEL_LOG_TOOL_CONTENT"] == "1"
-        assert "OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT" not in claude_settings["env"]
-        assert raw_api_bodies_path.is_dir()
+        assert not (claude_home / ".claude").exists()
+        assert not (claude_home / ".promptless/instruction-hub/claude-raw-api-bodies").exists()
     finally:
         server.stop()
 
@@ -1305,6 +1279,11 @@ def test_bootstrap_stdout_stays_codex_schema_safe(tmp_path: Path) -> None:
     server = _FakeWorkerServer()
     server.start()
     try:
+        codex_config = tmp_path / "codex-home/.codex/config.toml"
+        codex_config.parent.mkdir(parents=True)
+        codex_config.write_text(
+            "# BEGIN PROMPTLESS MANAGED HOST ENROLLMENT\n[otel]\n# END PROMPTLESS MANAGED HOST ENROLLMENT\n"
+        )
         codex_env = {
             "HOME": str(tmp_path / "codex-home"),
             "CODEX_HOME": str(tmp_path / "codex-home/.codex"),
@@ -1313,14 +1292,17 @@ def test_bootstrap_stdout_stays_codex_schema_safe(tmp_path: Path) -> None:
         }
 
         # Fresh browser enrollment records the start banner in diagnostics but leaves stdout for
-        # the final actionable restart message.
-        configured_payload, configured_result = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        # the final actionable restart message emitted by the managed-config cleanup.
+        configured_payload, configured_result = _run_bootstrap(
+            hub_root / "dist/codex/core", "codex", codex_env, expected_status="needs_restart"
+        )
         configured_stdout = _json_mapping(
             validate_json_value(json.loads(configured_result.stdout), "codex stdout"), "codex stdout"
         )
         assert set(configured_stdout) == {"systemMessage"}
         assert configured_stdout["systemMessage"] == configured_payload["systemMessage"]
         assert "Restart Codex" in _json_string(configured_stdout["systemMessage"], "systemMessage")
+        assert "removed" in _json_string(configured_stdout["systemMessage"], "systemMessage").lower()
         assert any(
             diagnostic.get("status") == "browser_enrollment_starting"
             and diagnostic.get("systemMessage") == BROWSER_ENROLLMENT_MESSAGE
@@ -1359,12 +1341,12 @@ def test_bootstrap_announces_plugin_update_per_host(tmp_path: Path) -> None:
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
-        # First install on each host records the version silently (an install is not an update),
-        # so the only message is the fresh-config restart prompt, never an "updated" notice.
+        # First install on each host records the version silently (an install is not an update):
+        # nothing is written, so there is no message at all.
         first_claude, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
-        assert "updated" not in _json_string(first_claude["systemMessage"], "systemMessage").lower()
+        assert "systemMessage" not in first_claude
         first_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
-        assert "updated" not in _json_string(first_codex["systemMessage"], "systemMessage").lower()
+        assert "systemMessage" not in first_codex
 
         # Rebuild the same hub at a newer version, then re-run: each host announces the change once.
         build_hub(hub_root, plugin_version="0.2.0")
@@ -1469,7 +1451,7 @@ def test_bootstrap_defers_recording_update_until_notice_surfaces(tmp_path: Path)
         server.stop()
 
 
-def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_path: Path) -> None:
+def test_bootstrap_repeat_runs_stay_configured_without_config_writes(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -1484,9 +1466,8 @@ def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_pa
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
         _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
-        _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env, expected_status="configured")
-        codex_config = (codex_home / ".codex/config.toml").read_text()
-        assert codex_config.count("BEGIN PROMPTLESS MANAGED HOST ENROLLMENT") == 1
+        _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        assert not (codex_home / ".codex/config.toml").exists()
 
         claude_home = tmp_path / "claude-home"
         claude_env = {
@@ -1498,13 +1479,12 @@ def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_pa
         }
         _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
         settings_path = claude_home / ".claude/settings.json"
-        first_settings = settings_path.read_text()
-        _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env, expected_status="configured")
-        assert settings_path.read_text() == first_settings
+        _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
+        assert not settings_path.exists()
         assert [check_in["status"] for check_in in server.check_ins] == [
-            "needs_restart",
             "configured",
-            "needs_restart",
+            "configured",
+            "configured",
             "configured",
         ]
         assert [request["target"] for request in server.session_requests] == ["codex", "claude"]
@@ -1517,7 +1497,6 @@ def test_bootstrap_second_run_reports_configured_without_duplicate_config(tmp_pa
     [
         "expired",
         "missing-write-permission",
-        "wrong-logs-path",
     ],
 )
 def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> None:
@@ -1546,7 +1525,37 @@ def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> N
         server.stop()
 
 
-def test_bootstrap_blocks_when_worker_requires_newer_runtime(tmp_path: Path) -> None:
+def test_bootstrap_ignores_legacy_collector_policy_sections(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    # Hosted policies still carry the retired OTLP collector section for older
+    # bootstraps; this runtime must tolerate any shape, including its absence.
+    malformed_collector = _policy_with(collector={"otlp_http_logs_endpoint": "not-a-url"})
+    policy_without_collector = _policy_with()
+    policy_body = _json_mapping(policy_without_collector["policy"], "policy")
+    policy_body.pop("collector", None)
+    for policy_payload in (malformed_collector, policy_without_collector):
+        server = _FakeWorkerServer(policy=policy_payload)
+        server.start()
+        try:
+            home = tmp_path / f"home-{len(server.check_ins)}-{server.base_url.rsplit(':', 1)[1]}"
+            _run_bootstrap(
+                hub_root / "dist/codex/core",
+                "codex",
+                {
+                    "HOME": str(home),
+                    "CODEX_HOME": str(home / ".codex"),
+                    "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                    "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+                },
+            )
+            assert server.check_ins[-1]["status"] == "configured"
+        finally:
+            server.stop()
+
+
+def test_bootstrap_blocks_when_worker_requires_different_runtime_version(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -1601,6 +1610,768 @@ def test_bootstrap_rejects_invalid_check_in_success_response(tmp_path: Path) -> 
         server.stop()
 
 
+def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        second_record = b'{"kind":"stop","message":"upload"}\n'
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"sessionId": "codex_session_1", "transcriptPath": str(transcript_path)},
+        )
+        assert server.trace_batches == []
+
+        baseline_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        baseline_sources = _json_mapping(baseline_ledger["sources"], "ledger.sources")
+        baseline_source = _json_mapping(next(iter(baseline_sources.values())), "ledger.sources[0]")
+        assert baseline_source["end_offset"] == len(first_record)
+
+        third_record = b'{"kind":"note","message":"coalesced"}\n'
+        transcript_path.write_bytes(first_record + second_record + third_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {
+                "sessionId": "",
+                "session": {"id": "codex_session_1"},
+                "transcriptPath": "",
+                "transcript": {"path": str(transcript_path)},
+            },
+        )
+
+        assert len(server.trace_batches) == 1
+        batch = server.trace_batches[0]
+        assert batch["source"] == "codex"
+        assert batch["host"] == "codex"
+        assert batch["session_id"] == "codex_session_1"
+        assert batch["policy_version"] == 1
+        assert batch["collector_version"] == "0.2.0"
+        chunks = _json_list(batch["chunks"], "batch.chunks")
+        # contiguous complete lines coalesce into one contract-shaped range chunk
+        assert len(chunks) == 1
+        chunk = _json_mapping(chunks[0], "batch.chunks[0]")
+        assert chunk["kind"] == "jsonl_range"
+        assert chunk["start_offset"] == len(first_record)
+        assert chunk["end_offset"] == len(first_record) + len(second_record) + len(third_record)
+        assert chunk["line_count"] == 2
+        assert chunk["lifecycle_event"] == "stop"
+        assert chunk["content_encoding"] == "gzip"
+        assert (
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content")))
+            == second_record + third_record
+        )
+
+        advanced_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        advanced_sources = _json_mapping(advanced_ledger["sources"], "ledger.sources")
+        advanced_source = _json_mapping(
+            advanced_sources[_json_string(chunk["source_path_hash"], "source_path_hash")], "source"
+        )
+        assert advanced_source["end_offset"] == transcript_path.stat().st_size
+    finally:
+        server.stop()
+
+
+def test_collect_without_baseline_uploads_new_ledger_sources_from_start(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"missed baseline"}\n'
+        second_record = b'{"kind":"stop","message":"complete"}\n'
+        transcript_path.write_bytes(first_record + second_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        # A terminal hook is the first collection to see this ledger (missed SessionStart).
+        # The completed transcript must upload from offset 0, not get baselined away.
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        assert len(server.trace_batches) == 1
+        batch = server.trace_batches[0]
+        chunks = _json_list(batch["chunks"], "batch.chunks")
+        assert len(chunks) == 1
+        chunk = _json_mapping(chunks[0], "batch.chunks[0]")
+        assert chunk["kind"] == "jsonl_range"
+        assert chunk["start_offset"] == 0
+        assert chunk["end_offset"] == len(first_record) + len(second_record)
+        assert chunk["line_count"] == 2
+        assert (
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content")))
+            == first_record + second_record
+        )
+
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        source = _json_mapping(sources[_json_string(chunk["source_path_hash"], "source_path_hash")], "source")
+        assert source["end_offset"] == transcript_path.stat().st_size
+
+        # The ledger advanced through the normal ACK path, so a repeat collect uploads nothing.
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        assert len(server.trace_batches) == 1
+    finally:
+        server.stop()
+
+
+def test_collect_uploads_subagent_transcript_with_parent_identity(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        agent_transcript_path = tmp_path / "codex-subagent.jsonl"
+        first_record = b'{"kind":"agent_start"}\n'
+        second_record = b'{"kind":"agent_stop"}\n'
+        agent_transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "parent_session_1", "transcript_path": str(agent_transcript_path)},
+        )
+        agent_transcript_path.write_bytes(first_record + second_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "subagent_stop", "--quiet"],
+            env,
+            {
+                "parent_session_id": "",
+                "parentSessionId": "parent_session_1",
+                "agentTranscriptPath": "",
+                "agent": {"id": "agent_1", "type": "worker", "transcriptPath": str(agent_transcript_path)},
+            },
+        )
+
+        assert len(server.trace_batches) == 1
+        batch = server.trace_batches[0]
+        assert "session_id" not in batch
+        assert batch["parent_session_id"] == "parent_session_1"
+        assert batch["agent_id"] == "agent_1"
+        assert batch["agent_type"] == "worker"
+        chunk = _json_mapping(_json_list(batch["chunks"], "batch.chunks")[0], "batch.chunks[0]")
+        assert chunk["lifecycle_event"] == "subagent_stop"
+        assert chunk["content_encoding"] == "gzip"
+        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == second_record
+    finally:
+        server.stop()
+
+
+def test_collect_scopes_lifecycle_event_to_the_hook_subject_file(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        codex_home = home / ".codex"
+        ledger_path = tmp_path / "ledger.json"
+        subject_path = tmp_path / "codex-session.jsonl"
+        idle_path = codex_home / "sessions/other-session.jsonl"
+        idle_path.parent.mkdir(parents=True)
+        subject_record = b'{"kind":"session_start"}\n'
+        idle_record = b'{"kind":"other_session"}\n'
+        subject_path.write_bytes(subject_record)
+        idle_path.write_bytes(idle_record)
+        stale = time.time() - (13 * 60 * 60)
+        os.utime(idle_path, (stale, stale))
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(codex_home),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(subject_path)},
+        )
+        subject_extra = b'{"kind":"stop"}\n'
+        idle_extra = b'{"kind":"idle_tail"}\n'
+        subject_path.write_bytes(subject_record + subject_extra)
+        idle_path.write_bytes(idle_record + idle_extra)
+        os.utime(idle_path, (stale, stale))
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(subject_path)},
+        )
+
+        uploaded_chunks = [
+            _json_mapping(chunk_value, "chunk")
+            for batch in server.trace_batches
+            for chunk_value in _json_list(batch["chunks"], "chunks")
+        ]
+        assert len(uploaded_chunks) == 2
+        # The hook's stop event describes only its own transcript; the idle-swept
+        # file from another session must not be finalized by it.
+        chunks_by_lifecycle = {chunk.get("lifecycle_event"): chunk for chunk in uploaded_chunks}
+        assert set(chunks_by_lifecycle) == {"stop", None}
+        subject_chunk = chunks_by_lifecycle["stop"]
+        idle_chunk = chunks_by_lifecycle[None]
+        assert gzip.decompress(base64.b64decode(_json_string(subject_chunk["content_base64"], "c"))) == subject_extra
+        assert gzip.decompress(base64.b64decode(_json_string(idle_chunk["content_base64"], "c"))) == idle_extra
+        assert "lifecycle_event" not in idle_chunk
+    finally:
+        server.stop()
+
+
+def test_collect_reports_oversized_record_with_content_size_reason(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        baseline_record = b'{"kind":"session_start"}\n'
+        oversized_record = b'{"kind":"huge","payload":"' + b"x" * (10 * 1024 * 1024) + b'"}\n'
+        trailing_record = b'{"kind":"stop"}\n'
+        transcript_path.write_bytes(baseline_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        transcript_path.write_bytes(baseline_record + oversized_record + trailing_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        uploaded_chunks = [
+            _json_mapping(chunk_value, "chunk")
+            for batch in server.trace_batches
+            for chunk_value in _json_list(batch["chunks"], "chunks")
+        ]
+        assert [chunk["kind"] for chunk in uploaded_chunks] == ["oversized_record", "jsonl_range"]
+        oversized_chunk = uploaded_chunks[0]
+        assert oversized_chunk["oversized_reason"] == "content_size"
+        assert oversized_chunk["byte_count"] == len(oversized_record)
+        assert oversized_chunk["start_offset"] == len(baseline_record)
+        assert oversized_chunk["end_offset"] == len(baseline_record) + len(oversized_record)
+
+        advanced_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        advanced_sources = _json_mapping(advanced_ledger["sources"], "ledger.sources")
+        advanced_source = _json_mapping(next(iter(advanced_sources.values())), "ledger.sources[0]")
+        assert advanced_source["end_offset"] == transcript_path.stat().st_size
+    finally:
+        server.stop()
+
+
+def test_collect_reports_oversized_record_with_transport_size_reason(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        baseline_record = b'{"kind":"session_start"}\n'
+        # Under the 10 MiB raw-record cap, but incompressible: gzip+base64 grows it
+        # ~4/3 past the request transport budget, so it cannot be sent as content.
+        incompressible_record = os.urandom(8 * 1024 * 1024 + 512 * 1024).replace(b"\n", b"x") + b"\n"
+        trailing_record = b'{"kind":"stop"}\n'
+        transcript_path.write_bytes(baseline_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        transcript_path.write_bytes(baseline_record + incompressible_record + trailing_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        uploaded_chunks = [
+            _json_mapping(chunk_value, "chunk")
+            for batch in server.trace_batches
+            for chunk_value in _json_list(batch["chunks"], "chunks")
+        ]
+        assert [chunk["kind"] for chunk in uploaded_chunks] == ["oversized_record", "jsonl_range"]
+        oversized_chunk = uploaded_chunks[0]
+        assert oversized_chunk["oversized_reason"] == "transport_size"
+        assert oversized_chunk["byte_count"] == len(incompressible_record)
+        assert oversized_chunk["start_offset"] == len(baseline_record)
+        assert oversized_chunk["end_offset"] == len(baseline_record) + len(incompressible_record)
+        assert "content_base64" not in oversized_chunk
+        trailing_chunk = uploaded_chunks[1]
+        assert (
+            gzip.decompress(base64.b64decode(_json_string(trailing_chunk["content_base64"], "content")))
+            == trailing_record
+        )
+
+        # The skip advances the ledger past the unsendable record: no retry wedge.
+        advanced_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        advanced_sources = _json_mapping(advanced_ledger["sources"], "ledger.sources")
+        advanced_source = _json_mapping(next(iter(advanced_sources.values())), "ledger.sources[0]")
+        assert advanced_source["end_offset"] == transcript_path.stat().st_size
+    finally:
+        server.stop()
+
+
+def test_collect_splits_batches_by_transport_size(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        baseline_record = b'{"kind":"session_start"}\n'
+        # Two incompressible 4 MiB records: 8 MiB decoded fits one batch, but each
+        # encodes to ~5.6 MiB, so transport accounting must split them across two.
+        first_blob = os.urandom(4 * 1024 * 1024).replace(b"\n", b"x") + b"\n"
+        second_blob = os.urandom(4 * 1024 * 1024).replace(b"\n", b"x") + b"\n"
+        transcript_path.write_bytes(baseline_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        transcript_path.write_bytes(baseline_record + first_blob + second_blob)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        assert len(server.trace_batches) == 2
+        uploaded_chunks = [
+            _json_mapping(chunk_value, "chunk")
+            for batch in server.trace_batches
+            for chunk_value in _json_list(batch["chunks"], "chunks")
+        ]
+        assert [chunk["kind"] for chunk in uploaded_chunks] == ["jsonl_range", "jsonl_range"]
+        reassembled = b"".join(
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content")))
+            for chunk in uploaded_chunks
+        )
+        assert reassembled == first_blob + second_blob
+
+        advanced_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        advanced_sources = _json_mapping(advanced_ledger["sources"], "ledger.sources")
+        advanced_source = _json_mapping(next(iter(advanced_sources.values())), "ledger.sources[0]")
+        assert advanced_source["end_offset"] == transcript_path.stat().st_size
+    finally:
+        server.stop()
+
+
+def test_collect_tolerates_unparsed_record_counts_and_advances_ledger(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    # The worker models undecodable ledger lines as informational counts; a nonzero
+    # count must never fail the upload or hold the ledger back.
+    server = _FakeWorkerServer(unparsed_record_count=2)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start"}\n'
+        second_record = b"not-json-but-complete-line\n"
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        transcript_path.write_bytes(first_record + second_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        assert len(server.trace_batches) == 1
+        advanced_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        advanced_sources = _json_mapping(advanced_ledger["sources"], "ledger.sources")
+        advanced_source = _json_mapping(next(iter(advanced_sources.values())), "ledger.sources[0]")
+        assert advanced_source["end_offset"] == transcript_path.stat().st_size
+    finally:
+        server.stop()
+
+
+def test_collect_skips_when_ledger_lock_is_busy_and_logs_diagnostic(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("fcntl lock contention test is POSIX-only")
+    import fcntl
+
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        second_record = b'{"kind":"stop","message":"upload"}\n'
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        transcript_path.write_bytes(first_record + second_record)
+
+        lock_path = ledger_path.with_name(f"{ledger_path.name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            _run_collect(
+                plugin_root,
+                ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+                env,
+                {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+            )
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+        assert server.trace_batches == []
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_skipped"
+        assert diagnostics[-1]["reason"] == "ledger_lock_busy"
+        diagnostic_log = _diagnostic_log_path(home)
+        assert diagnostic_log.stat().st_mode & 0o777 == 0o600
+        assert "plihost_localcredential" not in diagnostic_log.read_text()
+    finally:
+        server.stop()
+
+
+def test_zero_deadline_collect_baselines_fully_and_uploads_hook_subject(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        codex_home = home / ".codex"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        transcript_path.write_bytes(first_record)
+        idle_path = codex_home / "sessions/idle-history.jsonl"
+        idle_path.parent.mkdir(parents=True)
+        idle_path.write_bytes(b'{"kind":"idle_history"}\n')
+        stale = time.time() - (13 * 60 * 60)
+        os.utime(idle_path, (stale, stale))
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(codex_home),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+            "PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS": "0",
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # A zero deadline truncates the idle scan, but the first-run baseline must
+        # still inventory the full tree: a partial baseline would replay every
+        # missed file from offset zero later as a surprise backfill.
+        assert server.trace_batches == []
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert len(sources) == 2
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_baselined"
+        assert diagnostics[-1]["source_count"] == 2
+
+        second_record = b'{"kind":"stop","message":"upload"}\n'
+        transcript_path.write_bytes(first_record + second_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # The hook's own transcript still uploads with no budget at all: subject
+        # paths are unmetered and the first pending batch is always sent.
+        assert len(server.trace_batches) == 1
+        chunk = _json_mapping(_json_list(server.trace_batches[0]["chunks"], "batch.chunks")[0], "batch.chunks[0]")
+        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == second_record
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_partial"
+        assert diagnostics[-1]["reason"] == "collection_deadline_exceeded"
+        assert diagnostics[-1]["batch_count"] == 1
+    finally:
+        server.stop()
+
+
+def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+        zero_deadline_env = dict(env, PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS="0")
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # Multi-batch pending content: ~13 MiB so batch one fills at the 10 MiB cap.
+        filler_record = b'{"kind":"note","payload":"' + b"x" * 65_000 + b'"}\n'
+        appended_body = filler_record * 200
+        transcript_path.write_bytes(first_record + appended_body)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            zero_deadline_env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # The guaranteed first batch lands and is acked; the deadline stops the rest.
+        assert len(server.trace_batches) == 1
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_partial"
+        assert diagnostics[-1]["reason"] == "collection_deadline_exceeded"
+        assert diagnostics[-1]["batch_count"] == 1
+        truncated_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        truncated_source = _json_mapping(
+            next(iter(_json_mapping(truncated_ledger["sources"], "ledger.sources").values())), "ledger.sources[0]"
+        )
+        acked_offset = _json_int(truncated_source["end_offset"], "ledger.sources[0].end_offset")
+        assert len(first_record) < acked_offset < transcript_path.stat().st_size
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # The next collect resumes from the acked watermark and drains the rest.
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_complete"
+        drained_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        drained_source = _json_mapping(
+            next(iter(_json_mapping(drained_ledger["sources"], "ledger.sources").values())), "ledger.sources[0]"
+        )
+        assert drained_source["end_offset"] == transcript_path.stat().st_size
+        uploaded_chunks = [
+            _json_mapping(chunk, "chunk")
+            for batch in server.trace_batches
+            for chunk in _json_list(_json_mapping(batch, "batch")["chunks"], "batch.chunks")
+        ]
+        uploaded_chunks.sort(key=lambda chunk: _json_int(chunk["start_offset"], "chunk.start_offset"))
+        reassembled = b"".join(
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content")))
+            for chunk in uploaded_chunks
+        )
+        assert reassembled == appended_body
+    finally:
+        server.stop()
+
+
+def test_truncated_empty_scan_still_reaches_first_run_baseline(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        codex_home = home / ".codex"
+        idle_path = codex_home / "sessions/idle-history.jsonl"
+        idle_path.parent.mkdir(parents=True)
+        idle_path.write_bytes(b'{"kind":"idle_history"}\n')
+        stale = time.time() - (13 * 60 * 60)
+        os.utime(idle_path, (stale, stale))
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(codex_home),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+            "PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS": "0",
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        # No transcript path on hook stdin plus a zero budget: the truncated empty
+        # scan must not return no_sources before the ledger exists, or the first
+        # baseline never happens and later terminal hooks upload the pre-enrollment
+        # tree from offset 0.
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {},
+        )
+
+        assert server.trace_batches == []
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert len(sources) == 1
+        baselined_source = _json_mapping(next(iter(sources.values())), "ledger.sources[0]")
+        assert baselined_source["end_offset"] == idle_path.stat().st_size
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_baselined"
+        assert diagnostics[-1]["source_count"] == 1
+    finally:
+        server.stop()
+
+
 # Codex validates SessionStart hook *stdout* against a strict schema (serde deny_unknown_fields) and
 # rejects any key outside continue/stopReason/systemMessage/suppressOutput/hookSpecificOutput with
 # "hook returned invalid session start JSON output". The bootstrap therefore keeps Codex stdout to
@@ -1616,6 +2387,14 @@ def _bootstrap_diagnostics(stderr: str) -> list[dict[str, JsonValue]]:
     return [
         _json_mapping(validate_json_value(json.loads(line), "bootstrap diagnostic"), "bootstrap diagnostic")
         for line in stderr.splitlines()
+        if line.strip()
+    ]
+
+
+def _diagnostic_log_entries(home: Path) -> list[dict[str, JsonValue]]:
+    return [
+        _json_mapping(validate_json_value(json.loads(line), "runtime diagnostic log entry"), "runtime diagnostic log")
+        for line in _diagnostic_log_path(home).read_text().splitlines()
         if line.strip()
     ]
 
@@ -1661,7 +2440,7 @@ def _run_bootstrap(
     host: str,
     env: dict[str, str],
     *,
-    expected_status: str = "needs_restart",
+    expected_status: str = "configured",
 ) -> tuple[dict[str, JsonValue], subprocess.CompletedProcess[str]]:
     result = subprocess.run(
         [str(plugin_root / "bin" / HOST_RUNTIME_BIN), "ensure", "--host", host],
@@ -1703,6 +2482,30 @@ def _run_runtime_json(
     return _json_mapping(payload, "runtime command stdout"), result
 
 
+def _run_collect(
+    plugin_root: Path,
+    args: list[str],
+    env: dict[str, str],
+    stdin_payload: dict[str, JsonValue],
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        [str(plugin_root / "bin" / HOST_RUNTIME_BIN), *args],
+        env=_clean_env(**env),
+        input=json.dumps(stdin_payload),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "plihost_localcredential" not in result.stdout
+    assert "plihost_localcredential" not in result.stderr
+    assert "plihenroll_devicecode" not in result.stdout
+    assert "plihenroll_devicecode" not in result.stderr
+    assert result.stdout == ""
+    assert result.stderr == ""
+    return result
+
+
 def _start_bootstrap(plugin_root: Path, host: str, env: dict[str, str]) -> subprocess.Popen[str]:
     process_env = _clean_env()
     process_env.update(env)
@@ -1720,7 +2523,7 @@ def _start_bootstrap(plugin_root: Path, host: str, env: dict[str, str]) -> subpr
 def _read_bootstrap_process(
     process: subprocess.Popen[str],
     *,
-    expected_status: str = "needs_restart",
+    expected_status: str = "configured",
 ) -> dict[str, JsonValue]:
     payload = _read_any_bootstrap_status(process)
     assert payload["status"] == expected_status
@@ -1813,6 +2616,11 @@ def _json_string(value: JsonValue, field_path: str) -> str:
     return value
 
 
+def _json_int(value: JsonValue, field_path: str) -> int:
+    assert isinstance(value, int) and not isinstance(value, bool), f"{field_path} must be a JSON integer"
+    return value
+
+
 def _callback_state(callback_url_value: JsonValue, field_path: str) -> str:
     callback_url = _json_string(callback_url_value, field_path)
     state_values = parse_qs(urlsplit(callback_url).query).get("state")
@@ -1895,10 +2703,9 @@ def _invalid_policy(case: str) -> dict[str, JsonValue]:
         policy["expires_at"] = (now - dt.timedelta(minutes=1)).isoformat()
     elif case == "missing-write-permission":
         permissions["write_user_config"] = False
-    elif case == "wrong-logs-path":
-        collector["otlp_http_logs_endpoint"] = "http://127.0.0.1:4318/not-logs"
     else:
         raise AssertionError(f"unhandled invalid policy case: {case}")
+    del collector
     return payload
 
 
@@ -1923,16 +2730,19 @@ class _FakeWorkerServer:
         callback_state_override: str | None = None,
         pending_approval_url_override: str | None = None,
         pending_approval_path: str = "/instruction-hub/enroll",
+        unparsed_record_count: int = 0,
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
         self.policy_requests: list[str] = []
         self.poll_requests: list[dict[str, JsonValue]] = []
         self.session_requests: list[dict[str, JsonValue]] = []
+        self.trace_batches: list[dict[str, JsonValue]] = []
         self._session_condition = threading.Condition()
         _FakeWorkerHandler.check_ins = self.check_ins
         _FakeWorkerHandler.policy_requests = self.policy_requests
         _FakeWorkerHandler.poll_requests = self.poll_requests
         _FakeWorkerHandler.session_requests = self.session_requests
+        _FakeWorkerHandler.trace_batches = self.trace_batches
         _FakeWorkerHandler.policy_response = policy or _signed_policy()
         _FakeWorkerHandler.post_response = post_response
         _FakeWorkerHandler.session_response = session_response
@@ -1941,6 +2751,7 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.callback_state_override = callback_state_override
         _FakeWorkerHandler.pending_approval_url_override = pending_approval_url_override
         _FakeWorkerHandler.pending_approval_path = pending_approval_path
+        _FakeWorkerHandler.unparsed_record_count = unparsed_record_count
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
@@ -1959,6 +2770,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     check_ins: ClassVar[list[dict[str, JsonValue]]] = []
     policy_requests: ClassVar[list[str]] = []
     poll_requests: ClassVar[list[dict[str, JsonValue]]] = []
+    trace_batches: ClassVar[list[dict[str, JsonValue]]] = []
     policy_response: ClassVar[dict[str, JsonValue]]
     post_response: ClassVar[dict[str, JsonValue] | None]
     session_response: ClassVar[dict[str, JsonValue] | None]
@@ -1968,6 +2780,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     callback_state_override: ClassVar[str | None] = None
     pending_approval_url_override: ClassVar[str | None] = None
     pending_approval_path: ClassVar[str] = "/instruction-hub/enroll"
+    unparsed_record_count: ClassVar[int] = 0
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
@@ -2027,6 +2840,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         self._write_json(self.policy_response)
 
     def do_POST(self) -> None:
+        parsed = urlsplit(self.path)
         if self.path == "/v1/instruction-hub/host-enrollments/sessions/11111111-1111-4111-8111-111111111111/poll":
             payload = self._read_json_request("session poll request")
             if payload.get("device_code") != "plihenroll_devicecode":
@@ -2040,6 +2854,50 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
                     "host_credential": "plihost_localcredential",
                     "credential_id": "22222222-2222-4222-8222-222222222222",
                     "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat(),
+                }
+            )
+            return
+        if parsed.path == "/v0/traces/batches":
+            target = parse_qs(parsed.query).get("target")
+            if (
+                target not in (["codex"], ["claude"])
+                or self.headers.get("Authorization") != "Bearer plihost_localcredential"
+            ):
+                self.send_response(401)
+                self.end_headers()
+                return
+            payload = self._read_json_request("trace batch request")
+            self.trace_batches.append(payload)
+            chunks = _json_list(payload["chunks"], "trace batch chunks")
+            acknowledged_ranges: list[dict[str, JsonValue]] = []
+            raw_artifact_count = 0
+            skipped_record_count = 0
+            for chunk_value in chunks:
+                chunk = _json_mapping(chunk_value, "trace batch chunk")
+                if chunk["kind"] == "jsonl_range":
+                    raw_artifact_count += 1
+                elif chunk["kind"] == "oversized_record":
+                    skipped_record_count += 1
+                acknowledged_ranges.append(
+                    {
+                        "kind": chunk["kind"],
+                        "source_path_hash": chunk["source_path_hash"],
+                        "start_offset": chunk["start_offset"],
+                        "end_offset": chunk["end_offset"],
+                        "content_sha256": chunk["content_sha256"],
+                    }
+                )
+            self._write_json(
+                {
+                    "accepted": True,
+                    "batch_id": payload["batch_id"],
+                    "policy_version": payload["policy_version"],
+                    "raw_artifact_count": raw_artifact_count,
+                    "skipped_record_count": skipped_record_count,
+                    "acknowledged_ranges": acknowledged_ranges,
+                    "trace_count": raw_artifact_count,
+                    "event_count": raw_artifact_count,
+                    "unparsed_record_count": self.unparsed_record_count,
                 }
             )
             return
