@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
@@ -1743,6 +1744,72 @@ def test_collect_uploads_subagent_transcript_with_parent_identity(tmp_path: Path
         assert chunk["lifecycle_event"] == "subagent_stop"
         assert chunk["content_encoding"] == "gzip"
         assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == second_record
+    finally:
+        server.stop()
+
+
+def test_collect_scopes_lifecycle_event_to_the_hook_subject_file(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        codex_home = home / ".codex"
+        ledger_path = tmp_path / "ledger.json"
+        subject_path = tmp_path / "codex-session.jsonl"
+        idle_path = codex_home / "sessions/other-session.jsonl"
+        idle_path.parent.mkdir(parents=True)
+        subject_record = b'{"kind":"session_start"}\n'
+        idle_record = b'{"kind":"other_session"}\n'
+        subject_path.write_bytes(subject_record)
+        idle_path.write_bytes(idle_record)
+        stale = time.time() - (13 * 60 * 60)
+        os.utime(idle_path, (stale, stale))
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(codex_home),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(subject_path)},
+        )
+        subject_extra = b'{"kind":"stop"}\n'
+        idle_extra = b'{"kind":"idle_tail"}\n'
+        subject_path.write_bytes(subject_record + subject_extra)
+        idle_path.write_bytes(idle_record + idle_extra)
+        os.utime(idle_path, (stale, stale))
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(subject_path)},
+        )
+
+        uploaded_chunks = [
+            _json_mapping(chunk_value, "chunk")
+            for batch in server.trace_batches
+            for chunk_value in _json_list(batch["chunks"], "chunks")
+        ]
+        assert len(uploaded_chunks) == 2
+        # The hook's stop event describes only its own transcript; the idle-swept
+        # file from another session must not be finalized by it.
+        chunks_by_lifecycle = {chunk.get("lifecycle_event"): chunk for chunk in uploaded_chunks}
+        assert set(chunks_by_lifecycle) == {"stop", None}
+        subject_chunk = chunks_by_lifecycle["stop"]
+        idle_chunk = chunks_by_lifecycle[None]
+        assert gzip.decompress(base64.b64decode(_json_string(subject_chunk["content_base64"], "c"))) == subject_extra
+        assert gzip.decompress(base64.b64decode(_json_string(idle_chunk["content_base64"], "c"))) == idle_extra
+        assert "lifecycle_event" not in idle_chunk
     finally:
         server.stop()
 
