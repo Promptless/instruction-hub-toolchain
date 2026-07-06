@@ -562,27 +562,30 @@ def _run_collect(
             _emit({"status": "trace_upload_skipped", "reason": "ledger_lock_busy", "host": host}, quiet=quiet)
             return 0
         ledger = _load_source_ledger(ledger_path)
-        if ledger.is_new:
-            if not idle_scan_complete:
-                # A deadline-truncated inventory must never baseline: every file the
-                # scan missed would replay from offset zero later as a surprise backfill.
-                source_paths, idle_scan_complete = _collect_source_paths(
-                    host, hook_context, lifecycle_event=lifecycle_event, deadline=float("inf")
-                )
-            _baseline_source_offsets(ledger, source_paths)
-            _write_source_ledger(ledger)
-            _emit(
-                {
-                    "status": "trace_upload_baselined",
-                    "host": host,
-                    "source_count": len(source_paths),
-                    "drift_report_count": len(ledger.drift_reports),
-                },
-                quiet=quiet,
-            )
-            return 0
         if baseline:
+            if ledger.is_new:
+                if not idle_scan_complete:
+                    # A deadline-truncated inventory must never baseline: every file the
+                    # scan missed would replay from offset zero later as a surprise backfill.
+                    source_paths, idle_scan_complete = _collect_source_paths(
+                        host, hook_context, lifecycle_event=lifecycle_event, deadline=float("inf")
+                    )
+                _baseline_source_offsets(ledger, source_paths)
+                _write_source_ledger(ledger)
+                _emit(
+                    {
+                        "status": "trace_upload_baselined",
+                        "host": host,
+                        "source_count": len(source_paths),
+                        "drift_report_count": len(ledger.drift_reports),
+                    },
+                    quiet=quiet,
+                )
+                return 0
             ledger.drift_reports.append({"kind": "native_trace_existing_ledger", "baseline": False})
+        # A new/quarantined ledger seen without --baseline (e.g. a terminal hook after a missed
+        # SessionStart or a corrupt-ledger reset) must not baseline: that would skip the completed
+        # transcript entirely. Fall through so unknown sources upload from offset 0.
 
         deadline_exceeded = not idle_scan_complete
         try:
