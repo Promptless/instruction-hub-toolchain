@@ -115,7 +115,7 @@ def render_managed_runtimes(
         return ()
 
     _copy_runtime_executable(target_root)
-    _write_host_runtime_hook(target_root, target)
+    _write_host_runtime_hooks(target_root, target)
     record = ManagedRuntimeRecord(
         id=HOST_RUNTIME_ID,
         status="included",
@@ -142,18 +142,19 @@ def _copy_runtime_executable(target_root: Path) -> None:
     destination.chmod(0o755)
 
 
-def _write_host_runtime_hook(target_root: Path, target: Harness) -> None:
+def _write_host_runtime_hooks(target_root: Path, target: Harness) -> None:
     hook_path = target_root / "hooks/hooks.json"
     hook_config = _existing_hook_config(hook_path)
     hooks = hook_config.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         msg = f"{hook_path} field hooks must be a JSON object"
         raise InstructionHubError(msg)
-    session_start = hooks.setdefault("SessionStart", [])
-    if not isinstance(session_start, list):
-        msg = f"{hook_path} field hooks.SessionStart must be a JSON array"
-        raise InstructionHubError(msg)
-    session_start.append(_host_enrollment_hook_entry(target))
+    for event_name in _host_runtime_hook_events(target):
+        event_hooks = hooks.setdefault(event_name, [])
+        if not isinstance(event_hooks, list):
+            msg = f"{hook_path} field hooks.{event_name} must be a JSON array"
+            raise InstructionHubError(msg)
+        event_hooks.append(_host_runtime_hook_entry(target, event_name))
     write_json(hook_path, hook_config)
 
 
@@ -170,37 +171,79 @@ def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
         raise InstructionHubError(msg) from exc
 
 
-def _host_enrollment_hook_entry(target: Harness) -> dict[str, JsonValue]:
+def _host_runtime_hook_events(target: Harness) -> tuple[str, ...]:
     if target == "claude":
-        hook_command = _claude_host_runtime_hook_command()
-    else:
-        root_expr = "${PLUGIN_ROOT:-}"
-        host = "codex"
-        hook_command = {
-            "command": _posix_host_runtime_hook_command(root_expr=root_expr, host=host),
-        }
+        return ("SessionStart", "Stop", "SessionEnd", "SubagentStop")
+    return ("SessionStart", "Stop", "SubagentStop")
 
+
+def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, JsonValue]:
+    lifecycle = _host_runtime_lifecycle_arg(event_name)
+    if event_name == "SessionStart":
+        hook_command = _host_runtime_start_hook_command(target, lifecycle=lifecycle)
+    else:
+        hook_command = {
+            "command": f"{_host_runtime_command_prefix(target)} collect --host {target} --lifecycle {lifecycle} --quiet",
+        }
     # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
-    # the user to trust/review plugin hooks before running this startup command.
+    # the user to trust/review plugin hooks before running these commands.
     # https://developers.openai.com/codex/plugins/build
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
     # Promptless-built static native binary so customer machines do not need Python or uv.
-    # The hook deliberately omits --quiet so the runtime can surface its status. Both Claude and
-    # Codex render a SessionStart `systemMessage`: the runtime emits one when the Instruction Hub
-    # plugin version changes and for actionable enrollment outcomes (config written, pending
-    # approval, blocked). The binary still accepts --quiet for manual runs.
-    return {
-        "matcher": "startup|resume",
+    # SessionStart performs user-visible enrollment, writes config/check-in status, and then runs
+    # a quiet forward-only JSONL baseline. Terminal lifecycle hooks only upload native JSONL
+    # ranges; failures are non-blocking and stay out of the agent transcript.
+    hook_entry: dict[str, JsonValue] = {
         "hooks": [
             {
                 "type": "command",
                 "timeout": HOST_RUNTIME_HOOK_TIMEOUT_SECONDS,
-                "statusMessage": "Checking Promptless host runtime",
+                "statusMessage": (
+                    "Checking Promptless host runtime"
+                    if event_name == "SessionStart"
+                    else "Uploading Promptless traces"
+                ),
                 **hook_command,
             }
         ],
     }
+    if event_name == "SessionStart":
+        hook_entry["matcher"] = "startup|resume"
+    return hook_entry
+
+
+def _host_runtime_start_hook_command(target: Harness, *, lifecycle: str) -> dict[str, JsonValue]:
+    if target == "claude":
+        return _claude_host_runtime_hook_command(lifecycle=lifecycle)
+    return {
+        "command": _posix_host_runtime_hook_command(
+            root_expr="${PLUGIN_ROOT:-}",
+            host="codex",
+            lifecycle=lifecycle,
+        ),
+    }
+
+
+def _host_runtime_command_prefix(target: Harness) -> str:
+    if target == "claude":
+        return f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_EXECUTABLE}"'
+    return f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_EXECUTABLE}"'
+
+
+def _host_runtime_lifecycle_arg(event_name: str) -> str:
+    match event_name:
+        case "SessionStart":
+            return "session_start"
+        case "Stop":
+            return "stop"
+        case "SessionEnd":
+            return "session_end"
+        case "SubagentStop":
+            return "subagent_stop"
+        case _:
+            msg = f"unsupported host runtime hook event: {event_name}"
+            raise InstructionHubError(msg)
 
 
 def _system_message_json(message: str) -> str:
@@ -211,18 +254,22 @@ def _hook_json_system_message(message: str) -> str:
     return _system_message_json(message).replace('"', '\\"')
 
 
-def _claude_host_runtime_hook_command() -> dict[str, JsonValue]:
+def _claude_host_runtime_hook_command(*, lifecycle: str) -> dict[str, JsonValue]:
     return {
         "command": "node",
         "args": [
             "-e",
-            _node_host_runtime_hook_script(root_envs=("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT"), host="claude"),
+            _node_host_runtime_hook_script(
+                root_envs=("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT"),
+                host="claude",
+                lifecycle=lifecycle,
+            ),
             "${CLAUDE_PLUGIN_ROOT}",
         ],
     }
 
 
-def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness) -> str:
+def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness, lifecycle: str) -> str:
     root_env_names = json.dumps(list(root_envs), separators=(",", ":"))
     missing_root = _system_message_json(MISSING_RUNTIME_ROOT_MESSAGE)
     missing_file = _system_message_json(MISSING_RUNTIME_FILE_MESSAGE)
@@ -244,11 +291,12 @@ def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness)
         f"if (!runtimeStat.isFile()) {{ console.log({missing_file!r}); process.exit(0); }}\n"
         f"try {{ fs.accessSync(runtime, fs.constants.R_OK); }} catch (error) {{ console.log({unreadable_file!r}); process.exit(0); }}\n"
         f"const pythonProbe = {PYTHON_VERSION_PROBE!r};\n"
-        f"const runtimeArgs = [runtime, 'ensure', '--host', {host!r}];\n"
+        f"const ensureArgs = [runtime, 'ensure', '--host', {host!r}];\n"
+        f"const collectArgs = [runtime, 'collect', '--host', {host!r}, '--lifecycle', {lifecycle!r}, '--baseline', '--quiet'];\n"
         "const candidates = [\n"
-        "  { command: 'python3', probeArgs: ['-c', pythonProbe], runArgs: runtimeArgs },\n"
-        "  { command: 'python', probeArgs: ['-c', pythonProbe], runArgs: runtimeArgs },\n"
-        "  { command: 'py', probeArgs: ['-3', '-c', pythonProbe], runArgs: ['-3', ...runtimeArgs] },\n"
+        "  { command: 'python3', probeArgs: ['-c', pythonProbe], runPrefix: [] },\n"
+        "  { command: 'python', probeArgs: ['-c', pythonProbe], runPrefix: [] },\n"
+        "  { command: 'py', probeArgs: ['-3', '-c', pythonProbe], runPrefix: ['-3'] },\n"
         "];\n"
         "let sawUnsupportedPython = false;\n"
         "let sawBrokenPython = false;\n"
@@ -263,12 +311,15 @@ def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness)
         "    else sawBrokenPython = true;\n"
         "    continue;\n"
         "  }\n"
-        "  const result = spawnSync(candidate.command, candidate.runArgs, { stdio: 'inherit', env: process.env });\n"
-        "  if (result.error) {\n"
+        "  const ensure = spawnSync(candidate.command, [...candidate.runPrefix, ...ensureArgs], { stdio: 'inherit', env: process.env });\n"
+        "  if (ensure.error) {\n"
         "    sawBrokenPython = true;\n"
         "    continue;\n"
         "  }\n"
-        "  process.exit(result.status === null ? 1 : result.status);\n"
+        "  if (ensure.status !== 0) process.exit(ensure.status === null ? 1 : ensure.status);\n"
+        "  const collect = spawnSync(candidate.command, [...candidate.runPrefix, ...collectArgs], { stdio: 'inherit', env: process.env });\n"
+        "  if (collect.error) process.exit(1);\n"
+        "  process.exit(collect.status === null ? 1 : collect.status);\n"
         "}\n"
         f"if (sawUnsupportedPython) console.log({unsupported_python!r});\n"
         f"else if (sawBrokenPython) console.log({broken_python!r});\n"
@@ -277,7 +328,7 @@ def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness)
     )
 
 
-def _posix_host_runtime_hook_command(*, root_expr: str, host: Harness) -> str:
+def _posix_host_runtime_hook_command(*, root_expr: str, host: Harness, lifecycle: str) -> str:
     script = (
         f"root={root_expr}; "
         f'if [ -z "$root" ]; then {_posix_emit_system_message(MISSING_RUNTIME_ROOT_MESSAGE)}; exit 0; fi; '
@@ -302,8 +353,11 @@ def _posix_host_runtime_hook_command(*, root_expr: str, host: Harness) -> str:
         f'elif [ "$broken_python" -eq 1 ]; then {_posix_emit_system_message(BROKEN_PYTHON_MESSAGE)}; '
         f"else {_posix_emit_system_message(MISSING_PYTHON_MESSAGE)}; fi; "
         "exit 0; fi; "
-        f'if [ -n "$python_arg" ]; then exec "$python_cmd" "$python_arg" "$runtime" ensure --host {host}; fi; '
-        f'exec "$python_cmd" "$runtime" ensure --host {host}'
+        f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" ensure --host {host}; '
+        f'else "$python_cmd" "$runtime" ensure --host {host}; fi; '
+        'status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; '
+        f'if [ -n "$python_arg" ]; then exec "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle} --baseline --quiet; fi; '
+        f'exec "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle} --baseline --quiet'
     )
     return f"sh -c {shlex.quote(script)}"
 
