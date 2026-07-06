@@ -26,6 +26,7 @@ from promptless_instruction_hub.fs import JsonValue, validate_json_value
 HOST_RUNTIME_BIN = "promptless-host-runtime"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
 LAST_STATUS_REL_PATH = Path(".promptless/instruction-hub/last-bootstrap-status.json")
+DIAGNOSTIC_LOG_REL_PATH = Path(".promptless/instruction-hub/host-runtime-diagnostics.jsonl")
 BROWSER_ENROLLMENT_MESSAGE = (
     "Promptless Instruction Governance telemetry is starting browser-based enrollment. "
     "Approve the Promptless browser tab to continue."
@@ -40,6 +41,11 @@ def _host_state_path(home: Path) -> Path:
 def _last_status_path(home: Path) -> Path:
     """Return the last host-global bootstrap status file for debugging failed hook runs."""
     return home / LAST_STATUS_REL_PATH
+
+
+def _diagnostic_log_path(home: Path) -> Path:
+    """Return the redacted host-global hook diagnostic log."""
+    return home / DIAGNOSTIC_LOG_REL_PATH
 
 
 def _assert_no_promptless_directory(root: Path) -> None:
@@ -1631,7 +1637,7 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
             plugin_root,
             ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
             env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+            {"sessionId": "codex_session_1", "transcriptPath": str(transcript_path)},
         )
         assert server.trace_batches == []
 
@@ -1646,7 +1652,12 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
             plugin_root,
             ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
             env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+            {
+                "sessionId": "",
+                "session": {"id": "codex_session_1"},
+                "transcriptPath": "",
+                "transcript": {"path": str(transcript_path)},
+            },
         )
 
         assert len(server.trace_batches) == 1
@@ -1779,10 +1790,10 @@ def test_collect_uploads_subagent_transcript_with_parent_identity(tmp_path: Path
             ["collect", "--host", "codex", "--lifecycle", "subagent_stop", "--quiet"],
             env,
             {
-                "session_id": "parent_session_1",
-                "agent_id": "agent_1",
-                "agent_type": "worker",
-                "agent_transcript_path": str(agent_transcript_path),
+                "parent_session_id": "",
+                "parentSessionId": "parent_session_1",
+                "agentTranscriptPath": "",
+                "agent": {"id": "agent_1", "type": "worker", "transcriptPath": str(agent_transcript_path)},
             },
         )
 
@@ -1972,6 +1983,217 @@ def test_collect_tolerates_unparsed_record_counts_and_advances_ledger(tmp_path: 
         server.stop()
 
 
+def test_collect_skips_when_ledger_lock_is_busy_and_logs_diagnostic(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("fcntl lock contention test is POSIX-only")
+    import fcntl
+
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        second_record = b'{"kind":"stop","message":"upload"}\n'
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        transcript_path.write_bytes(first_record + second_record)
+
+        lock_path = ledger_path.with_name(f"{ledger_path.name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            _run_collect(
+                plugin_root,
+                ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+                env,
+                {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+            )
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+        assert server.trace_batches == []
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_skipped"
+        assert diagnostics[-1]["reason"] == "ledger_lock_busy"
+        diagnostic_log = _diagnostic_log_path(home)
+        assert diagnostic_log.stat().st_mode & 0o777 == 0o600
+        assert "plihost_localcredential" not in diagnostic_log.read_text()
+    finally:
+        server.stop()
+
+
+def test_zero_deadline_collect_baselines_fully_and_uploads_hook_subject(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        codex_home = home / ".codex"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        transcript_path.write_bytes(first_record)
+        idle_path = codex_home / "sessions/idle-history.jsonl"
+        idle_path.parent.mkdir(parents=True)
+        idle_path.write_bytes(b'{"kind":"idle_history"}\n')
+        stale = time.time() - (13 * 60 * 60)
+        os.utime(idle_path, (stale, stale))
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(codex_home),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+            "PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS": "0",
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # A zero deadline truncates the idle scan, but the first-run baseline must
+        # still inventory the full tree: a partial baseline would replay every
+        # missed file from offset zero later as a surprise backfill.
+        assert server.trace_batches == []
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert len(sources) == 2
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_baselined"
+        assert diagnostics[-1]["source_count"] == 2
+
+        second_record = b'{"kind":"stop","message":"upload"}\n'
+        transcript_path.write_bytes(first_record + second_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # The hook's own transcript still uploads with no budget at all: subject
+        # paths are unmetered and the first pending batch is always sent.
+        assert len(server.trace_batches) == 1
+        chunk = _json_mapping(_json_list(server.trace_batches[0]["chunks"], "batch.chunks")[0], "batch.chunks[0]")
+        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == second_record
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_partial"
+        assert diagnostics[-1]["reason"] == "collection_deadline_exceeded"
+        assert diagnostics[-1]["batch_count"] == 1
+    finally:
+        server.stop()
+
+
+def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+        zero_deadline_env = dict(env, PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS="0")
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # Multi-batch pending content: ~13 MiB so batch one fills at the 10 MiB cap.
+        filler_record = b'{"kind":"note","payload":"' + b"x" * 65_000 + b'"}\n'
+        appended_body = filler_record * 200
+        transcript_path.write_bytes(first_record + appended_body)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            zero_deadline_env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # The guaranteed first batch lands and is acked; the deadline stops the rest.
+        assert len(server.trace_batches) == 1
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_partial"
+        assert diagnostics[-1]["reason"] == "collection_deadline_exceeded"
+        assert diagnostics[-1]["batch_count"] == 1
+        truncated_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        truncated_source = _json_mapping(
+            next(iter(_json_mapping(truncated_ledger["sources"], "ledger.sources").values())), "ledger.sources[0]"
+        )
+        acked_offset = _json_int(truncated_source["end_offset"], "ledger.sources[0].end_offset")
+        assert len(first_record) < acked_offset < transcript_path.stat().st_size
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # The next collect resumes from the acked watermark and drains the rest.
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_complete"
+        drained_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        drained_source = _json_mapping(
+            next(iter(_json_mapping(drained_ledger["sources"], "ledger.sources").values())), "ledger.sources[0]"
+        )
+        assert drained_source["end_offset"] == transcript_path.stat().st_size
+        uploaded_chunks = [
+            _json_mapping(chunk, "chunk")
+            for batch in server.trace_batches
+            for chunk in _json_list(_json_mapping(batch, "batch")["chunks"], "batch.chunks")
+        ]
+        uploaded_chunks.sort(key=lambda chunk: _json_int(chunk["start_offset"], "chunk.start_offset"))
+        reassembled = b"".join(
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content")))
+            for chunk in uploaded_chunks
+        )
+        assert reassembled == appended_body
+    finally:
+        server.stop()
+
+
 # Codex validates SessionStart hook *stdout* against a strict schema (serde deny_unknown_fields) and
 # rejects any key outside continue/stopReason/systemMessage/suppressOutput/hookSpecificOutput with
 # "hook returned invalid session start JSON output". The bootstrap therefore keeps Codex stdout to
@@ -1987,6 +2209,14 @@ def _bootstrap_diagnostics(stderr: str) -> list[dict[str, JsonValue]]:
     return [
         _json_mapping(validate_json_value(json.loads(line), "bootstrap diagnostic"), "bootstrap diagnostic")
         for line in stderr.splitlines()
+        if line.strip()
+    ]
+
+
+def _diagnostic_log_entries(home: Path) -> list[dict[str, JsonValue]]:
+    return [
+        _json_mapping(validate_json_value(json.loads(line), "runtime diagnostic log entry"), "runtime diagnostic log")
+        for line in _diagnostic_log_path(home).read_text().splitlines()
         if line.strip()
     ]
 
@@ -2205,6 +2435,11 @@ def _json_list(value: JsonValue, field_path: str) -> list[JsonValue]:
 
 def _json_string(value: JsonValue, field_path: str) -> str:
     assert isinstance(value, str), f"{field_path} must be a JSON string"
+    return value
+
+
+def _json_int(value: JsonValue, field_path: str) -> int:
+    assert isinstance(value, int) and not isinstance(value, bool), f"{field_path} must be a JSON integer"
     return value
 
 
