@@ -42,7 +42,7 @@ if os.name == "nt":
 else:
     import fcntl
 
-RUNTIME_VERSION = "0.2.2"
+RUNTIME_VERSION = "0.2.3"
 RUNTIME_CHANNEL = "stable"
 RUNTIME_EXECUTABLE = "promptless-host-runtime"
 MANAGED_RUNTIME_ID = "host-runtime"
@@ -212,7 +212,7 @@ class HostCredential:
     value: str
     credential_id: str | None
     deployment_instance_id: str | None
-    internal_promptless_user: bool = False
+    is_internal_promptless_user: bool = False
 
 
 @dataclass(frozen=True)
@@ -1700,7 +1700,7 @@ def _first_enrollment_success_message(host: Host, *, status: ConfigStatus) -> st
 
 
 def _has_internal_promptless_identity(credential: HostCredential | None) -> bool:
-    if credential is not None and credential.internal_promptless_user:
+    if credential is not None and credential.is_internal_promptless_user:
         return True
     return _has_stored_internal_promptless_identity()
 
@@ -1936,7 +1936,7 @@ def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None
             value=credential_value,
             credential_id=credential_id,
             deployment_instance_id=deployment_instance_id,
-            internal_promptless_user=_stored_credential_has_internal_promptless_identity(cached_credential),
+            is_internal_promptless_user=_stored_credential_has_internal_promptless_identity(cached_credential),
         )
         if credential_value
         else None
@@ -1945,18 +1945,18 @@ def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None
 
 
 def _credential_with_policy_identity(credential: HostCredential, payload: dict[str, JsonValue]) -> HostCredential:
-    if credential.internal_promptless_user or not _policy_response_has_internal_promptless_identity(payload):
+    if credential.is_internal_promptless_user or not _policy_response_has_internal_promptless_identity(payload):
         return credential
     return HostCredential(
         value=credential.value,
         credential_id=credential.credential_id,
         deployment_instance_id=credential.deployment_instance_id,
-        internal_promptless_user=True,
+        is_internal_promptless_user=True,
     )
 
 
 def _store_internal_promptless_identity(context: EnrollmentContext, credential: HostCredential) -> None:
-    if not credential.internal_promptless_user:
+    if not credential.is_internal_promptless_user:
         return
     try:
         state_path = _state_path()
@@ -1965,9 +1965,9 @@ def _store_internal_promptless_identity(context: EnrollmentContext, credential: 
             credentials = _json_mapping_or_empty(state.get("credentials"))
             key = _credential_cache_key(context)
             cached_credential = _json_mapping_or_empty(credentials.get(key))
-            if not cached_credential or cached_credential.get("internal_promptless_user") is True:
+            if not cached_credential or cached_credential.get("is_internal_promptless_user") is True:
                 return
-            cached_credential["internal_promptless_user"] = True
+            cached_credential["is_internal_promptless_user"] = True
             credentials[key] = cached_credential
             state["credentials"] = credentials
             _write_state(state_path, state)
@@ -2285,7 +2285,7 @@ def _poll_enrollment_session(context: EnrollmentContext, session: EnrollmentSess
                     value=host_credential,
                     credential_id=_string_value(response.get("credential_id")),
                     deployment_instance_id=session.deployment_instance_id,
-                    internal_promptless_user=_worker_response_has_internal_promptless_identity(response),
+                    is_internal_promptless_user=_worker_response_has_internal_promptless_identity(response),
                 )
             )
         if status in {"expired", "consumed"}:
@@ -2315,8 +2315,8 @@ def _store_host_credential(
             "target": context.metadata.target,
             "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
-        if credential.internal_promptless_user:
-            credentials[_credential_cache_key(context)]["internal_promptless_user"] = True
+        if credential.is_internal_promptless_user:
+            credentials[_credential_cache_key(context)]["is_internal_promptless_user"] = True
         state["credentials"] = credentials
         pending_enrollments = _json_mapping_or_empty(state.get("pending_enrollments"))
         pending_enrollments.pop(_credential_cache_key(context), None)
@@ -2918,11 +2918,11 @@ def _identity_email(payload: dict[str, JsonValue]) -> str | None:
 
 
 def _stored_credential_has_internal_promptless_identity(payload: dict[str, JsonValue]) -> bool:
-    return payload.get("internal_promptless_user") is True
+    return payload.get("is_internal_promptless_user") is True
 
 
 def _worker_response_has_internal_promptless_identity(payload: dict[str, JsonValue]) -> bool:
-    return payload.get("internal_promptless_user") is True or _is_internal_promptless_email(_identity_email(payload))
+    return payload.get("is_internal_promptless_user") is True or _is_internal_promptless_email(_identity_email(payload))
 
 
 def _policy_response_has_internal_promptless_identity(payload: dict[str, JsonValue]) -> bool:

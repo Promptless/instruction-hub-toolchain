@@ -493,7 +493,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert runtime["id"] == "host-runtime"
         assert runtime["status"] == "included"
         assert runtime["target"] == target
-        assert runtime["version"] == "0.2.2"
+        assert runtime["version"] == "0.2.3"
         assert runtime["channel"] == "stable"
         assert runtime["path"] == f"bin/{HOST_RUNTIME_BIN}"
         assert len(runtime["sha256"]) == 64
@@ -536,7 +536,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     )
     assert payload["id"] == "host-runtime"
     assert payload["name"] == HOST_RUNTIME_BIN
-    assert payload["version"] == "0.2.2"
+    assert payload["version"] == "0.2.3"
     assert payload["channel"] == "stable"
     assert len(_json_string(payload["sha256"], "sha256")) == 64
 
@@ -548,7 +548,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert text_version.returncode == 0
-    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.2\n"
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.3\n"
     assert text_version.stderr == ""
 
 
@@ -736,7 +736,7 @@ def test_bootstrap_runs_without_local_dogfood_gate(tmp_path: Path) -> None:
     ["envelope", "policy"],
     ids=["identity-envelope", "identity-policy"],
 )
-def test_bootstrap_welcomes_internal_promptless_user_once_per_plugin_version(
+def test_bootstrap_welcomes_is_internal_promptless_user_once_per_plugin_version(
     tmp_path: Path,
     identity_location: str,
 ) -> None:
@@ -786,7 +786,7 @@ def test_bootstrap_welcomes_internal_promptless_user_once_per_plugin_version(
         credentials = _json_mapping(state["credentials"], "credentials")
         assert len(credentials) == 1
         credential = _json_mapping(next(iter(credentials.values())), "credential")
-        assert credential["internal_promptless_user"] is True
+        assert credential["is_internal_promptless_user"] is True
         assert "user_email" not in credential
         assert "email" not in credential
 
@@ -891,7 +891,7 @@ def test_bootstrap_ignores_non_internal_worker_identity(
         assert list(_json_mapping(state[FIRST_SUCCESS_SHOWN_KEY], "first-success shown")) == ["codex"]
         credentials = _json_mapping(state["credentials"], "credentials")
         credential = _json_mapping(next(iter(credentials.values())), "credential")
-        assert "internal_promptless_user" not in credential
+        assert "is_internal_promptless_user" not in credential
     finally:
         server.stop()
 
@@ -919,7 +919,7 @@ def test_cached_credential_trusts_only_persisted_internal_flag(tmp_path: Path) -
         credential_key = _credential_cache_key(worker_base_url=server.base_url, target="codex")
         credential = _json_mapping(credentials[credential_key], "credential")
         credential["user_email"] = "adit@gopromptless.ai"
-        credential.pop("internal_promptless_user", None)
+        credential.pop("is_internal_promptless_user", None)
         state_path.write_text(json.dumps(state))
 
         payload, _ = _run_bootstrap(plugin_root, "codex", env)
@@ -937,12 +937,12 @@ def test_cached_credential_trusts_only_persisted_internal_flag(tmp_path: Path) -
         assert INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY not in updated_state
         updated_credentials = _json_mapping(updated_state["credentials"], "updated credentials")
         updated_credential = _json_mapping(updated_credentials[credential_key], "updated credential")
-        assert "internal_promptless_user" not in updated_credential
+        assert "is_internal_promptless_user" not in updated_credential
     finally:
         server.stop()
 
 
-def test_bootstrap_welcomes_internal_promptless_user_from_poll_response(tmp_path: Path) -> None:
+def test_bootstrap_welcomes_is_internal_promptless_user_from_poll_response(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
@@ -971,7 +971,7 @@ def test_bootstrap_welcomes_internal_promptless_user_from_poll_response(tmp_path
         assert state[INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY] == {"0.1.0": shown_at}
         credentials = _json_mapping(state["credentials"], "credentials")
         credential = _json_mapping(next(iter(credentials.values())), "credential")
-        assert credential["internal_promptless_user"] is True
+        assert credential["is_internal_promptless_user"] is True
     finally:
         server.stop()
 
@@ -1390,7 +1390,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
         assert server.session_requests[0]["package_id"] == "core"
-        assert server.session_requests[0]["bootstrap_version"] == "0.2.2"
+        assert server.session_requests[0]["bootstrap_version"] == "0.2.3"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
         assert server.session_requests[0]["pending_callback"] == "1"
         assert server.session_requests[1]["target"] == "claude"
@@ -1412,7 +1412,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "policy_version",
                 "status",
             }
-            assert check_in["bootstrap_version"] == "0.2.2"
+            assert check_in["bootstrap_version"] == "0.2.3"
             assert check_in["plugin_version"] == "0.1.0"
             assert check_in["status"] == "configured"
             assert check_in["needs_restart"] is False
@@ -2302,7 +2302,7 @@ def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> N
             credentials[_credential_cache_key(worker_base_url=server.base_url, target="codex")],
             "credential",
         )
-        assert "internal_promptless_user" not in credential
+        assert "is_internal_promptless_user" not in credential
         assert server.check_ins == []
     finally:
         server.stop()
@@ -2492,7 +2492,7 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
         assert batch["host"] == "codex"
         assert batch["session_id"] == "codex_session_1"
         assert batch["policy_version"] == 1
-        assert batch["collector_version"] == "0.2.2"
+        assert batch["collector_version"] == "0.2.3"
         chunks = _json_list(batch["chunks"], "batch.chunks")
         # contiguous complete lines coalesce into one contract-shaped range chunk
         assert len(chunks) == 1
