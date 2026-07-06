@@ -788,11 +788,12 @@ def _iter_upload_batches(
     ledger: SourceLedger,
     source_paths: tuple[Path, ...],
 ) -> Iterator[UploadBatch]:
+    lifecycle_paths = _lifecycle_subject_paths(hook_context, lifecycle_event)
     pending_events: list[SourceEvent] = []
     pending_payloads: list[dict[str, JsonValue]] = []
     pending_decoded_bytes = 0
     for event in _iter_source_events(ledger, source_paths):
-        payload = _chunk_payload(event, lifecycle_event)
+        payload = _chunk_payload(event, lifecycle_event if event.path in lifecycle_paths else None)
         next_decoded_bytes = pending_decoded_bytes + event.byte_count
         if (
             pending_payloads
@@ -905,7 +906,28 @@ def _oversized_event(path: Path, path_hash: str, start_offset: int, end_offset: 
     )
 
 
-def _chunk_payload(event: SourceEvent, lifecycle_event: LifecycleEvent) -> dict[str, JsonValue]:
+def _lifecycle_subject_paths(hook_context: HookTraceContext, lifecycle_event: LifecycleEvent) -> frozenset[Path]:
+    """Return the files the hook's lifecycle event actually describes.
+
+    Idle-file sweeps piggyback on whatever hook fired; stamping the hook's
+    lifecycle event onto chunks from other sessions' files would finalize those
+    sessions spuriously on the worker.
+    """
+
+    if lifecycle_event == "subagent_stop":
+        subject = hook_context.agent_transcript_path or hook_context.transcript_path
+    else:
+        subject = hook_context.transcript_path
+    if subject is None:
+        return frozenset()
+    try:
+        resolved = subject.expanduser().resolve(strict=False)
+    except OSError:
+        resolved = subject.expanduser().absolute()
+    return frozenset((resolved,))
+
+
+def _chunk_payload(event: SourceEvent, lifecycle_event: LifecycleEvent | None) -> dict[str, JsonValue]:
     if event.content_sha256 is None:
         raise BootstrapError("source event missing content hash")
     payload: dict[str, JsonValue] = {
@@ -914,8 +936,9 @@ def _chunk_payload(event: SourceEvent, lifecycle_event: LifecycleEvent) -> dict[
         "start_offset": event.start_offset,
         "end_offset": event.end_offset,
         "content_sha256": event.content_sha256,
-        "lifecycle_event": lifecycle_event,
     }
+    if lifecycle_event is not None:
+        payload["lifecycle_event"] = lifecycle_event
     if event.kind == "oversized_record":
         if event.oversized_reason is None:
             raise BootstrapError("oversized record event missing reason")
