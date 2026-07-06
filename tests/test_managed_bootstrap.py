@@ -34,6 +34,8 @@ HOST_RUNTIME_BIN = "promptless-host-runtime"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
 LAST_STATUS_REL_PATH = Path(".promptless/instruction-hub/last-bootstrap-status.json")
 DIAGNOSTIC_LOG_REL_PATH = Path(".promptless/instruction-hub/host-runtime-diagnostics.jsonl")
+INTERNAL_WELCOME_SHOWN_AT_KEY = "internal_promptless_welcome_shown_at"
+INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY = "internal_promptless_welcome_shown_at_by_version"
 BROWSER_ENROLLMENT_MESSAGE = (
     "Promptless Instruction Governance telemetry is starting browser-based enrollment. "
     "Approve the Promptless browser tab to continue."
@@ -567,10 +569,13 @@ def test_bootstrap_runs_without_local_dogfood_gate(tmp_path: Path) -> None:
     ["envelope", "policy"],
     ids=["identity-envelope", "identity-policy"],
 )
-def test_bootstrap_welcomes_internal_promptless_user_once(tmp_path: Path, identity_location: str) -> None:
+def test_bootstrap_welcomes_internal_promptless_user_once_per_plugin_version(
+    tmp_path: Path,
+    identity_location: str,
+) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
-    build_hub(hub_root)
+    build_hub(hub_root, plugin_version="0.1.0")
     internal_policy = _policy_with()
     if identity_location == "envelope":
         internal_policy["user_email"] = "Adit@GoPromptless.AI"
@@ -591,6 +596,7 @@ def test_bootstrap_welcomes_internal_promptless_user_once(tmp_path: Path, identi
         first_payload, first_result = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
         first_message = _json_string(first_payload["systemMessage"], "systemMessage")
         assert "welcome promptless pigfooder." in first_message
+        assert "Promptless marketplace version installed: v0.1.0." in first_message
         assert ",-,------," in first_message
         first_stdout = _json_mapping(
             validate_json_value(json.loads(first_result.stdout), "bootstrap stdout"),
@@ -602,8 +608,13 @@ def test_bootstrap_welcomes_internal_promptless_user_once(tmp_path: Path, identi
             validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
             "host state",
         )
-        shown_at = _json_string(state["internal_promptless_welcome_shown_at"], "welcome shown at")
+        shown_at = _json_string(state[INTERNAL_WELCOME_SHOWN_AT_KEY], "welcome shown at")
         assert shown_at != ""
+        shown_by_version = _json_mapping(
+            state[INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY],
+            "welcome shown by version",
+        )
+        assert shown_by_version == {"0.1.0": shown_at}
         credentials = _json_mapping(state["credentials"], "credentials")
         assert len(credentials) == 1
         credential = _json_mapping(next(iter(credentials.values())), "credential")
@@ -620,7 +631,44 @@ def test_bootstrap_welcomes_internal_promptless_user_once(tmp_path: Path, identi
             validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
             "host state",
         )
-        assert second_state["internal_promptless_welcome_shown_at"] == shown_at
+        assert second_state[INTERNAL_WELCOME_SHOWN_AT_KEY] == shown_at
+        assert second_state[INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY] == {"0.1.0": shown_at}
+
+        build_hub(hub_root, plugin_version="0.2.0")
+        upgraded_payload, upgraded_result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            env,
+            expected_status="configured",
+        )
+        upgraded_message = _json_string(upgraded_payload["systemMessage"], "systemMessage")
+        assert "Promptless Instruction Hub updated to v0.2.0 (was v0.1.0)." in upgraded_message
+        assert "welcome promptless pigfooder." in upgraded_message
+        assert "Promptless marketplace version installed: v0.2.0." in upgraded_message
+        upgraded_stdout = _json_mapping(
+            validate_json_value(json.loads(upgraded_result.stdout), "upgraded stdout"),
+            "upgraded stdout",
+        )
+        assert upgraded_stdout == {"systemMessage": upgraded_message}
+        upgraded_state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "upgraded host state"),
+            "upgraded host state",
+        )
+        upgraded_shown_at = _json_string(upgraded_state[INTERNAL_WELCOME_SHOWN_AT_KEY], "upgraded welcome shown at")
+        upgraded_shown_by_version = _json_mapping(
+            upgraded_state[INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY],
+            "upgraded welcome shown by version",
+        )
+        assert upgraded_shown_by_version == {"0.1.0": shown_at, "0.2.0": upgraded_shown_at}
+
+        steady_payload, steady_result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            env,
+            expected_status="configured",
+        )
+        assert "systemMessage" not in steady_payload
+        assert steady_result.stdout == ""
     finally:
         server.stop()
 
@@ -666,7 +714,8 @@ def test_bootstrap_ignores_non_internal_worker_identity(
             validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
             "host state",
         )
-        assert "internal_promptless_welcome_shown_at" not in state
+        assert INTERNAL_WELCOME_SHOWN_AT_KEY not in state
+        assert INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY not in state
         credentials = _json_mapping(state["credentials"], "credentials")
         credential = _json_mapping(next(iter(credentials.values())), "credential")
         assert "internal_promptless_user" not in credential
@@ -707,7 +756,8 @@ def test_cached_credential_trusts_only_persisted_internal_flag(tmp_path: Path) -
             validate_json_value(json.loads(state_path.read_text()), "updated host state"),
             "updated host state",
         )
-        assert "internal_promptless_welcome_shown_at" not in updated_state
+        assert INTERNAL_WELCOME_SHOWN_AT_KEY not in updated_state
+        assert INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY not in updated_state
         updated_credentials = _json_mapping(updated_state["credentials"], "updated credentials")
         updated_credential = _json_mapping(updated_credentials[credential_key], "updated credential")
         assert "internal_promptless_user" not in updated_credential
@@ -733,11 +783,14 @@ def test_bootstrap_welcomes_internal_promptless_user_from_poll_response(tmp_path
         payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
         message = _json_string(payload["systemMessage"], "systemMessage")
         assert "welcome promptless pigfooder." in message
+        assert "Promptless marketplace version installed: v0.1.0." in message
 
         state = _json_mapping(
             validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
             "host state",
         )
+        shown_at = _json_string(state[INTERNAL_WELCOME_SHOWN_AT_KEY], "welcome shown at")
+        assert state[INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY] == {"0.1.0": shown_at}
         credentials = _json_mapping(state["credentials"], "credentials")
         credential = _json_mapping(next(iter(credentials.values())), "credential")
         assert credential["internal_promptless_user"] is True
@@ -1931,7 +1984,8 @@ def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> N
             validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
             "host state",
         )
-        assert "internal_promptless_welcome_shown_at" not in state
+        assert INTERNAL_WELCOME_SHOWN_AT_KEY not in state
+        assert INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY not in state
         credentials = _json_mapping(state["credentials"], "credentials")
         credential = _json_mapping(
             credentials[_credential_cache_key(worker_base_url=server.base_url, target="codex")],

@@ -172,7 +172,7 @@ posts a check-in. `collect` is the non-blocking native JSONL upload path. `enrol
 acquires only the host credential. `status` prints local JSON without network,
 browser, config writes, or check-ins. `reset --yes` clears cached host
 credentials and pending enrollments while preserving the stable host id and
-last-seen plugin versions, and one-time internal welcome marker. `version`
+last-seen plugin versions, and per-version internal welcome markers. `version`
 reports runtime metadata.
 
 Before the customer-grade release, replace the dogfood Python implementation

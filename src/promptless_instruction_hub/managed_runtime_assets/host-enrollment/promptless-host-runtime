@@ -94,18 +94,19 @@ COLLECT_DEADLINE_ENV = "PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS"
 CALLBACK_STATE_PARAM = "state"
 INTERNAL_PROMPTLESS_EMAIL_DOMAIN = "gopromptless.ai"
 INTERNAL_PROMPTLESS_WELCOME_SHOWN_AT_KEY = "internal_promptless_welcome_shown_at"
-INTERNAL_PROMPTLESS_WELCOME_MESSAGE = "\n".join(
-    [
-        "            ,-,------,",
-        r"          _ \(\(_,--'",
-        r"     <`--'\>/(/(__",
-        "     /. .  `'` '  \\",
-        "    (`')  ,        @",
-        "     `-._,        /",
-        "        )-)_/--( > ",
-        "       ''''  ''''",
-        "welcome promptless pigfooder.",
-    ]
+INTERNAL_PROMPTLESS_WELCOME_SHOWN_VERSIONS_KEY = (
+    "internal_promptless_welcome_shown_at_by_version"
+)
+INTERNAL_PROMPTLESS_WELCOME_MESSAGE_LINES = (
+    "            ,-,------,",
+    r"          _ \(\(_,--'",
+    r"     <`--'\>/(/(__",
+    "     /. .  `'` '  \\",
+    "    (`')  ,        @",
+    "     `-._,        /",
+    "        )-)_/--( > ",
+    "       ''''  ''''",
+    "welcome promptless pigfooder.",
 )
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
@@ -489,7 +490,10 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
             },
             quiet=quiet,
             update_notice=update_notice,
-            internal_welcome_notice=_claim_internal_promptless_welcome(quiet=quiet),
+            internal_welcome_notice=_claim_internal_promptless_welcome(
+                quiet=quiet,
+                plugin_version=metadata.plugin_version,
+            ),
         )
         return 0
     credential = enrollment_attempt.credential
@@ -510,7 +514,10 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
                 },
                 quiet=quiet,
                 update_notice=update_notice,
-                internal_welcome_notice=_claim_internal_promptless_welcome(quiet=quiet),
+                internal_welcome_notice=_claim_internal_promptless_welcome(
+                    quiet=quiet,
+                    plugin_version=metadata.plugin_version,
+                ),
             )
             return 0
         credential = enrollment_attempt.credential
@@ -535,7 +542,11 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
             {"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host},
             quiet=quiet,
             update_notice=update_notice,
-            internal_welcome_notice=_claim_internal_promptless_welcome(credential=credential, quiet=quiet),
+            internal_welcome_notice=_claim_internal_promptless_welcome(
+                credential=credential,
+                quiet=quiet,
+                plugin_version=metadata.plugin_version,
+            ),
         )
         return 0
 
@@ -545,7 +556,11 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
         {"status": result.status, "host": host, "needs_restart": result.needs_restart},
         quiet=quiet,
         update_notice=update_notice,
-        internal_welcome_notice=_claim_internal_promptless_welcome(credential=credential, quiet=quiet),
+        internal_welcome_notice=_claim_internal_promptless_welcome(
+            credential=credential,
+            quiet=quiet,
+            plugin_version=metadata.plugin_version,
+        ),
     )
     return 0
 
@@ -1546,22 +1561,44 @@ def _claim_internal_promptless_welcome(
     credential: HostCredential | None = None,
     *,
     quiet: bool,
+    plugin_version: str | None = None,
 ) -> str | None:
-    """Return the internal dogfood welcome once for a host-global Promptless user state."""
+    """Return the internal dogfood welcome once per installed marketplace version."""
 
-    if quiet or not _has_internal_promptless_identity(credential):
+    welcome_version = _non_empty(plugin_version)
+    if (
+        quiet
+        or welcome_version is None
+        or welcome_version == "unknown"
+        or not _has_internal_promptless_identity(credential)
+    ):
         return None
     try:
         state_path = _state_path()
         with _state_file_lock(state_path):
             state = _load_state(state_path)
-            if _string_value(state.get(INTERNAL_PROMPTLESS_WELCOME_SHOWN_AT_KEY)) is not None:
+            shown_versions = _json_mapping_or_empty(
+                state.get(INTERNAL_PROMPTLESS_WELCOME_SHOWN_VERSIONS_KEY)
+            )
+            if _string_value(shown_versions.get(welcome_version)) is not None:
                 return None
-            state[INTERNAL_PROMPTLESS_WELCOME_SHOWN_AT_KEY] = dt.datetime.now(dt.timezone.utc).isoformat()
+            shown_at = dt.datetime.now(dt.timezone.utc).isoformat()
+            shown_versions[welcome_version] = shown_at
+            state[INTERNAL_PROMPTLESS_WELCOME_SHOWN_VERSIONS_KEY] = shown_versions
+            state[INTERNAL_PROMPTLESS_WELCOME_SHOWN_AT_KEY] = shown_at
             _write_state(state_path, state)
     except (OSError, BootstrapError):
         return None
-    return INTERNAL_PROMPTLESS_WELCOME_MESSAGE
+    return _internal_promptless_welcome_message(welcome_version)
+
+
+def _internal_promptless_welcome_message(plugin_version: str) -> str:
+    return "\n".join(
+        [
+            *INTERNAL_PROMPTLESS_WELCOME_MESSAGE_LINES,
+            f"Promptless marketplace version installed: v{plugin_version}.",
+        ]
+    )
 
 
 def _has_internal_promptless_identity(credential: HostCredential | None) -> bool:
