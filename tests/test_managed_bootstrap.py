@@ -1978,7 +1978,7 @@ def test_collect_skips_when_ledger_lock_is_busy_and_logs_diagnostic(tmp_path: Pa
         server.stop()
 
 
-def test_collect_deadline_expires_fail_open_and_logs_diagnostic(tmp_path: Path) -> None:
+def test_zero_deadline_collect_baselines_fully_and_uploads_hook_subject(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -1987,17 +1987,46 @@ def test_collect_deadline_expires_fail_open_and_logs_diagnostic(tmp_path: Path) 
     server.start()
     try:
         home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        codex_home = home / ".codex"
         transcript_path = tmp_path / "codex-session.jsonl"
-        transcript_path.write_bytes(b'{"kind":"stop","message":"upload"}\n')
+        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        transcript_path.write_bytes(first_record)
+        idle_path = codex_home / "sessions/idle-history.jsonl"
+        idle_path.parent.mkdir(parents=True)
+        idle_path.write_bytes(b'{"kind":"idle_history"}\n')
+        stale = time.time() - (13 * 60 * 60)
+        os.utime(idle_path, (stale, stale))
         env = {
             "HOME": str(home),
-            "CODEX_HOME": str(home / ".codex"),
+            "CODEX_HOME": str(codex_home),
             "PLUGIN_ROOT": str(plugin_root),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
             "PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS": "0",
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # A zero deadline truncates the idle scan, but the first-run baseline must
+        # still inventory the full tree: a partial baseline would replay every
+        # missed file from offset zero later as a surprise backfill.
+        assert server.trace_batches == []
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert len(sources) == 2
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_baselined"
+        assert diagnostics[-1]["source_count"] == 2
+
+        second_record = b'{"kind":"stop","message":"upload"}\n'
+        transcript_path.write_bytes(first_record + second_record)
         _run_collect(
             plugin_root,
             ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
@@ -2005,10 +2034,99 @@ def test_collect_deadline_expires_fail_open_and_logs_diagnostic(tmp_path: Path) 
             {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
         )
 
-        assert server.trace_batches == []
+        # The hook's own transcript still uploads with no budget at all: subject
+        # paths are unmetered and the first pending batch is always sent.
+        assert len(server.trace_batches) == 1
+        chunk = _json_mapping(_json_list(server.trace_batches[0]["chunks"], "batch.chunks")[0], "batch.chunks[0]")
+        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == second_record
         diagnostics = _diagnostic_log_entries(home)
-        assert diagnostics[-1]["status"] == "trace_upload_skipped"
+        assert diagnostics[-1]["status"] == "trace_upload_partial"
         assert diagnostics[-1]["reason"] == "collection_deadline_exceeded"
+        assert diagnostics[-1]["batch_count"] == 1
+    finally:
+        server.stop()
+
+
+def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+        zero_deadline_env = dict(env, PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS="0")
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # Multi-batch pending content: ~13 MiB so batch one fills at the 10 MiB cap.
+        filler_record = b'{"kind":"note","payload":"' + b"x" * 65_000 + b'"}\n'
+        appended_body = filler_record * 200
+        transcript_path.write_bytes(first_record + appended_body)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            zero_deadline_env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # The guaranteed first batch lands and is acked; the deadline stops the rest.
+        assert len(server.trace_batches) == 1
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_partial"
+        assert diagnostics[-1]["reason"] == "collection_deadline_exceeded"
+        assert diagnostics[-1]["batch_count"] == 1
+        truncated_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        truncated_source = _json_mapping(
+            next(iter(_json_mapping(truncated_ledger["sources"], "ledger.sources").values())), "ledger.sources[0]"
+        )
+        acked_offset = _json_int(truncated_source["end_offset"], "ledger.sources[0].end_offset")
+        assert len(first_record) < acked_offset < transcript_path.stat().st_size
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # The next collect resumes from the acked watermark and drains the rest.
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_complete"
+        drained_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        drained_source = _json_mapping(
+            next(iter(_json_mapping(drained_ledger["sources"], "ledger.sources").values())), "ledger.sources[0]"
+        )
+        assert drained_source["end_offset"] == transcript_path.stat().st_size
+        uploaded_chunks = [
+            _json_mapping(chunk, "chunk")
+            for batch in server.trace_batches
+            for chunk in _json_list(_json_mapping(batch, "batch")["chunks"], "batch.chunks")
+        ]
+        uploaded_chunks.sort(key=lambda chunk: _json_int(chunk["start_offset"], "chunk.start_offset"))
+        reassembled = b"".join(
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content")))
+            for chunk in uploaded_chunks
+        )
+        assert reassembled == appended_body
     finally:
         server.stop()
 
@@ -2254,6 +2372,11 @@ def _json_list(value: JsonValue, field_path: str) -> list[JsonValue]:
 
 def _json_string(value: JsonValue, field_path: str) -> str:
     assert isinstance(value, str), f"{field_path} must be a JSON string"
+    return value
+
+
+def _json_int(value: JsonValue, field_path: str) -> int:
+    assert isinstance(value, int) and not isinstance(value, bool), f"{field_path} must be a JSON integer"
     return value
 
 

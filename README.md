@@ -118,12 +118,29 @@ ledger lives at `~/.promptless/instruction-hub/host-runtime-ledger.json` or
 same host credential and are gated by the `enabled_hosts` policy.
 
 Quiet collection stays hook-safe: it never writes status JSON to stdout, and it
-fails open if the ledger lock is busy or the collection deadline expires.
-Support diagnostics are written as bounded, redacted JSONL at
+fails open if the ledger lock is busy. The collection deadline (default 25
+seconds, overridable with `PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS`) is
+a budget for optional catch-up work, never a reason to skip the hook's own
+transcript: hook-subject paths are collected without deadline checks, the first
+pending upload batch is always sent so every hook makes forward progress, and
+only the idle scan and follow-on batches stop when the budget runs out
+(reported as `trace_upload_partial`; the forward-only ledger resumes on the
+next collect). The first-run baseline never uses a deadline-truncated
+inventory — files missed by a partial scan would replay from offset zero later
+as a surprise backfill — so on a new ledger the inventory scan reruns
+unmetered. Support diagnostics are written as bounded, redacted JSONL at
 `~/.promptless/instruction-hub/host-runtime-diagnostics.jsonl` with `0600`
-permissions and without transcript content, tool inputs, or credentials. The
-default collection deadline is 25 seconds and can be overridden with
-`PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS` for support and tests.
+permissions and without transcript content, tool inputs, or credentials.
+
+Planned follow-on (not yet implemented): move all tree-scale work out of the
+hook path into a detached drainer. Hooks would upload only their own transcript
+increment and then spawn a short-lived, low-priority background process that
+owns the idle sweep and any historical backfill under its own byte/time budget,
+acquiring the ledger lock per batch so live hooks never skip on
+`ledger_lock_busy`. That change should also dissolve the first-run baseline
+into an explicit newest-first backlog policy so pre-enrollment history can be
+uploaded gradually instead of being permanently skipped. Hooks stay the
+scheduler — no launchd/systemd daemon on user machines.
 
 Host enrollment is per host, not per plugin. The credential and pending approval
 are cached at a single host-global path (`~/.promptless/instruction-hub/`) and

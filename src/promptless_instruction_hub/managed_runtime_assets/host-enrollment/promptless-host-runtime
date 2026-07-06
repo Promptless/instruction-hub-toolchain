@@ -119,7 +119,13 @@ class BootstrapAuthError(BootstrapError):
 
 
 class CollectDeadlineExceeded(BootstrapError):
-    """Native trace collection exceeded its hook-safe runtime budget."""
+    """Optional collection work exceeded the hook-safe runtime budget.
+
+    The deadline meters catch-up work only: the idle root scan and upload
+    batches after the first. Hook-subject path collection, the first-run
+    baseline inventory, and the first pending batch always run so a hook can
+    never be starved of its own transcript by tree-scale work.
+    """
 
 
 @dataclass(frozen=True)
@@ -339,9 +345,6 @@ def _run_collect_command(host: Host, *, lifecycle: str | None, baseline: bool, q
         event = _lifecycle_event(lifecycle)
         hook_context = _hook_trace_context(_read_hook_context())
         return _run_collect(host, lifecycle_event=event, hook_context=hook_context, baseline=baseline, quiet=quiet)
-    except CollectDeadlineExceeded:
-        _emit({"status": "trace_upload_skipped", "reason": "collection_deadline_exceeded", "host": host}, quiet=quiet)
-        return 0
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
         _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
         return 0
@@ -525,7 +528,6 @@ def _run_collect(
     worker_base_url = _worker_base_url()
     dashboard_base_url = _dashboard_base_url()
     context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
-    _ensure_collect_deadline(deadline)
     credential = _cached_host_credential(context)
     if credential is None:
         _emit({"status": "trace_upload_skipped", "reason": "not_enrolled", "host": host}, quiet=quiet)
@@ -543,8 +545,9 @@ def _run_collect(
         _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
         return 0
 
-    _ensure_collect_deadline(deadline)
-    source_paths = _collect_source_paths(host, hook_context, lifecycle_event=lifecycle_event, deadline=deadline)
+    source_paths, idle_scan_complete = _collect_source_paths(
+        host, hook_context, lifecycle_event=lifecycle_event, deadline=deadline
+    )
     if not source_paths:
         _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
         return 0
@@ -560,6 +563,12 @@ def _run_collect(
             return 0
         ledger = _load_source_ledger(ledger_path)
         if ledger.is_new:
+            if not idle_scan_complete:
+                # A deadline-truncated inventory must never baseline: every file the
+                # scan missed would replay from offset zero later as a surprise backfill.
+                source_paths, idle_scan_complete = _collect_source_paths(
+                    host, hook_context, lifecycle_event=lifecycle_event, deadline=float("inf")
+                )
             _baseline_source_offsets(ledger, source_paths)
             _write_source_ledger(ledger)
             _emit(
@@ -575,33 +584,37 @@ def _run_collect(
         if baseline:
             ledger.drift_reports.append({"kind": "native_trace_existing_ledger", "baseline": False})
 
-        for batch in _iter_upload_batches(
-            host=host,
-            metadata=metadata,
-            policy=policy,
-            lifecycle_event=lifecycle_event,
-            hook_context=hook_context,
-            ledger=ledger,
-            source_paths=source_paths,
-            deadline=deadline,
-        ):
-            response = _post_upload_batch(upload_url, credential, policy, batch)
-            _advance_ledger_from_response(ledger, source_paths, response)
-            _write_source_ledger(ledger)
-            uploaded_batch_count += 1
-            uploaded_chunk_count += len(batch.events)
-            unparsed_record_count += _optional_int_value(response.get("unparsed_record_count")) or 0
+        deadline_exceeded = not idle_scan_complete
+        try:
+            for batch in _iter_upload_batches(
+                host=host,
+                metadata=metadata,
+                policy=policy,
+                lifecycle_event=lifecycle_event,
+                hook_context=hook_context,
+                ledger=ledger,
+                source_paths=source_paths,
+                deadline=deadline,
+            ):
+                response = _post_upload_batch(upload_url, credential, policy, batch)
+                _advance_ledger_from_response(ledger, source_paths, response)
+                _write_source_ledger(ledger)
+                uploaded_batch_count += 1
+                uploaded_chunk_count += len(batch.events)
+                unparsed_record_count += _optional_int_value(response.get("unparsed_record_count")) or 0
+        except CollectDeadlineExceeded:
+            deadline_exceeded = True
 
-    _emit(
-        {
-            "status": "trace_upload_complete",
-            "host": host,
-            "batch_count": uploaded_batch_count,
-            "chunk_count": uploaded_chunk_count,
-            "unparsed_record_count": unparsed_record_count,
-        },
-        quiet=quiet,
-    )
+    payload: dict[str, JsonValue] = {
+        "status": "trace_upload_partial" if deadline_exceeded else "trace_upload_complete",
+        "host": host,
+        "batch_count": uploaded_batch_count,
+        "chunk_count": uploaded_chunk_count,
+        "unparsed_record_count": unparsed_record_count,
+    }
+    if deadline_exceeded:
+        payload["reason"] = "collection_deadline_exceeded"
+    _emit(payload, quiet=quiet)
     return 0
 
 
@@ -710,7 +723,14 @@ def _collect_source_paths(
     *,
     lifecycle_event: LifecycleEvent,
     deadline: float,
-) -> tuple[Path, ...]:
+) -> tuple[tuple[Path, ...], bool]:
+    """Order upload sources hook-subject-first and report idle-scan completeness.
+
+    The hook's own transcript paths are mandatory and never metered; only the
+    optional idle catch-up scan honors the deadline. Returns the ordered paths
+    plus whether the idle scan covered the full tree.
+    """
+
     explicit_paths: list[Path] = []
     if lifecycle_event == "subagent_stop" and hook_context.agent_transcript_path is not None:
         explicit_paths.append(hook_context.agent_transcript_path)
@@ -722,12 +742,11 @@ def _collect_source_paths(
     ordered_paths: list[Path] = []
     seen: set[str] = set()
     for path in explicit_paths:
-        _ensure_collect_deadline(deadline)
         _append_unique_path(ordered_paths, seen, path)
-    for path in _idle_root_scan_paths(host, deadline=deadline):
-        _ensure_collect_deadline(deadline)
+    idle_paths, idle_scan_complete = _idle_root_scan_paths(host, deadline=deadline)
+    for path in idle_paths:
         _append_unique_path(ordered_paths, seen, path)
-    return tuple(ordered_paths)
+    return tuple(ordered_paths), idle_scan_complete
 
 
 def _append_unique_path(paths: list[Path], seen: set[str], path: Path) -> None:
@@ -742,23 +761,34 @@ def _append_unique_path(paths: list[Path], seen: set[str], path: Path) -> None:
     paths.append(resolved)
 
 
-def _idle_root_scan_paths(host: Host, *, deadline: float) -> tuple[Path, ...]:
+def _idle_root_scan_paths(host: Host, *, deadline: float) -> tuple[tuple[Path, ...], bool]:
+    """Scan native transcript roots for idle files, truncating at the deadline.
+
+    The idle sweep is catch-up work: on deadline pressure it returns whatever
+    it found so far instead of failing the whole collect. Returns the sorted
+    idle paths plus whether the scan covered the full tree.
+    """
+
     now = time.time()
     result: list[Path] = []
-    for pattern in _native_trace_globs(host):
-        for raw_path in glob.iglob(pattern, recursive=True):
-            _ensure_collect_deadline(deadline)
-            path = Path(raw_path)
-            if not path.is_file():
-                continue
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                continue
-            if now - mtime < IDLE_SESSION_GRACE_SECONDS:
-                continue
-            result.append(path)
-    return tuple(sorted(result))
+    complete = True
+    try:
+        for pattern in _native_trace_globs(host):
+            for raw_path in glob.iglob(pattern, recursive=True):
+                _ensure_collect_deadline(deadline)
+                path = Path(raw_path)
+                if not path.is_file():
+                    continue
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    continue
+                if now - mtime < IDLE_SESSION_GRACE_SECONDS:
+                    continue
+                result.append(path)
+    except CollectDeadlineExceeded:
+        complete = False
+    return tuple(sorted(result)), complete
 
 
 def _native_trace_globs(host: Host) -> tuple[str, ...]:
@@ -872,12 +902,22 @@ def _iter_upload_batches(
     source_paths: tuple[Path, ...],
     deadline: float,
 ) -> Iterator[UploadBatch]:
+    """Yield contract-shaped upload batches, metering everything after the first.
+
+    The first batch is always yielded regardless of the deadline so every hook
+    makes forward progress on its own transcript (source paths are ordered
+    hook-subject-first); later batches stop at the deadline and the forward-only
+    ledger resumes them on the next collect.
+    """
+
     lifecycle_paths = _lifecycle_subject_paths(hook_context, lifecycle_event)
     pending_events: list[SourceEvent] = []
     pending_payloads: list[dict[str, JsonValue]] = []
     pending_decoded_bytes = 0
+    yielded_batch = False
     for event in _iter_source_events(ledger, source_paths):
-        _ensure_collect_deadline(deadline)
+        if yielded_batch:
+            _ensure_collect_deadline(deadline)
         payload = _chunk_payload(event, lifecycle_event if event.path in lifecycle_paths else None)
         next_decoded_bytes = pending_decoded_bytes + event.byte_count
         if (
@@ -896,6 +936,7 @@ def _iter_upload_batches(
                 events=tuple(pending_events),
                 chunks=tuple(pending_payloads),
             )
+            yielded_batch = True
             pending_events = []
             pending_payloads = []
             pending_decoded_bytes = 0
