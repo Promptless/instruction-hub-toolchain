@@ -126,7 +126,10 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 assert "const allowSiblingRuntime = true;" in hook_script
                 assert "'ensure'" not in hook_script
                 assert "'--baseline'" not in hook_script
-                assert f"const collectArgs = [runtime, 'collect', '--host', 'claude', '--lifecycle', {lifecycle!r}, '--quiet'];" in hook_script
+                assert (
+                    f"const collectArgs = [runtime, 'collect', '--host', 'claude', '--lifecycle', {lifecycle!r}, '--quiet'];"
+                    in hook_script
+                )
             else:
                 hook_command = hook["command"]
                 assert hook_command.startswith("sh -c '")
@@ -222,10 +225,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
 
         def make_stale_root_without_runtime(lifecycle: str) -> Path:
             stale_root = (
-                tmp_path
-                / f"{target}-{lifecycle}-missing-runtime-cache"
-                / "promptless-instruction-hub-dev"
-                / "0.3.1"
+                tmp_path / f"{target}-{lifecycle}-missing-runtime-cache" / "promptless-instruction-hub-dev" / "0.3.1"
             )
             stale_root.mkdir(parents=True)
             return stale_root
