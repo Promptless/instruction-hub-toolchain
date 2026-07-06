@@ -2063,6 +2063,83 @@ def test_collect_splits_batches_by_transport_size(tmp_path: Path) -> None:
         server.stop()
 
 
+def test_collect_skips_unreadable_idle_source_and_uploads_the_rest(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        codex_home = home / ".codex"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start"}\n'
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(codex_home),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        # Two idle files appear after the baseline; the alphabetically first one
+        # stats fine but cannot be opened. It must not abort the run: the pending
+        # hook-subject chunk and the idle file sorted after it still upload.
+        unreadable_path = codex_home / "sessions/aaa-unreadable.jsonl"
+        unreadable_path.parent.mkdir(parents=True)
+        unreadable_path.write_bytes(b'{"kind":"locked"}\n')
+        readable_path = codex_home / "sessions/zzz-readable.jsonl"
+        readable_record = b'{"kind":"idle_after_bad_file"}\n'
+        readable_path.write_bytes(readable_record)
+        stale = time.time() - (13 * 60 * 60)
+        os.utime(unreadable_path, (stale, stale))
+        os.utime(readable_path, (stale, stale))
+        unreadable_path.chmod(0)
+
+        second_record = b'{"kind":"stop"}\n'
+        transcript_path.write_bytes(first_record + second_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        uploaded_contents = {
+            gzip.decompress(
+                base64.b64decode(_json_string(_json_mapping(chunk_value, "chunk")["content_base64"], "content"))
+            )
+            for batch in server.trace_batches
+            for chunk_value in _json_list(batch["chunks"], "chunks")
+        }
+        assert uploaded_contents == {second_record, readable_record}
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_complete"
+        assert diagnostics[-1]["unreadable_source_count"] == 1
+        assert diagnostics[-1]["batch_count"] == 1
+
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert len(sources) == 2
+        advanced_offsets = sorted(
+            _json_int(_json_mapping(source, "source")["end_offset"], "end_offset") for source in sources.values()
+        )
+        assert advanced_offsets == sorted([transcript_path.stat().st_size, len(readable_record)])
+    finally:
+        server.stop()
+
+
 def test_collect_tolerates_unparsed_record_counts_and_advances_ledger(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
