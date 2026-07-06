@@ -23,11 +23,19 @@ import pytest
 from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, validate_json_value
+from promptless_instruction_hub.managed_runtime import (
+    MISSING_PYTHON_MESSAGE,
+    MISSING_RUNTIME_FILE_MESSAGE,
+    MISSING_RUNTIME_ROOT_MESSAGE,
+    UNSUPPORTED_PYTHON_MESSAGE,
+)
 
 HOST_RUNTIME_BIN = "promptless-host-runtime"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
 LAST_STATUS_REL_PATH = Path(".promptless/instruction-hub/last-bootstrap-status.json")
 DIAGNOSTIC_LOG_REL_PATH = Path(".promptless/instruction-hub/host-runtime-diagnostics.jsonl")
+INTERNAL_WELCOME_SHOWN_AT_KEY = "internal_promptless_welcome_shown_at"
+INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY = "internal_promptless_welcome_shown_at_by_version"
 BROWSER_ENROLLMENT_MESSAGE = (
     "Promptless Instruction Governance telemetry is starting browser-based enrollment. "
     "Approve the Promptless browser tab to continue."
@@ -53,6 +61,20 @@ def _assert_no_promptless_directory(root: Path) -> None:
     assert list(root.rglob(".promptless")) == []
 
 
+def _assert_hook_output(result: subprocess.CompletedProcess[str], expected: object) -> None:
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert json.loads(result.stdout) == expected
+
+
+def _assert_hook_system_message(result: subprocess.CompletedProcess[str], message: str) -> None:
+    _assert_hook_output(result, {"systemMessage": message})
+
+
+def _assert_hook_argv(result: subprocess.CompletedProcess[str], target: str) -> None:
+    _assert_hook_output(result, {"argv": ["ensure", "--host", target]})
+
+
 def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -75,10 +97,6 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             command_prefix = f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}"'
         else:
             command_prefix = f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}"'
-        assert session_start_hook["command"] == (
-            f"{command_prefix} ensure --host {target} && "
-            f"{command_prefix} collect --host {target} --lifecycle session_start --baseline --quiet"
-        )
         bootstrap_source = bootstrap_path.read_text()
         assert "ENROLLMENT_CALLBACK_DEADLINE_SECONDS" not in bootstrap_source
         assert "ThreadingHTTPServer" not in bootstrap_source
@@ -94,6 +112,210 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             hook = hook_events[event_name][0]["hooks"][0]
             assert hook["command"] == f"{command_prefix} collect --host {target} --lifecycle {lifecycle} --quiet"
             assert hook["timeout"] == 150
+
+        stub_root = tmp_path / f"{target}-stub-plugin"
+        stub_runtime = stub_root / "bin" / HOST_RUNTIME_BIN
+        stub_call_log = tmp_path / f"{target}-stub-calls.jsonl"
+        stub_runtime.parent.mkdir(parents=True)
+        stub_runtime.write_text(
+            "import json, os, sys\n"
+            "with open(os.environ['PROMPTLESS_STUB_CALL_LOG'], 'a') as call_log:\n"
+            "    call_log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "if sys.argv[1:2] == ['ensure']:\n"
+            "    print(json.dumps({'argv': sys.argv[1:]}))\n"
+        )
+        stub_runtime.chmod(0o644)
+
+        missing_runtime_root = tmp_path / f"{target}-missing-runtime-plugin"
+        missing_runtime_root.mkdir()
+
+        def reset_stub_calls() -> None:
+            stub_call_log.unlink(missing_ok=True)
+
+        def assert_startup_calls() -> None:
+            assert [json.loads(line) for line in stub_call_log.read_text().splitlines()] == [
+                ["ensure", "--host", target],
+                ["collect", "--host", target, "--lifecycle", "session_start", "--baseline", "--quiet"],
+            ]
+
+        if target == "claude":
+            hook_args = session_start_hook["args"]
+            assert session_start_hook["command"] == "node"
+            assert hook_args[0] == "-e"
+            assert len(hook_args) == 3
+            hook_script = hook_args[1]
+            assert hook_args[2] == "${CLAUDE_PLUGIN_ROOT}"
+            assert "CLAUDE_PLUGIN_ROOT" in hook_script
+            assert "PLUGIN_ROOT" in hook_script
+            assert f"path.join(root, 'bin', {HOST_RUNTIME_BIN!r})" in hook_script
+            assert "spawnSync" in hook_script
+            assert "sys.version_info >= (3, 9)" in hook_script
+            assert MISSING_PYTHON_MESSAGE in hook_script
+            assert UNSUPPORTED_PYTHON_MESSAGE in hook_script
+            assert "'collect'" in hook_script
+            assert "'--baseline'" in hook_script
+            assert "'--quiet'" in hook_script
+
+            node_path = shutil.which("node")
+            assert node_path is not None
+
+            missing_root = subprocess.run(
+                [session_start_hook["command"], *hook_args],
+                env=_clean_env(HOME=str(tmp_path / f"{target}-home")),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_system_message(missing_root, MISSING_RUNTIME_ROOT_MESSAGE)
+
+            missing_runtime = subprocess.run(
+                [node_path, hook_args[0], hook_script, str(missing_runtime_root)],
+                env=_clean_env(HOME=str(tmp_path / f"{target}-missing-runtime-home")),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_system_message(missing_runtime, MISSING_RUNTIME_FILE_MESSAGE)
+
+            missing_python = subprocess.run(
+                [node_path, hook_args[0], hook_script, str(stub_root)],
+                env=_clean_env(HOME=str(tmp_path / f"{target}-missing-python-home"), PATH=""),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_system_message(missing_python, MISSING_PYTHON_MESSAGE)
+
+            unsupported_python_bin = tmp_path / f"{target}-unsupported-python-bin"
+            unsupported_python_bin.mkdir()
+            _write_shell_script(unsupported_python_bin / "python3", "exit 2")
+            _write_shell_script(unsupported_python_bin / "python", "exit 2")
+            unsupported_python = subprocess.run(
+                [node_path, hook_args[0], hook_script, str(stub_root)],
+                env=_clean_env(
+                    HOME=str(tmp_path / f"{target}-unsupported-python-home"),
+                    PATH=str(unsupported_python_bin),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_system_message(unsupported_python, UNSUPPORTED_PYTHON_MESSAGE)
+
+            fallback_python_bin = tmp_path / f"{target}-fallback-python-bin"
+            fallback_python_bin.mkdir()
+            _write_shell_script(fallback_python_bin / "python3", "exit 2")
+            _write_python_forwarder(fallback_python_bin / "python")
+            reset_stub_calls()
+            fallback_python = subprocess.run(
+                [node_path, hook_args[0], hook_script, str(stub_root)],
+                env=_clean_env(
+                    HOME=str(tmp_path / f"{target}-fallback-python-home"),
+                    PATH=str(fallback_python_bin),
+                    PROMPTLESS_STUB_CALL_LOG=str(stub_call_log),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_argv(fallback_python, target)
+            assert_startup_calls()
+
+            reset_stub_calls()
+            env_rooted = subprocess.run(
+                [node_path, *hook_args],
+                env=_clean_env(
+                    HOME=str(tmp_path / f"{target}-env-rooted-home"),
+                    CLAUDE_PLUGIN_ROOT=str(stub_root),
+                    PROMPTLESS_STUB_CALL_LOG=str(stub_call_log),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_argv(env_rooted, target)
+            assert_startup_calls()
+
+            reset_stub_calls()
+            rooted = subprocess.run(
+                [session_start_hook["command"], hook_args[0], hook_script, str(stub_root)],
+                env=_clean_env(
+                    HOME=str(tmp_path / f"{target}-rooted-home"),
+                    PROMPTLESS_STUB_CALL_LOG=str(stub_call_log),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        else:
+            hook_command = session_start_hook["command"]
+            assert "root=${PLUGIN_ROOT:-}" in hook_command
+            assert '"$runtime" ensure --host codex' in hook_command
+            assert '"$runtime" collect --host codex --lifecycle session_start --baseline --quiet' in hook_command
+            assert hook_command.startswith("sh -c '")
+            assert f'runtime="$root/bin/{HOST_RUNTIME_BIN}"' in hook_command
+            assert '[ ! -r "$runtime" ]' in hook_command
+
+            missing_root = subprocess.run(
+                hook_command,
+                shell=True,
+                env=_clean_env(HOME=str(tmp_path / f"{target}-home")),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_system_message(missing_root, MISSING_RUNTIME_ROOT_MESSAGE)
+
+            missing_runtime = subprocess.run(
+                hook_command,
+                shell=True,
+                env=_clean_env(
+                    HOME=str(tmp_path / f"{target}-missing-runtime-home"),
+                    PLUGIN_ROOT=str(missing_runtime_root),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_system_message(missing_runtime, MISSING_RUNTIME_FILE_MESSAGE)
+
+            fallback_python_bin = tmp_path / f"{target}-fallback-python-bin"
+            fallback_python_bin.mkdir()
+            sh_path = shutil.which("sh") or "/bin/sh"
+            _write_shell_script(fallback_python_bin / "sh", f'exec {shlex.quote(sh_path)} "$@"')
+            _write_shell_script(fallback_python_bin / "python3", "exit 2")
+            _write_python_forwarder(fallback_python_bin / "python")
+            reset_stub_calls()
+            fallback_python = subprocess.run(
+                shlex.split(hook_command),
+                env=_clean_env(
+                    HOME=str(tmp_path / f"{target}-fallback-python-home"),
+                    PATH=str(fallback_python_bin),
+                    PLUGIN_ROOT=str(stub_root),
+                    PROMPTLESS_STUB_CALL_LOG=str(stub_call_log),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_argv(fallback_python, target)
+            assert_startup_calls()
+
+            reset_stub_calls()
+            rooted = subprocess.run(
+                hook_command,
+                shell=True,
+                env=_clean_env(
+                    HOME=str(tmp_path / f"{target}-rooted-home"),
+                    PLUGIN_ROOT=str(stub_root),
+                    PROMPTLESS_STUB_CALL_LOG=str(stub_call_log),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        _assert_hook_argv(rooted, target)
+        assert_startup_calls()
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
@@ -338,6 +560,243 @@ def test_bootstrap_runs_without_local_dogfood_gate(tmp_path: Path) -> None:
         assert server.worker_not_found_requests == []
         assert server.policy_requests == ["/v0/host-enrollment/policy?target=codex"]
         assert len(server.check_ins) == 1
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize(
+    "identity_location",
+    ["envelope", "policy"],
+    ids=["identity-envelope", "identity-policy"],
+)
+def test_bootstrap_welcomes_internal_promptless_user_once_per_plugin_version(
+    tmp_path: Path,
+    identity_location: str,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root, plugin_version="0.1.0")
+    internal_policy = _policy_with()
+    if identity_location == "envelope":
+        internal_policy["user_email"] = "Adit@GoPromptless.AI"
+    else:
+        policy_body = _json_mapping(internal_policy["policy"], "policy")
+        policy_body["user_email"] = "Adit@GoPromptless.AI"
+    server = _FakeWorkerServer(policy=internal_policy)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        first_payload, first_result = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
+        first_message = _json_string(first_payload["systemMessage"], "systemMessage")
+        assert "welcome promptless pigfooder." in first_message
+        assert "version: v0.1.0" in first_message
+        assert "Promptless marketplace version installed" not in first_message
+        assert ",-,------," in first_message
+        first_stdout = _json_mapping(
+            validate_json_value(json.loads(first_result.stdout), "bootstrap stdout"),
+            "bootstrap stdout",
+        )
+        assert first_stdout == {"systemMessage": first_message}
+
+        state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        shown_at = _json_string(state[INTERNAL_WELCOME_SHOWN_AT_KEY], "welcome shown at")
+        assert shown_at != ""
+        shown_by_version = _json_mapping(
+            state[INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY],
+            "welcome shown by version",
+        )
+        assert shown_by_version == {"0.1.0": shown_at}
+        credentials = _json_mapping(state["credentials"], "credentials")
+        assert len(credentials) == 1
+        credential = _json_mapping(next(iter(credentials.values())), "credential")
+        assert credential["internal_promptless_user"] is True
+        assert "user_email" not in credential
+        assert "email" not in credential
+
+        second_payload, second_result = _run_bootstrap(
+            hub_root / "dist/codex/core", "codex", env, expected_status="configured"
+        )
+        assert "systemMessage" not in second_payload
+        assert second_result.stdout == ""
+        second_state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        assert second_state[INTERNAL_WELCOME_SHOWN_AT_KEY] == shown_at
+        assert second_state[INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY] == {"0.1.0": shown_at}
+
+        build_hub(hub_root, plugin_version="0.2.0")
+        upgraded_payload, upgraded_result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            env,
+            expected_status="configured",
+        )
+        upgraded_message = _json_string(upgraded_payload["systemMessage"], "systemMessage")
+        assert "Promptless Instruction Governance updated to v0.2.0 (was v0.1.0)." in upgraded_message
+        assert "welcome promptless pigfooder." in upgraded_message
+        assert "version updated: v0.2.0" in upgraded_message
+        assert "Promptless marketplace version installed" not in upgraded_message
+        upgraded_stdout = _json_mapping(
+            validate_json_value(json.loads(upgraded_result.stdout), "upgraded stdout"),
+            "upgraded stdout",
+        )
+        assert upgraded_stdout == {"systemMessage": upgraded_message}
+        upgraded_state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "upgraded host state"),
+            "upgraded host state",
+        )
+        upgraded_shown_at = _json_string(upgraded_state[INTERNAL_WELCOME_SHOWN_AT_KEY], "upgraded welcome shown at")
+        upgraded_shown_by_version = _json_mapping(
+            upgraded_state[INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY],
+            "upgraded welcome shown by version",
+        )
+        assert upgraded_shown_by_version == {"0.1.0": shown_at, "0.2.0": upgraded_shown_at}
+
+        steady_payload, steady_result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            env,
+            expected_status="configured",
+        )
+        assert "systemMessage" not in steady_payload
+        assert steady_result.stdout == ""
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize(
+    ("identity_location", "email"),
+    [
+        ("envelope", "customer@example.com"),
+        ("policy", "customer@example.com"),
+        ("envelope", "adit @gopromptless.ai"),
+    ],
+    ids=["external-envelope", "external-policy", "malformed-envelope"],
+)
+def test_bootstrap_ignores_non_internal_worker_identity(
+    tmp_path: Path,
+    identity_location: str,
+    email: str,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    policy = _policy_with()
+    if identity_location == "envelope":
+        policy["user_email"] = email
+    else:
+        policy_body = _json_mapping(policy["policy"], "policy")
+        policy_body["user_email"] = email
+    server = _FakeWorkerServer(policy=policy)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
+        assert "systemMessage" not in payload
+
+        state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        assert INTERNAL_WELCOME_SHOWN_AT_KEY not in state
+        assert INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY not in state
+        credentials = _json_mapping(state["credentials"], "credentials")
+        credential = _json_mapping(next(iter(credentials.values())), "credential")
+        assert "internal_promptless_user" not in credential
+    finally:
+        server.stop()
+
+
+def test_cached_credential_trusts_only_persisted_internal_flag(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_root = hub_root / "dist/codex/core"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        state_path = _host_state_path(home)
+        state = _json_mapping(validate_json_value(json.loads(state_path.read_text()), "host state"), "host state")
+        credentials = _json_mapping(state["credentials"], "credentials")
+        credential_key = _credential_cache_key(worker_base_url=server.base_url, target="codex")
+        credential = _json_mapping(credentials[credential_key], "credential")
+        credential["user_email"] = "adit@gopromptless.ai"
+        credential.pop("internal_promptless_user", None)
+        state_path.write_text(json.dumps(state))
+
+        payload, _ = _run_bootstrap(plugin_root, "codex", env)
+        assert "systemMessage" not in payload
+
+        updated_state = _json_mapping(
+            validate_json_value(json.loads(state_path.read_text()), "updated host state"),
+            "updated host state",
+        )
+        assert INTERNAL_WELCOME_SHOWN_AT_KEY not in updated_state
+        assert INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY not in updated_state
+        updated_credentials = _json_mapping(updated_state["credentials"], "updated credentials")
+        updated_credential = _json_mapping(updated_credentials[credential_key], "updated credential")
+        assert "internal_promptless_user" not in updated_credential
+    finally:
+        server.stop()
+
+
+def test_bootstrap_welcomes_internal_promptless_user_from_credential_response(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    server = _FakeWorkerServer(credential_response_extra={"user_email": "Adit@GoPromptless.AI"})
+    server.start()
+    try:
+        home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
+        message = _json_string(payload["systemMessage"], "systemMessage")
+        assert "welcome promptless pigfooder." in message
+        assert "version: v0.1.0" in message
+        assert "Promptless marketplace version installed" not in message
+
+        state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        shown_at = _json_string(state[INTERNAL_WELCOME_SHOWN_AT_KEY], "welcome shown at")
+        assert state[INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY] == {"0.1.0": shown_at}
+        credentials = _json_mapping(state["credentials"], "credentials")
+        credential = _json_mapping(next(iter(credentials.values())), "credential")
+        assert credential["internal_promptless_user"] is True
     finally:
         server.stop()
 
@@ -1851,23 +2310,38 @@ def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> N
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    server = _FakeControlPlane(policy=_invalid_policy(case))
+    invalid_policy = _invalid_policy(case)
+    invalid_policy["user_email"] = "Adit@GoPromptless.AI"
+    server = _FakeControlPlane(policy=invalid_policy)
     server.start()
     try:
         home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
         _run_bootstrap(
             hub_root / "dist/codex/core",
             "codex",
-            {
-                "HOME": str(home),
-                "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.worker_base_url,
-            },
+            env,
             expected_status="error",
         )
 
         assert not (home / ".codex/config.toml").exists()
+        state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        assert INTERNAL_WELCOME_SHOWN_AT_KEY not in state
+        assert INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY not in state
+        credentials = _json_mapping(state["credentials"], "credentials")
+        credential = _json_mapping(
+            credentials[_credential_cache_key(worker_base_url=server.base_url, target="codex")],
+            "credential",
+        )
+        assert "internal_promptless_user" not in credential
         assert server.check_ins == []
     finally:
         server.stop()
@@ -2924,6 +3398,24 @@ def _clean_env(**overrides: str) -> dict[str, str]:
     return env
 
 
+def _write_shell_script(path: Path, body: str) -> None:
+    path.write_text(f"#!/bin/sh\n{body}\n")
+    path.chmod(0o755)
+
+
+def _write_python_forwarder(path: Path) -> None:
+    _write_shell_script(path, f'exec {shlex.quote(sys.executable)} "$@"')
+
+
+def _credential_cache_key(*, worker_base_url: str, target: str) -> str:
+    cache_material = {
+        "deployment_instance_id": "worker-local-1",
+        "target": target,
+        "worker_base_url": worker_base_url,
+    }
+    return hashlib.sha256(json.dumps(cache_material, sort_keys=True).encode()).hexdigest()
+
+
 def _async_urlopen_browser_command(path: Path) -> str:
     path.write_text(
         """
@@ -3056,6 +3548,7 @@ class _FakeControlPlane:
         approval_url_override: str | None = None,
         approval_path: str = "/instruction-hub/enroll",
         credential_responses: list[str | int] | None = None,
+        credential_response_extra: dict[str, JsonValue] | None = None,
         approval_http_statuses: list[int] | None = None,
         unparsed_record_count: int = 0,
     ) -> None:
@@ -3078,6 +3571,7 @@ class _FakeControlPlane:
         # ("pending"/"approved"/"expired"/"consumed") or a forced HTTP status (int, e.g. 409 or
         # 500). An exhausted script falls back to the register-as-poll default semantics.
         self.credential_responses: list[str | int] = list(credential_responses or [])
+        self.credential_response_extra: dict[str, JsonValue] = dict(credential_response_extra or {})
         # Forced HTTP statuses for the hosted approval page, consumed one per GET, so tests can
         # fail the loopback browser-open on one run and let a later run succeed.
         self.approval_http_statuses: list[int] = list(approval_http_statuses or [])
@@ -3334,13 +3828,13 @@ class _FakeApiHandler(_ControlPlaneHandler):
                 status=409,
             )
             return
-        self._write_json(
-            {
-                "status": "consumed",
-                "credential_id": _FAKE_CREDENTIAL_ID,
-                "expires_at": _future_expiry(),
-            }
-        )
+        response_payload: dict[str, JsonValue] = {
+            "status": "consumed",
+            "credential_id": _FAKE_CREDENTIAL_ID,
+            "expires_at": _future_expiry(),
+        }
+        response_payload.update(plane.credential_response_extra)
+        self._write_json(response_payload)
 
     def _write_forced_credential_status(self, status: int) -> None:
         if status == 409:
