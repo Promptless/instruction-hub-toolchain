@@ -88,20 +88,21 @@ pin to an immutable tag for stricter reproducibility.
 
 The toolchain owns Promptless-managed runtime artifacts that must be injected
 into generated customer plugins, including the host runtime used by Codex and
-Claude startup hooks. During dogfood, generated Codex hooks wrap the bundled
-stdlib-only Python script with POSIX shell checks that emit schema-safe startup
-diagnostics when the host cannot resolve the plugin root, a readable runtime
-file, or Python 3.9+. Generated Claude hooks use Claude Code's exec-form hook so
-Windows installs do not need a POSIX shell; Node must be available to start the
-inline launcher, which then resolves the plugin root, finds a usable Python 3.9+
-interpreter, and emits the same root/runtime/python diagnostics before loading
-the managed runtime:
+Claude lifecycle hooks. During dogfood, generated Codex hooks wrap the bundled
+stdlib-only Python script with POSIX shell checks. Generated Claude hooks use
+Claude Code's exec-form hook so Windows installs do not need a POSIX shell; Node
+must be available to start the inline launcher. Startup launchers emit
+schema-safe diagnostics when the host cannot resolve the plugin root, a readable
+runtime file, or Python 3.9+. Terminal lifecycle launchers stay quiet: they
+resolve the runtime under the plugin root, fall back to a sibling installed
+version for the same plugin id when the recorded root is stale, and exit 0 with
+no output when no usable runtime exists.
 
 ```sh
 sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime ensure --host codex; run promptless-host-runtime collect --host codex --lifecycle session_start --baseline --quiet'
-python3 "${PLUGIN_ROOT}/bin/promptless-host-runtime" collect --host codex --lifecycle stop --quiet
+sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle stop --quiet'
 node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find Python 3.9+; run promptless-host-runtime ensure --host claude; run promptless-host-runtime collect --host claude --lifecycle session_start --baseline --quiet' '${CLAUDE_PLUGIN_ROOT}'
-python3 "${CLAUDE_PLUGIN_ROOT}/bin/promptless-host-runtime" collect --host claude --lifecycle session_end --quiet
+node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host claude --lifecycle session_end --quiet' '${CLAUDE_PLUGIN_ROOT}'
 ```
 
 The dogfood host runtime uses `PROMPTLESS_WORKER_BASE_URL` or the default

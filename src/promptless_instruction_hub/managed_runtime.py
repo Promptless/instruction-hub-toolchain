@@ -182,9 +182,7 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
     if event_name == "SessionStart":
         hook_command = _host_runtime_start_hook_command(target, lifecycle=lifecycle)
     else:
-        hook_command = {
-            "command": f"{_host_runtime_command_prefix(target)} collect --host {target} --lifecycle {lifecycle} --quiet",
-        }
+        hook_command = _host_runtime_terminal_hook_command(target, lifecycle=lifecycle)
     # Codex and Claude both load plugin-root hooks from hooks/hooks.json. Codex may require
     # the user to trust/review plugin hooks before running these commands.
     # https://developers.openai.com/codex/plugins/build
@@ -215,20 +213,46 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
 
 def _host_runtime_start_hook_command(target: Harness, *, lifecycle: str) -> dict[str, JsonValue]:
     if target == "claude":
-        return _claude_host_runtime_hook_command(lifecycle=lifecycle)
+        return _claude_host_runtime_hook_command(
+            lifecycle=lifecycle,
+            run_ensure=True,
+            baseline=True,
+            quiet_failure=False,
+            allow_sibling_runtime=False,
+        )
     return {
         "command": _posix_host_runtime_hook_command(
             root_expr="${PLUGIN_ROOT:-}",
             host="codex",
             lifecycle=lifecycle,
+            run_ensure=True,
+            baseline=True,
+            quiet_failure=False,
+            allow_sibling_runtime=False,
         ),
     }
 
 
-def _host_runtime_command_prefix(target: Harness) -> str:
+def _host_runtime_terminal_hook_command(target: Harness, *, lifecycle: str) -> dict[str, JsonValue]:
     if target == "claude":
-        return f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_EXECUTABLE}"'
-    return f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_EXECUTABLE}"'
+        return _claude_host_runtime_hook_command(
+            lifecycle=lifecycle,
+            run_ensure=False,
+            baseline=False,
+            quiet_failure=True,
+            allow_sibling_runtime=True,
+        )
+    return {
+        "command": _posix_host_runtime_hook_command(
+            root_expr="${PLUGIN_ROOT:-}",
+            host="codex",
+            lifecycle=lifecycle,
+            run_ensure=False,
+            baseline=False,
+            quiet_failure=True,
+            allow_sibling_runtime=True,
+        ),
+    }
 
 
 def _host_runtime_lifecycle_arg(event_name: str) -> str:
@@ -254,7 +278,14 @@ def _hook_json_system_message(message: str) -> str:
     return _system_message_json(message).replace('"', '\\"')
 
 
-def _claude_host_runtime_hook_command(*, lifecycle: str) -> dict[str, JsonValue]:
+def _claude_host_runtime_hook_command(
+    *,
+    lifecycle: str,
+    run_ensure: bool,
+    baseline: bool,
+    quiet_failure: bool,
+    allow_sibling_runtime: bool,
+) -> dict[str, JsonValue]:
     return {
         "command": "node",
         "args": [
@@ -263,13 +294,26 @@ def _claude_host_runtime_hook_command(*, lifecycle: str) -> dict[str, JsonValue]
                 root_envs=("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT"),
                 host="claude",
                 lifecycle=lifecycle,
+                run_ensure=run_ensure,
+                baseline=baseline,
+                quiet_failure=quiet_failure,
+                allow_sibling_runtime=allow_sibling_runtime,
             ),
             "${CLAUDE_PLUGIN_ROOT}",
         ],
     }
 
 
-def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness, lifecycle: str) -> str:
+def _node_host_runtime_hook_script(
+    *,
+    root_envs: tuple[str, ...],
+    host: Harness,
+    lifecycle: str,
+    run_ensure: bool,
+    baseline: bool,
+    quiet_failure: bool,
+    allow_sibling_runtime: bool,
+) -> str:
     root_env_names = json.dumps(list(root_envs), separators=(",", ":"))
     missing_root = _system_message_json(MISSING_RUNTIME_ROOT_MESSAGE)
     missing_file = _system_message_json(MISSING_RUNTIME_FILE_MESSAGE)
@@ -277,22 +321,75 @@ def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness,
     missing_python = _system_message_json(MISSING_PYTHON_MESSAGE)
     unsupported_python = _system_message_json(UNSUPPORTED_PYTHON_MESSAGE)
     broken_python = _system_message_json(BROKEN_PYTHON_MESSAGE)
+    collect_args = [
+        "runtime",
+        "'collect'",
+        "'--host'",
+        repr(host),
+        "'--lifecycle'",
+        repr(lifecycle),
+    ]
+    if baseline:
+        collect_args.append("'--baseline'")
+    collect_args.append("'--quiet'")
+    ensure_run_script = ""
+    if run_ensure:
+        ensure_run_script = (
+            f"const ensureArgs = [runtime, 'ensure', '--host', {host!r}];\n"
+            "  const ensure = spawnSync(candidate.command, [...candidate.runPrefix, ...ensureArgs], { stdio: 'inherit', env: process.env });\n"
+            "  if (ensure.error) {\n"
+            "    sawBrokenPython = true;\n"
+            "    continue;\n"
+            "  }\n"
+            "  if (ensure.status !== 0) process.exit(ensure.status === null ? 1 : ensure.status);\n"
+        )
     return (
         "const fs = require('fs');\n"
         "const path = require('path');\n"
         "const { spawnSync } = require('child_process');\n"
         f"const rootEnvNames = {root_env_names};\n"
+        f"const emitDiagnostics = {json.dumps(not quiet_failure)};\n"
+        f"const allowSiblingRuntime = {json.dumps(allow_sibling_runtime)};\n"
+        "function finishWithDiagnostic(payload) {\n"
+        "  if (emitDiagnostics) console.log(payload);\n"
+        "  process.exit(0);\n"
+        "}\n"
+        "function runtimeState(candidate) {\n"
+        "  let stat;\n"
+        "  try { stat = fs.statSync(candidate); } catch (error) { return 'missing'; }\n"
+        "  if (!stat.isFile()) return 'missing';\n"
+        "  try { fs.accessSync(candidate, fs.constants.R_OK); } catch (error) { return 'unreadable'; }\n"
+        "  return 'ready';\n"
+        "}\n"
+        "function siblingRuntime(rootPath) {\n"
+        "  const parent = path.dirname(rootPath);\n"
+        "  let entries;\n"
+        "  try { entries = fs.readdirSync(parent, { withFileTypes: true }); } catch (error) { return ''; }\n"
+        "  entries.sort((left, right) => left.name.localeCompare(right.name));\n"
+        "  let selected = '';\n"
+        "  for (const entry of entries) {\n"
+        "    if (!entry.isDirectory()) continue;\n"
+        f"    const candidate = path.join(parent, entry.name, 'bin', {HOST_RUNTIME_EXECUTABLE!r});\n"
+        "    if (runtimeState(candidate) === 'ready') selected = candidate;\n"
+        "  }\n"
+        "  return selected;\n"
+        "}\n"
         "let root = process.argv.slice(1).find((value) => value && !value.startsWith('${')) || '';\n"
         "for (const name of rootEnvNames) {\n  if (root) break;\n  root = process.env[name] || '';\n}\n"
-        f"if (!root) {{ console.log({missing_root!r}); process.exit(0); }}\n"
-        f"const runtime = path.join(root, 'bin', {HOST_RUNTIME_EXECUTABLE!r});\n"
-        "let runtimeStat;\n"
-        f"try {{ runtimeStat = fs.statSync(runtime); }} catch (error) {{ console.log({missing_file!r}); process.exit(0); }}\n"
-        f"if (!runtimeStat.isFile()) {{ console.log({missing_file!r}); process.exit(0); }}\n"
-        f"try {{ fs.accessSync(runtime, fs.constants.R_OK); }} catch (error) {{ console.log({unreadable_file!r}); process.exit(0); }}\n"
+        f"if (!root) finishWithDiagnostic({missing_root!r});\n"
+        f"let runtime = path.join(root, 'bin', {HOST_RUNTIME_EXECUTABLE!r});\n"
+        "let runtimeStatus = runtimeState(runtime);\n"
+        "if (runtimeStatus !== 'ready' && allowSiblingRuntime) {\n"
+        "  const fallbackRuntime = siblingRuntime(root);\n"
+        "  if (fallbackRuntime) {\n"
+        "    runtime = fallbackRuntime;\n"
+        "    runtimeStatus = 'ready';\n"
+        "  }\n"
+        "}\n"
+        f"if (runtimeStatus === 'missing') finishWithDiagnostic({missing_file!r});\n"
+        f"if (runtimeStatus === 'unreadable') finishWithDiagnostic({unreadable_file!r});\n"
         f"const pythonProbe = {PYTHON_VERSION_PROBE!r};\n"
-        f"const ensureArgs = [runtime, 'ensure', '--host', {host!r}];\n"
-        f"const collectArgs = [runtime, 'collect', '--host', {host!r}, '--lifecycle', {lifecycle!r}, '--baseline', '--quiet'];\n"
+        f"const collectArgs = [{', '.join(collect_args)}];\n"
         "const candidates = [\n"
         "  { command: 'python3', probeArgs: ['-c', pythonProbe], runPrefix: [] },\n"
         "  { command: 'python', probeArgs: ['-c', pythonProbe], runPrefix: [] },\n"
@@ -311,30 +408,81 @@ def _node_host_runtime_hook_script(*, root_envs: tuple[str, ...], host: Harness,
         "    else sawBrokenPython = true;\n"
         "    continue;\n"
         "  }\n"
-        "  const ensure = spawnSync(candidate.command, [...candidate.runPrefix, ...ensureArgs], { stdio: 'inherit', env: process.env });\n"
-        "  if (ensure.error) {\n"
-        "    sawBrokenPython = true;\n"
-        "    continue;\n"
-        "  }\n"
-        "  if (ensure.status !== 0) process.exit(ensure.status === null ? 1 : ensure.status);\n"
-        "  const collect = spawnSync(candidate.command, [...candidate.runPrefix, ...collectArgs], { stdio: 'inherit', env: process.env });\n"
+        f"{ensure_run_script}"
+        "  const collectStdio = emitDiagnostics ? 'inherit' : ['inherit', 'ignore', 'ignore'];\n"
+        "  const collect = spawnSync(candidate.command, [...candidate.runPrefix, ...collectArgs], { stdio: collectStdio, env: process.env });\n"
+        "  if (!emitDiagnostics) process.exit(0);\n"
         "  if (collect.error) process.exit(1);\n"
         "  process.exit(collect.status === null ? 1 : collect.status);\n"
         "}\n"
-        f"if (sawUnsupportedPython) console.log({unsupported_python!r});\n"
-        f"else if (sawBrokenPython) console.log({broken_python!r});\n"
-        f"else console.log({missing_python!r});\n"
+        f"if (sawUnsupportedPython) finishWithDiagnostic({unsupported_python!r});\n"
+        f"else if (sawBrokenPython) finishWithDiagnostic({broken_python!r});\n"
+        f"else finishWithDiagnostic({missing_python!r});\n"
         "process.exit(0);\n"
     )
 
 
-def _posix_host_runtime_hook_command(*, root_expr: str, host: Harness, lifecycle: str) -> str:
+def _posix_host_runtime_hook_command(
+    *,
+    root_expr: str,
+    host: Harness,
+    lifecycle: str,
+    run_ensure: bool,
+    baseline: bool,
+    quiet_failure: bool,
+    allow_sibling_runtime: bool,
+) -> str:
+    collect_baseline_arg = " --baseline" if baseline else ""
+    missing_root_action = "exit 0"
+    if not quiet_failure:
+        missing_root_action = f"{_posix_emit_system_message(MISSING_RUNTIME_ROOT_MESSAGE)}; exit 0"
+    if allow_sibling_runtime:
+        runtime_check = (
+            f'runtime="$root/bin/{HOST_RUNTIME_EXECUTABLE}"; '
+            'if [ ! -f "$runtime" ] || [ ! -r "$runtime" ]; then '
+            "runtime=; root_parent=${root%/*}; "
+            f'for candidate in "$root_parent"/*/bin/{HOST_RUNTIME_EXECUTABLE}; do '
+            'if [ -f "$candidate" ] && [ -r "$candidate" ]; then runtime="$candidate"; fi; '
+            "done; "
+            "fi; "
+            'if [ -z "$runtime" ]; then exit 0; fi; '
+        )
+    else:
+        runtime_check = (
+            f'runtime="$root/bin/{HOST_RUNTIME_EXECUTABLE}"; '
+            f'if [ ! -f "$runtime" ]; then {_posix_emit_system_message(MISSING_RUNTIME_FILE_MESSAGE)}; exit 0; fi; '
+            f'if [ ! -r "$runtime" ]; then {_posix_emit_system_message(UNREADABLE_RUNTIME_FILE_MESSAGE)}; exit 0; fi; '
+        )
+    missing_python_action = "exit 0"
+    if not quiet_failure:
+        missing_python_action = (
+            f'if [ "$unsupported_python" -eq 1 ]; then {_posix_emit_system_message(UNSUPPORTED_PYTHON_MESSAGE)}; '
+            f'elif [ "$broken_python" -eq 1 ]; then {_posix_emit_system_message(BROKEN_PYTHON_MESSAGE)}; '
+            f"else {_posix_emit_system_message(MISSING_PYTHON_MESSAGE)}; fi; "
+            "exit 0"
+        )
+    ensure_command = ""
+    if run_ensure:
+        ensure_command = (
+            f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" ensure --host {host}; '
+            f'else "$python_cmd" "$runtime" ensure --host {host}; fi; '
+            'status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; '
+        )
+    if quiet_failure:
+        collect_command = (
+            f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet >/dev/null 2>&1; '
+            f'else "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet >/dev/null 2>&1; fi; '
+            "exit 0"
+        )
+    else:
+        collect_command = (
+            f'if [ -n "$python_arg" ]; then exec "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet; fi; '
+            f'exec "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet'
+        )
     script = (
         f"root={root_expr}; "
-        f'if [ -z "$root" ]; then {_posix_emit_system_message(MISSING_RUNTIME_ROOT_MESSAGE)}; exit 0; fi; '
-        f'runtime="$root/bin/{HOST_RUNTIME_EXECUTABLE}"; '
-        f'if [ ! -f "$runtime" ]; then {_posix_emit_system_message(MISSING_RUNTIME_FILE_MESSAGE)}; exit 0; fi; '
-        f'if [ ! -r "$runtime" ]; then {_posix_emit_system_message(UNREADABLE_RUNTIME_FILE_MESSAGE)}; exit 0; fi; '
+        f'if [ -z "$root" ]; then {missing_root_action}; fi; '
+        f"{runtime_check}"
         f'probe="{PYTHON_VERSION_PROBE}"; '
         "python_cmd=; python_arg=; unsupported_python=0; broken_python=0; "
         "for candidate in python3 python; do "
@@ -349,15 +497,10 @@ def _posix_host_runtime_hook_command(*, root_expr: str, host: Harness, lifecycle
         'elif [ "$status" -eq 2 ]; then unsupported_python=1; else broken_python=1; fi; '
         "fi; "
         'if [ -z "$python_cmd" ]; then '
-        f'if [ "$unsupported_python" -eq 1 ]; then {_posix_emit_system_message(UNSUPPORTED_PYTHON_MESSAGE)}; '
-        f'elif [ "$broken_python" -eq 1 ]; then {_posix_emit_system_message(BROKEN_PYTHON_MESSAGE)}; '
-        f"else {_posix_emit_system_message(MISSING_PYTHON_MESSAGE)}; fi; "
-        "exit 0; fi; "
-        f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" ensure --host {host}; '
-        f'else "$python_cmd" "$runtime" ensure --host {host}; fi; '
-        'status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; '
-        f'if [ -n "$python_arg" ]; then exec "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle} --baseline --quiet; fi; '
-        f'exec "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle} --baseline --quiet'
+        f"{missing_python_action}; "
+        "fi; "
+        f"{ensure_command}"
+        f"{collect_command}"
     )
     return f"sh -c {shlex.quote(script)}"
 
