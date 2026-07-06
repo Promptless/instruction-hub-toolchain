@@ -171,9 +171,9 @@ path that enrolls when needed, removes legacy managed telemetry config, and
 posts a check-in. `collect` is the non-blocking native JSONL upload path. `enroll`
 acquires only the host credential. `status` prints local JSON without network,
 browser, config writes, or check-ins. `reset --yes` clears cached host
-credentials and pending enrollments while preserving the stable host id and
-last-seen plugin versions, and per-version internal welcome markers. `version`
-reports runtime metadata.
+credentials and pending enrollments while preserving the stable host id,
+last-seen plugin versions, and one internal welcome marker per installed
+marketplace version. `version` reports runtime metadata.
 
 Before the customer-grade release, replace the dogfood Python implementation
 with a static native binary built and versioned by Promptless, then bundled into
