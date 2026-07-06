@@ -577,9 +577,7 @@ def _run_host_enrollment(
         {"status": result.status, "host": host, "needs_restart": result.needs_restart},
         quiet=quiet,
         update_notice=update_notice,
-        first_success_notice=_claim_first_enrollment_success_notice(
-            host, needs_restart=result.needs_restart, quiet=quiet
-        ),
+        first_success_notice=_claim_first_enrollment_success_notice(host, status=result.status, quiet=quiet),
         internal_welcome_notice=_claim_internal_promptless_welcome(
             credential=credential,
             quiet=quiet,
@@ -1636,21 +1634,23 @@ def _internal_promptless_welcome_message(plugin_version: str, *, version_updated
     )
 
 
-def _claim_first_enrollment_success_notice(host: Host, *, needs_restart: bool, quiet: bool) -> str | None:
+def _claim_first_enrollment_success_notice(host: Host, *, status: ConfigStatus, quiet: bool) -> str | None:
     """Return a one-time confirmation the first time enrollment succeeds for a host.
 
     The SessionStart hook runs on every startup/resume and stays silent on the steady
     "already configured" state, so a fresh install never gets a "you're enrolled" signal.
     This surfaces one -- and only one -- confirmation the first time enrollment reaches a
     healthy result (configured or needs_restart) for each host, then latches so later sessions
-    stay quiet. Enrollment writes nothing the running host must reload (the credential lives in
+    stay quiet. A blocked result (e.g. malformed legacy managed markers) is not a success: it
+    returns None without claiming the latch, so the confirmation still fires after manual
+    repair. Enrollment writes nothing the running host must reload (the credential lives in
     the host-global state file and traces upload out-of-process from the hooks), so the message
     is a plain confirmation rather than a restart prompt; the needs_restart branch adds its own
     restart instruction, so this stays generic there to avoid contradicting it. A quiet baseline
     run returns None without claiming the latch, leaving the notice for the next visible session.
     """
 
-    message = _first_enrollment_success_message(host, needs_restart=needs_restart)
+    message = _first_enrollment_success_message(host, status=status)
     if quiet or message is None:
         return None
     try:
@@ -1668,11 +1668,13 @@ def _claim_first_enrollment_success_notice(host: Host, *, needs_restart: bool, q
     return message
 
 
-def _first_enrollment_success_message(host: Host, *, needs_restart: bool) -> str | None:
+def _first_enrollment_success_message(host: Host, *, status: ConfigStatus) -> str | None:
+    if status == "blocked":
+        return None
     host_label = HOST_DISPLAY_NAMES.get(host)
     if host_label is None:
         return None
-    if needs_restart:
+    if status == "needs_restart":
         # The needs_restart status message already tells the user to restart to drop the legacy
         # config it removed, so keep this to a bare confirmation to avoid contradicting it.
         return f"Promptless Instruction Governance telemetry is now enrolled for {host_label.name}."

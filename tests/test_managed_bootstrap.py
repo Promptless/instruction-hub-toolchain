@@ -1651,15 +1651,16 @@ def test_bootstrap_blocks_malformed_managed_codex_config(tmp_path: Path) -> None
         )
         codex_config.write_text(original_codex_config)
 
+        codex_env = {
+            "HOME": str(codex_home),
+            "CODEX_HOME": str(codex_home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
         codex_payload, _ = _run_bootstrap(
             hub_root / "dist/codex/core",
             "codex",
-            {
-                "HOME": str(codex_home),
-                "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
+            codex_env,
             expected_status="blocked",
         )
 
@@ -1670,6 +1671,30 @@ def test_bootstrap_blocks_malformed_managed_codex_config(tmp_path: Path) -> None
         first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
         assert first_drift_report["kind"] == "manual_config_required"
         assert "malformed" in _json_string(first_drift_report["message"], "drift_reports[0].message")
+
+        # A blocked result is not a success: no first-success confirmation is mixed into the
+        # blocked message, and the latch stays unclaimed so the confirmation can fire later.
+        blocked_message = _json_string(codex_payload["systemMessage"], "systemMessage")
+        assert "blocked" in blocked_message
+        assert FIRST_SUCCESS_ACTIVE_FRAGMENT not in blocked_message
+        assert FIRST_SUCCESS_NO_RESTART_FRAGMENT not in blocked_message
+        blocked_state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(codex_home).read_text()), "host state"),
+            "host state",
+        )
+        assert FIRST_SUCCESS_SHOWN_KEY not in blocked_state
+
+        # After the user repairs the config by hand, the next session is the real first success
+        # and confirms once.
+        codex_config.write_text('model = "gpt-5"\n')
+        repaired_payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        repaired_message = _json_string(repaired_payload["systemMessage"], "systemMessage")
+        assert FIRST_SUCCESS_ACTIVE_FRAGMENT in repaired_message
+        repaired_state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(codex_home).read_text()), "host state"),
+            "host state",
+        )
+        assert "codex" in _json_mapping(repaired_state[FIRST_SUCCESS_SHOWN_KEY], "first-success shown")
     finally:
         server.stop()
 
