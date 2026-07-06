@@ -25,7 +25,7 @@ HOST_RUNTIME_EXECUTABLE = "promptless-host-runtime"
 # host can kill SessionStart before a resumable pending enrollment is persisted.
 HOST_RUNTIME_HOOK_TIMEOUT_SECONDS = 390
 HOST_RUNTIME_CHANNEL = "stable"
-HOST_RUNTIME_VERSION = "0.2.2"
+HOST_RUNTIME_VERSION = "0.2.3"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
 SUPPORTED_HOST_RUNTIME_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 MISSING_RUNTIME_ROOT_MESSAGE = (
