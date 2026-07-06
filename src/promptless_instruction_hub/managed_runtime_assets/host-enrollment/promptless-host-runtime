@@ -467,7 +467,13 @@ def _run_ensure(host: Host, *, quiet: bool) -> int:
     metadata = _load_runtime_metadata(plugin_root, host)
     pending_update = _pending_plugin_update(metadata)
     update_notice = pending_update.notice if pending_update is not None else None
-    exit_code = _run_host_enrollment(host, metadata, quiet=quiet, update_notice=update_notice)
+    exit_code = _run_host_enrollment(
+        host,
+        metadata,
+        quiet=quiet,
+        update_notice=update_notice,
+        plugin_version_updated=update_notice is not None,
+    )
     # Reached only when the host enrollment step returned without raising, i.e. the SessionStart
     # output (including any update notice) was emitted. A quiet run suppresses that output, so it
     # does not consume the one-time notice.
@@ -476,7 +482,14 @@ def _run_ensure(host: Host, *, quiet: bool) -> int:
     return exit_code
 
 
-def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, update_notice: str | None) -> int:
+def _run_host_enrollment(
+    host: Host,
+    metadata: RuntimeMetadata,
+    *,
+    quiet: bool,
+    update_notice: str | None,
+    plugin_version_updated: bool,
+) -> int:
     worker_base_url = _worker_base_url()
     dashboard_base_url = _dashboard_base_url()
     context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
@@ -493,6 +506,7 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
             internal_welcome_notice=_claim_internal_promptless_welcome(
                 quiet=quiet,
                 plugin_version=metadata.plugin_version,
+                version_updated=plugin_version_updated,
             ),
         )
         return 0
@@ -517,6 +531,7 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
                 internal_welcome_notice=_claim_internal_promptless_welcome(
                     quiet=quiet,
                     plugin_version=metadata.plugin_version,
+                    version_updated=plugin_version_updated,
                 ),
             )
             return 0
@@ -546,6 +561,7 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
                 credential=credential,
                 quiet=quiet,
                 plugin_version=metadata.plugin_version,
+                version_updated=plugin_version_updated,
             ),
         )
         return 0
@@ -560,6 +576,7 @@ def _run_host_enrollment(host: Host, metadata: RuntimeMetadata, *, quiet: bool, 
             credential=credential,
             quiet=quiet,
             plugin_version=metadata.plugin_version,
+            version_updated=plugin_version_updated,
         ),
     )
     return 0
@@ -1562,6 +1579,7 @@ def _claim_internal_promptless_welcome(
     *,
     quiet: bool,
     plugin_version: str | None = None,
+    version_updated: bool = False,
 ) -> str | None:
     """Return the internal dogfood welcome once per installed marketplace version."""
 
@@ -1589,14 +1607,15 @@ def _claim_internal_promptless_welcome(
             _write_state(state_path, state)
     except (OSError, BootstrapError):
         return None
-    return _internal_promptless_welcome_message(welcome_version)
+    return _internal_promptless_welcome_message(welcome_version, version_updated=version_updated)
 
 
-def _internal_promptless_welcome_message(plugin_version: str) -> str:
+def _internal_promptless_welcome_message(plugin_version: str, *, version_updated: bool) -> str:
+    version_label = "version updated" if version_updated else "version"
     return "\n".join(
         [
             *INTERNAL_PROMPTLESS_WELCOME_MESSAGE_LINES,
-            f"Promptless marketplace version installed: v{plugin_version}.",
+            f"{version_label}: v{plugin_version}",
         ]
     )
 

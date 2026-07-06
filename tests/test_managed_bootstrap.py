@@ -596,7 +596,8 @@ def test_bootstrap_welcomes_internal_promptless_user_once_per_plugin_version(
         first_payload, first_result = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
         first_message = _json_string(first_payload["systemMessage"], "systemMessage")
         assert "welcome promptless pigfooder." in first_message
-        assert "Promptless marketplace version installed: v0.1.0." in first_message
+        assert "version: v0.1.0" in first_message
+        assert "Promptless marketplace version installed" not in first_message
         assert ",-,------," in first_message
         first_stdout = _json_mapping(
             validate_json_value(json.loads(first_result.stdout), "bootstrap stdout"),
@@ -644,7 +645,8 @@ def test_bootstrap_welcomes_internal_promptless_user_once_per_plugin_version(
         upgraded_message = _json_string(upgraded_payload["systemMessage"], "systemMessage")
         assert "Promptless Instruction Hub updated to v0.2.0 (was v0.1.0)." in upgraded_message
         assert "welcome promptless pigfooder." in upgraded_message
-        assert "Promptless marketplace version installed: v0.2.0." in upgraded_message
+        assert "version updated: v0.2.0" in upgraded_message
+        assert "Promptless marketplace version installed" not in upgraded_message
         upgraded_stdout = _json_mapping(
             validate_json_value(json.loads(upgraded_result.stdout), "upgraded stdout"),
             "upgraded stdout",
@@ -783,7 +785,8 @@ def test_bootstrap_welcomes_internal_promptless_user_from_poll_response(tmp_path
         payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
         message = _json_string(payload["systemMessage"], "systemMessage")
         assert "welcome promptless pigfooder." in message
-        assert "Promptless marketplace version installed: v0.1.0." in message
+        assert "version: v0.1.0" in message
+        assert "Promptless marketplace version installed" not in message
 
         state = _json_mapping(
             validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
