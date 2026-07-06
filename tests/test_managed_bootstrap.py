@@ -36,6 +36,9 @@ LAST_STATUS_REL_PATH = Path(".promptless/instruction-hub/last-bootstrap-status.j
 DIAGNOSTIC_LOG_REL_PATH = Path(".promptless/instruction-hub/host-runtime-diagnostics.jsonl")
 INTERNAL_WELCOME_SHOWN_AT_KEY = "internal_promptless_welcome_shown_at"
 INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY = "internal_promptless_welcome_shown_at_by_version"
+FIRST_SUCCESS_SHOWN_KEY = "first_enrollment_success_shown_at_by_target"
+FIRST_SUCCESS_ACTIVE_FRAGMENT = "telemetry is now active for"
+FIRST_SUCCESS_NO_RESTART_FRAGMENT = "No restart or plugin reload is needed."
 BROWSER_ENROLLMENT_MESSAGE = (
     "Promptless Instruction Governance telemetry is starting browser-based enrollment. "
     "Approve the Promptless browser tab to continue."
@@ -490,7 +493,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert runtime["id"] == "host-runtime"
         assert runtime["status"] == "included"
         assert runtime["target"] == target
-        assert runtime["version"] == "0.2.1"
+        assert runtime["version"] == "0.2.2"
         assert runtime["channel"] == "stable"
         assert runtime["path"] == f"bin/{HOST_RUNTIME_BIN}"
         assert len(runtime["sha256"]) == 64
@@ -533,7 +536,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     )
     assert payload["id"] == "host-runtime"
     assert payload["name"] == HOST_RUNTIME_BIN
-    assert payload["version"] == "0.2.1"
+    assert payload["version"] == "0.2.2"
     assert payload["channel"] == "stable"
     assert len(_json_string(payload["sha256"], "sha256")) == 64
 
@@ -545,7 +548,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert text_version.returncode == 0
-    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.1\n"
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.2\n"
     assert text_version.stderr == ""
 
 
@@ -874,7 +877,10 @@ def test_bootstrap_ignores_non_internal_worker_identity(
         }
 
         payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
-        assert "systemMessage" not in payload
+        # A non-internal identity gets the generic first-success confirmation, never the internal welcome.
+        message = _json_string(payload["systemMessage"], "systemMessage")
+        assert FIRST_SUCCESS_ACTIVE_FRAGMENT in message
+        assert "welcome promptless pigfooder." not in message
 
         state = _json_mapping(
             validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
@@ -882,6 +888,7 @@ def test_bootstrap_ignores_non_internal_worker_identity(
         )
         assert INTERNAL_WELCOME_SHOWN_AT_KEY not in state
         assert INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY not in state
+        assert list(_json_mapping(state[FIRST_SUCCESS_SHOWN_KEY], "first-success shown")) == ["codex"]
         credentials = _json_mapping(state["credentials"], "credentials")
         credential = _json_mapping(next(iter(credentials.values())), "credential")
         assert "internal_promptless_user" not in credential
@@ -916,7 +923,11 @@ def test_cached_credential_trusts_only_persisted_internal_flag(tmp_path: Path) -
         state_path.write_text(json.dumps(state))
 
         payload, _ = _run_bootstrap(plugin_root, "codex", env)
-        assert "systemMessage" not in payload
+        # A cached credential lacking the persisted internal flag still gets the generic
+        # first-success confirmation, but never the internal welcome.
+        message = _json_string(payload["systemMessage"], "systemMessage")
+        assert FIRST_SUCCESS_ACTIVE_FRAGMENT in message
+        assert "welcome promptless pigfooder." not in message
 
         updated_state = _json_mapping(
             validate_json_value(json.loads(state_path.read_text()), "updated host state"),
@@ -961,6 +972,111 @@ def test_bootstrap_welcomes_internal_promptless_user_from_poll_response(tmp_path
         credentials = _json_mapping(state["credentials"], "credentials")
         credential = _json_mapping(next(iter(credentials.values())), "credential")
         assert credential["internal_promptless_user"] is True
+    finally:
+        server.stop()
+
+
+def test_bootstrap_confirms_first_successful_enrollment_once_per_host(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        codex_env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        # The first healthy enrollment confirms once and reassures the user no restart is needed.
+        first_payload, first_result = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        first_message = _json_string(first_payload["systemMessage"], "systemMessage")
+        assert FIRST_SUCCESS_ACTIVE_FRAGMENT in first_message
+        assert FIRST_SUCCESS_NO_RESTART_FRAGMENT in first_message
+        assert "welcome promptless pigfooder." not in first_message
+        first_stdout = _json_mapping(
+            validate_json_value(json.loads(first_result.stdout), "bootstrap stdout"),
+            "bootstrap stdout",
+        )
+        assert first_stdout == {"systemMessage": first_message}
+
+        state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        shown_targets = _json_mapping(state[FIRST_SUCCESS_SHOWN_KEY], "first-success shown")
+        codex_shown_at = _json_string(shown_targets["codex"], "codex shown at")
+        assert codex_shown_at != ""
+        assert "claude" not in shown_targets
+
+        # A later session for the same host has nothing to say.
+        second_payload, second_result = _run_bootstrap(
+            hub_root / "dist/codex/core", "codex", codex_env, expected_status="configured"
+        )
+        assert "systemMessage" not in second_payload
+        assert second_result.stdout == ""
+        second_state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        assert second_state[FIRST_SUCCESS_SHOWN_KEY] == {"codex": codex_shown_at}
+
+        # A different host sharing the same home is confirmed independently (the latch is per target).
+        claude_env = {
+            "HOME": str(home),
+            "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+            "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+            "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+        claude_payload, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
+        claude_message = _json_string(claude_payload["systemMessage"], "systemMessage")
+        assert FIRST_SUCCESS_ACTIVE_FRAGMENT in claude_message
+        assert "Claude Code" in claude_message
+        third_state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        third_shown = _json_mapping(third_state[FIRST_SUCCESS_SHOWN_KEY], "first-success shown")
+        assert set(third_shown) == {"codex", "claude"}
+        assert third_shown["codex"] == codex_shown_at
+    finally:
+        server.stop()
+
+
+def test_reset_clears_first_successful_enrollment_latch(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_root = hub_root / "dist/codex/core"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        first_payload, _ = _run_bootstrap(plugin_root, "codex", env)
+        assert FIRST_SUCCESS_ACTIVE_FRAGMENT in _json_string(first_payload["systemMessage"], "systemMessage")
+
+        # Steady state is silent; the latch keeps the confirmation from repeating every session.
+        steady_payload, _ = _run_bootstrap(plugin_root, "codex", env, expected_status="configured")
+        assert "systemMessage" not in steady_payload
+
+        # A reset re-arms the confirmation by dropping the host from the latch.
+        _run_runtime_json(plugin_root, ["reset", "--host", "codex", "--yes"], env)
+        reset_state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        assert "codex" not in _json_mapping(reset_state[FIRST_SUCCESS_SHOWN_KEY], "first-success shown")
     finally:
         server.stop()
 
@@ -1274,7 +1390,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
         assert server.session_requests[0]["package_id"] == "core"
-        assert server.session_requests[0]["bootstrap_version"] == "0.2.1"
+        assert server.session_requests[0]["bootstrap_version"] == "0.2.2"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
         assert server.session_requests[0]["pending_callback"] == "1"
         assert server.session_requests[1]["target"] == "claude"
@@ -1296,7 +1412,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "policy_version",
                 "status",
             }
-            assert check_in["bootstrap_version"] == "0.2.1"
+            assert check_in["bootstrap_version"] == "0.2.2"
             assert check_in["plugin_version"] == "0.1.0"
             assert check_in["status"] == "configured"
             assert check_in["needs_restart"] is False
@@ -1699,15 +1815,16 @@ def test_bootstrap_blocks_malformed_managed_codex_config(tmp_path: Path) -> None
         )
         codex_config.write_text(original_codex_config)
 
+        codex_env = {
+            "HOME": str(codex_home),
+            "CODEX_HOME": str(codex_home / ".codex"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
         codex_payload, _ = _run_bootstrap(
             hub_root / "dist/codex/core",
             "codex",
-            {
-                "HOME": str(codex_home),
-                "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            },
+            codex_env,
             expected_status="blocked",
         )
 
@@ -1718,6 +1835,30 @@ def test_bootstrap_blocks_malformed_managed_codex_config(tmp_path: Path) -> None
         first_drift_report = _json_mapping(drift_reports[0], "drift_reports[0]")
         assert first_drift_report["kind"] == "manual_config_required"
         assert "malformed" in _json_string(first_drift_report["message"], "drift_reports[0].message")
+
+        # A blocked result is not a success: no first-success confirmation is mixed into the
+        # blocked message, and the latch stays unclaimed so the confirmation can fire later.
+        blocked_message = _json_string(codex_payload["systemMessage"], "systemMessage")
+        assert "blocked" in blocked_message
+        assert FIRST_SUCCESS_ACTIVE_FRAGMENT not in blocked_message
+        assert FIRST_SUCCESS_NO_RESTART_FRAGMENT not in blocked_message
+        blocked_state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(codex_home).read_text()), "host state"),
+            "host state",
+        )
+        assert FIRST_SUCCESS_SHOWN_KEY not in blocked_state
+
+        # After the user repairs the config by hand, the next session is the real first success
+        # and confirms once.
+        codex_config.write_text('model = "gpt-5"\n')
+        repaired_payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        repaired_message = _json_string(repaired_payload["systemMessage"], "systemMessage")
+        assert FIRST_SUCCESS_ACTIVE_FRAGMENT in repaired_message
+        repaired_state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(codex_home).read_text()), "host state"),
+            "host state",
+        )
+        assert "codex" in _json_mapping(repaired_state[FIRST_SUCCESS_SHOWN_KEY], "first-success shown")
     finally:
         server.stop()
 
@@ -1965,12 +2106,16 @@ def test_bootstrap_announces_plugin_update_per_host(tmp_path: Path) -> None:
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
-        # First install on each host records the version silently (an install is not an update):
-        # nothing is written, so there is no message at all.
+        # First install on each host records the version but is not an update, so it shows the
+        # one-time first-success confirmation without any version-change notice.
         first_claude, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
-        assert "systemMessage" not in first_claude
+        first_claude_message = _json_string(first_claude["systemMessage"], "systemMessage")
+        assert FIRST_SUCCESS_ACTIVE_FRAGMENT in first_claude_message
+        assert "updated to" not in first_claude_message
         first_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
-        assert "systemMessage" not in first_codex
+        first_codex_message = _json_string(first_codex["systemMessage"], "systemMessage")
+        assert FIRST_SUCCESS_ACTIVE_FRAGMENT in first_codex_message
+        assert "updated to" not in first_codex_message
 
         # Rebuild the same hub at a newer version, then re-run: each host announces the change once.
         build_hub(hub_root, plugin_version="0.2.0")
@@ -2347,7 +2492,7 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
         assert batch["host"] == "codex"
         assert batch["session_id"] == "codex_session_1"
         assert batch["policy_version"] == 1
-        assert batch["collector_version"] == "0.2.1"
+        assert batch["collector_version"] == "0.2.2"
         chunks = _json_list(batch["chunks"], "batch.chunks")
         # contiguous complete lines coalesce into one contract-shaped range chunk
         assert len(chunks) == 1
