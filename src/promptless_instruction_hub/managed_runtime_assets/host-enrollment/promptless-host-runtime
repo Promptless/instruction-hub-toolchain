@@ -42,7 +42,7 @@ if os.name == "nt":
 else:
     import fcntl
 
-RUNTIME_VERSION = "0.2.1"
+RUNTIME_VERSION = "0.2.2"
 RUNTIME_CHANNEL = "stable"
 RUNTIME_EXECUTABLE = "promptless-host-runtime"
 MANAGED_RUNTIME_ID = "host-runtime"
@@ -108,6 +108,10 @@ INTERNAL_PROMPTLESS_WELCOME_MESSAGE_LINES = (
     "       ''''  ''''",
     "welcome promptless pigfooder.",
 )
+# Latch for the one-time "enrollment succeeded" confirmation, keyed by target (claude/codex) so
+# each host is confirmed once. Fired for every user on the first healthy enrollment, unlike the
+# internal-only pigfooder welcome above.
+FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY = "first_enrollment_success_shown_at_by_target"
 Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
 LifecycleEvent = Literal["session_start", "stop", "session_end", "subagent_stop"]
@@ -370,16 +374,6 @@ def _run_ensure_command(host: Host, *, quiet: bool) -> int:
     finally:
         _flush_control_output()
 
-def _run_collect_command(host: Host, *, lifecycle: str | None, baseline: bool, quiet: bool) -> int:
-    try:
-        event = _lifecycle_event(lifecycle)
-        hook_context = _hook_trace_context(_read_hook_context())
-        return _run_collect(host, lifecycle_event=event, hook_context=hook_context, baseline=baseline, quiet=quiet)
-    except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
-        _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
-        return 0
-    finally:
-        _flush_control_output()
 
 def _run_collect_command(host: Host, *, lifecycle: str | None, baseline: bool, quiet: bool) -> int:
     try:
@@ -583,6 +577,9 @@ def _run_host_enrollment(
         {"status": result.status, "host": host, "needs_restart": result.needs_restart},
         quiet=quiet,
         update_notice=update_notice,
+        first_success_notice=_claim_first_enrollment_success_notice(
+            host, needs_restart=result.needs_restart, quiet=quiet
+        ),
         internal_welcome_notice=_claim_internal_promptless_welcome(
             credential=credential,
             quiet=quiet,
@@ -1515,6 +1512,14 @@ def _reset_host_state(host: Host) -> tuple[int, int]:
                 continue
             kept_pending[key] = pending_value
         state["pending_enrollments"] = kept_pending
+
+        # Re-arm the one-time first-success confirmation: a reset makes the next enrollment a
+        # genuine first success for this host, so it should confirm again.
+        shown_targets = _json_mapping_or_empty(state.get(FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY))
+        if host in shown_targets:
+            del shown_targets[host]
+            state[FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY] = shown_targets
+
         _write_state(state_path, state)
     return credentials_removed, pending_removed
 
@@ -1628,6 +1633,52 @@ def _internal_promptless_welcome_message(plugin_version: str, *, version_updated
             *INTERNAL_PROMPTLESS_WELCOME_MESSAGE_LINES,
             f"{version_label}: v{plugin_version}",
         ]
+    )
+
+
+def _claim_first_enrollment_success_notice(host: Host, *, needs_restart: bool, quiet: bool) -> str | None:
+    """Return a one-time confirmation the first time enrollment succeeds for a host.
+
+    The SessionStart hook runs on every startup/resume and stays silent on the steady
+    "already configured" state, so a fresh install never gets a "you're enrolled" signal.
+    This surfaces one -- and only one -- confirmation the first time enrollment reaches a
+    healthy result (configured or needs_restart) for each host, then latches so later sessions
+    stay quiet. Enrollment writes nothing the running host must reload (the credential lives in
+    the host-global state file and traces upload out-of-process from the hooks), so the message
+    is a plain confirmation rather than a restart prompt; the needs_restart branch adds its own
+    restart instruction, so this stays generic there to avoid contradicting it. A quiet baseline
+    run returns None without claiming the latch, leaving the notice for the next visible session.
+    """
+
+    message = _first_enrollment_success_message(host, needs_restart=needs_restart)
+    if quiet or message is None:
+        return None
+    try:
+        state_path = _state_path()
+        with _state_file_lock(state_path):
+            state = _load_state(state_path)
+            shown_targets = _json_mapping_or_empty(state.get(FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY))
+            if _string_value(shown_targets.get(host)) is not None:
+                return None
+            shown_targets[host] = dt.datetime.now(dt.timezone.utc).isoformat()
+            state[FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY] = shown_targets
+            _write_state(state_path, state)
+    except (OSError, BootstrapError):
+        return None
+    return message
+
+
+def _first_enrollment_success_message(host: Host, *, needs_restart: bool) -> str | None:
+    host_label = HOST_DISPLAY_NAMES.get(host)
+    if host_label is None:
+        return None
+    if needs_restart:
+        # The needs_restart status message already tells the user to restart to drop the legacy
+        # config it removed, so keep this to a bare confirmation to avoid contradicting it.
+        return f"Promptless Instruction Governance telemetry is now enrolled for {host_label.name}."
+    return (
+        f"Promptless Instruction Governance telemetry is now active for {host_label.name}. "
+        "No restart or plugin reload is needed."
     )
 
 
@@ -2901,6 +2952,7 @@ def _emit(
     *,
     quiet: bool = False,
     update_notice: str | None = None,
+    first_success_notice: str | None = None,
     internal_welcome_notice: str | None = None,
 ) -> None:
     # SessionStart hook output contract. Codex validates the hook's *stdout* against a strict schema
@@ -2913,7 +2965,9 @@ def _emit(
     # (status/host/needs_restart/reason) still goes to stderr, which neither host parses as hook
     # control output.
     # https://developers.openai.com/codex/hooks  https://code.claude.com/docs/en/hooks
-    message = _system_message(update_notice, internal_welcome_notice, _enrollment_user_message(payload))
+    message = _system_message(
+        update_notice, internal_welcome_notice, first_success_notice, _enrollment_user_message(payload)
+    )
     terminal_sequence = _terminal_sequence(payload, message)
     diagnostic = dict(payload)
     if message:
@@ -3030,9 +3084,9 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
     """Return a user-facing enrollment-status message for the host, or None to stay silent.
 
     Both Claude and Codex surface a message, and only for outcomes worth showing on a hook that
-    runs every startup/resume: a fresh config write, a pending browser approval, a block, or an
-    failure that needs user action. The steady "already configured" state stays silent so the hook
-    does not banner every session.
+    runs every startup/resume: legacy-config removal, a pending browser approval, a block, or a
+    failure that needs user action. The steady "already configured" state stays silent here; the
+    one-time first-success confirmation is emitted separately (see _claim_first_enrollment_success_notice).
     """
 
     status = payload.get("status")
@@ -3080,12 +3134,6 @@ def _enrollment_user_message(payload: dict[str, JsonValue]) -> str | None:
         return (
             "Promptless host enrollment is awaiting browser approval. "
             f"Approve in the browser tab that opened, then restart {host_label.name}."
-        )
-    if status == "error":
-        message = _string_value(payload.get("message")) or "unknown error"
-        return (
-            f"Promptless host enrollment failed for {host_label.name}: {message}. "
-            "Details were saved to ~/.promptless/instruction-hub/last-bootstrap-status.json."
         )
     if status == "blocked":
         if payload.get("reason") == "bootstrap_upgrade_required":
