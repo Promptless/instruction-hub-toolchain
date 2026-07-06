@@ -93,10 +93,6 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             expected_events = ("SessionStart", "Stop", "SessionEnd", "SubagentStop")
         assert set(hook_events) == set(expected_events)
         session_start_hook = hook_events["SessionStart"][0]["hooks"][0]
-        if target == "claude":
-            command_prefix = f'python3 "${{CLAUDE_PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}"'
-        else:
-            command_prefix = f'python3 "${{PLUGIN_ROOT}}/bin/{HOST_RUNTIME_BIN}"'
         callback_deadline_match = re.search(
             r"^ENROLLMENT_CALLBACK_DEADLINE_SECONDS = (?P<value>\d+)$",
             bootstrap_path.read_text(),
@@ -106,16 +102,39 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert session_start_hook["timeout"] == 390
         assert session_start_hook["timeout"] > int(callback_deadline_match.group("value"))
         assert hook_events["SessionStart"][0]["matcher"] == "startup|resume"
-        for event_name, lifecycle in (
-            ("Stop", "stop"),
-            ("SessionEnd", "session_end"),
-            ("SubagentStop", "subagent_stop"),
-        ):
-            if event_name not in hook_events:
-                continue
+        terminal_events = tuple(
+            (event_name, lifecycle)
+            for event_name, lifecycle in (
+                ("Stop", "stop"),
+                ("SessionEnd", "session_end"),
+                ("SubagentStop", "subagent_stop"),
+            )
+            if event_name in hook_events
+        )
+        for event_name, _lifecycle in terminal_events:
             hook = hook_events[event_name][0]["hooks"][0]
-            assert hook["command"] == f"{command_prefix} collect --host {target} --lifecycle {lifecycle} --quiet"
             assert hook["timeout"] == 390
+            assert hook["statusMessage"] == "Uploading Promptless traces"
+
+        for event_name, lifecycle in terminal_events:
+            hook = hook_events[event_name][0]["hooks"][0]
+            if target == "claude":
+                assert hook["command"] == "node"
+                assert hook["args"][0] == "-e"
+                assert len(hook["args"]) == 3
+                hook_script = hook["args"][1]
+                assert "const allowSiblingRuntime = true;" in hook_script
+                assert "'ensure'" not in hook_script
+                assert "'--baseline'" not in hook_script
+                assert f"const collectArgs = [runtime, 'collect', '--host', 'claude', '--lifecycle', {lifecycle!r}, '--quiet'];" in hook_script
+            else:
+                hook_command = hook["command"]
+                assert hook_command.startswith("sh -c '")
+                assert "root=${PLUGIN_ROOT:-}" in hook_command
+                assert "root_parent=${root%/*}" in hook_command
+                assert f'"$runtime" collect --host codex --lifecycle {lifecycle} --quiet' in hook_command
+                assert "ensure --host" not in hook_command
+                assert "--baseline" not in hook_command
 
         stub_root = tmp_path / f"{target}-stub-plugin"
         stub_runtime = stub_root / "bin" / HOST_RUNTIME_BIN
@@ -136,11 +155,80 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         def reset_stub_calls() -> None:
             stub_call_log.unlink(missing_ok=True)
 
+        def stub_calls() -> list[list[str]]:
+            if not stub_call_log.exists():
+                return []
+            return [json.loads(line) for line in stub_call_log.read_text().splitlines()]
+
         def assert_startup_calls() -> None:
-            assert [json.loads(line) for line in stub_call_log.read_text().splitlines()] == [
+            assert stub_calls() == [
                 ["ensure", "--host", target],
                 ["collect", "--host", target, "--lifecycle", "session_start", "--baseline", "--quiet"],
             ]
+
+        def assert_terminal_calls(lifecycle: str) -> None:
+            assert stub_calls() == [
+                ["collect", "--host", target, "--lifecycle", lifecycle, "--quiet"],
+            ]
+
+        def assert_quiet_success(result: subprocess.CompletedProcess[str]) -> None:
+            assert result.returncode == 0
+            assert result.stdout == ""
+            assert result.stderr == ""
+
+        def terminal_hook_result(
+            event_name: str,
+            *,
+            root: Path | None,
+            home: Path,
+        ) -> subprocess.CompletedProcess[str]:
+            hook = hook_events[event_name][0]["hooks"][0]
+            env_vars = {
+                "HOME": str(home),
+                "PROMPTLESS_STUB_CALL_LOG": str(stub_call_log),
+            }
+            if target == "claude":
+                node_path = shutil.which("node")
+                assert node_path is not None
+                if root is not None:
+                    env_vars["CLAUDE_PLUGIN_ROOT"] = str(root)
+                return subprocess.run(
+                    [node_path, *hook["args"]],
+                    env=_clean_env(**env_vars),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+            if root is not None:
+                env_vars["PLUGIN_ROOT"] = str(root)
+            return subprocess.run(
+                hook["command"],
+                shell=True,
+                env=_clean_env(**env_vars),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        def make_stale_root_with_sibling_runtime(lifecycle: str) -> Path:
+            plugin_id_root = tmp_path / f"{target}-{lifecycle}-managed-cache" / "promptless-instruction-hub-dev"
+            stale_root = plugin_id_root / "0.3.1"
+            sibling_runtime = plugin_id_root / "0.3.2" / "bin" / HOST_RUNTIME_BIN
+            stale_root.mkdir(parents=True)
+            sibling_runtime.parent.mkdir(parents=True)
+            shutil.copy2(stub_runtime, sibling_runtime)
+            sibling_runtime.chmod(0o644)
+            return stale_root
+
+        def make_stale_root_without_runtime(lifecycle: str) -> Path:
+            stale_root = (
+                tmp_path
+                / f"{target}-{lifecycle}-missing-runtime-cache"
+                / "promptless-instruction-hub-dev"
+                / "0.3.1"
+            )
+            stale_root.mkdir(parents=True)
+            return stale_root
 
         if target == "claude":
             hook_args = session_start_hook["args"]
@@ -320,6 +408,45 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             )
         _assert_hook_argv(rooted, target)
         assert_startup_calls()
+
+        for event_name, lifecycle in terminal_events:
+            reset_stub_calls()
+            primary_runtime = terminal_hook_result(
+                event_name,
+                root=stub_root,
+                home=tmp_path / f"{target}-{lifecycle}-terminal-primary-home",
+            )
+            assert_quiet_success(primary_runtime)
+            assert_terminal_calls(lifecycle)
+
+            reset_stub_calls()
+            stale_root = make_stale_root_with_sibling_runtime(lifecycle)
+            sibling_runtime = terminal_hook_result(
+                event_name,
+                root=stale_root,
+                home=tmp_path / f"{target}-{lifecycle}-terminal-sibling-home",
+            )
+            assert_quiet_success(sibling_runtime)
+            assert_terminal_calls(lifecycle)
+
+            reset_stub_calls()
+            missing_root = terminal_hook_result(
+                event_name,
+                root=make_stale_root_without_runtime(lifecycle),
+                home=tmp_path / f"{target}-{lifecycle}-terminal-missing-home",
+            )
+            assert_quiet_success(missing_root)
+            assert stub_calls() == []
+
+            reset_stub_calls()
+            empty_root = terminal_hook_result(
+                event_name,
+                root=None,
+                home=tmp_path / f"{target}-{lifecycle}-terminal-empty-root-home",
+            )
+            assert_quiet_success(empty_root)
+            assert stub_calls() == []
+
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
         runtime = metadata["managed_runtimes"][0]
