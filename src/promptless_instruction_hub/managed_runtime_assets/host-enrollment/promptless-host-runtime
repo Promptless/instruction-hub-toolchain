@@ -2219,9 +2219,9 @@ def _validate_signed_policy(payload: dict[str, JsonValue], host: Host) -> HostPo
     enabled_hosts = policy_value.get("enabled_hosts")
     if not isinstance(enabled_hosts, list) or host not in enabled_hosts:
         raise BootstrapError(f"policy does not enable {host}")
-    permissions = policy_value.get("plugin_permissions")
-    if not isinstance(permissions, dict) or permissions.get("write_user_config") is not True:
-        raise BootstrapError("policy does not allow user config writes")
+    # plugin_permissions is deliberately ignored: the runtime no longer writes user config
+    # beyond deleting its own legacy managed blocks, so there is no capability to gate. A
+    # policy carrying the retired field still validates while hosted/worker phase it out.
     required_bootstrap_version = _string_value(policy_value.get("required_bootstrap_version"))
     return HostPolicy(
         policy_version=policy_version,

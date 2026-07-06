@@ -1496,7 +1496,6 @@ def test_bootstrap_repeat_runs_stay_configured_without_config_writes(tmp_path: P
     "case",
     [
         "expired",
-        "missing-write-permission",
     ],
 )
 def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> None:
@@ -1553,6 +1552,49 @@ def test_bootstrap_ignores_legacy_collector_policy_sections(tmp_path: Path) -> N
             assert server.check_ins[-1]["status"] == "configured"
         finally:
             server.stop()
+
+
+def test_upload_only_policy_permissions_block_neither_ensure_nor_collect(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    # Hosted policies still carry the retired plugin_permissions section for older
+    # bootstraps. An upload-only grant must not reject config cleanup or, worse,
+    # silently drop every lifecycle trace upload for the org.
+    upload_only_policy = _policy_with(plugin_permissions={"write_user_config": False, "repair_user_config": False})
+    server = _FakeWorkerServer(policy=upload_only_policy)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        record = b'{"kind":"stop","message":"upload-only policy"}\n'
+        transcript_path.write_bytes(record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_bootstrap(plugin_root, "codex", env)
+        assert server.check_ins[-1]["status"] == "configured"
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        assert len(server.trace_batches) == 1
+        chunks = _json_list(server.trace_batches[0]["chunks"], "batch.chunks")
+        chunk = _json_mapping(chunks[0], "batch.chunks[0]")
+        assert chunk["start_offset"] == 0
+        assert chunk["end_offset"] == len(record)
+    finally:
+        server.stop()
 
 
 def test_bootstrap_blocks_when_worker_requires_different_runtime_version(tmp_path: Path) -> None:
@@ -2518,16 +2560,11 @@ def _invalid_policy(case: str) -> dict[str, JsonValue]:
     now = dt.datetime.now(dt.timezone.utc)
     payload = _policy_with()
     policy = _json_mapping(payload["policy"], "policy")
-    collector = _json_mapping(policy["collector"], "policy.collector")
-    permissions = _json_mapping(policy["plugin_permissions"], "policy.plugin_permissions")
 
     if case == "expired":
         policy["expires_at"] = (now - dt.timedelta(minutes=1)).isoformat()
-    elif case == "missing-write-permission":
-        permissions["write_user_config"] = False
     else:
         raise AssertionError(f"unhandled invalid policy case: {case}")
-    del collector
     return payload
 
 
@@ -2810,10 +2847,6 @@ def _signed_policy() -> dict[str, JsonValue]:
                 "tls": None,
             },
             "enabled_hosts": ["codex", "claude"],
-            "plugin_permissions": {
-                "write_user_config": True,
-                "repair_user_config": True,
-            },
             "required_bootstrap_version": "0.2.0",
         },
         "signature": "hmac-sha256-v1:test",
