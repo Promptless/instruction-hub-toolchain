@@ -542,21 +542,24 @@ def _run_collect(
     unparsed_record_count = 0
     with _source_ledger_lock(ledger_path):
         ledger = _load_source_ledger(ledger_path)
-        if ledger.is_new:
-            _baseline_source_offsets(ledger, source_paths)
-            _write_source_ledger(ledger)
-            _emit(
-                {
-                    "status": "trace_upload_baselined",
-                    "host": host,
-                    "source_count": len(source_paths),
-                    "drift_report_count": len(ledger.drift_reports),
-                },
-                quiet=quiet,
-            )
-            return 0
         if baseline:
+            if ledger.is_new:
+                _baseline_source_offsets(ledger, source_paths)
+                _write_source_ledger(ledger)
+                _emit(
+                    {
+                        "status": "trace_upload_baselined",
+                        "host": host,
+                        "source_count": len(source_paths),
+                        "drift_report_count": len(ledger.drift_reports),
+                    },
+                    quiet=quiet,
+                )
+                return 0
             ledger.drift_reports.append({"kind": "native_trace_existing_ledger", "baseline": False})
+        # A new/quarantined ledger seen without --baseline (e.g. a terminal hook after a missed
+        # SessionStart or a corrupt-ledger reset) must not baseline: that would skip the completed
+        # transcript entirely. Fall through so unknown sources upload from offset 0.
 
         for batch in _iter_upload_batches(
             host=host,

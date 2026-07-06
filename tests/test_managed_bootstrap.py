@@ -1681,6 +1681,69 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
         server.stop()
 
 
+def test_collect_without_baseline_uploads_new_ledger_sources_from_start(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"missed baseline"}\n'
+        second_record = b'{"kind":"stop","message":"complete"}\n'
+        transcript_path.write_bytes(first_record + second_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        # A terminal hook is the first collection to see this ledger (missed SessionStart).
+        # The completed transcript must upload from offset 0, not get baselined away.
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        assert len(server.trace_batches) == 1
+        batch = server.trace_batches[0]
+        chunks = _json_list(batch["chunks"], "batch.chunks")
+        assert len(chunks) == 1
+        chunk = _json_mapping(chunks[0], "batch.chunks[0]")
+        assert chunk["kind"] == "jsonl_range"
+        assert chunk["start_offset"] == 0
+        assert chunk["end_offset"] == len(first_record) + len(second_record)
+        assert chunk["line_count"] == 2
+        assert (
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content")))
+            == first_record + second_record
+        )
+
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        source = _json_mapping(sources[_json_string(chunk["source_path_hash"], "source_path_hash")], "source")
+        assert source["end_offset"] == transcript_path.stat().st_size
+
+        # The ledger advanced through the normal ACK path, so a repeat collect uploads nothing.
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        assert len(server.trace_batches) == 1
+    finally:
+        server.stop()
+
+
 def test_collect_uploads_subagent_transcript_with_parent_identity(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
