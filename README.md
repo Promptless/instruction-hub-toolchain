@@ -115,8 +115,7 @@ transcript references first, accepting snake_case, camelCase, and nested
 scans idle host-native transcript roots as a catch-up path. The forward-only
 ledger lives at `~/.promptless/instruction-hub/host-runtime-ledger.json` or
 `PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads are authenticated with the
-same host credential and are gated by the same `enabled_hosts` policy used for
-OTEL config.
+same host credential and are gated by the `enabled_hosts` policy.
 
 Quiet collection stays hook-safe: it never writes status JSON to stdout, and it
 fails open if the ledger lock is busy or the collection deadline expires.
@@ -136,21 +135,17 @@ others reuse the result or defer to a later session. The per-plugin
 `CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA` directories are intentionally not used for this
 state.
 
-For Claude Code, managed telemetry follows Claude's supported capture paths
-instead of relying on OpenTelemetry SDK attribute-length variables to override
-producer-side truncation. Inline tool content remains Claude-bounded OTel event
-content. When policy enables raw API body capture, the host runtime uses
-`OTEL_LOG_RAW_API_BODIES=file:<dir>` under the host-global Promptless state
-directory so Claude writes untruncated local request/response JSON files and
-emits `body_ref` events through the configured OTLP logs pipeline. The runtime
-also enables Claude's enhanced telemetry, OTLP logs/metrics/traces exporters,
-per-signal HTTP/protobuf protocols, detailed beta tracing, prompt logging,
-assistant response logging, tool details, and tool content when policy enables
-those capture categories.
+Native JSONL ledgers are the only telemetry source: the runtime writes no OTel
+exporter config for either host. Hosts configured by earlier managed bootstraps
+have that config removed on the next `ensure` run — the managed `[otel]` block
+in Codex `config.toml` and the marker-owned `OTEL_*`/telemetry env keys in
+Claude `settings.json` are deleted (with a timestamped backup), while unmanaged
+user config is never touched. The hosted policy's legacy `collector` section is
+ignored.
 
 The host runtime has one executable with subcommands. `ensure` is the hook-safe
-path that enrolls when needed, writes local host telemetry config, and posts a
-check-in. `collect` is the non-blocking native JSONL upload path. `enroll`
+path that enrolls when needed, removes legacy managed telemetry config, and
+posts a check-in. `collect` is the non-blocking native JSONL upload path. `enroll`
 acquires only the host credential. `status` prints local JSON without network,
 browser, config writes, or check-ins. `reset --yes` clears cached host
 credentials and pending enrollments while preserving the stable host id and
@@ -166,4 +161,4 @@ Promptless artifact that the toolchain copies into plugin `bin/`.
 The dogfood runtime trusts the authenticated TLS worker response and validates
 only the hosted policy shape. The customer-grade static binary must verify an
 asymmetric hosted-policy signature with a pinned Promptless public key before it
-writes local host telemetry config.
+edits local host config.
