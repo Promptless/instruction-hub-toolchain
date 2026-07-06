@@ -409,7 +409,7 @@ def _node_host_runtime_hook_script(
         "    continue;\n"
         "  }\n"
         f"{ensure_run_script}"
-        "  const collectStdio = emitDiagnostics ? 'inherit' : 'ignore';\n"
+        "  const collectStdio = emitDiagnostics ? 'inherit' : ['inherit', 'ignore', 'ignore'];\n"
         "  const collect = spawnSync(candidate.command, [...candidate.runPrefix, ...collectArgs], { stdio: collectStdio, env: process.env });\n"
         "  if (!emitDiagnostics) process.exit(0);\n"
         "  if (collect.error) process.exit(1);\n"

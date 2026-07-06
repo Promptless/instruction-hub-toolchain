@@ -142,6 +142,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         stub_root = tmp_path / f"{target}-stub-plugin"
         stub_runtime = stub_root / "bin" / HOST_RUNTIME_BIN
         stub_call_log = tmp_path / f"{target}-stub-calls.jsonl"
+        stub_stdin_log = tmp_path / f"{target}-stub-stdin.jsonl"
         stub_runtime.parent.mkdir(parents=True)
         stub_runtime.write_text(
             "import json, os, sys\n"
@@ -149,6 +150,9 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             "    call_log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             "if sys.argv[1:2] == ['ensure']:\n"
             "    print(json.dumps({'argv': sys.argv[1:]}))\n"
+            "elif sys.argv[1:2] == ['collect'] and '--baseline' not in sys.argv:\n"
+            "    with open(os.environ['PROMPTLESS_STUB_STDIN_LOG'], 'a') as stdin_log:\n"
+            "        stdin_log.write(json.dumps({'argv': sys.argv[1:], 'stdin': sys.stdin.read()}) + '\\n')\n"
         )
         stub_runtime.chmod(0o644)
 
@@ -157,11 +161,17 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
 
         def reset_stub_calls() -> None:
             stub_call_log.unlink(missing_ok=True)
+            stub_stdin_log.unlink(missing_ok=True)
 
         def stub_calls() -> list[list[str]]:
             if not stub_call_log.exists():
                 return []
             return [json.loads(line) for line in stub_call_log.read_text().splitlines()]
+
+        def stub_stdin_entries() -> list[dict[str, JsonValue]]:
+            if not stub_stdin_log.exists():
+                return []
+            return [json.loads(line) for line in stub_stdin_log.read_text().splitlines()]
 
         def assert_startup_calls() -> None:
             assert stub_calls() == [
@@ -184,11 +194,13 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             *,
             root: Path | None,
             home: Path,
+            input_text: str | None = None,
         ) -> subprocess.CompletedProcess[str]:
             hook = hook_events[event_name][0]["hooks"][0]
             env_vars = {
                 "HOME": str(home),
                 "PROMPTLESS_STUB_CALL_LOG": str(stub_call_log),
+                "PROMPTLESS_STUB_STDIN_LOG": str(stub_stdin_log),
             }
             if target == "claude":
                 node_path = shutil.which("node")
@@ -199,6 +211,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                     [node_path, *hook["args"]],
                     env=_clean_env(**env_vars),
                     text=True,
+                    input=input_text,
                     capture_output=True,
                     check=False,
                 )
@@ -209,6 +222,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 shell=True,
                 env=_clean_env(**env_vars),
                 text=True,
+                input=input_text,
                 capture_output=True,
                 check=False,
             )
@@ -446,6 +460,29 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             )
             assert_quiet_success(empty_root)
             assert stub_calls() == []
+
+        if target == "claude":
+            reset_stub_calls()
+            stdin_payload = json.dumps(
+                {
+                    "session_id": "claude_session_1",
+                    "transcript_path": str(tmp_path / "claude-session.jsonl"),
+                }
+            )
+            stop_result = terminal_hook_result(
+                "Stop",
+                root=stub_root,
+                home=tmp_path / "claude-stop-stdin-home",
+                input_text=stdin_payload,
+            )
+            assert_quiet_success(stop_result)
+            assert_terminal_calls("stop")
+            assert stub_stdin_entries() == [
+                {
+                    "argv": ["collect", "--host", "claude", "--lifecycle", "stop", "--quiet"],
+                    "stdin": stdin_payload,
+                }
+            ]
 
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
