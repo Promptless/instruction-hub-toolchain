@@ -1935,6 +1935,134 @@ def test_collect_reports_oversized_record_with_content_size_reason(tmp_path: Pat
         server.stop()
 
 
+def test_collect_reports_oversized_record_with_transport_size_reason(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        baseline_record = b'{"kind":"session_start"}\n'
+        # Under the 10 MiB raw-record cap, but incompressible: gzip+base64 grows it
+        # ~4/3 past the request transport budget, so it cannot be sent as content.
+        incompressible_record = os.urandom(8 * 1024 * 1024 + 512 * 1024).replace(b"\n", b"x") + b"\n"
+        trailing_record = b'{"kind":"stop"}\n'
+        transcript_path.write_bytes(baseline_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        transcript_path.write_bytes(baseline_record + incompressible_record + trailing_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        uploaded_chunks = [
+            _json_mapping(chunk_value, "chunk")
+            for batch in server.trace_batches
+            for chunk_value in _json_list(batch["chunks"], "chunks")
+        ]
+        assert [chunk["kind"] for chunk in uploaded_chunks] == ["oversized_record", "jsonl_range"]
+        oversized_chunk = uploaded_chunks[0]
+        assert oversized_chunk["oversized_reason"] == "transport_size"
+        assert oversized_chunk["byte_count"] == len(incompressible_record)
+        assert oversized_chunk["start_offset"] == len(baseline_record)
+        assert oversized_chunk["end_offset"] == len(baseline_record) + len(incompressible_record)
+        assert "content_base64" not in oversized_chunk
+        trailing_chunk = uploaded_chunks[1]
+        assert (
+            gzip.decompress(base64.b64decode(_json_string(trailing_chunk["content_base64"], "content")))
+            == trailing_record
+        )
+
+        # The skip advances the ledger past the unsendable record: no retry wedge.
+        advanced_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        advanced_sources = _json_mapping(advanced_ledger["sources"], "ledger.sources")
+        advanced_source = _json_mapping(next(iter(advanced_sources.values())), "ledger.sources[0]")
+        assert advanced_source["end_offset"] == transcript_path.stat().st_size
+    finally:
+        server.stop()
+
+
+def test_collect_splits_batches_by_transport_size(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        baseline_record = b'{"kind":"session_start"}\n'
+        # Two incompressible 4 MiB records: 8 MiB decoded fits one batch, but each
+        # encodes to ~5.6 MiB, so transport accounting must split them across two.
+        first_blob = os.urandom(4 * 1024 * 1024).replace(b"\n", b"x") + b"\n"
+        second_blob = os.urandom(4 * 1024 * 1024).replace(b"\n", b"x") + b"\n"
+        transcript_path.write_bytes(baseline_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        transcript_path.write_bytes(baseline_record + first_blob + second_blob)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        assert len(server.trace_batches) == 2
+        uploaded_chunks = [
+            _json_mapping(chunk_value, "chunk")
+            for batch in server.trace_batches
+            for chunk_value in _json_list(batch["chunks"], "chunks")
+        ]
+        assert [chunk["kind"] for chunk in uploaded_chunks] == ["jsonl_range", "jsonl_range"]
+        reassembled = b"".join(
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content")))
+            for chunk in uploaded_chunks
+        )
+        assert reassembled == first_blob + second_blob
+
+        advanced_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        advanced_sources = _json_mapping(advanced_ledger["sources"], "ledger.sources")
+        advanced_source = _json_mapping(next(iter(advanced_sources.values())), "ledger.sources[0]")
+        assert advanced_source["end_offset"] == transcript_path.stat().st_size
+    finally:
+        server.stop()
+
+
 def test_collect_tolerates_unparsed_record_counts_and_advances_ledger(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -2190,6 +2318,56 @@ def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) ->
             for chunk in uploaded_chunks
         )
         assert reassembled == appended_body
+    finally:
+        server.stop()
+
+
+def test_truncated_empty_scan_still_reaches_first_run_baseline(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        codex_home = home / ".codex"
+        idle_path = codex_home / "sessions/idle-history.jsonl"
+        idle_path.parent.mkdir(parents=True)
+        idle_path.write_bytes(b'{"kind":"idle_history"}\n')
+        stale = time.time() - (13 * 60 * 60)
+        os.utime(idle_path, (stale, stale))
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(codex_home),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+            "PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS": "0",
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        # No transcript path on hook stdin plus a zero budget: the truncated empty
+        # scan must not return no_sources before the ledger exists, or the first
+        # baseline never happens and later terminal hooks upload the pre-enrollment
+        # tree from offset 0.
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {},
+        )
+
+        assert server.trace_batches == []
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert len(sources) == 1
+        baselined_source = _json_mapping(next(iter(sources.values())), "ledger.sources[0]")
+        assert baselined_source["end_offset"] == idle_path.stat().st_size
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_baselined"
+        assert diagnostics[-1]["source_count"] == 1
     finally:
         server.stop()
 

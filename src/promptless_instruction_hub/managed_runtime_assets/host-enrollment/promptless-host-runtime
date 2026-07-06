@@ -66,6 +66,15 @@ MAX_TRACE_BATCH_BYTES = 10 * 1024 * 1024
 MAX_RECORD_BYTES = 10 * 1024 * 1024
 CHUNK_TARGET_BYTES = 4 * 1024 * 1024
 MAX_UPLOAD_CHUNKS_PER_BATCH = 200
+# Per-request wire budget measured on the encoded body, distinct from the decoded
+# MAX_TRACE_BATCH_BYTES: high-entropy content grows ~4/3 under gzip+base64, so raw
+# size alone cannot bound a request. The worker's HTTP body limit is configurable
+# (256 MiB shipped); bounding here makes collector request size an invariant instead
+# of a property of content entropy. CHUNK_TARGET_BYTES * 4/3 must stay well under
+# this budget so multi-line ranges never overflow it; only single oversized lines do.
+MAX_TRANSPORT_BATCH_BYTES = 10 * 1024 * 1024
+TRANSPORT_CHUNK_OVERHEAD_BYTES = 1024
+TRANSPORT_BATCH_OVERHEAD_BYTES = 16 * 1024
 MAX_DIAGNOSTIC_LOG_BYTES = 512 * 1024
 SOURCE_READ_BLOCK_BYTES = 1024 * 1024
 IDLE_SESSION_GRACE_SECONDS = 12 * 60 * 60
@@ -87,9 +96,9 @@ Host = Literal["codex", "claude"]
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
 LifecycleEvent = Literal["session_start", "stop", "session_end", "subagent_stop"]
 SourceEventKind = Literal["jsonl_range", "oversized_record"]
-# Worker contract vocabulary (NativeTraceOversizedRecordChunk.oversized_reason). The
-# collector only emits content_size: with per-record and per-batch caps equal, a record
-# whose gzip+base64 transport encoding overflows is impossible below the content cap.
+# Worker contract vocabulary (NativeTraceOversizedRecordChunk.oversized_reason):
+# content_size marks raw records over MAX_RECORD_BYTES; transport_size marks records
+# whose gzip+base64 encoding cannot fit one request's transport budget.
 OversizedReason = Literal["content_size", "transport_size"]
 
 # This bin runs under the host's own python3, which on macOS is the system Python 3.9
@@ -548,7 +557,11 @@ def _run_collect(
     source_paths, idle_scan_complete = _collect_source_paths(
         host, hook_context, lifecycle_event=lifecycle_event, deadline=deadline
     )
-    if not source_paths:
+    if not source_paths and idle_scan_complete:
+        # Only a complete scan proves there is nothing to do. A truncated empty scan
+        # must fall through so a first-run --baseline can rerun the inventory
+        # unmetered; returning here would leave the ledger uncreated and later
+        # terminal hooks would upload pre-enrollment history from offset 0.
         _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
         return 0
 
@@ -914,20 +927,40 @@ def _iter_upload_batches(
     """
 
     lifecycle_paths = _lifecycle_subject_paths(hook_context, lifecycle_event)
+    transport_budget = MAX_TRANSPORT_BATCH_BYTES - TRANSPORT_BATCH_OVERHEAD_BYTES
     pending_events: list[SourceEvent] = []
     pending_payloads: list[dict[str, JsonValue]] = []
     pending_decoded_bytes = 0
+    pending_transport_bytes = 0
     yielded_batch = False
     for event in _iter_source_events(ledger, source_paths):
         if yielded_batch:
             _ensure_collect_deadline(deadline)
-        payload = _chunk_payload(event, lifecycle_event if event.path in lifecycle_paths else None)
+        chunk_lifecycle = lifecycle_event if event.path in lifecycle_paths else None
+        payload = _chunk_payload(event, chunk_lifecycle)
+        chunk_transport_bytes = _chunk_transport_bytes(payload)
+        if event.kind == "jsonl_range" and chunk_transport_bytes > transport_budget:
+            # Passing the raw-size cap does not guarantee the wire fits: high-entropy
+            # content grows ~4/3 under gzip+base64. Skip-report the record so the
+            # ledger advances past it instead of retrying an unsendable chunk forever.
+            event = _oversized_event(
+                event.path,
+                event.path_hash,
+                event.start_offset,
+                event.end_offset,
+                event.content or b"",
+                reason="transport_size",
+            )
+            payload = _chunk_payload(event, chunk_lifecycle)
+            chunk_transport_bytes = _chunk_transport_bytes(payload)
         next_decoded_bytes = pending_decoded_bytes + event.byte_count
+        next_transport_bytes = pending_transport_bytes + chunk_transport_bytes
         if (
             pending_payloads
             and (
                 len(pending_payloads) >= MAX_UPLOAD_CHUNKS_PER_BATCH
                 or next_decoded_bytes > MAX_TRACE_BATCH_BYTES
+                or next_transport_bytes > transport_budget
             )
         ):
             yield _upload_batch(
@@ -943,9 +976,11 @@ def _iter_upload_batches(
             pending_events = []
             pending_payloads = []
             pending_decoded_bytes = 0
+            pending_transport_bytes = 0
         pending_events.append(event)
         pending_payloads.append(payload)
         pending_decoded_bytes += event.byte_count
+        pending_transport_bytes += chunk_transport_bytes
     if pending_events:
         yield _upload_batch(
             host=host,
@@ -995,7 +1030,7 @@ def _iter_source_events(ledger: SourceLedger, source_paths: tuple[Path, ...]) ->
                     if buffered_lines:
                         yield _range_event(path, path_hash, buffered_start, record_start, bytes(buffered_lines))
                         buffered_lines = bytearray()
-                    yield _oversized_event(path, path_hash, record_start, handle.tell(), line)
+                    yield _oversized_event(path, path_hash, record_start, handle.tell(), line, reason="content_size")
                     buffered_start = handle.tell()
                     continue
                 if buffered_lines and len(buffered_lines) + len(line) > CHUNK_TARGET_BYTES:
@@ -1022,16 +1057,24 @@ def _range_event(path: Path, path_hash: str, start_offset: int, end_offset: int,
     )
 
 
-def _oversized_event(path: Path, path_hash: str, start_offset: int, end_offset: int, line: bytes) -> SourceEvent:
+def _oversized_event(
+    path: Path,
+    path_hash: str,
+    start_offset: int,
+    end_offset: int,
+    content: bytes,
+    *,
+    reason: OversizedReason,
+) -> SourceEvent:
     return SourceEvent(
         kind="oversized_record",
         path=path,
         path_hash=path_hash,
         start_offset=start_offset,
         end_offset=end_offset,
-        byte_count=len(line),
-        content_sha256=hashlib.sha256(line).hexdigest(),
-        oversized_reason="content_size",
+        byte_count=len(content),
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        oversized_reason=reason,
     )
 
 
@@ -1084,6 +1127,17 @@ def _chunk_payload(event: SourceEvent, lifecycle_event: LifecycleEvent | None) -
 
 def _gzip_base64(content: bytes) -> str:
     return base64.b64encode(gzip.compress(content, mtime=0)).decode("ascii")
+
+
+def _chunk_transport_bytes(payload: dict[str, JsonValue]) -> int:
+    """Bound one chunk's JSON wire footprint from above.
+
+    base64 text needs no JSON escaping, so its serialized length equals its
+    string length; the flat overhead covers the chunk's envelope fields.
+    """
+
+    content = _string_value(payload.get("content_base64"))
+    return (len(content) if content is not None else 0) + TRANSPORT_CHUNK_OVERHEAD_BYTES
 
 
 def _upload_batch(
