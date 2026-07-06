@@ -690,6 +690,9 @@ def _run_collect(
         except CollectDeadlineExceeded:
             deadline_exceeded = True
 
+    unreadable_source_count = sum(
+        1 for report in ledger.drift_reports if report.get("kind") == "native_trace_source_unreadable"
+    )
     payload: dict[str, JsonValue] = {
         "status": "trace_upload_partial" if deadline_exceeded else "trace_upload_complete",
         "host": host,
@@ -697,6 +700,8 @@ def _run_collect(
         "chunk_count": uploaded_chunk_count,
         "unparsed_record_count": unparsed_record_count,
     }
+    if unreadable_source_count:
+        payload["unreadable_source_count"] = unreadable_source_count
     if deadline_exceeded:
         payload["reason"] = "collection_deadline_exceeded"
     _emit(payload, quiet=quiet)
@@ -1086,31 +1091,41 @@ def _iter_source_events(ledger: SourceLedger, source_paths: tuple[Path, ...]) ->
             start_offset = 0
         if start_offset == file_size:
             continue
-        with path.open("rb") as handle:
-            handle.seek(start_offset)
-            buffered_lines = bytearray()
-            buffered_start = start_offset
-            while handle.tell() < file_size:
-                record_start = handle.tell()
-                line = handle.readline()
-                if line == b"" or not line.endswith(b"\n"):
-                    break
-                if len(line) > MAX_RECORD_BYTES:
-                    if buffered_lines:
+        try:
+            with path.open("rb") as handle:
+                handle.seek(start_offset)
+                buffered_lines = bytearray()
+                buffered_start = start_offset
+                while handle.tell() < file_size:
+                    record_start = handle.tell()
+                    line = handle.readline()
+                    if line == b"" or not line.endswith(b"\n"):
+                        break
+                    if len(line) > MAX_RECORD_BYTES:
+                        if buffered_lines:
+                            yield _range_event(path, path_hash, buffered_start, record_start, bytes(buffered_lines))
+                            buffered_lines = bytearray()
+                        yield _oversized_event(
+                            path, path_hash, record_start, handle.tell(), line, reason="content_size"
+                        )
+                        buffered_start = handle.tell()
+                        continue
+                    if buffered_lines and len(buffered_lines) + len(line) > CHUNK_TARGET_BYTES:
                         yield _range_event(path, path_hash, buffered_start, record_start, bytes(buffered_lines))
                         buffered_lines = bytearray()
-                    yield _oversized_event(path, path_hash, record_start, handle.tell(), line, reason="content_size")
-                    buffered_start = handle.tell()
-                    continue
-                if buffered_lines and len(buffered_lines) + len(line) > CHUNK_TARGET_BYTES:
-                    yield _range_event(path, path_hash, buffered_start, record_start, bytes(buffered_lines))
-                    buffered_lines = bytearray()
-                    buffered_start = record_start
-                buffered_lines += line
-            if buffered_lines:
-                yield _range_event(
-                    path, path_hash, buffered_start, buffered_start + len(buffered_lines), bytes(buffered_lines)
-                )
+                        buffered_start = record_start
+                    buffered_lines += line
+                if buffered_lines:
+                    yield _range_event(
+                        path, path_hash, buffered_start, buffered_start + len(buffered_lines), bytes(buffered_lines)
+                    )
+        except OSError:
+            # A source that vanished or lost read permission after the stat() above
+            # must not abort the run: that would drop every pending chunk, including
+            # the hook subject's, and a persistently unreadable idle file would block
+            # all uploads forever. Ranges already yielded stay contiguous from the
+            # watermark, which retries the remainder on the next collect.
+            ledger.drift_reports.append({"kind": "native_trace_source_unreadable", "source_path_hash": path_hash})
 
 
 def _range_event(path: Path, path_hash: str, start_offset: int, end_offset: int, content: bytes) -> SourceEvent:

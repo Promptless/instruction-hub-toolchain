@@ -134,7 +134,10 @@ only the idle scan and follow-on batches stop when the budget runs out
 next collect). The first-run baseline never uses a deadline-truncated
 inventory — files missed by a partial scan would replay from offset zero later
 as a surprise backfill — so on a new ledger the inventory scan reruns
-unmetered. Support diagnostics are written as bounded, redacted JSONL at
+unmetered. A source that vanishes or loses read permission mid-collect is
+skipped with a drift entry (surfaced as `unreadable_source_count`) instead of
+failing the run, so one bad idle file cannot block the hook subject's upload.
+Support diagnostics are written as bounded, redacted JSONL at
 `~/.promptless/instruction-hub/host-runtime-diagnostics.jsonl` with `0600`
 permissions and without transcript content, tool inputs, or credentials.
 
