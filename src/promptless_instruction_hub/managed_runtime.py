@@ -20,12 +20,12 @@ RuntimeStatus = Literal["included"]
 HOST_RUNTIME_ID = "host-runtime"
 HOST_RUNTIME_ASSET_DIR = "host-enrollment"
 HOST_RUNTIME_EXECUTABLE = "promptless-host-runtime"
-# Keep this above the browser callback deadline plus the follow-up poll,
-# policy fetch, local config write, and check-in network calls. Otherwise the
-# host can kill SessionStart before a resumable pending enrollment is persisted.
-HOST_RUNTIME_HOOK_TIMEOUT_SECONDS = 390
+# Keep this above the worst-case SessionStart run: worker healthz + device-session create +
+# the 35s register-driven approval wait + one in-flight request timeout + an auth-retry
+# re-enrollment pass + policy fetch + config write + check-in comes to roughly 130s.
+HOST_RUNTIME_HOOK_TIMEOUT_SECONDS = 150
 HOST_RUNTIME_CHANNEL = "stable"
-HOST_RUNTIME_VERSION = "0.2.1"
+HOST_RUNTIME_VERSION = "0.3.0"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
 SUPPORTED_HOST_RUNTIME_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 MISSING_RUNTIME_ROOT_MESSAGE = (
