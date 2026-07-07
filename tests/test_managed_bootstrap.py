@@ -493,7 +493,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert runtime["id"] == "host-runtime"
         assert runtime["status"] == "included"
         assert runtime["target"] == target
-        assert runtime["version"] == "0.2.3"
+        assert runtime["version"] == "0.2.4"
         assert runtime["channel"] == "stable"
         assert runtime["path"] == f"bin/{HOST_RUNTIME_BIN}"
         assert len(runtime["sha256"]) == 64
@@ -536,7 +536,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     )
     assert payload["id"] == "host-runtime"
     assert payload["name"] == HOST_RUNTIME_BIN
-    assert payload["version"] == "0.2.3"
+    assert payload["version"] == "0.2.4"
     assert payload["channel"] == "stable"
     assert len(_json_string(payload["sha256"], "sha256")) == 64
 
@@ -548,7 +548,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert text_version.returncode == 0
-    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.3\n"
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.4\n"
     assert text_version.stderr == ""
 
 
@@ -1390,7 +1390,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
         assert server.session_requests[0]["package_id"] == "core"
-        assert server.session_requests[0]["bootstrap_version"] == "0.2.3"
+        assert server.session_requests[0]["bootstrap_version"] == "0.2.4"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
         assert server.session_requests[0]["pending_callback"] == "1"
         assert server.session_requests[1]["target"] == "claude"
@@ -1412,7 +1412,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "policy_version",
                 "status",
             }
-            assert check_in["bootstrap_version"] == "0.2.3"
+            assert check_in["bootstrap_version"] == "0.2.4"
             assert check_in["plugin_version"] == "0.1.0"
             assert check_in["status"] == "configured"
             assert check_in["needs_restart"] is False
@@ -2492,7 +2492,9 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
         assert batch["host"] == "codex"
         assert batch["session_id"] == "codex_session_1"
         assert batch["policy_version"] == 1
-        assert batch["collector_version"] == "0.2.3"
+        assert batch["collector_version"] == "0.2.4"
+        assert "session_context_manifests" not in batch
+        assert "context_artifacts" not in batch
         chunks = _json_list(batch["chunks"], "batch.chunks")
         # contiguous complete lines coalesce into one contract-shaped range chunk
         assert len(chunks) == 1
@@ -2514,6 +2516,112 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
             advanced_sources[_json_string(chunk["source_path_hash"], "source_path_hash")], "source"
         )
         assert advanced_source["end_offset"] == transcript_path.stat().st_size
+    finally:
+        server.stop()
+
+
+def test_collect_uploads_policy_enabled_session_context_manifest(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    skill_root = hub_root / "assets/skills/context-capture"
+    skill_root.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Context Capture\n\nUse the live workspace context.\n")
+    (skill_root / "examples").mkdir()
+    (skill_root / "examples/pattern.txt").write_text("Inspect imported skills before editing.\n")
+    (skill_root / ".env").write_text("TOKEN=super-secret-token-that-should-not-upload\n")
+    (hub_root / "packages/core.yaml").write_text("id: core\nname: Core\nincludes:\n  - skill:context-capture\n")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer(policy=_policy_with(trace_context_manifest_version=1))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"sessionId": "codex_session_1", "transcriptPath": str(transcript_path)},
+        )
+
+        assert len(server.trace_batches) == 1
+        batch = server.trace_batches[0]
+        assert batch["chunks"] == []
+        manifests = _json_list(batch["session_context_manifests"], "batch.session_context_manifests")
+        assert len(manifests) == 1
+        manifest = _json_mapping(manifests[0], "session_context_manifest")
+        assert manifest["session_id"] == "codex_session_1"
+        assert manifest["schema_version"] == 1
+        assert manifest["collector_version"] == "0.2.4"
+        assert manifest["plugin_version"] == "0.1.0"
+        assert manifest["manifest_hash"] == _manifest_hash_without_captured_at(manifest)
+        installed_plugins = _json_list(manifest["installed_plugins"], "manifest.installed_plugins")
+        installed_plugin = _json_mapping(installed_plugins[0], "manifest.installed_plugins[0]")
+        assert installed_plugin["plugin_id"] == "promptless-instruction-hub-core"
+        assert installed_plugin["version"] == "0.1.0"
+        available_skills = _json_list(manifest["available_skills"], "manifest.available_skills")
+        assert len(available_skills) == 1
+        skill = _json_mapping(available_skills[0], "manifest.available_skills[0]")
+        assert skill["name"] == "context-capture"
+        assert skill["description"] == "Context Capture"
+        artifact_id = _json_string(skill["artifact_id"], "skill.artifact_id")
+        raw_artifacts = _json_list(manifest["raw_artifacts"], "manifest.raw_artifacts")
+        assert len(raw_artifacts) == 1
+        raw_artifact = _json_mapping(raw_artifacts[0], "manifest.raw_artifacts[0]")
+        assert raw_artifact["artifact_id"] == artifact_id
+        context_artifacts = _json_list(batch["context_artifacts"], "batch.context_artifacts")
+        assert len(context_artifacts) == 1
+        artifact = _json_mapping(context_artifacts[0], "batch.context_artifacts[0]")
+        assert artifact["artifact_id"] == artifact_id
+        compressed_bundle = base64.b64decode(_json_string(artifact["content_base64"], "artifact.content_base64"))
+        assert artifact["content_sha256"] == hashlib.sha256(compressed_bundle).hexdigest()
+        bundle_bytes = gzip.decompress(compressed_bundle)
+        assert artifact["source_byte_count"] == len(bundle_bytes)
+        bundle = _json_mapping(validate_json_value(json.loads(bundle_bytes), "skill bundle"), "skill bundle")
+        files = [_json_mapping(file_value, "bundle.files[]") for file_value in _json_list(bundle["files"], "bundle.files")]
+        assert {file["path"] for file in files} == {"SKILL.md", "examples/pattern.txt"}
+        skill_file = next(file for file in files if file["path"] == "SKILL.md")
+        assert base64.b64decode(_json_string(skill_file["content_base64"], "skill file")) == (
+            b'---\nname: "context-capture"\ndescription: "Context Capture"\n---\n\n'
+            b"# Context Capture\n\nUse the live workspace context.\n"
+        )
+        diagnostics = _json_list(manifest["diagnostics"], "manifest.diagnostics")
+        skipped = [
+            _json_mapping(value, "diagnostic")
+            for value in diagnostics
+            if _json_mapping(value, "diagnostic").get("code") == "context_artifact_file_skipped"
+        ]
+        assert skipped == [
+            {
+                "code": "context_artifact_file_skipped",
+                "severity": "warning",
+                "kind": "skill_bundle",
+                "name": "context-capture",
+                "reason": "sensitive_path",
+                "path": ".env",
+            }
+        ]
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"sessionId": "codex_session_1", "transcriptPath": str(transcript_path)},
+        )
+
+        assert len(server.trace_batches) == 1
     finally:
         server.stop()
 
@@ -3540,6 +3648,15 @@ def _json_string(value: JsonValue, field_path: str) -> str:
 def _json_int(value: JsonValue, field_path: str) -> int:
     assert isinstance(value, int) and not isinstance(value, bool), f"{field_path} must be a JSON integer"
     return value
+
+
+def _manifest_hash_without_captured_at(manifest: dict[str, JsonValue]) -> str:
+    hash_input = {
+        key: value
+        for key, value in manifest.items()
+        if key not in {"manifest_hash", "captured_at"}
+    }
+    return hashlib.sha256(json.dumps(hash_input, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _callback_state(callback_url_value: JsonValue, field_path: str) -> str:
