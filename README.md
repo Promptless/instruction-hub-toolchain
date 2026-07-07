@@ -124,6 +124,15 @@ ledger lives at `~/.promptless/instruction-hub/host-runtime-ledger.json` or
 `PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads are authenticated with the
 same host credential and are gated by the `enabled_hosts` policy.
 
+When the hosted policy sets `trace_context_manifest_version: 1`, collection also
+uploads a `session_context_manifests` entry and bounded `context_artifacts` for
+the active session. The manifest records installed plugin identity and version,
+available skills, workspace metadata, and runtime metadata; raw skill bundles
+are compressed JSON artifacts from the executing plugin root with secret
+filename skips, full-content secret scanning, and byte caps. Manifest hashes are
+stored in the forward-only ledger only after the worker acknowledges the exact
+hash so rejected context is retried without replaying baselined transcripts.
+
 Quiet collection stays hook-safe: it never writes status JSON to stdout, and it
 fails open if the ledger lock is busy. The collection deadline (default 25
 seconds, overridable with `PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS`) is
