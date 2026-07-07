@@ -2265,6 +2265,7 @@ def test_bootstrap_repeat_runs_stay_configured_without_config_writes(tmp_path: P
     "case",
     [
         "expired",
+        "invalid_trace_context_manifest_version",
     ],
 )
 def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> None:
@@ -2528,6 +2529,7 @@ def test_collect_uploads_policy_enabled_session_context_manifest(tmp_path: Path)
     (skill_root / "SKILL.md").write_text("# Context Capture\n\nUse the live workspace context.\n")
     (skill_root / "examples").mkdir()
     (skill_root / "examples/pattern.txt").write_text("Inspect imported skills before editing.\n")
+    (skill_root / "examples/late-value.txt").write_text("x" * (512 * 1024 + 1) + "\napi_key=" + "a" * 24 + "\n")
     (skill_root / ".env").write_text("TOKEN=super-secret-token-that-should-not-upload\n")
     (hub_root / "packages/core.yaml").write_text("id: core\nname: Core\nincludes:\n  - skill:context-capture\n")
     build_hub(hub_root)
@@ -2590,7 +2592,9 @@ def test_collect_uploads_policy_enabled_session_context_manifest(tmp_path: Path)
         bundle_bytes = gzip.decompress(compressed_bundle)
         assert artifact["source_byte_count"] == len(bundle_bytes)
         bundle = _json_mapping(validate_json_value(json.loads(bundle_bytes), "skill bundle"), "skill bundle")
-        files = [_json_mapping(file_value, "bundle.files[]") for file_value in _json_list(bundle["files"], "bundle.files")]
+        files = [
+            _json_mapping(file_value, "bundle.files[]") for file_value in _json_list(bundle["files"], "bundle.files")
+        ]
         assert {file["path"] for file in files} == {"SKILL.md", "examples/pattern.txt"}
         skill_file = next(file for file in files if file["path"] == "SKILL.md")
         assert base64.b64decode(_json_string(skill_file["content_base64"], "skill file")) == (
@@ -2611,7 +2615,15 @@ def test_collect_uploads_policy_enabled_session_context_manifest(tmp_path: Path)
                 "name": "context-capture",
                 "reason": "sensitive_path",
                 "path": ".env",
-            }
+            },
+            {
+                "code": "context_artifact_file_skipped",
+                "severity": "warning",
+                "kind": "skill_bundle",
+                "name": "context-capture",
+                "reason": "sensitive_content",
+                "path": "examples/late-value.txt",
+            },
         ]
 
         _run_collect(
@@ -2622,6 +2634,62 @@ def test_collect_uploads_policy_enabled_session_context_manifest(tmp_path: Path)
         )
 
         assert len(server.trace_batches) == 1
+    finally:
+        server.stop()
+
+
+def test_collect_baseline_keeps_source_ledger_when_context_manifest_is_rejected(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    skill_root = hub_root / "assets/skills/context-capture"
+    skill_root.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Context Capture\n\nUse the live workspace context.\n")
+    (hub_root / "packages/core.yaml").write_text("id: core\nname: Core\nincludes:\n  - skill:context-capture\n")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer(
+        policy=_policy_with(trace_context_manifest_version=1),
+        trace_batch_response={"accepted_session_context_manifest_hashes": []},
+    )
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"sessionId": "codex_session_1", "transcriptPath": str(transcript_path)},
+        )
+
+        assert len(server.trace_batches) == 1
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        source_path_hash = hashlib.sha256(str(transcript_path).encode()).hexdigest()
+        source = _json_mapping(sources[source_path_hash], "ledger.sources[transcript]")
+        assert source["end_offset"] == len(first_record)
+        assert "session_context_manifest_hashes" not in ledger
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"sessionId": "codex_session_1", "transcriptPath": str(transcript_path)},
+        )
+
+        assert len(server.trace_batches) == 2
     finally:
         server.stop()
 
@@ -3651,11 +3719,7 @@ def _json_int(value: JsonValue, field_path: str) -> int:
 
 
 def _manifest_hash_without_captured_at(manifest: dict[str, JsonValue]) -> str:
-    hash_input = {
-        key: value
-        for key, value in manifest.items()
-        if key not in {"manifest_hash", "captured_at"}
-    }
+    hash_input = {key: value for key, value in manifest.items() if key not in {"manifest_hash", "captured_at"}}
     return hashlib.sha256(json.dumps(hash_input, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -3737,6 +3801,8 @@ def _invalid_policy(case: str) -> dict[str, JsonValue]:
 
     if case == "expired":
         policy["expires_at"] = (now - dt.timedelta(minutes=1)).isoformat()
+    elif case == "invalid_trace_context_manifest_version":
+        policy["trace_context_manifest_version"] = "1"
     else:
         raise AssertionError(f"unhandled invalid policy case: {case}")
     return payload
@@ -3770,6 +3836,7 @@ class _FakeWorkerServer:
         policy: dict[str, JsonValue] | None = None,
         poll_response: dict[str, JsonValue] | None = None,
         post_response: dict[str, JsonValue] | None = None,
+        trace_batch_response: dict[str, JsonValue] | None = None,
         session_response: dict[str, JsonValue] | None = None,
         session_barrier_count: int = 0,
         callback_state_override: str | None = None,
@@ -3791,6 +3858,7 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.policy_response = policy or _signed_policy()
         _FakeWorkerHandler.poll_response = poll_response
         _FakeWorkerHandler.post_response = post_response
+        _FakeWorkerHandler.trace_batch_response = trace_batch_response
         _FakeWorkerHandler.session_response = session_response
         _FakeWorkerHandler.session_barrier_count = session_barrier_count
         _FakeWorkerHandler.session_condition = self._session_condition
@@ -3820,6 +3888,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     policy_response: ClassVar[dict[str, JsonValue]]
     poll_response: ClassVar[dict[str, JsonValue] | None]
     post_response: ClassVar[dict[str, JsonValue] | None]
+    trace_batch_response: ClassVar[dict[str, JsonValue] | None]
     session_response: ClassVar[dict[str, JsonValue] | None]
     session_barrier_count: ClassVar[int] = 0
     session_condition: ClassVar[threading.Condition | None] = None
@@ -3909,9 +3978,17 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             payload = self._read_json_request("trace batch request")
             self.trace_batches.append(payload)
             chunks = _json_list(payload["chunks"], "trace batch chunks")
+            manifests = _json_list(
+                payload.get("session_context_manifests", []), "trace batch session context manifests"
+            )
+            context_artifacts = _json_list(payload.get("context_artifacts", []), "trace batch context artifacts")
             acknowledged_ranges: list[dict[str, JsonValue]] = []
+            accepted_manifest_hashes: list[str] = []
             raw_artifact_count = 0
             skipped_record_count = 0
+            for manifest_value in manifests:
+                manifest = _json_mapping(manifest_value, "trace batch session context manifest")
+                accepted_manifest_hashes.append(_json_string(manifest["manifest_hash"], "manifest.manifest_hash"))
             for chunk_value in chunks:
                 chunk = _json_mapping(chunk_value, "trace batch chunk")
                 if chunk["kind"] == "jsonl_range":
@@ -3927,19 +4004,22 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
                         "content_sha256": chunk["content_sha256"],
                     }
                 )
-            self._write_json(
-                {
-                    "accepted": True,
-                    "batch_id": payload["batch_id"],
-                    "policy_version": payload["policy_version"],
-                    "raw_artifact_count": raw_artifact_count,
-                    "skipped_record_count": skipped_record_count,
-                    "acknowledged_ranges": acknowledged_ranges,
-                    "trace_count": raw_artifact_count,
-                    "event_count": raw_artifact_count,
-                    "unparsed_record_count": self.unparsed_record_count,
-                }
-            )
+            response: dict[str, JsonValue] = {
+                "accepted": True,
+                "batch_id": payload["batch_id"],
+                "policy_version": payload["policy_version"],
+                "raw_artifact_count": raw_artifact_count,
+                "raw_context_artifact_count": len(context_artifacts),
+                "accepted_session_context_manifest_hashes": accepted_manifest_hashes,
+                "skipped_record_count": skipped_record_count,
+                "acknowledged_ranges": acknowledged_ranges,
+                "trace_count": raw_artifact_count,
+                "event_count": raw_artifact_count,
+                "unparsed_record_count": self.unparsed_record_count,
+            }
+            if self.trace_batch_response is not None:
+                response.update(self.trace_batch_response)
+            self._write_json(response)
             return
         if (
             self.path != "/v0/host-enrollment/check-ins"

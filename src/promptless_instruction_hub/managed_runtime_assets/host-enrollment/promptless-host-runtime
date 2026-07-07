@@ -71,7 +71,6 @@ MAX_CONTEXT_ARTIFACT_FILES = 512
 MAX_CONTEXT_ARTIFACT_FILE_BYTES = 16 * 1024 * 1024
 MAX_CONTEXT_ARTIFACT_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_CONTEXT_ARTIFACT_TRANSPORT_BYTES = 8 * 1024 * 1024
-MAX_SECRET_SCAN_BYTES = 512 * 1024
 # Per-request wire budget measured on the encoded body, distinct from the decoded
 # MAX_TRACE_BATCH_BYTES: high-entropy content grows ~4/3 under gzip+base64, so raw
 # size alone cannot bound a request. The worker's HTTP body limit is configurable
@@ -100,9 +99,7 @@ COLLECT_DEADLINE_ENV = "PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS"
 CALLBACK_STATE_PARAM = "state"
 INTERNAL_PROMPTLESS_EMAIL_DOMAIN = "gopromptless.ai"
 INTERNAL_PROMPTLESS_WELCOME_SHOWN_AT_KEY = "internal_promptless_welcome_shown_at"
-INTERNAL_PROMPTLESS_WELCOME_SHOWN_VERSIONS_KEY = (
-    "internal_promptless_welcome_shown_at_by_version"
-)
+INTERNAL_PROMPTLESS_WELCOME_SHOWN_VERSIONS_KEY = "internal_promptless_welcome_shown_at_by_version"
 INTERNAL_PROMPTLESS_WELCOME_MESSAGE_LINES = (
     "            ,-,------,",
     r"          _ \(\(_,--'",
@@ -266,6 +263,7 @@ class ConfigResult:
     needs_restart: bool
     effective_config: dict[str, JsonValue]
     drift_reports: list[dict[str, JsonValue]]
+
 
 @dataclass(frozen=True)
 class HookTraceContext:
@@ -615,6 +613,7 @@ def _run_host_enrollment(
     )
     return 0
 
+
 def _run_collect(
     host: Host,
     *,
@@ -649,6 +648,15 @@ def _run_collect(
     source_paths, idle_scan_complete = _collect_source_paths(
         host, hook_context, lifecycle_event=lifecycle_event, deadline=deadline
     )
+    session_context = _session_context_upload(
+        host=host,
+        metadata=metadata,
+        policy=policy,
+        lifecycle_event=lifecycle_event,
+        hook_context=hook_context,
+        plugin_root=plugin_root,
+        deadline=deadline,
+    )
 
     upload_url = _worker_url(worker_base_url, f"/v0/traces/batches?{urlencode({'target': host})}")
     ledger_path = _ledger_path()
@@ -660,15 +668,11 @@ def _run_collect(
             _emit({"status": "trace_upload_skipped", "reason": "ledger_lock_busy", "host": host}, quiet=quiet)
             return 0
         ledger = _load_source_ledger(ledger_path)
-        session_context = _session_context_upload(
-            host=host,
-            metadata=metadata,
-            policy=policy,
-            lifecycle_event=lifecycle_event,
-            hook_context=hook_context,
-            plugin_root=plugin_root,
-            ledger=ledger,
-        )
+        if (
+            session_context is not None
+            and ledger.session_context_manifest_hashes.get(session_context.session_id) == session_context.manifest_hash
+        ):
+            session_context = None
         if not source_paths and idle_scan_complete and session_context is None:
             # Only a complete scan proves there is nothing to do. A truncated empty scan
             # must fall through so a first-run --baseline can rerun the inventory
@@ -684,14 +688,18 @@ def _run_collect(
                     source_paths, idle_scan_complete = _collect_source_paths(
                         host, hook_context, lifecycle_event=lifecycle_event, deadline=float("inf")
                     )
-                if session_context is not None:
-                    batch = _context_upload_batch(host, metadata, policy, lifecycle_event, hook_context, session_context)
-                    response = _post_upload_batch(upload_url, credential, policy, batch)
-                    _record_uploaded_session_context(ledger, batch)
-                    uploaded_batch_count += 1
-                    unparsed_record_count += _optional_int_value(response.get("unparsed_record_count")) or 0
                 _baseline_source_offsets(ledger, source_paths)
                 _write_source_ledger(ledger)
+                if session_context is not None:
+                    batch = _context_upload_batch(
+                        host, metadata, policy, lifecycle_event, hook_context, session_context
+                    )
+                    context_unparsed_count = _post_optional_context_upload_batch(
+                        upload_url, credential, policy, ledger, batch
+                    )
+                    if context_unparsed_count is not None:
+                        uploaded_batch_count += 1
+                        unparsed_record_count += context_unparsed_count
                 _emit(
                     {
                         "status": "trace_upload_baselined",
@@ -720,6 +728,19 @@ def _run_collect(
                 session_context=session_context,
                 deadline=deadline,
             ):
+                if _is_context_only_batch(batch):
+                    context_unparsed_count = _post_optional_context_upload_batch(
+                        upload_url,
+                        credential,
+                        policy,
+                        ledger,
+                        batch,
+                    )
+                    if context_unparsed_count is None:
+                        continue
+                    uploaded_batch_count += 1
+                    unparsed_record_count += context_unparsed_count
+                    continue
                 response = _post_upload_batch(upload_url, credential, policy, batch)
                 _record_uploaded_session_context(ledger, batch)
                 _advance_ledger_from_response(ledger, source_paths, response)
@@ -1089,13 +1110,10 @@ def _iter_upload_batches(
             chunk_transport_bytes = _chunk_transport_bytes(payload)
         next_decoded_bytes = pending_decoded_bytes + event.byte_count
         next_transport_bytes = pending_transport_bytes + chunk_transport_bytes
-        if (
-            pending_payloads
-            and (
-                len(pending_payloads) >= MAX_UPLOAD_CHUNKS_PER_BATCH
-                or next_decoded_bytes > MAX_TRACE_BATCH_BYTES
-                or next_transport_bytes > transport_budget
-            )
+        if pending_payloads and (
+            len(pending_payloads) >= MAX_UPLOAD_CHUNKS_PER_BATCH
+            or next_decoded_bytes > MAX_TRACE_BATCH_BYTES
+            or next_transport_bytes > transport_budget
         ):
             yield _upload_batch(
                 host=host,
@@ -1281,7 +1299,7 @@ def _session_context_upload(
     lifecycle_event: LifecycleEvent,
     hook_context: HookTraceContext,
     plugin_root: Path | None,
-    ledger: SourceLedger,
+    deadline: float,
 ) -> SessionContextUpload | None:
     if policy.trace_context_manifest_version != SESSION_CONTEXT_MANIFEST_VERSION:
         return None
@@ -1295,6 +1313,7 @@ def _session_context_upload(
         plugin_root=plugin_root,
         metadata=metadata,
         diagnostics=diagnostics,
+        deadline=deadline,
     )
     manifest: dict[str, JsonValue] = {
         "schema_version": SESSION_CONTEXT_MANIFEST_VERSION,
@@ -1304,8 +1323,6 @@ def _session_context_upload(
         "plugin_version": metadata.plugin_version,
         "installed_plugins": [_installed_plugin_manifest(metadata)],
         "available_skills": skills,
-        "mcp_servers": [],
-        "tools": [],
         "workspace": _workspace_context_manifest(hook_context),
         "runtime": _runtime_context_manifest(host, metadata),
         "sidecars": _sidecar_context_manifest(plugin_root, metadata),
@@ -1314,8 +1331,6 @@ def _session_context_upload(
     }
     manifest.update(_native_request_context(hook_context, lifecycle_event))
     manifest_hash = _session_context_manifest_hash(manifest)
-    if ledger.session_context_manifest_hashes.get(session_id) == manifest_hash:
-        return None
     manifest["manifest_hash"] = manifest_hash
     return SessionContextUpload(
         session_id=session_id,
@@ -1340,6 +1355,7 @@ def _available_skill_inventory(
     plugin_root: Path | None,
     metadata: RuntimeMetadata,
     diagnostics: list[dict[str, JsonValue]],
+    deadline: float,
 ) -> tuple[list[dict[str, JsonValue]], list[dict[str, JsonValue]], list[dict[str, JsonValue]]]:
     if plugin_root is None:
         diagnostics.append({"code": "missing_plugin_root", "severity": "warning"})
@@ -1353,7 +1369,15 @@ def _available_skill_inventory(
     artifacts: list[dict[str, JsonValue]] = []
     artifact_summaries: list[dict[str, JsonValue]] = []
     remaining_transport_bytes = MAX_CONTEXT_ARTIFACT_TRANSPORT_BYTES
-    for skill_root in sorted(skills_root.iterdir()):
+    try:
+        skill_roots = sorted(skills_root.iterdir())
+    except OSError:
+        diagnostics.append({"code": "available_skills_scan_failed", "severity": "warning"})
+        return [], [], []
+    for skill_root in skill_roots:
+        if _collect_deadline_reached(deadline):
+            diagnostics.append({"code": "context_inventory_deadline_exceeded", "severity": "warning"})
+            break
         if not skill_root.is_dir() or skill_root.is_symlink():
             continue
         skill_file = skill_root / "SKILL.md"
@@ -1376,6 +1400,7 @@ def _available_skill_inventory(
             skill_root=skill_root,
             metadata=metadata,
             remaining_transport_bytes=remaining_transport_bytes,
+            deadline=deadline,
         )
         diagnostics.extend(artifact_diagnostics)
         if artifact is not None and artifact_summary is not None:
@@ -1444,8 +1469,9 @@ def _skill_bundle_context_artifact(
     skill_root: Path,
     metadata: RuntimeMetadata,
     remaining_transport_bytes: int,
+    deadline: float,
 ) -> tuple[dict[str, JsonValue] | None, dict[str, JsonValue] | None, list[dict[str, JsonValue]], int]:
-    bundle, diagnostics = _skill_bundle_payload(skill_name, skill_root)
+    bundle, diagnostics = _skill_bundle_payload(skill_name, skill_root, deadline)
     raw_content = json.dumps(bundle, sort_keys=True, separators=(",", ":")).encode("utf-8")
     compressed_content = gzip.compress(raw_content, mtime=0)
     content_base64 = base64.b64encode(compressed_content).decode("ascii")
@@ -1462,9 +1488,12 @@ def _skill_bundle_context_artifact(
         )
         return None, None, diagnostics, remaining_transport_bytes
     content_sha256 = hashlib.sha256(compressed_content).hexdigest()
-    artifact_id = "skill-bundle-" + hashlib.sha256(
-        f"{metadata.plugin_id}:{metadata.plugin_version}:{metadata.package_id}:{skill_name}:{content_sha256}".encode()
-    ).hexdigest()[:48]
+    artifact_id = (
+        "skill-bundle-"
+        + hashlib.sha256(
+            f"{metadata.plugin_id}:{metadata.plugin_version}:{metadata.package_id}:{skill_name}:{content_sha256}".encode()
+        ).hexdigest()[:48]
+    )
     metadata_payload: dict[str, JsonValue] = {
         "plugin_id": metadata.plugin_id,
         "plugin_version": metadata.plugin_version,
@@ -1494,7 +1523,11 @@ def _skill_bundle_context_artifact(
     return artifact, summary, diagnostics, remaining_transport_bytes - transport_bytes
 
 
-def _skill_bundle_payload(skill_name: str, skill_root: Path) -> tuple[dict[str, JsonValue], list[dict[str, JsonValue]]]:
+def _skill_bundle_payload(
+    skill_name: str,
+    skill_root: Path,
+    deadline: float,
+) -> tuple[dict[str, JsonValue], list[dict[str, JsonValue]]]:
     files: list[dict[str, JsonValue]] = []
     diagnostics: list[dict[str, JsonValue]] = []
     file_source_bytes = 0
@@ -1505,6 +1538,12 @@ def _skill_bundle_payload(skill_name: str, skill_root: Path) -> tuple[dict[str, 
         paths = []
         diagnostics.append({"code": "context_artifact_skill_scan_failed", "severity": "warning", "name": skill_name})
     for path in paths:
+        if _collect_deadline_reached(deadline):
+            diagnostics.append(
+                {"code": "context_artifact_deadline_exceeded", "severity": "warning", "name": skill_name}
+            )
+            truncated = True
+            break
         if path.is_dir():
             continue
         relative_path = path.relative_to(skill_root)
@@ -1512,7 +1551,9 @@ def _skill_bundle_payload(skill_name: str, skill_root: Path) -> tuple[dict[str, 
             diagnostics.append(_context_artifact_file_skipped("symlink", skill_name, relative_path))
             continue
         if len(files) >= MAX_CONTEXT_ARTIFACT_FILES:
-            diagnostics.append({"code": "context_artifact_file_limit_exceeded", "severity": "warning", "name": skill_name})
+            diagnostics.append(
+                {"code": "context_artifact_file_limit_exceeded", "severity": "warning", "name": skill_name}
+            )
             truncated = True
             break
         if _sensitive_context_artifact_path(relative_path):
@@ -1527,7 +1568,9 @@ def _skill_bundle_payload(skill_name: str, skill_root: Path) -> tuple[dict[str, 
             diagnostics.append(_context_artifact_file_skipped("file_size", skill_name, relative_path))
             continue
         if file_source_bytes + stat_result.st_size > MAX_CONTEXT_ARTIFACT_SOURCE_BYTES:
-            diagnostics.append({"code": "context_artifact_source_budget_exceeded", "severity": "warning", "name": skill_name})
+            diagnostics.append(
+                {"code": "context_artifact_source_budget_exceeded", "severity": "warning", "name": skill_name}
+            )
             truncated = True
             break
         try:
@@ -1578,7 +1621,7 @@ def _sensitive_context_artifact_path(relative_path: Path) -> bool:
 
 
 def _sensitive_context_artifact_content(content: bytes) -> bool:
-    sample = content[:MAX_SECRET_SCAN_BYTES].decode("utf-8", errors="ignore")
+    sample = content.decode("utf-8", errors="ignore")
     return (
         CONTEXT_ARTIFACT_PRIVATE_KEY_RE.search(sample) is not None
         or CONTEXT_ARTIFACT_SECRET_VALUE_RE.search(sample) is not None
@@ -1633,11 +1676,7 @@ def _sidecar_context_manifest(plugin_root: Path | None, metadata: RuntimeMetadat
 
 
 def _session_context_manifest_hash(manifest: dict[str, JsonValue]) -> str:
-    hash_input = {
-        key: value
-        for key, value in manifest.items()
-        if key not in {"manifest_hash", "captured_at"}
-    }
+    hash_input = {key: value for key, value in manifest.items() if key not in {"manifest_hash", "captured_at"}}
     return hashlib.sha256(json.dumps(hash_input, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
@@ -1770,6 +1809,30 @@ def _post_upload_batch(
     return response
 
 
+def _post_optional_context_upload_batch(
+    upload_url: str,
+    credential: HostCredential,
+    policy: HostPolicy,
+    ledger: SourceLedger,
+    batch: UploadBatch,
+) -> int | None:
+    try:
+        response = _post_upload_batch(upload_url, credential, policy, batch)
+    except BootstrapAuthError:
+        raise
+    except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
+        _record_session_context_upload_failure(ledger, batch, exc)
+        _write_source_ledger(ledger)
+        return None
+    _record_uploaded_session_context(ledger, batch)
+    _write_source_ledger(ledger)
+    return _optional_int_value(response.get("unparsed_record_count")) or 0
+
+
+def _is_context_only_batch(batch: UploadBatch) -> bool:
+    return batch.context_manifest_hash is not None and not batch.events
+
+
 def _validate_upload_response(response: dict[str, JsonValue], policy: HostPolicy, batch: UploadBatch) -> None:
     if response.get("accepted") is not True:
         raise BootstrapError("trace batch response was not accepted")
@@ -1783,6 +1846,18 @@ def _validate_upload_response(response: dict[str, JsonValue], policy: HostPolicy
     expected_raw_count = sum(1 for event in batch.events if event.kind == "jsonl_range")
     if response.get("raw_artifact_count") != expected_raw_count:
         raise BootstrapError("trace batch response raw_artifact_count did not match upload request")
+    raw_context_artifacts = batch.request.get("context_artifacts")
+    expected_context_artifact_count = len(raw_context_artifacts) if isinstance(raw_context_artifacts, list) else 0
+    if response.get("raw_context_artifact_count") != expected_context_artifact_count:
+        raise BootstrapError("trace batch response raw_context_artifact_count did not match upload request")
+    if batch.context_manifest_hash is not None:
+        accepted_manifest_hashes = response.get("accepted_session_context_manifest_hashes")
+        if not isinstance(accepted_manifest_hashes, list) or not all(
+            type(manifest_hash) is str for manifest_hash in accepted_manifest_hashes
+        ):
+            raise BootstrapError("trace batch response accepted_session_context_manifest_hashes must be a string list")
+        if batch.context_manifest_hash not in accepted_manifest_hashes:
+            raise BootstrapError("trace batch response did not acknowledge session context manifest")
     expected_skipped_count = sum(1 for event in batch.events if event.kind == "oversized_record")
     if response.get("skipped_record_count") != expected_skipped_count:
         raise BootstrapError("trace batch response skipped_record_count did not match upload request")
@@ -1815,6 +1890,15 @@ def _record_uploaded_session_context(ledger: SourceLedger, batch: UploadBatch) -
     if batch.context_manifest_session_id is None or batch.context_manifest_hash is None:
         return
     ledger.session_context_manifest_hashes[batch.context_manifest_session_id] = batch.context_manifest_hash
+
+
+def _record_session_context_upload_failure(ledger: SourceLedger, batch: UploadBatch, exc: Exception) -> None:
+    report: dict[str, JsonValue] = {"kind": "session_context_upload_failed", "message": _redact_text(str(exc))}
+    if batch.context_manifest_session_id is not None:
+        report["session_id"] = batch.context_manifest_session_id
+    if batch.context_manifest_hash is not None:
+        report["manifest_hash"] = batch.context_manifest_hash
+    ledger.drift_reports.append(report)
 
 
 def _expected_acknowledged_ranges(events: tuple[SourceEvent, ...]) -> list[dict[str, JsonValue]]:
@@ -1865,6 +1949,10 @@ def _collect_deadline() -> float:
 def _ensure_collect_deadline(deadline: float) -> None:
     if time.monotonic() >= deadline:
         raise CollectDeadlineExceeded("native trace collection exceeded deadline")
+
+
+def _collect_deadline_reached(deadline: float) -> bool:
+    return time.monotonic() >= deadline
 
 
 def _status_payload(host: Host) -> dict[str, JsonValue]:
@@ -2103,9 +2191,7 @@ def _claim_internal_promptless_welcome(
         state_path = _state_path()
         with _state_file_lock(state_path):
             state = _load_state(state_path)
-            shown_versions = _json_mapping_or_empty(
-                state.get(INTERNAL_PROMPTLESS_WELCOME_SHOWN_VERSIONS_KEY)
-            )
+            shown_versions = _json_mapping_or_empty(state.get(INTERNAL_PROMPTLESS_WELCOME_SHOWN_VERSIONS_KEY))
             if _string_value(shown_versions.get(welcome_version)) is not None:
                 return None
             shown_at = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -2271,7 +2357,6 @@ def _last_status_path() -> Path:
 
 def _diagnostic_log_path() -> Path:
     return _state_path().with_name(DIAGNOSTIC_LOG_FILE_NAME)
-
 
 
 def _load_state(path: Path) -> dict[str, JsonValue]:
@@ -2996,8 +3081,17 @@ def _validate_signed_policy(payload: dict[str, JsonValue], host: Host) -> HostPo
     # beyond deleting its own legacy managed blocks, so there is no capability to gate. A
     # policy carrying the retired field still validates while hosted/worker phase it out.
     required_bootstrap_version = _string_value(policy_value.get("required_bootstrap_version"))
-    trace_context_manifest_version = _optional_int_value(policy_value.get("trace_context_manifest_version"))
-    if trace_context_manifest_version is not None and trace_context_manifest_version != SESSION_CONTEXT_MANIFEST_VERSION:
+    if "trace_context_manifest_version" in policy_value:
+        trace_context_manifest_version = _int_value(
+            policy_value.get("trace_context_manifest_version"),
+            "policy.trace_context_manifest_version",
+        )
+    else:
+        trace_context_manifest_version = None
+    if (
+        trace_context_manifest_version is not None
+        and trace_context_manifest_version != SESSION_CONTEXT_MANIFEST_VERSION
+    ):
         raise BootstrapError("policy.trace_context_manifest_version is unsupported")
     return HostPolicy(
         policy_version=policy_version,
