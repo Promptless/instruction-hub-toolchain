@@ -219,6 +219,7 @@ def _host_runtime_start_hook_command(target: Harness, *, lifecycle: str) -> dict
             baseline=True,
             quiet_failure=False,
             allow_sibling_runtime=False,
+            collect_claude_desktop=True,
         )
     return {
         "command": _posix_host_runtime_hook_command(
@@ -241,6 +242,7 @@ def _host_runtime_terminal_hook_command(target: Harness, *, lifecycle: str) -> d
             baseline=False,
             quiet_failure=True,
             allow_sibling_runtime=True,
+            collect_claude_desktop=False,
         )
     return {
         "command": _posix_host_runtime_hook_command(
@@ -285,6 +287,7 @@ def _claude_host_runtime_hook_command(
     baseline: bool,
     quiet_failure: bool,
     allow_sibling_runtime: bool,
+    collect_claude_desktop: bool,
 ) -> dict[str, JsonValue]:
     return {
         "command": "node",
@@ -298,6 +301,7 @@ def _claude_host_runtime_hook_command(
                 baseline=baseline,
                 quiet_failure=quiet_failure,
                 allow_sibling_runtime=allow_sibling_runtime,
+                collect_claude_desktop=collect_claude_desktop,
             ),
             "${CLAUDE_PLUGIN_ROOT}",
         ],
@@ -313,6 +317,7 @@ def _node_host_runtime_hook_script(
     baseline: bool,
     quiet_failure: bool,
     allow_sibling_runtime: bool,
+    collect_claude_desktop: bool,
 ) -> str:
     root_env_names = json.dumps(list(root_envs), separators=(",", ":"))
     missing_root = _system_message_json(MISSING_RUNTIME_ROOT_MESSAGE)
@@ -342,6 +347,16 @@ def _node_host_runtime_hook_script(
             "    continue;\n"
             "  }\n"
             "  if (ensure.status !== 0) process.exit(ensure.status === null ? 1 : ensure.status);\n"
+        )
+    claude_desktop_collect_script = ""
+    if collect_claude_desktop:
+        claude_desktop_collect_script = (
+            "  const desktopEnsureArgs = [runtime, 'ensure', '--host', 'claude-desktop', '--if-sources', '--quiet'];\n"
+            "  const desktopEnsure = spawnSync(candidate.command, [...candidate.runPrefix, ...desktopEnsureArgs], { stdio: ['ignore', 'ignore', 'ignore'], env: process.env });\n"
+            "  if (!desktopEnsure.error && desktopEnsure.status === 0) {\n"
+            "    const desktopCollectArgs = [runtime, 'collect', '--host', 'claude-desktop', '--lifecycle', 'session_start', '--baseline', '--quiet'];\n"
+            "    spawnSync(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], { stdio: ['ignore', 'ignore', 'ignore'], env: process.env });\n"
+            "  }\n"
         )
     return (
         "const fs = require('fs');\n"
@@ -413,7 +428,10 @@ def _node_host_runtime_hook_script(
         "  const collect = spawnSync(candidate.command, [...candidate.runPrefix, ...collectArgs], { stdio: collectStdio, env: process.env });\n"
         "  if (!emitDiagnostics) process.exit(0);\n"
         "  if (collect.error) process.exit(1);\n"
-        "  process.exit(collect.status === null ? 1 : collect.status);\n"
+        "  const collectStatus = collect.status === null ? 1 : collect.status;\n"
+        "  if (collectStatus !== 0) process.exit(collectStatus);\n"
+        f"{claude_desktop_collect_script}"
+        "  process.exit(0);\n"
         "}\n"
         f"if (sawUnsupportedPython) finishWithDiagnostic({unsupported_python!r});\n"
         f"else if (sawBrokenPython) finishWithDiagnostic({broken_python!r});\n"
