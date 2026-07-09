@@ -186,6 +186,13 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 expected_calls.extend(
                     [
                         [
+                            "ensure",
+                            "--host",
+                            "claude-desktop",
+                            "--if-sources",
+                            "--quiet",
+                        ],
+                        [
                             "collect",
                             "--host",
                             "claude-desktop",
@@ -281,8 +288,8 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert "'--baseline'" in hook_script
             assert "'--quiet'" in hook_script
             assert "'claude-desktop'" in hook_script
-            assert "'--if-sources'" not in hook_script
-            assert "desktopEnsure" not in hook_script
+            assert "'--if-sources'" in hook_script
+            assert "desktopEnsure" in hook_script
 
             node_path = shutil.which("node")
             assert node_path is not None

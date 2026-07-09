@@ -101,7 +101,7 @@ no output when no usable runtime exists.
 ```sh
 sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime ensure --host codex; run promptless-host-runtime collect --host codex --lifecycle session_start --baseline --quiet'
 sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle stop --quiet'
-node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find Python 3.9+; run promptless-host-runtime ensure --host claude; run promptless-host-runtime collect --host claude --lifecycle session_start --baseline --quiet' '${CLAUDE_PLUGIN_ROOT}'
+node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find Python 3.9+; run promptless-host-runtime ensure --host claude; run promptless-host-runtime collect --host claude --lifecycle session_start --baseline --quiet; best-effort run promptless-host-runtime ensure --host claude-desktop --if-sources --quiet; then collect --host claude-desktop only if ensure succeeds' '${CLAUDE_PLUGIN_ROOT}'
 node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host claude --lifecycle session_end --quiet' '${CLAUDE_PLUGIN_ROOT}'
 ```
 
