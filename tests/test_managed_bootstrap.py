@@ -24,6 +24,8 @@ from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, validate_json_value
 from promptless_instruction_hub.managed_runtime import (
+    HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS,
+    HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS,
     MISSING_PYTHON_MESSAGE,
     MISSING_RUNTIME_FILE_MESSAGE,
     MISSING_RUNTIME_ROOT_MESSAGE,
@@ -102,7 +104,10 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             re.MULTILINE,
         )
         assert callback_deadline_match is not None
-        assert session_start_hook["timeout"] == 390
+        expected_startup_timeout = HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
+        if target == "claude":
+            expected_startup_timeout = HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS
+        assert session_start_hook["timeout"] == expected_startup_timeout
         assert session_start_hook["timeout"] > int(callback_deadline_match.group("value"))
         assert hook_events["SessionStart"][0]["matcher"] == "startup|resume"
         terminal_events = tuple(
@@ -116,7 +121,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         )
         for event_name, _lifecycle in terminal_events:
             hook = hook_events[event_name][0]["hooks"][0]
-            assert hook["timeout"] == 390
+            assert hook["timeout"] == HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
             assert hook["statusMessage"] == "Uploading Promptless traces"
 
         for event_name, lifecycle in terminal_events:

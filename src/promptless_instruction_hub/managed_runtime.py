@@ -20,10 +20,13 @@ RuntimeStatus = Literal["included"]
 HOST_RUNTIME_ID = "host-runtime"
 HOST_RUNTIME_ASSET_DIR = "host-enrollment"
 HOST_RUNTIME_EXECUTABLE = "promptless-host-runtime"
-# Keep this above the browser callback deadline plus the follow-up poll,
-# policy fetch, local config write, and check-in network calls. Otherwise the
-# host can kill SessionStart before a resumable pending enrollment is persisted.
-HOST_RUNTIME_HOOK_TIMEOUT_SECONDS = 390
+# Keep one startup pass above the browser callback deadline plus the follow-up poll,
+# policy fetch, local config write, check-in network calls, and trace collection.
+# Claude SessionStart can run two startup passes serially: Claude Code first, then a
+# best-effort Claude Desktop pass when Desktop audit sources exist.
+HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS = 390
+HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS = HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS * 2
+HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS = HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
 HOST_RUNTIME_CHANNEL = "stable"
 HOST_RUNTIME_VERSION = "0.2.3"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
@@ -196,7 +199,7 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
         "hooks": [
             {
                 "type": "command",
-                "timeout": HOST_RUNTIME_HOOK_TIMEOUT_SECONDS,
+                "timeout": _host_runtime_hook_timeout(target, event_name),
                 "statusMessage": (
                     "Checking Promptless host runtime"
                     if event_name == "SessionStart"
@@ -209,6 +212,14 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
     if event_name == "SessionStart":
         hook_entry["matcher"] = "startup|resume"
     return hook_entry
+
+
+def _host_runtime_hook_timeout(target: Harness, event_name: str) -> int:
+    if target == "claude" and event_name == "SessionStart":
+        return HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS
+    if event_name == "SessionStart":
+        return HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
+    return HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS
 
 
 def _host_runtime_start_hook_command(target: Harness, *, lifecycle: str) -> dict[str, JsonValue]:
