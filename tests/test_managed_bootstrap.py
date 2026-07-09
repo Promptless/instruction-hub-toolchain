@@ -185,7 +185,6 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             if target == "claude":
                 expected_calls.extend(
                     [
-                        ["ensure", "--host", "claude-desktop", "--if-sources", "--quiet"],
                         [
                             "collect",
                             "--host",
@@ -282,7 +281,8 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert "'--baseline'" in hook_script
             assert "'--quiet'" in hook_script
             assert "'claude-desktop'" in hook_script
-            assert "'--if-sources'" in hook_script
+            assert "'--if-sources'" not in hook_script
+            assert "desktopEnsure" not in hook_script
 
             node_path = shutil.which("node")
             assert node_path is not None
@@ -2570,6 +2570,37 @@ def test_claude_desktop_ensure_if_sources_skips_without_audit_files(tmp_path: Pa
         server.stop()
 
 
+def test_claude_desktop_collect_skips_without_cached_credential(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/claude/core"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        audit_path = _claude_desktop_audit_path(home, "local-agent-mode-sessions", "session-1")
+        audit_path.parent.mkdir(parents=True)
+        audit_path.write_bytes(b'{"sessionId":"desktop_session_1","message":"baseline"}\n')
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "claude-desktop", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            {
+                "HOME": str(home),
+                "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            {},
+        )
+
+        assert server.session_requests == []
+        assert server.policy_requests == []
+        assert server.trace_batches == []
+    finally:
+        server.stop()
+
+
 def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -2586,7 +2617,6 @@ def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> No
         second_record = b'{"sessionId":"desktop_session_1","message":"upload"}\n'
         audit_path.write_bytes(first_record)
         stale_time = time.time() - (13 * 60 * 60)
-        os.utime(audit_path, (stale_time, stale_time))
         env = {
             "HOME": str(home),
             "CLAUDE_PLUGIN_ROOT": str(plugin_root),

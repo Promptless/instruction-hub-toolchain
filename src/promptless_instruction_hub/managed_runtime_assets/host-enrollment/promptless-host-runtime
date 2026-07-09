@@ -633,7 +633,7 @@ def _run_collect(
     source_paths, idle_scan_complete = _collect_source_paths(
         host, hook_context, lifecycle_event=lifecycle_event, deadline=deadline
     )
-    if not source_paths and idle_scan_complete:
+    if not source_paths and idle_scan_complete and not baseline:
         # Only a complete scan proves there is nothing to do. A truncated empty scan
         # must fall through so a first-run --baseline can rerun the inventory
         # unmetered; returning here would leave the ledger uncreated and later
@@ -654,12 +654,17 @@ def _run_collect(
         if baseline:
             host_baselined = host in ledger.host_baselines or _ledger_has_host_source(ledger, host)
             if not host_baselined:
-                if not idle_scan_complete:
-                    # A deadline-truncated inventory must never baseline: every file the
-                    # scan missed would replay from offset zero later as a surprise backfill.
-                    source_paths, idle_scan_complete = _collect_source_paths(
-                        host, hook_context, lifecycle_event=lifecycle_event, deadline=float("inf")
-                    )
+                # Baseline discovery records offsets for every known source,
+                # including files still inside the idle grace period. Uploads
+                # keep the idle filter; baselines must not skip fresh audit
+                # files and then mark their later bytes as pre-enrollment.
+                source_paths, idle_scan_complete = _collect_source_paths(
+                    host,
+                    hook_context,
+                    lifecycle_event=lifecycle_event,
+                    deadline=float("inf"),
+                    include_active=True,
+                )
                 _baseline_source_offsets(ledger, source_paths)
                 ledger.host_baselines.add(host)
                 _write_source_ledger(ledger)
@@ -823,12 +828,13 @@ def _collect_source_paths(
     *,
     lifecycle_event: LifecycleEvent,
     deadline: float,
+    include_active: bool = False,
 ) -> tuple[tuple[Path, ...], bool]:
     """Order upload sources hook-subject-first and report idle-scan completeness.
 
     The hook's own transcript paths are mandatory and never metered; only the
-    optional idle catch-up scan honors the deadline. Returns the ordered paths
-    plus whether the idle scan covered the full tree.
+    optional root scan honors the deadline. Returns the ordered paths plus
+    whether the scan covered the full tree.
     """
 
     explicit_paths: list[Path] = []
@@ -843,7 +849,7 @@ def _collect_source_paths(
     seen: set[str] = set()
     for path in explicit_paths:
         _append_unique_path(ordered_paths, seen, path)
-    idle_paths, idle_scan_complete = _idle_root_scan_paths(host, deadline=deadline)
+    idle_paths, idle_scan_complete = _idle_root_scan_paths(host, deadline=deadline, include_active=include_active)
     for path in idle_paths:
         _append_unique_path(ordered_paths, seen, path)
     return tuple(ordered_paths), idle_scan_complete
@@ -861,12 +867,12 @@ def _append_unique_path(paths: list[Path], seen: set[str], path: Path) -> None:
     paths.append(resolved)
 
 
-def _idle_root_scan_paths(host: Host, *, deadline: float) -> tuple[tuple[Path, ...], bool]:
-    """Scan native transcript roots for idle files, truncating at the deadline.
+def _idle_root_scan_paths(host: Host, *, deadline: float, include_active: bool = False) -> tuple[tuple[Path, ...], bool]:
+    """Scan native transcript roots for files, truncating at the deadline.
 
     The idle sweep is catch-up work: on deadline pressure it returns whatever
     it found so far instead of failing the whole collect. Returns the sorted
-    idle paths plus whether the scan covered the full tree.
+    paths plus whether the scan covered the full tree.
     """
 
     now = time.time()
@@ -883,7 +889,7 @@ def _idle_root_scan_paths(host: Host, *, deadline: float) -> tuple[tuple[Path, .
                     mtime = path.stat().st_mtime
                 except OSError:
                     continue
-                if now - mtime < IDLE_SESSION_GRACE_SECONDS:
+                if not include_active and now - mtime < IDLE_SESSION_GRACE_SECONDS:
                     continue
                 result.append(path)
     except CollectDeadlineExceeded:
