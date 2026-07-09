@@ -190,7 +190,6 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                             "--host",
                             "claude-desktop",
                             "--if-sources",
-                            "--quiet",
                         ],
                         [
                             "collect",
@@ -290,6 +289,8 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert "'claude-desktop'" in hook_script
             assert "'--if-sources'" in hook_script
             assert "desktopEnsure" in hook_script
+            assert "timeout: 5000" not in hook_script
+            assert "['ignore', 'ignore', 'inherit']" in hook_script
 
             node_path = shutil.which("node")
             assert node_path is not None
