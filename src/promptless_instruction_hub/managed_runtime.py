@@ -20,10 +20,13 @@ RuntimeStatus = Literal["included"]
 HOST_RUNTIME_ID = "host-runtime"
 HOST_RUNTIME_ASSET_DIR = "host-enrollment"
 HOST_RUNTIME_EXECUTABLE = "promptless-host-runtime"
-# Keep this above the browser callback deadline plus the follow-up poll,
-# policy fetch, local config write, and check-in network calls. Otherwise the
-# host can kill SessionStart before a resumable pending enrollment is persisted.
-HOST_RUNTIME_HOOK_TIMEOUT_SECONDS = 390
+# Keep one startup pass above the browser callback deadline plus the follow-up poll,
+# policy fetch, local config write, check-in network calls, and trace collection.
+# Claude SessionStart can run two startup passes serially: Claude Code first, then a
+# best-effort Claude Desktop pass when Desktop audit sources exist.
+HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS = 390
+HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS = HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS * 2
+HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS = HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
 HOST_RUNTIME_CHANNEL = "stable"
 HOST_RUNTIME_VERSION = "0.2.3"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
@@ -196,7 +199,7 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
         "hooks": [
             {
                 "type": "command",
-                "timeout": HOST_RUNTIME_HOOK_TIMEOUT_SECONDS,
+                "timeout": _host_runtime_hook_timeout(target, event_name),
                 "statusMessage": (
                     "Checking Promptless host runtime"
                     if event_name == "SessionStart"
@@ -211,6 +214,14 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
     return hook_entry
 
 
+def _host_runtime_hook_timeout(target: Harness, event_name: str) -> int:
+    if target == "claude" and event_name == "SessionStart":
+        return HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS
+    if event_name == "SessionStart":
+        return HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
+    return HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS
+
+
 def _host_runtime_start_hook_command(target: Harness, *, lifecycle: str) -> dict[str, JsonValue]:
     if target == "claude":
         return _claude_host_runtime_hook_command(
@@ -219,6 +230,7 @@ def _host_runtime_start_hook_command(target: Harness, *, lifecycle: str) -> dict
             baseline=True,
             quiet_failure=False,
             allow_sibling_runtime=False,
+            collect_claude_desktop=True,
         )
     return {
         "command": _posix_host_runtime_hook_command(
@@ -241,6 +253,7 @@ def _host_runtime_terminal_hook_command(target: Harness, *, lifecycle: str) -> d
             baseline=False,
             quiet_failure=True,
             allow_sibling_runtime=True,
+            collect_claude_desktop=False,
         )
     return {
         "command": _posix_host_runtime_hook_command(
@@ -285,6 +298,7 @@ def _claude_host_runtime_hook_command(
     baseline: bool,
     quiet_failure: bool,
     allow_sibling_runtime: bool,
+    collect_claude_desktop: bool,
 ) -> dict[str, JsonValue]:
     return {
         "command": "node",
@@ -298,6 +312,7 @@ def _claude_host_runtime_hook_command(
                 baseline=baseline,
                 quiet_failure=quiet_failure,
                 allow_sibling_runtime=allow_sibling_runtime,
+                collect_claude_desktop=collect_claude_desktop,
             ),
             "${CLAUDE_PLUGIN_ROOT}",
         ],
@@ -313,6 +328,7 @@ def _node_host_runtime_hook_script(
     baseline: bool,
     quiet_failure: bool,
     allow_sibling_runtime: bool,
+    collect_claude_desktop: bool,
 ) -> str:
     root_env_names = json.dumps(list(root_envs), separators=(",", ":"))
     missing_root = _system_message_json(MISSING_RUNTIME_ROOT_MESSAGE)
@@ -342,6 +358,18 @@ def _node_host_runtime_hook_script(
             "    continue;\n"
             "  }\n"
             "  if (ensure.status !== 0) process.exit(ensure.status === null ? 1 : ensure.status);\n"
+        )
+    claude_desktop_collect_script = ""
+    if collect_claude_desktop:
+        # Desktop ensure is not quiet so pending approval is persisted, but stdout stays
+        # suppressed so the best-effort sibling ensure cannot emit a second hook-control object.
+        claude_desktop_collect_script = (
+            "  const desktopEnsureArgs = [runtime, 'ensure', '--host', 'claude-desktop', '--if-sources'];\n"
+            "  const desktopEnsure = spawnSync(candidate.command, [...candidate.runPrefix, ...desktopEnsureArgs], { stdio: ['ignore', 'ignore', 'inherit'], env: process.env });\n"
+            "  if (!desktopEnsure.error && desktopEnsure.status === 0) {\n"
+            "    const desktopCollectArgs = [runtime, 'collect', '--host', 'claude-desktop', '--lifecycle', 'session_start', '--baseline', '--quiet'];\n"
+            "    spawnSync(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], { stdio: ['ignore', 'ignore', 'ignore'], env: process.env });\n"
+            "  }\n"
         )
     return (
         "const fs = require('fs');\n"
@@ -413,7 +441,10 @@ def _node_host_runtime_hook_script(
         "  const collect = spawnSync(candidate.command, [...candidate.runPrefix, ...collectArgs], { stdio: collectStdio, env: process.env });\n"
         "  if (!emitDiagnostics) process.exit(0);\n"
         "  if (collect.error) process.exit(1);\n"
-        "  process.exit(collect.status === null ? 1 : collect.status);\n"
+        "  const collectStatus = collect.status === null ? 1 : collect.status;\n"
+        "  if (collectStatus !== 0) process.exit(collectStatus);\n"
+        f"{claude_desktop_collect_script}"
+        "  process.exit(0);\n"
         "}\n"
         f"if (sawUnsupportedPython) finishWithDiagnostic({unsupported_python!r});\n"
         f"else if (sawBrokenPython) finishWithDiagnostic({broken_python!r});\n"

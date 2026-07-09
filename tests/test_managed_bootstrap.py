@@ -24,6 +24,8 @@ from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, validate_json_value
 from promptless_instruction_hub.managed_runtime import (
+    HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS,
+    HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS,
     MISSING_PYTHON_MESSAGE,
     MISSING_RUNTIME_FILE_MESSAGE,
     MISSING_RUNTIME_ROOT_MESSAGE,
@@ -102,7 +104,10 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             re.MULTILINE,
         )
         assert callback_deadline_match is not None
-        assert session_start_hook["timeout"] == 390
+        expected_startup_timeout = HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
+        if target == "claude":
+            expected_startup_timeout = HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS
+        assert session_start_hook["timeout"] == expected_startup_timeout
         assert session_start_hook["timeout"] > int(callback_deadline_match.group("value"))
         assert hook_events["SessionStart"][0]["matcher"] == "startup|resume"
         terminal_events = tuple(
@@ -116,7 +121,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         )
         for event_name, _lifecycle in terminal_events:
             hook = hook_events[event_name][0]["hooks"][0]
-            assert hook["timeout"] == 390
+            assert hook["timeout"] == HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
             assert hook["statusMessage"] == "Uploading Promptless traces"
 
         for event_name, lifecycle in terminal_events:
@@ -133,6 +138,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                     f"const collectArgs = [runtime, 'collect', '--host', 'claude', '--lifecycle', {lifecycle!r}, '--quiet'];"
                     in hook_script
                 )
+                assert "'claude-desktop'" not in hook_script
             else:
                 hook_command = hook["command"]
                 assert hook_command.startswith("sh -c '")
@@ -177,10 +183,31 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             return [json.loads(line) for line in stub_stdin_log.read_text().splitlines()]
 
         def assert_startup_calls() -> None:
-            assert stub_calls() == [
+            expected_calls = [
                 ["ensure", "--host", target],
                 ["collect", "--host", target, "--lifecycle", "session_start", "--baseline", "--quiet"],
             ]
+            if target == "claude":
+                expected_calls.extend(
+                    [
+                        [
+                            "ensure",
+                            "--host",
+                            "claude-desktop",
+                            "--if-sources",
+                        ],
+                        [
+                            "collect",
+                            "--host",
+                            "claude-desktop",
+                            "--lifecycle",
+                            "session_start",
+                            "--baseline",
+                            "--quiet",
+                        ],
+                    ]
+                )
+            assert stub_calls() == expected_calls
 
         def assert_terminal_calls(lifecycle: str) -> None:
             assert stub_calls() == [
@@ -264,6 +291,11 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert "'collect'" in hook_script
             assert "'--baseline'" in hook_script
             assert "'--quiet'" in hook_script
+            assert "'claude-desktop'" in hook_script
+            assert "'--if-sources'" in hook_script
+            assert "desktopEnsure" in hook_script
+            assert "timeout: 5000" not in hook_script
+            assert "['ignore', 'ignore', 'inherit']" in hook_script
 
             node_path = shutil.which("node")
             assert node_path is not None
@@ -2518,6 +2550,185 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
         server.stop()
 
 
+def test_claude_desktop_ensure_if_sources_skips_without_audit_files(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/claude/core"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        result = subprocess.run(
+            [str(plugin_root / "bin" / HOST_RUNTIME_BIN), "ensure", "--host", "claude-desktop", "--if-sources"],
+            env=_clean_env(
+                HOME=str(home),
+                CLAUDE_PLUGIN_ROOT=str(plugin_root),
+                PROMPTLESS_WORKER_BASE_URL=server.base_url,
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0
+        assert result.stdout == ""
+        payload = _assert_session_start_streams(result.stdout, result.stderr, "trace_upload_skipped")
+        assert payload["host"] == "claude-desktop"
+        assert payload["reason"] == "no_sources"
+        assert server.session_requests == []
+        assert server.policy_requests == []
+        assert server.check_ins == []
+    finally:
+        server.stop()
+
+
+def test_claude_desktop_collect_skips_without_cached_credential(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/claude/core"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        audit_path = _claude_desktop_audit_path(home, "local-agent-mode-sessions", "session-1")
+        audit_path.parent.mkdir(parents=True)
+        audit_path.write_bytes(b'{"sessionId":"desktop_session_1","message":"baseline"}\n')
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "claude-desktop", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            {
+                "HOME": str(home),
+                "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            {},
+        )
+
+        assert server.session_requests == []
+        assert server.policy_requests == []
+        assert server.trace_batches == []
+    finally:
+        server.stop()
+
+
+def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/claude/core"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        audit_path = _claude_desktop_audit_path(home, "local-agent-mode-sessions", "session-1")
+        audit_path.parent.mkdir(parents=True)
+        first_record = b'{"sessionId":"desktop_session_1","message":"baseline"}\n'
+        second_record = b'{"sessionId":"desktop_session_1","message":"upload"}\n'
+        audit_path.write_bytes(first_record)
+        stale_time = time.time() - (13 * 60 * 60)
+        env = {
+            "HOME": str(home),
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "claude-desktop"], env)
+        assert server.session_requests[-1]["target"] == "claude-desktop"
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "claude-desktop", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {},
+        )
+        assert server.trace_batches == []
+
+        audit_path.write_bytes(first_record + second_record)
+        os.utime(audit_path, (stale_time, stale_time))
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "claude-desktop", "--lifecycle", "stop", "--quiet"],
+            env,
+            {},
+        )
+
+        assert len(server.trace_batches) == 1
+        batch = server.trace_batches[0]
+        assert batch["source"] == "claude-desktop"
+        assert batch["host"] == "claude-desktop"
+        assert batch["collector_version"] == "0.2.3"
+        chunks = _json_list(batch["chunks"], "batch.chunks")
+        assert len(chunks) == 1
+        chunk = _json_mapping(chunks[0], "batch.chunks[0]")
+        assert chunk["kind"] == "jsonl_range"
+        assert chunk["start_offset"] == len(first_record)
+        assert chunk["end_offset"] == len(first_record) + len(second_record)
+        assert "lifecycle_event" not in chunk
+        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == second_record
+
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        assert "claude-desktop" in _json_list(ledger["host_baselines"], "ledger.host_baselines")
+    finally:
+        server.stop()
+
+
+def test_claude_desktop_baseline_is_per_host_with_shared_ledger(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/claude/core"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        claude_path = home / ".claude/projects/project-1/session.jsonl"
+        desktop_path = _claude_desktop_audit_path(home, "claude-code-sessions", "session-1")
+        claude_path.parent.mkdir(parents=True)
+        desktop_path.parent.mkdir(parents=True)
+        claude_path.write_bytes(b'{"sessionId":"claude_session_1","message":"baseline"}\n')
+        desktop_path.write_bytes(b'{"sessionId":"desktop_session_1","message":"baseline"}\n')
+        stale_time = time.time() - (13 * 60 * 60)
+        os.utime(claude_path, (stale_time, stale_time))
+        os.utime(desktop_path, (stale_time, stale_time))
+        env = {
+            "HOME": str(home),
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "claude"], env)
+        _run_runtime_json(plugin_root, ["enroll", "--host", "claude-desktop"], env)
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "claude", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {},
+        )
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "claude-desktop", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {},
+        )
+
+        assert server.trace_batches == []
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        assert set(_json_list(ledger["host_baselines"], "ledger.host_baselines")) == {"claude", "claude-desktop"}
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert len(sources) == 2
+        assert [request["target"] for request in server.session_requests] == ["claude", "claude-desktop"]
+    finally:
+        server.stop()
+
+
 def test_collect_without_baseline_uploads_new_ledger_sources_from_start(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -3478,6 +3689,16 @@ def _clean_env(**overrides: str) -> dict[str, str]:
     return env
 
 
+def _claude_desktop_audit_path(home: Path, store_name: str, session_name: str) -> Path:
+    if os.name == "nt":
+        claude_base = home / "AppData/Roaming/Claude"
+    elif sys.platform == "darwin":
+        claude_base = home / "Library/Application Support/Claude"
+    else:
+        claude_base = home / ".config/Claude"
+    return claude_base / store_name / session_name / "audit.jsonl"
+
+
 def _write_shell_script(path: Path, body: str) -> None:
     path.write_text(f"#!/bin/sh\n{body}\n")
     path.chmod(0o755)
@@ -3760,7 +3981,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         target = parse_qs(parsed.query).get("target")
         if (
             parsed.path != "/v0/host-enrollment/policy"
-            or target not in (["codex"], ["claude"])
+            or target not in (["codex"], ["claude"], ["claude-desktop"])
             or self.headers.get("Authorization") != "Bearer plihost_localcredential"
         ):
             self.send_response(401)
@@ -3783,7 +4004,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
         if parsed.path == "/v0/traces/batches":
             target = parse_qs(parsed.query).get("target")
             if (
-                target not in (["codex"], ["claude"])
+                target not in (["codex"], ["claude"], ["claude-desktop"])
                 or self.headers.get("Authorization") != "Bearer plihost_localcredential"
             ):
                 self.send_response(401)
@@ -3892,7 +4113,7 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             condition.wait_for(lambda: len(self.session_requests) >= self.session_barrier_count, timeout=10)
 
 
-def _signed_policy() -> dict[str, JsonValue]:
+def _signed_policy(*, enabled_hosts: list[str] | None = None) -> dict[str, JsonValue]:
     now = dt.datetime.now(dt.timezone.utc)
     return {
         "policy": {
@@ -3910,7 +4131,7 @@ def _signed_policy() -> dict[str, JsonValue]:
                 "headers": {"Authorization": "Bearer otlp-token"},
                 "tls": None,
             },
-            "enabled_hosts": ["codex", "claude"],
+            "enabled_hosts": enabled_hosts or ["codex", "claude"],
             "required_bootstrap_version": "0.2.0",
         },
         "signature": "hmac-sha256-v1:test",
