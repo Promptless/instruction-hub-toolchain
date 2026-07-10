@@ -30,8 +30,8 @@ jobs:
         run: uv sync --frozen
 
       - run: bash -n scripts/run.sh
-      - run: uv run ruff check src tests
-      - run: uv run ruff format --check src tests
+      - run: uv run ruff check src tests scripts
+      - run: uv run ruff format --check src tests scripts
 
   typecheck:
     runs-on: ubuntu-latest
@@ -53,7 +53,7 @@ jobs:
         run: uv sync --frozen
 
       - name: Run ty
-        run: uv run ty check src tests --extra-search-path "${GITHUB_WORKSPACE}/src"
+        run: uv run ty check src tests scripts --extra-search-path "${GITHUB_WORKSPACE}/src"
 
   test:
     runs-on: ubuntu-latest
@@ -101,3 +101,77 @@ jobs:
         with:
           mode: build
           hub-root: test-hub
+
+  release-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up toolchain Python
+        id: toolchain-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Build source distribution and wheel from source distribution
+        env:
+          TOOLCHAIN_PYTHON: ${{ steps.toolchain-python.outputs.python-path }}
+        run: |
+          rm -rf dist
+          uv build --sdist --no-sources --python "$TOOLCHAIN_PYTHON" --out-dir dist
+          uv build --wheel --no-sources --python "$TOOLCHAIN_PYTHON" --out-dir dist dist/*.tar.gz
+
+      - name: Set up managed-runtime Python floor
+        id: runtime-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Smoke test installed artifacts and generated runtime
+        env:
+          RUNTIME_PYTHON: ${{ steps.runtime-python.outputs.python-path }}
+          TOOLCHAIN_PYTHON: ${{ steps.toolchain-python.outputs.python-path }}
+        run: >-
+          "$TOOLCHAIN_PYTHON" scripts/ci_managed_runtime_smoke.py artifacts
+          --dist dist
+          --uv "$(command -v uv)"
+          --runtime-python "$RUNTIME_PYTHON"
+
+  managed-runtime-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up toolchain Python
+        id: toolchain-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up managed-runtime Python floor
+        id: runtime-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        run: uv sync --frozen --python "${{ steps.toolchain-python.outputs.python-path }}"
+
+      - name: Smoke test generated runtime and Windows state lock
+        run: >-
+          uv run --frozen --python "${{ steps.toolchain-python.outputs.python-path }}"
+          python scripts/ci_managed_runtime_smoke.py platform
+          --runtime-python "${{ steps.runtime-python.outputs.python-path }}"
+          --require-windows

@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Run the Promptless managed host runtime."""
+
+import importlib.util
+import os
+import sys
+
+sys.dont_write_bytecode = True
+
+_BUNDLE_ERROR = (
+    "Promptless Instruction Hub could not load its managed runtime bundle. Reinstall the Promptless plugin.\n"
+)
+
+
+def _bundle_error():
+    sys.stderr.write(_BUNDLE_ERROR)
+    raise SystemExit(1)
+
+
+def _exec_bundle_module(spec, module):
+    try:
+        spec.loader.exec_module(module)
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.startswith("promptless_host_runtime."):
+            _bundle_error()
+        raise
+
+
+def _load_main():
+    bundle_root = os.path.dirname(os.path.realpath(__file__))
+    package_root = os.path.join(bundle_root, "promptless_host_runtime")
+    package_init = os.path.join(package_root, "__init__.py")
+    cli_path = os.path.join(package_root, "cli.py")
+    if any(not os.path.isfile(path) or not os.access(path, os.R_OK) for path in (package_init, cli_path)):
+        _bundle_error()
+
+    package_spec = importlib.util.spec_from_file_location(
+        "promptless_host_runtime",
+        package_init,
+        submodule_search_locations=[package_root],
+    )
+    if package_spec is None or package_spec.loader is None:
+        _bundle_error()
+    package = importlib.util.module_from_spec(package_spec)
+    sys.modules[package_spec.name] = package
+    _exec_bundle_module(package_spec, package)
+
+    cli_spec = importlib.util.spec_from_file_location("promptless_host_runtime.cli", cli_path)
+    if cli_spec is None or cli_spec.loader is None:
+        _bundle_error()
+    cli = importlib.util.module_from_spec(cli_spec)
+    sys.modules[cli_spec.name] = cli
+    _exec_bundle_module(cli_spec, cli)
+    return cli.main
+
+
+main = _load_main()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

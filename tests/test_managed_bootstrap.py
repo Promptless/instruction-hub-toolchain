@@ -24,6 +24,7 @@ from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, validate_json_value
 from promptless_instruction_hub.managed_runtime import (
+    HOST_RUNTIME_BUNDLE_RELATIVE_PATHS,
     HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS,
     HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS,
     MISSING_PYTHON_MESSAGE,
@@ -33,6 +34,7 @@ from promptless_instruction_hub.managed_runtime import (
 )
 
 HOST_RUNTIME_BIN = "promptless-host-runtime"
+HOST_RUNTIME_PACKAGE = "promptless_host_runtime"
 HOST_STATE_REL_PATH = Path(".promptless/instruction-hub/host-enrollment-state.json")
 LAST_STATUS_REL_PATH = Path(".promptless/instruction-hub/last-bootstrap-status.json")
 DIAGNOSTIC_LOG_REL_PATH = Path(".promptless/instruction-hub/host-runtime-diagnostics.jsonl")
@@ -44,6 +46,9 @@ FIRST_SUCCESS_NO_RESTART_FRAGMENT = "No restart or plugin reload is needed."
 BROWSER_ENROLLMENT_MESSAGE = (
     "Promptless Instruction Governance telemetry is starting browser-based enrollment. "
     "Approve the Promptless browser tab to continue."
+)
+BUNDLE_LOAD_ERROR = (
+    "Promptless Instruction Hub could not load its managed runtime bundle. Reinstall the Promptless plugin.\n"
 )
 
 
@@ -60,6 +65,25 @@ def _last_status_path(home: Path) -> Path:
 def _diagnostic_log_path(home: Path) -> Path:
     """Return the redacted host-global hook diagnostic log."""
     return home / DIAGNOSTIC_LOG_REL_PATH
+
+
+def _runtime_bundle_sha256(bin_root: Path) -> str:
+    package_root = bin_root / HOST_RUNTIME_PACKAGE
+    files = [bin_root / HOST_RUNTIME_BIN]
+    files.extend(
+        path
+        for path in package_root.rglob("*")
+        if path.is_file() and "__pycache__" not in path.relative_to(bin_root).parts and path.suffix != ".pyc"
+    )
+
+    digest = hashlib.sha256()
+    for path in sorted(files, key=lambda candidate: candidate.relative_to(bin_root).as_posix()):
+        relative_path = path.relative_to(bin_root).as_posix()
+        digest.update(relative_path.encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _assert_no_promptless_directory(root: Path) -> None:
@@ -89,8 +113,10 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
     for target in ("codex", "claude"):
         plugin_root = hub_root / "dist" / target / "core"
         bootstrap_path = plugin_root / "bin" / HOST_RUNTIME_BIN
+        runtime_package_path = plugin_root / "bin" / HOST_RUNTIME_PACKAGE
         assert bootstrap_path.exists()
         assert os.access(bootstrap_path, os.X_OK)
+        assert runtime_package_path.is_dir()
         hooks = json.loads((plugin_root / "hooks/hooks.json").read_text())
         hook_events = hooks["hooks"]
         expected_events = ("SessionStart", "Stop", "SubagentStop")
@@ -100,7 +126,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         session_start_hook = hook_events["SessionStart"][0]["hooks"][0]
         callback_deadline_match = re.search(
             r"^ENROLLMENT_CALLBACK_DEADLINE_SECONDS = (?P<value>\d+)$",
-            bootstrap_path.read_text(),
+            (runtime_package_path / "contracts.py").read_text(),
             re.MULTILINE,
         )
         assert callback_deadline_match is not None
@@ -150,9 +176,17 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
 
         stub_root = tmp_path / f"{target}-stub-plugin"
         stub_runtime = stub_root / "bin" / HOST_RUNTIME_BIN
+        stub_runtime_package = stub_root / "bin" / HOST_RUNTIME_PACKAGE
         stub_call_log = tmp_path / f"{target}-stub-calls.jsonl"
         stub_stdin_log = tmp_path / f"{target}-stub-stdin.jsonl"
         stub_runtime.parent.mkdir(parents=True)
+        assert f"{HOST_RUNTIME_PACKAGE}/contracts.py" in HOST_RUNTIME_BUNDLE_RELATIVE_PATHS
+        for relative_path in HOST_RUNTIME_BUNDLE_RELATIVE_PATHS:
+            if relative_path == HOST_RUNTIME_BIN:
+                continue
+            stub_path = stub_root / "bin" / relative_path
+            stub_path.parent.mkdir(parents=True, exist_ok=True)
+            stub_path.write_text("")
         stub_runtime.write_text(
             "import json, os, sys\n"
             "with open(os.environ['PROMPTLESS_STUB_CALL_LOG'], 'a') as call_log:\n"
@@ -167,6 +201,15 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
 
         missing_runtime_root = tmp_path / f"{target}-missing-runtime-plugin"
         missing_runtime_root.mkdir()
+        incomplete_runtime_root = tmp_path / f"{target}-incomplete-runtime-plugin"
+        incomplete_runtime = incomplete_runtime_root / "bin" / HOST_RUNTIME_BIN
+        incomplete_runtime_package = incomplete_runtime_root / "bin" / HOST_RUNTIME_PACKAGE
+        incomplete_runtime_package.mkdir(parents=True)
+        shutil.copy2(stub_runtime, incomplete_runtime)
+        (incomplete_runtime_package / "__init__.py").write_text("")
+        missing_import_runtime_root = tmp_path / f"{target}-missing-import-runtime-plugin"
+        shutil.copytree(stub_root / "bin", missing_import_runtime_root / "bin")
+        (missing_import_runtime_root / "bin" / HOST_RUNTIME_PACKAGE / "contracts.py").unlink()
 
         def reset_stub_calls() -> None:
             stub_call_log.unlink(missing_ok=True)
@@ -190,12 +233,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             if target == "claude":
                 expected_calls.extend(
                     [
-                        [
-                            "ensure",
-                            "--host",
-                            "claude-desktop",
-                            "--if-sources",
-                        ],
+                        ["ensure", "--host", "claude-desktop", "--if-sources"],
                         [
                             "collect",
                             "--host",
@@ -260,18 +298,27 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         def make_stale_root_with_sibling_runtime(lifecycle: str) -> Path:
             plugin_id_root = tmp_path / f"{target}-{lifecycle}-managed-cache" / "promptless-instruction-hub-dev"
             stale_root = plugin_id_root / "0.3.1"
-            sibling_runtime = plugin_id_root / "0.3.2" / "bin" / HOST_RUNTIME_BIN
-            stale_root.mkdir(parents=True)
+            stale_runtime = stale_root / "bin" / HOST_RUNTIME_BIN
+            sibling_bin = plugin_id_root / "0.3.2" / "bin"
+            sibling_runtime = sibling_bin / HOST_RUNTIME_BIN
+            stale_runtime.parent.mkdir(parents=True)
+            shutil.copy2(stub_runtime, stale_runtime)
+            shutil.copytree(stub_runtime_package, stale_runtime.parent / HOST_RUNTIME_PACKAGE)
+            (stale_runtime.parent / HOST_RUNTIME_PACKAGE / "contracts.py").unlink()
+            stale_runtime.write_text("raise SystemExit(97)\n")
             sibling_runtime.parent.mkdir(parents=True)
             shutil.copy2(stub_runtime, sibling_runtime)
+            shutil.copytree(stub_runtime_package, sibling_bin / HOST_RUNTIME_PACKAGE)
             sibling_runtime.chmod(0o644)
             return stale_root
 
         def make_stale_root_without_runtime(lifecycle: str) -> Path:
-            stale_root = (
-                tmp_path / f"{target}-{lifecycle}-missing-runtime-cache" / "promptless-instruction-hub-dev" / "0.3.1"
-            )
+            plugin_id_root = tmp_path / f"{target}-{lifecycle}-missing-runtime-cache" / "promptless-instruction-hub-dev"
+            stale_root = plugin_id_root / "0.3.1"
+            incomplete_sibling_runtime = plugin_id_root / "0.3.2" / "bin" / HOST_RUNTIME_BIN
             stale_root.mkdir(parents=True)
+            incomplete_sibling_runtime.parent.mkdir(parents=True)
+            shutil.copy2(stub_runtime, incomplete_sibling_runtime)
             return stale_root
 
         if target == "claude":
@@ -284,6 +331,9 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert "CLAUDE_PLUGIN_ROOT" in hook_script
             assert "PLUGIN_ROOT" in hook_script
             assert f"path.join(root, 'bin', {HOST_RUNTIME_BIN!r})" in hook_script
+            assert "const bundleRelativePaths =" in hook_script
+            assert f'"{HOST_RUNTIME_PACKAGE}/contracts.py"' in hook_script
+            assert "relativePath.split('/')" in hook_script
             assert "spawnSync" in hook_script
             assert "sys.version_info >= (3, 9)" in hook_script
             assert MISSING_PYTHON_MESSAGE in hook_script
@@ -317,6 +367,24 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 check=False,
             )
             _assert_hook_system_message(missing_runtime, MISSING_RUNTIME_FILE_MESSAGE)
+
+            incomplete_runtime_result = subprocess.run(
+                [node_path, hook_args[0], hook_script, str(incomplete_runtime_root)],
+                env=_clean_env(HOME=str(tmp_path / f"{target}-incomplete-runtime-home")),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_system_message(incomplete_runtime_result, MISSING_RUNTIME_FILE_MESSAGE)
+
+            missing_import_runtime_result = subprocess.run(
+                [node_path, hook_args[0], hook_script, str(missing_import_runtime_root)],
+                env=_clean_env(HOME=str(tmp_path / f"{target}-missing-import-runtime-home")),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_system_message(missing_import_runtime_result, MISSING_RUNTIME_FILE_MESSAGE)
 
             missing_python = subprocess.run(
                 [node_path, hook_args[0], hook_script, str(stub_root)],
@@ -395,7 +463,10 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert '"$runtime" collect --host codex --lifecycle session_start --baseline --quiet' in hook_command
             assert hook_command.startswith("sh -c '")
             assert f'runtime="$root/bin/{HOST_RUNTIME_BIN}"' in hook_command
-            assert '[ ! -r "$runtime" ]' in hook_command
+            assert "runtime_state" in hook_command
+            assert "runtime_bundle_dir=${runtime_candidate%/*}" in hook_command
+            assert f"{HOST_RUNTIME_PACKAGE}/contracts.py" in hook_command
+            assert 'required_path="$runtime_bundle_dir/$relative_path"' in hook_command
 
             missing_root = subprocess.run(
                 hook_command,
@@ -419,6 +490,32 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 check=False,
             )
             _assert_hook_system_message(missing_runtime, MISSING_RUNTIME_FILE_MESSAGE)
+
+            incomplete_runtime_result = subprocess.run(
+                hook_command,
+                shell=True,
+                env=_clean_env(
+                    HOME=str(tmp_path / f"{target}-incomplete-runtime-home"),
+                    PLUGIN_ROOT=str(incomplete_runtime_root),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_system_message(incomplete_runtime_result, MISSING_RUNTIME_FILE_MESSAGE)
+
+            missing_import_runtime_result = subprocess.run(
+                hook_command,
+                shell=True,
+                env=_clean_env(
+                    HOME=str(tmp_path / f"{target}-missing-import-runtime-home"),
+                    PLUGIN_ROOT=str(missing_import_runtime_root),
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            _assert_hook_system_message(missing_import_runtime_result, MISSING_RUNTIME_FILE_MESSAGE)
 
             fallback_python_bin = tmp_path / f"{target}-fallback-python-bin"
             fallback_python_bin.mkdir()
@@ -525,10 +622,12 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert runtime["id"] == "host-runtime"
         assert runtime["status"] == "included"
         assert runtime["target"] == target
-        assert runtime["version"] == "0.2.3"
+        assert runtime["version"] == "0.2.4"
         assert runtime["channel"] == "stable"
         assert runtime["path"] == f"bin/{HOST_RUNTIME_BIN}"
-        assert len(runtime["sha256"]) == 64
+        assert runtime["sha256"] == _runtime_bundle_sha256(plugin_root / "bin")
+        assert list(runtime_package_path.rglob("__pycache__")) == []
+        assert list(runtime_package_path.rglob("*.pyc")) == []
 
     codex_manifest = json.loads((hub_root / "dist/codex/core/.codex-plugin/plugin.json").read_text())
     assert codex_manifest["hooks"] == "./hooks/hooks.json"
@@ -536,6 +635,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
     for target in ("cursor", "gemini"):
         plugin_root = hub_root / "dist" / target / "core"
         assert not (plugin_root / "bin" / HOST_RUNTIME_BIN).exists()
+        assert not (plugin_root / "bin" / HOST_RUNTIME_PACKAGE).exists()
         assert not (plugin_root / "hub.managed-runtimes.json").exists()
 
     release_manifest = json.loads((hub_root / "hub.release.json").read_text())
@@ -568,9 +668,29 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     )
     assert payload["id"] == "host-runtime"
     assert payload["name"] == HOST_RUNTIME_BIN
-    assert payload["version"] == "0.2.3"
+    assert payload["version"] == "0.2.4"
     assert payload["channel"] == "stable"
-    assert len(_json_string(payload["sha256"], "sha256")) == 64
+    manifest = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
+    bundle_sha256 = _runtime_bundle_sha256(plugin_root / "bin")
+    assert payload["sha256"] == manifest["managed_runtimes"][0]["sha256"] == bundle_sha256
+
+    isolated = subprocess.run(
+        [sys.executable, "-S", str(runtime_path), "version", "--json"],
+        cwd=tmp_path,
+        env=_clean_env(
+            HOME=str(home),
+            PLUGIN_ROOT=str(plugin_root),
+            PYTHONPATH="",
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert isolated.returncode == 0
+    assert json.loads(isolated.stdout)["sha256"] == bundle_sha256
+    assert isolated.stderr == ""
+    assert list((plugin_root / "bin" / HOST_RUNTIME_PACKAGE).rglob("__pycache__")) == []
+    assert list((plugin_root / "bin" / HOST_RUNTIME_PACKAGE).rglob("*.pyc")) == []
 
     text_version = subprocess.run(
         [str(runtime_path), "version"],
@@ -580,8 +700,131 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert text_version.returncode == 0
-    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.3\n"
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.4\n"
     assert text_version.stderr == ""
+
+    poison_root = tmp_path / "poison-pythonpath"
+    poison_package = poison_root / HOST_RUNTIME_PACKAGE
+    poison_marker = tmp_path / "poison-loaded"
+    poison_package.mkdir(parents=True)
+    (poison_package / "__init__.py").write_text("")
+    (poison_package / "cli.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['PROMPTLESS_POISON_MARKER']).write_text('loaded')\n"
+        "def main():\n"
+        "    return 99\n"
+    )
+    poisoned_pythonpath = subprocess.run(
+        [str(runtime_path), "version", "--json"],
+        env=_clean_env(
+            HOME=str(home),
+            PLUGIN_ROOT=str(plugin_root),
+            PYTHONPATH=str(poison_root),
+            PROMPTLESS_POISON_MARKER=str(poison_marker),
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert poisoned_pythonpath.returncode == 0
+    assert json.loads(poisoned_pythonpath.stdout)["version"] == "0.2.4"
+    assert poisoned_pythonpath.stderr == ""
+    assert not poison_marker.exists()
+
+    incomplete_bin = tmp_path / "incomplete-bin"
+    incomplete_bin.mkdir()
+    incomplete_runtime = incomplete_bin / HOST_RUNTIME_BIN
+    shutil.copy2(runtime_path, incomplete_runtime)
+    incomplete_bundle = subprocess.run(
+        [str(incomplete_runtime), "version"],
+        env=_clean_env(
+            HOME=str(home),
+            PLUGIN_ROOT=str(plugin_root),
+            PYTHONPATH=str(poison_root),
+            PROMPTLESS_POISON_MARKER=str(poison_marker),
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert incomplete_bundle.returncode == 1
+    assert incomplete_bundle.stdout == ""
+    assert incomplete_bundle.stderr == BUNDLE_LOAD_ERROR
+    assert not poison_marker.exists()
+
+    missing_module_bin = tmp_path / "missing-module-bin"
+    shutil.copytree(plugin_root / "bin", missing_module_bin)
+    (missing_module_bin / HOST_RUNTIME_PACKAGE / "contracts.py").unlink()
+    missing_module = subprocess.run(
+        [str(missing_module_bin / HOST_RUNTIME_BIN), "version"],
+        env=_clean_env(
+            HOME=str(home),
+            PLUGIN_ROOT=str(plugin_root),
+            PYTHONPATH=str(poison_root),
+            PROMPTLESS_POISON_MARKER=str(poison_marker),
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert missing_module.returncode == 1
+    assert missing_module.stdout == ""
+    assert missing_module.stderr == BUNDLE_LOAD_ERROR
+    assert not poison_marker.exists()
+
+    internal_import_bin = tmp_path / "internal-import-bin"
+    shutil.copytree(plugin_root / "bin", internal_import_bin)
+    internal_cli = internal_import_bin / HOST_RUNTIME_PACKAGE / "cli.py"
+    internal_cli.write_text(
+        internal_cli.read_text().replace(
+            "from __future__ import annotations\n",
+            "from __future__ import annotations\n\nraise ImportError('sentinel internal import')\n",
+            1,
+        )
+    )
+    internal_import = subprocess.run(
+        [str(internal_import_bin / HOST_RUNTIME_BIN), "version"],
+        env=_clean_env(HOME=str(home), PLUGIN_ROOT=str(plugin_root)),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert internal_import.returncode == 1
+    assert internal_import.stdout == ""
+    assert "ImportError: sentinel internal import" in internal_import.stderr
+    assert BUNDLE_LOAD_ERROR.strip() not in internal_import.stderr
+
+
+def test_host_runtime_bundle_digest_tracks_runtime_files_only(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root)
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    bin_root = plugin_root / "bin"
+    runtime_path = bin_root / HOST_RUNTIME_BIN
+    manifest = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
+    manifest_sha256 = manifest["managed_runtimes"][0]["sha256"]
+    env = {"HOME": str(tmp_path / "home"), "PLUGIN_ROOT": str(plugin_root)}
+
+    original_launcher = runtime_path.read_bytes()
+    runtime_path.write_bytes(original_launcher + b"\n# digest mutation\n")
+    launcher_payload, _ = _run_runtime_json(plugin_root, ["version", "--json"], env)
+    assert launcher_payload["sha256"] != manifest_sha256
+    runtime_path.write_bytes(original_launcher)
+
+    module_path = bin_root / HOST_RUNTIME_PACKAGE / "contracts.py"
+    original_module = module_path.read_bytes()
+    module_path.write_bytes(original_module + b"\n# digest mutation\n")
+    module_payload, _ = _run_runtime_json(plugin_root, ["version", "--json"], env)
+    assert module_payload["sha256"] != manifest_sha256
+    module_path.write_bytes(original_module)
+
+    cache_root = bin_root / HOST_RUNTIME_PACKAGE / "__pycache__"
+    cache_root.mkdir()
+    (cache_root / "contracts.cpython-311.pyc").write_bytes(b"ignored bytecode")
+    cache_payload, _ = _run_runtime_json(plugin_root, ["version", "--json"], env)
+    assert cache_payload["sha256"] == manifest_sha256
 
 
 def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:
@@ -1422,7 +1665,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
         assert server.session_requests[0]["package_id"] == "core"
-        assert server.session_requests[0]["bootstrap_version"] == "0.2.3"
+        assert server.session_requests[0]["bootstrap_version"] == "0.2.4"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
         assert server.session_requests[0]["pending_callback"] == "1"
         assert server.session_requests[1]["target"] == "claude"
@@ -1444,7 +1687,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "policy_version",
                 "status",
             }
-            assert check_in["bootstrap_version"] == "0.2.3"
+            assert check_in["bootstrap_version"] == "0.2.4"
             assert check_in["plugin_version"] == "0.1.0"
             assert check_in["status"] == "configured"
             assert check_in["needs_restart"] is False
@@ -2524,7 +2767,7 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
         assert batch["host"] == "codex"
         assert batch["session_id"] == "codex_session_1"
         assert batch["policy_version"] == 1
-        assert batch["collector_version"] == "0.2.3"
+        assert batch["collector_version"] == "0.2.4"
         chunks = _json_list(batch["chunks"], "batch.chunks")
         # contiguous complete lines coalesce into one contract-shaped range chunk
         assert len(chunks) == 1
@@ -2546,6 +2789,175 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
             advanced_sources[_json_string(chunk["source_path_hash"], "source_path_hash")], "source"
         )
         assert advanced_source["end_offset"] == transcript_path.stat().st_size
+    finally:
+        server.stop()
+
+
+def test_collect_zero_source_first_baseline_persists_host_marker(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {},
+        )
+
+        assert server.trace_batches == []
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        assert _json_mapping(ledger["sources"], "ledger.sources") == {}
+        assert _json_list(ledger["host_baselines"], "ledger.host_baselines") == ["codex"]
+    finally:
+        server.stop()
+
+
+def test_collect_legacy_host_source_is_treated_as_existing_baseline(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        codex_home = home / ".codex"
+        transcript_path = codex_home / "sessions/session.jsonl"
+        transcript_path.parent.mkdir(parents=True)
+        first_record = b'{"kind":"session_start","message":"legacy baseline"}\n'
+        appended_record = b'{"kind":"stop","message":"must upload"}\n'
+        transcript_path.write_bytes(first_record + appended_record)
+        ledger_path = tmp_path / "ledger.json"
+        source_path_hash = hashlib.sha256(str(transcript_path.resolve()).encode()).hexdigest()
+        ledger_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "sources": {
+                        source_path_hash: {
+                            "path": str(transcript_path.resolve()),
+                            "end_offset": len(first_record),
+                        }
+                    },
+                }
+            )
+        )
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(codex_home),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+
+        assert len(server.trace_batches) == 1
+        chunks = _json_list(server.trace_batches[0]["chunks"], "batch.chunks")
+        assert len(chunks) == 1
+        chunk = _json_mapping(chunks[0], "batch.chunks[0]")
+        assert chunk["start_offset"] == len(first_record)
+        assert chunk["end_offset"] == len(first_record) + len(appended_record)
+        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == appended_record
+
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        assert _json_list(ledger["host_baselines"], "ledger.host_baselines") == ["codex"]
+    finally:
+        server.stop()
+
+
+def test_claude_desktop_discovers_both_audit_stores_under_platform_config_root(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/claude/core"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        config_root = tmp_path / "desktop-config"
+        env = {
+            "HOME": str(home),
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(tmp_path / "ledger.json"),
+        }
+        if os.name == "nt":
+            env["APPDATA"] = str(config_root)
+            claude_base = config_root / "Claude"
+        elif sys.platform == "darwin":
+            claude_base = home / "Library/Application Support/Claude"
+        else:
+            env["XDG_CONFIG_HOME"] = str(config_root)
+            claude_base = config_root / "Claude"
+
+        appended_records: dict[Path, bytes] = {}
+        for store_name in ("local-agent-mode-sessions", "claude-code-sessions"):
+            audit_path = claude_base / store_name / f"{store_name}-session/audit.jsonl"
+            audit_path.parent.mkdir(parents=True)
+            baseline_record = json.dumps({"store": store_name, "message": "baseline"}).encode() + b"\n"
+            appended_record = json.dumps({"store": store_name, "message": "upload"}).encode() + b"\n"
+            audit_path.write_bytes(baseline_record)
+            appended_records[audit_path.resolve()] = appended_record
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "claude-desktop"], env)
+        _run_collect(
+            plugin_root,
+            [
+                "collect",
+                "--host",
+                "claude-desktop",
+                "--lifecycle",
+                "session_start",
+                "--baseline",
+                "--quiet",
+            ],
+            env,
+            {},
+        )
+        assert server.trace_batches == []
+
+        stale_time = time.time() - (13 * 60 * 60)
+        for audit_path, appended_record in appended_records.items():
+            audit_path.write_bytes(audit_path.read_bytes() + appended_record)
+            os.utime(audit_path, (stale_time, stale_time))
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "claude-desktop", "--lifecycle", "stop", "--quiet"],
+            env,
+            {},
+        )
+
+        chunks = [
+            _json_mapping(chunk, "batch.chunks[]")
+            for batch in server.trace_batches
+            for chunk in _json_list(batch["chunks"], "batch.chunks")
+        ]
+        assert len(chunks) == 2
+        assert {
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) for chunk in chunks
+        } == set(appended_records.values())
     finally:
         server.stop()
 
@@ -2661,7 +3073,7 @@ def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> No
         batch = server.trace_batches[0]
         assert batch["source"] == "claude-desktop"
         assert batch["host"] == "claude-desktop"
-        assert batch["collector_version"] == "0.2.3"
+        assert batch["collector_version"] == "0.2.4"
         chunks = _json_list(batch["chunks"], "batch.chunks")
         assert len(chunks) == 1
         chunk = _json_mapping(chunks[0], "batch.chunks[0]")

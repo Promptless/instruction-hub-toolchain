@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shlex
 import shutil
@@ -12,14 +13,15 @@ from typing import Literal
 
 from promptless_instruction_hub.config import MANAGED_RUNTIME_MANIFEST_PATH
 from promptless_instruction_hub.errors import InstructionHubError
-from promptless_instruction_hub.fs import JsonValue, file_hash, read_json_mapping, write_json
+from promptless_instruction_hub.fs import JsonValue, read_json_mapping, write_json
 from promptless_instruction_hub.models import Harness, HubConfig, PackageDefinition
 
 RuntimeStatus = Literal["included"]
 
 HOST_RUNTIME_ID = "host-runtime"
-HOST_RUNTIME_ASSET_DIR = "host-enrollment"
+HOST_RUNTIME_ASSET_DIR = "host_enrollment"
 HOST_RUNTIME_EXECUTABLE = "promptless-host-runtime"
+HOST_RUNTIME_PACKAGE = "promptless_host_runtime"
 # Keep one startup pass above the browser callback deadline plus the follow-up poll,
 # policy fetch, local config write, check-in network calls, and trace collection.
 # Claude SessionStart can run two startup passes serially: Claude Code first, then a
@@ -28,7 +30,7 @@ HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS = 390
 HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS = HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS * 2
 HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS = HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
 HOST_RUNTIME_CHANNEL = "stable"
-HOST_RUNTIME_VERSION = "0.2.3"
+HOST_RUNTIME_VERSION = "0.2.4"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
 SUPPORTED_HOST_RUNTIME_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 MISSING_RUNTIME_ROOT_MESSAGE = (
@@ -59,6 +61,7 @@ PYTHON_VERSION_PROBE = f"import sys; raise SystemExit(0 if sys.version_info >= {
 
 _ASSET_ROOT = Path(__file__).parent / "managed_runtime_assets" / HOST_RUNTIME_ASSET_DIR
 _EXECUTABLE_SOURCE = _ASSET_ROOT / HOST_RUNTIME_EXECUTABLE
+_PACKAGE_SOURCE = _ASSET_ROOT / HOST_RUNTIME_PACKAGE
 
 
 @dataclass(frozen=True)
@@ -117,7 +120,7 @@ def render_managed_runtimes(
     if target not in SUPPORTED_HOST_RUNTIME_TARGETS:
         return ()
 
-    _copy_runtime_executable(target_root)
+    _copy_runtime_bundle(target_root)
     _write_host_runtime_hooks(target_root, target)
     record = ManagedRuntimeRecord(
         id=HOST_RUNTIME_ID,
@@ -129,7 +132,7 @@ def render_managed_runtimes(
         toolchain_version=_toolchain_version(),
         channel=HOST_RUNTIME_CHANNEL,
         version=HOST_RUNTIME_VERSION,
-        sha256=file_hash(_EXECUTABLE_SOURCE),
+        sha256=_runtime_bundle_sha256(_ASSET_ROOT),
         executable=HOST_RUNTIME_EXECUTABLE,
         path=f"bin/{HOST_RUNTIME_EXECUTABLE}",
         hook="hooks/hooks.json",
@@ -138,11 +141,53 @@ def render_managed_runtimes(
     return (record,)
 
 
-def _copy_runtime_executable(target_root: Path) -> None:
-    destination = target_root / "bin" / HOST_RUNTIME_EXECUTABLE
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(_EXECUTABLE_SOURCE, destination)
-    destination.chmod(0o755)
+def _copy_runtime_bundle(target_root: Path) -> None:
+    bin_root = target_root / "bin"
+    bin_root.mkdir(parents=True, exist_ok=True)
+
+    executable_destination = bin_root / HOST_RUNTIME_EXECUTABLE
+    shutil.copy2(_EXECUTABLE_SOURCE, executable_destination)
+    executable_destination.chmod(0o755)
+
+    package_destination = bin_root / HOST_RUNTIME_PACKAGE
+    if package_destination.exists():
+        shutil.rmtree(package_destination)
+    shutil.copytree(
+        _PACKAGE_SOURCE,
+        package_destination,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+
+
+def _runtime_bundle_sha256(bundle_root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in _runtime_bundle_files(bundle_root):
+        relative_path = path.relative_to(bundle_root).as_posix()
+        digest.update(relative_path.encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _runtime_bundle_files(bundle_root: Path) -> tuple[Path, ...]:
+    package_root = bundle_root / HOST_RUNTIME_PACKAGE
+    package_files = (
+        path
+        for path in package_root.rglob("*")
+        if path.is_file() and "__pycache__" not in path.relative_to(bundle_root).parts and path.suffix != ".pyc"
+    )
+    return tuple(
+        sorted(
+            (bundle_root / HOST_RUNTIME_EXECUTABLE, *package_files),
+            key=lambda path: path.relative_to(bundle_root).as_posix(),
+        )
+    )
+
+
+HOST_RUNTIME_BUNDLE_RELATIVE_PATHS = tuple(
+    path.relative_to(_ASSET_ROOT).as_posix() for path in _runtime_bundle_files(_ASSET_ROOT)
+)
 
 
 def _write_host_runtime_hooks(target_root: Path, target: Harness) -> None:
@@ -331,6 +376,7 @@ def _node_host_runtime_hook_script(
     collect_claude_desktop: bool,
 ) -> str:
     root_env_names = json.dumps(list(root_envs), separators=(",", ":"))
+    bundle_relative_paths = json.dumps(HOST_RUNTIME_BUNDLE_RELATIVE_PATHS, separators=(",", ":"))
     missing_root = _system_message_json(MISSING_RUNTIME_ROOT_MESSAGE)
     missing_file = _system_message_json(MISSING_RUNTIME_FILE_MESSAGE)
     unreadable_file = _system_message_json(UNREADABLE_RUNTIME_FILE_MESSAGE)
@@ -376,6 +422,7 @@ def _node_host_runtime_hook_script(
         "const path = require('path');\n"
         "const { spawnSync } = require('child_process');\n"
         f"const rootEnvNames = {root_env_names};\n"
+        f"const bundleRelativePaths = {bundle_relative_paths};\n"
         f"const emitDiagnostics = {json.dumps(not quiet_failure)};\n"
         f"const allowSiblingRuntime = {json.dumps(allow_sibling_runtime)};\n"
         "function finishWithDiagnostic(payload) {\n"
@@ -383,10 +430,16 @@ def _node_host_runtime_hook_script(
         "  process.exit(0);\n"
         "}\n"
         "function runtimeState(candidate) {\n"
-        "  let stat;\n"
-        "  try { stat = fs.statSync(candidate); } catch (error) { return 'missing'; }\n"
-        "  if (!stat.isFile()) return 'missing';\n"
-        "  try { fs.accessSync(candidate, fs.constants.R_OK); } catch (error) { return 'unreadable'; }\n"
+        "  const bundleRoot = path.dirname(candidate);\n"
+        "  const requiredFiles = bundleRelativePaths.map((relativePath) => path.join(bundleRoot, ...relativePath.split('/')));\n"
+        "  for (const requiredFile of requiredFiles) {\n"
+        "    let stat;\n"
+        "    try { stat = fs.statSync(requiredFile); } catch (error) { return 'missing'; }\n"
+        "    if (!stat.isFile()) return 'missing';\n"
+        "  }\n"
+        "  for (const requiredFile of requiredFiles) {\n"
+        "    try { fs.accessSync(requiredFile, fs.constants.R_OK); } catch (error) { return 'unreadable'; }\n"
+        "  }\n"
         "  return 'ready';\n"
         "}\n"
         "function siblingRuntime(rootPath) {\n"
@@ -464,16 +517,32 @@ def _posix_host_runtime_hook_command(
     allow_sibling_runtime: bool,
 ) -> str:
     collect_baseline_arg = " --baseline" if baseline else ""
+    bundle_relative_paths = " ".join(shlex.quote(path) for path in HOST_RUNTIME_BUNDLE_RELATIVE_PATHS)
+    runtime_state_function = (
+        "runtime_state() { "
+        "runtime_candidate=$1; runtime_bundle_dir=${runtime_candidate%/*}; "
+        f"for relative_path in {bundle_relative_paths}; do "
+        'required_path="$runtime_bundle_dir/$relative_path"; '
+        'if [ ! -f "$required_path" ]; then return 1; fi; '
+        "done; "
+        f"for relative_path in {bundle_relative_paths}; do "
+        'required_path="$runtime_bundle_dir/$relative_path"; '
+        'if [ ! -r "$required_path" ]; then return 2; fi; '
+        "done; "
+        "return 0; "
+        "}; "
+    )
     missing_root_action = "exit 0"
     if not quiet_failure:
         missing_root_action = f"{_posix_emit_system_message(MISSING_RUNTIME_ROOT_MESSAGE)}; exit 0"
     if allow_sibling_runtime:
         runtime_check = (
             f'runtime="$root/bin/{HOST_RUNTIME_EXECUTABLE}"; '
-            'if [ ! -f "$runtime" ] || [ ! -r "$runtime" ]; then '
+            'runtime_state "$runtime"; runtime_status=$?; '
+            'if [ "$runtime_status" -ne 0 ]; then '
             "runtime=; root_parent=${root%/*}; "
             f'for candidate in "$root_parent"/*/bin/{HOST_RUNTIME_EXECUTABLE}; do '
-            'if [ -f "$candidate" ] && [ -r "$candidate" ]; then runtime="$candidate"; fi; '
+            'if runtime_state "$candidate"; then runtime="$candidate"; fi; '
             "done; "
             "fi; "
             'if [ -z "$runtime" ]; then exit 0; fi; '
@@ -481,8 +550,11 @@ def _posix_host_runtime_hook_command(
     else:
         runtime_check = (
             f'runtime="$root/bin/{HOST_RUNTIME_EXECUTABLE}"; '
-            f'if [ ! -f "$runtime" ]; then {_posix_emit_system_message(MISSING_RUNTIME_FILE_MESSAGE)}; exit 0; fi; '
-            f'if [ ! -r "$runtime" ]; then {_posix_emit_system_message(UNREADABLE_RUNTIME_FILE_MESSAGE)}; exit 0; fi; '
+            'runtime_state "$runtime"; runtime_status=$?; '
+            f'if [ "$runtime_status" -eq 1 ]; then {_posix_emit_system_message(MISSING_RUNTIME_FILE_MESSAGE)}; '
+            "exit 0; fi; "
+            f'if [ "$runtime_status" -ne 0 ]; then {_posix_emit_system_message(UNREADABLE_RUNTIME_FILE_MESSAGE)}; '
+            "exit 0; fi; "
         )
     missing_python_action = "exit 0"
     if not quiet_failure:
@@ -513,6 +585,7 @@ def _posix_host_runtime_hook_command(
     script = (
         f"root={root_expr}; "
         f'if [ -z "$root" ]; then {missing_root_action}; fi; '
+        f"{runtime_state_function}"
         f"{runtime_check}"
         f'probe="{PYTHON_VERSION_PROBE}"; '
         "python_cmd=; python_arg=; unsupported_python=0; broken_python=0; "
