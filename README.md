@@ -89,14 +89,18 @@ pin to an immutable tag for stricter reproducibility.
 The toolchain owns Promptless-managed runtime artifacts that must be injected
 into generated customer plugins, including the host runtime used by Codex and
 Claude lifecycle hooks. During dogfood, generated Codex hooks wrap the bundled
-stdlib-only Python script with POSIX shell checks. Generated Claude hooks use
+stdlib-only Python runtime with POSIX shell checks. The stable executable in
+`bin/` delegates to private sibling modules that separate CLI dispatch,
+enrollment, trace collection, host configuration, persistence, and output.
+Generated Claude hooks use
 Claude Code's exec-form hook so Windows installs do not need a POSIX shell; Node
 must be available to start the inline launcher. Startup launchers emit
 schema-safe diagnostics when the host cannot resolve the plugin root, a readable
-runtime file, or Python 3.9+. Terminal lifecycle launchers stay quiet: they
-resolve the runtime under the plugin root, fall back to a sibling installed
-version for the same plugin id when the recorded root is stale, and exit 0 with
-no output when no usable runtime exists.
+managed runtime bundle (the launcher plus its sibling package and CLI entry
+module), or Python 3.9+. Terminal lifecycle launchers stay quiet: they resolve a
+complete runtime bundle under the plugin root, fall back to a complete sibling
+installed version for the same plugin id when the recorded root is stale or
+incomplete, and exit 0 with no output when no usable bundle exists.
 
 ```sh
 sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime ensure --host codex; run promptless-host-runtime collect --host codex --lifecycle session_start --baseline --quiet'
@@ -115,7 +119,7 @@ host credential to fetch `/v0/host-enrollment/policy?target=...` and post
 
 The same runtime also uploads native host transcript JSONL ranges to
 `/v0/traces/batches?target=...`. SessionStart hooks run `ensure` and then a
-quiet first-run baseline; terminal lifecycle hooks (`Stop`, Claude
+quiet first baseline for each host; terminal lifecycle hooks (`Stop`, Claude
 `SessionEnd`, and `SubagentStop`) run collection only. Collection uses hook stdin
 transcript references first, accepting snake_case, camelCase, and nested
 `session`/`transcript`/`agent` shapes from Codex- and Claude-style hooks, then
@@ -132,9 +136,9 @@ transcript: hook-subject paths are collected without deadline checks, the first
 pending upload batch is always sent so every hook makes forward progress, and
 only the idle scan and follow-on batches stop when the budget runs out
 (reported as `trace_upload_partial`; the forward-only ledger resumes on the
-next collect). The first-run baseline never uses a deadline-truncated
+next collect). A host's first baseline never uses a deadline-truncated
 inventory — files missed by a partial scan would replay from offset zero later
-as a surprise backfill — so on a new ledger the inventory scan reruns
+as a surprise backfill — so the inventory scan reruns
 unmetered. A source that vanishes or loses read permission mid-collect is
 skipped with a drift entry (surfaced as `unreadable_source_count`) instead of
 failing the run, so one bad idle file cannot block the hook subject's upload.
@@ -170,7 +174,7 @@ Claude `settings.json` are deleted (with a timestamped backup), while unmanaged
 user config is never touched. The hosted policy's legacy `collector` section is
 ignored.
 
-The host runtime has one executable with subcommands. `ensure` is the hook-safe
+The host runtime has one executable entrypoint with subcommands. `ensure` is the hook-safe
 path that enrolls when needed, removes legacy managed telemetry config, and
 posts a check-in. `collect` is the non-blocking native JSONL upload path. `enroll`
 acquires only the host credential. `status` prints local JSON without network,
@@ -184,7 +188,7 @@ with a static native binary built and versioned by Promptless, then bundled into
 the toolchain release. Customer Instruction Hub repositories should not need
 Python, Node, uv, Go, Rust, curl, jq, or other runtime/build dependencies installed
 for the hook to run. Customer builds should only consume the already-built
-Promptless artifact that the toolchain copies into plugin `bin/`.
+Promptless artifact bundle that the toolchain copies into plugin `bin/`.
 
 The dogfood runtime trusts the authenticated TLS worker response and validates
 only the hosted policy shape. The customer-grade static binary must verify an
