@@ -22,6 +22,9 @@ HOST_RUNTIME_ID = "host-runtime"
 HOST_RUNTIME_ASSET_DIR = "host_enrollment"
 HOST_RUNTIME_EXECUTABLE = "promptless-host-runtime"
 HOST_RUNTIME_PACKAGE = "promptless_host_runtime"
+# Directory (relative to a plugin root) that the runtime bundle is copied into.
+# Intentionally not "bin": claude.ai-hosted plugins must not ship a top-level bin/.
+HOST_RUNTIME_OUTPUT_DIR = "runtime"
 # Keep one startup pass above the browser callback deadline plus the follow-up poll,
 # policy fetch, local config write, check-in network calls, and trace collection.
 # Claude SessionStart can run two startup passes serially: Claude Code first, then a
@@ -134,7 +137,7 @@ def render_managed_runtimes(
         version=HOST_RUNTIME_VERSION,
         sha256=_runtime_bundle_sha256(_ASSET_ROOT),
         executable=HOST_RUNTIME_EXECUTABLE,
-        path=f"bin/{HOST_RUNTIME_EXECUTABLE}",
+        path=f"{HOST_RUNTIME_OUTPUT_DIR}/{HOST_RUNTIME_EXECUTABLE}",
         hook="hooks/hooks.json",
     )
     _write_plugin_manifest(target_root, (record,))
@@ -142,14 +145,14 @@ def render_managed_runtimes(
 
 
 def _copy_runtime_bundle(target_root: Path) -> None:
-    bin_root = target_root / "bin"
-    bin_root.mkdir(parents=True, exist_ok=True)
+    runtime_root = target_root / HOST_RUNTIME_OUTPUT_DIR
+    runtime_root.mkdir(parents=True, exist_ok=True)
 
-    executable_destination = bin_root / HOST_RUNTIME_EXECUTABLE
+    executable_destination = runtime_root / HOST_RUNTIME_EXECUTABLE
     shutil.copy2(_EXECUTABLE_SOURCE, executable_destination)
     executable_destination.chmod(0o755)
 
-    package_destination = bin_root / HOST_RUNTIME_PACKAGE
+    package_destination = runtime_root / HOST_RUNTIME_PACKAGE
     if package_destination.exists():
         shutil.rmtree(package_destination)
     shutil.copytree(
@@ -450,7 +453,7 @@ def _node_host_runtime_hook_script(
         "  let selected = '';\n"
         "  for (const entry of entries) {\n"
         "    if (!entry.isDirectory()) continue;\n"
-        f"    const candidate = path.join(parent, entry.name, 'bin', {HOST_RUNTIME_EXECUTABLE!r});\n"
+        f"    const candidate = path.join(parent, entry.name, {HOST_RUNTIME_OUTPUT_DIR!r}, {HOST_RUNTIME_EXECUTABLE!r});\n"
         "    if (runtimeState(candidate) === 'ready') selected = candidate;\n"
         "  }\n"
         "  return selected;\n"
@@ -458,7 +461,7 @@ def _node_host_runtime_hook_script(
         "let root = process.argv.slice(1).find((value) => value && !value.startsWith('${')) || '';\n"
         "for (const name of rootEnvNames) {\n  if (root) break;\n  root = process.env[name] || '';\n}\n"
         f"if (!root) finishWithDiagnostic({missing_root!r});\n"
-        f"let runtime = path.join(root, 'bin', {HOST_RUNTIME_EXECUTABLE!r});\n"
+        f"let runtime = path.join(root, {HOST_RUNTIME_OUTPUT_DIR!r}, {HOST_RUNTIME_EXECUTABLE!r});\n"
         "let runtimeStatus = runtimeState(runtime);\n"
         "if (runtimeStatus !== 'ready' && allowSiblingRuntime) {\n"
         "  const fallbackRuntime = siblingRuntime(root);\n"
@@ -537,11 +540,11 @@ def _posix_host_runtime_hook_command(
         missing_root_action = f"{_posix_emit_system_message(MISSING_RUNTIME_ROOT_MESSAGE)}; exit 0"
     if allow_sibling_runtime:
         runtime_check = (
-            f'runtime="$root/bin/{HOST_RUNTIME_EXECUTABLE}"; '
+            f'runtime="$root/{HOST_RUNTIME_OUTPUT_DIR}/{HOST_RUNTIME_EXECUTABLE}"; '
             'runtime_state "$runtime"; runtime_status=$?; '
             'if [ "$runtime_status" -ne 0 ]; then '
             "runtime=; root_parent=${root%/*}; "
-            f'for candidate in "$root_parent"/*/bin/{HOST_RUNTIME_EXECUTABLE}; do '
+            f'for candidate in "$root_parent"/*/{HOST_RUNTIME_OUTPUT_DIR}/{HOST_RUNTIME_EXECUTABLE}; do '
             'if runtime_state "$candidate"; then runtime="$candidate"; fi; '
             "done; "
             "fi; "
@@ -549,7 +552,7 @@ def _posix_host_runtime_hook_command(
         )
     else:
         runtime_check = (
-            f'runtime="$root/bin/{HOST_RUNTIME_EXECUTABLE}"; '
+            f'runtime="$root/{HOST_RUNTIME_OUTPUT_DIR}/{HOST_RUNTIME_EXECUTABLE}"; '
             'runtime_state "$runtime"; runtime_status=$?; '
             f'if [ "$runtime_status" -eq 1 ]; then {_posix_emit_system_message(MISSING_RUNTIME_FILE_MESSAGE)}; '
             "exit 0; fi; "
