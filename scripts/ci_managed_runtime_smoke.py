@@ -169,7 +169,7 @@ def _assert_generated_bundle(bin_root: Path) -> None:
 
 
 def _verify_generated_runtime(plugin_root: Path, runtime_python: Path, toolchain_version: str, workspace: Path) -> None:
-    bin_root = plugin_root / "bin"
+    bin_root = plugin_root / "runtime"
     runtime = bin_root / RUNTIME_EXECUTABLE
     _assert_generated_bundle(bin_root)
 
@@ -183,7 +183,7 @@ def _verify_generated_runtime(plugin_root: Path, runtime_python: Path, toolchain
         "id": "host-runtime",
         "status": "included",
         "target": "codex",
-        "path": f"bin/{RUNTIME_EXECUTABLE}",
+        "path": f"runtime/{RUNTIME_EXECUTABLE}",
         "executable": RUNTIME_EXECUTABLE,
         "toolchain_version": toolchain_version,
         "sha256": digest,
@@ -386,7 +386,7 @@ def _platform_smoke(runtime_python: Path, *, require_windows: bool) -> None:
         toolchain_version = _installed_version(Path(sys.executable), workspace)
         plugin_root = _build_hub([sys.executable, "-m", "promptless_instruction_hub.cli"], workspace)
         _verify_generated_runtime(plugin_root, runtime_python, toolchain_version, workspace)
-        _two_process_lock_smoke(plugin_root / "bin", runtime_python, workspace)
+        _two_process_lock_smoke(plugin_root / "runtime", runtime_python, workspace)
     print(f"validated generated runtime and two-process state lock on os.name={os.name}")
 
 

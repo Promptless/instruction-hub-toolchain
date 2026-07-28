@@ -90,7 +90,7 @@ The toolchain owns Promptless-managed runtime artifacts that must be injected
 into generated customer plugins, including the host runtime used by Codex and
 Claude lifecycle hooks. During dogfood, generated Codex hooks wrap the bundled
 stdlib-only Python runtime with POSIX shell checks. The stable executable in
-`bin/` delegates to private sibling modules that separate CLI dispatch,
+`runtime/` delegates to private sibling modules that separate CLI dispatch,
 enrollment, trace collection, host configuration, persistence, and output.
 Generated Claude hooks use
 Claude Code's exec-form hook so Windows installs do not need a POSIX shell; Node
@@ -99,8 +99,9 @@ schema-safe diagnostics when the host cannot resolve the plugin root, a readable
 managed runtime bundle (the launcher plus its sibling package and CLI entry
 module), or Python 3.9+. Terminal lifecycle launchers stay quiet: they resolve a
 complete runtime bundle under the plugin root, fall back to a complete sibling
-installed version for the same plugin id when the recorded root is stale or
-incomplete, and exit 0 with no output when no usable bundle exists.
+installed version with the same runtime-bundle layout for the same plugin id
+when the recorded root is stale or incomplete, and exit 0 with no output when
+no usable bundle exists.
 
 ```sh
 sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime ensure --host codex; run promptless-host-runtime collect --host codex --lifecycle session_start --baseline --quiet'
@@ -188,7 +189,7 @@ with a static native binary built and versioned by Promptless, then bundled into
 the toolchain release. Customer Instruction Hub repositories should not need
 Python, Node, uv, Go, Rust, curl, jq, or other runtime/build dependencies installed
 for the hook to run. Customer builds should only consume the already-built
-Promptless artifact bundle that the toolchain copies into plugin `bin/`.
+Promptless artifact bundle that the toolchain copies into plugin `runtime/`.
 
 The dogfood runtime trusts the authenticated TLS worker response and validates
 only the hosted policy shape. The customer-grade static binary must verify an
