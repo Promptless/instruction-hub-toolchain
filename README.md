@@ -99,8 +99,9 @@ schema-safe diagnostics when the host cannot resolve the plugin root, a readable
 managed runtime bundle (the launcher plus its sibling package and CLI entry
 module), or Python 3.9+. Terminal lifecycle launchers stay quiet: they resolve a
 complete runtime bundle under the plugin root, fall back to a complete sibling
-installed version for the same plugin id when the recorded root is stale or
-incomplete, and exit 0 with no output when no usable bundle exists.
+installed version with the same runtime-bundle layout for the same plugin id
+when the recorded root is stale or incomplete, and exit 0 with no output when
+no usable bundle exists.
 
 ```sh
 sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime ensure --host codex; run promptless-host-runtime collect --host codex --lifecycle session_start --baseline --quiet'
