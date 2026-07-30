@@ -44,6 +44,18 @@ The action runs the bundled compiler directly:
 uv run --project "$GITHUB_ACTION_PATH" promptless-instruction-hub <command>
 ```
 
+Before publishing a source change, run the full non-mutating compilation:
+
+```bash
+pig verify --hub .
+```
+
+`pig verify` validates every stable asset and renders every stable package for
+every configured target in an ephemeral directory. It does not create, update,
+or compare generated files in the source worktree, whether verification
+succeeds or fails. Use `pig build --check` instead when the repository
+intentionally commits generated artifacts and must prove they are current.
+
 ## Modes
 
 - `build`: validate the hub and run a build without committing generated files.

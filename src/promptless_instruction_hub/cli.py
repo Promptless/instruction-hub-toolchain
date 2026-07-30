@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH
-from promptless_instruction_hub.compiler import build_hub, init_hub, validate_hub
+from promptless_instruction_hub.compiler import build_hub, init_hub, validate_hub, verify_hub
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.mcp_status import run_status_mcp
 from promptless_instruction_hub.release.versions import resolve_publish_plugin_version
@@ -45,6 +45,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     validate_parser = subcommands.add_parser("validate", help="validate hub source files")
     _add_hub_arg(validate_parser)
+
+    verify_parser = subcommands.add_parser(
+        "verify",
+        help="validate and fully compile the hub without changing its worktree",
+    )
+    _add_hub_arg(verify_parser)
 
     build_parser = subcommands.add_parser("build", help="generate target distribution artifacts")
     _add_hub_arg(build_parser)
@@ -90,6 +96,12 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "validate":
         result = validate_hub(args.hub)
         print(f"valid Instruction Hub: {len(result.stable_assets)} stable asset(s)")
+        return 0
+    if args.command == "verify":
+        result = verify_hub(args.hub)
+        print(
+            f"verified release {result.release_id} ({result.release_hash[:12]}) across {result.target_count} target(s)"
+        )
         return 0
     if args.command == "build":
         result = build_hub(args.hub, check=args.check, plugin_version=args.plugin_version)

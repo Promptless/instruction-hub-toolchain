@@ -1,6 +1,6 @@
 [project]
 name = "promptless-instruction-hub"
-version = "0.1.0"
+version = "0.2.0"
 description = "Promptless Instruction Hub scanner and distribution compiler"
 requires-python = ">=3.11"
 dependencies = [
