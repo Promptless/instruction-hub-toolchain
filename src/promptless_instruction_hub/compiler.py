@@ -24,7 +24,15 @@ GENERATED_PATHS = (
     STABLE_CHANNEL_PATH,
 )
 
-__all__ = ["BuildResult", "ValidationResult", "build_hub", "init_hub", "validate_hub"]
+__all__ = [
+    "BuildResult",
+    "ValidationResult",
+    "VerifyResult",
+    "build_hub",
+    "init_hub",
+    "validate_hub",
+    "verify_hub",
+]
 
 
 @dataclass(frozen=True)
@@ -36,6 +44,16 @@ class BuildResult:
     target_count: int
     asset_count: int
     checked: bool
+
+
+@dataclass(frozen=True)
+class VerifyResult:
+    """Summary of a non-mutating Instruction Hub compilation."""
+
+    release_id: str
+    release_hash: str
+    target_count: int
+    asset_count: int
 
 
 def init_hub(
@@ -88,10 +106,7 @@ def build_hub(hub_root: Path, *, check: bool = False, plugin_version: str | None
         validation = _with_plugin_version(validation, plugin_version)
     with tempfile.TemporaryDirectory(prefix="promptless-instruction-hub-") as temp_dir:
         output_root = Path(temp_dir)
-        managed_runtimes = render_target_plugins(output_root, validation.config, validation.stable_packages)
-        release_manifest = build_release_manifest(output_root, validation, managed_runtimes)
-        write_release_files(output_root, release_manifest)
-        embed_release_manifest(output_root, validation.config, validation.stable_packages, release_manifest)
+        release_manifest = _compile_hub(output_root, validation)
         if check:
             _check_generated_output(root, output_root)
         else:
@@ -103,6 +118,28 @@ def build_hub(hub_root: Path, *, check: bool = False, plugin_version: str | None
         asset_count=len(validation.stable_assets),
         checked=check,
     )
+
+
+def verify_hub(hub_root: Path) -> VerifyResult:
+    """Validate and fully compile an Instruction Hub without changing its worktree."""
+
+    validation = validate_hub(hub_root.resolve())
+    with tempfile.TemporaryDirectory(prefix="promptless-instruction-hub-verify-") as temp_dir:
+        release_manifest = _compile_hub(Path(temp_dir), validation)
+    return VerifyResult(
+        release_id=str(release_manifest["release_id"]),
+        release_hash=str(release_manifest["release_hash"]),
+        target_count=len(validation.config.targets),
+        asset_count=len(validation.stable_assets),
+    )
+
+
+def _compile_hub(output_root: Path, validation: ValidationResult) -> dict[str, JsonValue]:
+    managed_runtimes = render_target_plugins(output_root, validation.config, validation.stable_packages)
+    release_manifest = build_release_manifest(output_root, validation, managed_runtimes)
+    write_release_files(output_root, release_manifest)
+    embed_release_manifest(output_root, validation.config, validation.stable_packages, release_manifest)
+    return release_manifest
 
 
 def _write_file_if_missing(path: Path, data: JsonValue) -> None:
