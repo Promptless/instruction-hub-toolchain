@@ -19,6 +19,7 @@ from .contracts import (
     HostPolicy,
     JsonValue,
     RuntimeMetadata,
+    WorkerResponseError,
 )
 from .redaction import _redact_json
 from .validation import _datetime_value, _decode_json_object, _int_value, _string_value
@@ -37,7 +38,7 @@ def _get_json(url: str, token: str | None, *, label: str) -> dict[str, JsonValue
     except urllib.error.HTTPError as exc:
         if exc.code in {401, 403}:
             raise BootstrapAuthError(f"{label} request failed with HTTP {exc.code}") from exc
-        raise BootstrapError(f"{label} request failed with HTTP {exc.code}") from exc
+        raise _worker_response_error(exc, label) from exc
     except (TimeoutError, socket.timeout) as exc:
         raise _worker_timeout_error(label) from exc
     except urllib.error.URLError as exc:
@@ -84,7 +85,7 @@ def _post_json_response(
     except urllib.error.HTTPError as exc:
         if exc.code in {401, 403}:
             raise BootstrapAuthError(f"{label} request failed with HTTP {exc.code}") from exc
-        raise BootstrapError(f"{label} request failed with HTTP {exc.code}") from exc
+        raise _worker_response_error(exc, label) from exc
     except (TimeoutError, socket.timeout) as exc:
         raise _worker_timeout_error(label) from exc
     except urllib.error.URLError as exc:
@@ -97,6 +98,18 @@ def _worker_timeout_error(label: str) -> BootstrapError:
     return BootstrapError(
         f"Promptless worker did not respond within {HTTP_TIMEOUT_SECONDS} seconds while waiting for the {label}. "
         "Retry shortly; if it persists, check the worker's health and workload."
+    )
+
+
+def _worker_response_error(error: urllib.error.HTTPError, label: str) -> WorkerResponseError:
+    try:
+        response_body = error.read()
+    except OSError:
+        response_body = b""
+    return WorkerResponseError(
+        f"{label} request failed with HTTP {error.code}",
+        status_code=error.code,
+        response_body=response_body,
     )
 
 
