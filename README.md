@@ -175,6 +175,13 @@ bounded `host-runtime-diagnostics.jsonl` log.
 
 #### Native trace collection
 
+The worker's per-source watermark is authoritative after an ambiguous upload.
+When a committed response is lost and the local file grows before retry, the
+worker returns its watermark with the exact straddling range. The runtime
+validates that conflict against the rejected batch, advances only to an
+interior worker watermark, and rebuilds the remaining upload in the same hook
+run. It does not reconcile gaps, rewinds, or conflicts for another range.
+
 The runtime uploads native host transcript JSONL ranges to
 `/v0/traces/batches?target=...`. Claude Code, Codex, and Claude Desktop share one
 uploader and forward-only ledger. The ledger lives at
