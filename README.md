@@ -141,6 +141,13 @@ ledger lives at `~/.promptless/instruction-hub/host-runtime-ledger.json` or
 `PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads are authenticated with the
 same host credential and are gated by the `enabled_hosts` policy.
 
+The worker's per-source watermark is authoritative after an ambiguous upload.
+When a committed response is lost and the local file grows before retry, the
+worker returns its watermark with the exact straddling range. The runtime
+validates that conflict against the rejected batch, advances only to an
+interior worker watermark, and rebuilds the remaining upload in the same hook
+run. It does not reconcile gaps, rewinds, or conflicts for another range.
+
 Quiet collection stays hook-safe: it never writes status JSON to stdout, and it
 fails open if the ledger lock is busy. The collection deadline (default 25
 seconds, overridable with `PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS`) is

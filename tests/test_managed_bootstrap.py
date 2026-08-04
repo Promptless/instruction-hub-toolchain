@@ -622,7 +622,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert runtime["id"] == "host-runtime"
         assert runtime["status"] == "included"
         assert runtime["target"] == target
-        assert runtime["version"] == "0.2.4"
+        assert runtime["version"] == "0.2.5"
         assert runtime["channel"] == "stable"
         assert runtime["path"] == f"runtime/{HOST_RUNTIME_BIN}"
         assert runtime["sha256"] == _runtime_bundle_sha256(plugin_root / "runtime")
@@ -668,7 +668,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     )
     assert payload["id"] == "host-runtime"
     assert payload["name"] == HOST_RUNTIME_BIN
-    assert payload["version"] == "0.2.4"
+    assert payload["version"] == "0.2.5"
     assert payload["channel"] == "stable"
     manifest = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
     bundle_sha256 = _runtime_bundle_sha256(plugin_root / "runtime")
@@ -700,7 +700,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert text_version.returncode == 0
-    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.4\n"
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.5\n"
     assert text_version.stderr == ""
 
     poison_root = tmp_path / "poison-pythonpath"
@@ -728,7 +728,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert poisoned_pythonpath.returncode == 0
-    assert json.loads(poisoned_pythonpath.stdout)["version"] == "0.2.4"
+    assert json.loads(poisoned_pythonpath.stdout)["version"] == "0.2.5"
     assert poisoned_pythonpath.stderr == ""
     assert not poison_marker.exists()
 
@@ -1665,7 +1665,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
         assert server.session_requests[0]["package_id"] == "core"
-        assert server.session_requests[0]["bootstrap_version"] == "0.2.4"
+        assert server.session_requests[0]["bootstrap_version"] == "0.2.5"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
         assert server.session_requests[0]["pending_callback"] == "1"
         assert server.session_requests[1]["target"] == "claude"
@@ -1687,7 +1687,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "policy_version",
                 "status",
             }
-            assert check_in["bootstrap_version"] == "0.2.4"
+            assert check_in["bootstrap_version"] == "0.2.5"
             assert check_in["plugin_version"] == "0.1.0"
             assert check_in["status"] == "configured"
             assert check_in["needs_restart"] is False
@@ -2767,7 +2767,7 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
         assert batch["host"] == "codex"
         assert batch["session_id"] == "codex_session_1"
         assert batch["policy_version"] == 1
-        assert batch["collector_version"] == "0.2.4"
+        assert batch["collector_version"] == "0.2.5"
         chunks = _json_list(batch["chunks"], "batch.chunks")
         # contiguous complete lines coalesce into one contract-shaped range chunk
         assert len(chunks) == 1
@@ -3073,7 +3073,7 @@ def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> No
         batch = server.trace_batches[0]
         assert batch["source"] == "claude-desktop"
         assert batch["host"] == "claude-desktop"
-        assert batch["collector_version"] == "0.2.4"
+        assert batch["collector_version"] == "0.2.5"
         chunks = _json_list(batch["chunks"], "batch.chunks")
         assert len(chunks) == 1
         chunk = _json_mapping(chunks[0], "batch.chunks[0]")
@@ -3200,6 +3200,67 @@ def test_collect_without_baseline_uploads_new_ledger_sources_from_start(tmp_path
             {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
         )
         assert len(server.trace_batches) == 1
+    finally:
+        server.stop()
+
+
+def test_collect_recovers_when_worker_committed_an_upload_without_acknowledging_it(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer(enforce_trace_watermarks=True, drop_next_trace_response_after_commit=True)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"committed without response"}\n'
+        appended_record = b'{"kind":"stop","message":"appended before retry"}\n'
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+        hook_context = {"session_id": "codex_session_1", "transcript_path": str(transcript_path)}
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"],
+            env,
+            hook_context,
+        )
+        assert not ledger_path.exists()
+
+        transcript_path.write_bytes(first_record + appended_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            hook_context,
+        )
+
+        assert len(server.trace_batches) == 3
+        requested_ranges = []
+        for batch in server.trace_batches:
+            chunks = _json_list(batch["chunks"], "batch.chunks")
+            assert len(chunks) == 1
+            chunk = _json_mapping(chunks[0], "batch.chunks[0]")
+            requested_ranges.append((chunk["start_offset"], chunk["end_offset"]))
+        assert requested_ranges == [
+            (0, len(first_record)),
+            (0, len(first_record) + len(appended_record)),
+            (len(first_record), len(first_record) + len(appended_record)),
+        ]
+
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        source = _json_mapping(next(iter(sources.values())), "ledger.sources[0]")
+        assert source["end_offset"] == len(first_record) + len(appended_record)
     finally:
         server.stop()
 
@@ -4292,6 +4353,8 @@ class _FakeWorkerServer:
         pending_approval_url_override: str | None = None,
         pending_approval_path: str = "/instruction-hub/enroll",
         unparsed_record_count: int = 0,
+        enforce_trace_watermarks: bool = False,
+        drop_next_trace_response_after_commit: bool = False,
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
         self.policy_requests: list[str] = []
@@ -4314,6 +4377,9 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.pending_approval_url_override = pending_approval_url_override
         _FakeWorkerHandler.pending_approval_path = pending_approval_path
         _FakeWorkerHandler.unparsed_record_count = unparsed_record_count
+        _FakeWorkerHandler.enforce_trace_watermarks = enforce_trace_watermarks
+        _FakeWorkerHandler.drop_next_trace_response_after_commit = drop_next_trace_response_after_commit
+        _FakeWorkerHandler.trace_watermarks = {}
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
@@ -4344,6 +4410,9 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     pending_approval_url_override: ClassVar[str | None] = None
     pending_approval_path: ClassVar[str] = "/instruction-hub/enroll"
     unparsed_record_count: ClassVar[int] = 0
+    enforce_trace_watermarks: ClassVar[bool] = False
+    drop_next_trace_response_after_commit: ClassVar[bool] = False
+    trace_watermarks: ClassVar[dict[tuple[str, str], int]] = {}
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
@@ -4430,6 +4499,29 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             skipped_record_count = 0
             for chunk_value in chunks:
                 chunk = _json_mapping(chunk_value, "trace batch chunk")
+                source = _json_string(payload["source"], "trace batch source")
+                source_path_hash = _json_string(chunk["source_path_hash"], "trace batch source path hash")
+                start_offset = _json_int(chunk["start_offset"], "trace batch start offset")
+                end_offset = _json_int(chunk["end_offset"], "trace batch end offset")
+                watermark_key = (source, source_path_hash)
+                acknowledged_offset = self.trace_watermarks.get(watermark_key, 0)
+                if self.enforce_trace_watermarks and end_offset > acknowledged_offset:
+                    if acknowledged_offset > 0 and start_offset != acknowledged_offset:
+                        self._write_json(
+                            {
+                                "detail": {
+                                    "code": "trace_source_sequence_conflict",
+                                    "source": source,
+                                    "source_path_hash": source_path_hash,
+                                    "requested_start_offset": start_offset,
+                                    "requested_end_offset": end_offset,
+                                    "acknowledged_offset": acknowledged_offset,
+                                }
+                            },
+                            status=409,
+                        )
+                        return
+                    self.trace_watermarks[watermark_key] = end_offset
                 if chunk["kind"] == "jsonl_range":
                     raw_artifact_count += 1
                 elif chunk["kind"] == "oversized_record":
@@ -4443,6 +4535,10 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
                         "content_sha256": chunk["content_sha256"],
                     }
                 )
+            if self.drop_next_trace_response_after_commit:
+                type(self).drop_next_trace_response_after_commit = False
+                self.close_connection = True
+                return
             self._write_json(
                 {
                     "accepted": True,
