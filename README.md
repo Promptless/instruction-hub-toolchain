@@ -189,7 +189,9 @@ ignored.
 
 The host runtime has one executable entrypoint with subcommands. `ensure` is the hook-safe
 path that enrolls when needed, removes legacy managed telemetry config, and
-posts a check-in. `collect` is the non-blocking native JSONL upload path. `enroll`
+posts a check-in. `collect` is the non-blocking native JSONL upload path; pass
+`--include-active` for a user-initiated sweep that includes files still inside
+the idle grace period after SessionStart has established the upload baseline. `enroll`
 acquires only the host credential. `status` prints local JSON without network,
 browser, config writes, or check-ins. `reset --yes` clears cached host
 credentials and pending enrollments while preserving the stable host id,

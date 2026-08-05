@@ -622,7 +622,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert runtime["id"] == "host-runtime"
         assert runtime["status"] == "included"
         assert runtime["target"] == target
-        assert runtime["version"] == "0.2.4"
+        assert runtime["version"] == "0.2.5"
         assert runtime["channel"] == "stable"
         assert runtime["path"] == f"runtime/{HOST_RUNTIME_BIN}"
         assert runtime["sha256"] == _runtime_bundle_sha256(plugin_root / "runtime")
@@ -668,7 +668,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     )
     assert payload["id"] == "host-runtime"
     assert payload["name"] == HOST_RUNTIME_BIN
-    assert payload["version"] == "0.2.4"
+    assert payload["version"] == "0.2.5"
     assert payload["channel"] == "stable"
     manifest = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
     bundle_sha256 = _runtime_bundle_sha256(plugin_root / "runtime")
@@ -700,7 +700,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert text_version.returncode == 0
-    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.4\n"
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.5\n"
     assert text_version.stderr == ""
 
     poison_root = tmp_path / "poison-pythonpath"
@@ -728,7 +728,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert poisoned_pythonpath.returncode == 0
-    assert json.loads(poisoned_pythonpath.stdout)["version"] == "0.2.4"
+    assert json.loads(poisoned_pythonpath.stdout)["version"] == "0.2.5"
     assert poisoned_pythonpath.stderr == ""
     assert not poison_marker.exists()
 
@@ -1665,7 +1665,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
         assert server.session_requests[0]["package_id"] == "core"
-        assert server.session_requests[0]["bootstrap_version"] == "0.2.4"
+        assert server.session_requests[0]["bootstrap_version"] == "0.2.5"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
         assert server.session_requests[0]["pending_callback"] == "1"
         assert server.session_requests[1]["target"] == "claude"
@@ -1687,7 +1687,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "policy_version",
                 "status",
             }
-            assert check_in["bootstrap_version"] == "0.2.4"
+            assert check_in["bootstrap_version"] == "0.2.5"
             assert check_in["plugin_version"] == "0.1.0"
             assert check_in["status"] == "configured"
             assert check_in["needs_restart"] is False
@@ -2648,6 +2648,7 @@ def test_upload_only_policy_permissions_block_neither_ensure_nor_collect(tmp_pat
             {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
         )
         assert len(server.trace_batches) == 1
+
         chunks = _json_list(server.trace_batches[0]["chunks"], "batch.chunks")
         chunk = _json_mapping(chunks[0], "batch.chunks[0]")
         assert chunk["start_offset"] == 0
@@ -2767,7 +2768,7 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
         assert batch["host"] == "codex"
         assert batch["session_id"] == "codex_session_1"
         assert batch["policy_version"] == 1
-        assert batch["collector_version"] == "0.2.4"
+        assert batch["collector_version"] == "0.2.5"
         chunks = _json_list(batch["chunks"], "batch.chunks")
         # contiguous complete lines coalesce into one contract-shaped range chunk
         assert len(chunks) == 1
@@ -3073,7 +3074,7 @@ def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> No
         batch = server.trace_batches[0]
         assert batch["source"] == "claude-desktop"
         assert batch["host"] == "claude-desktop"
-        assert batch["collector_version"] == "0.2.4"
+        assert batch["collector_version"] == "0.2.5"
         chunks = _json_list(batch["chunks"], "batch.chunks")
         assert len(chunks) == 1
         chunk = _json_mapping(chunks[0], "batch.chunks[0]")
@@ -3151,13 +3152,15 @@ def test_collect_without_baseline_uploads_new_ledger_sources_from_start(tmp_path
     try:
         home = tmp_path / "home"
         ledger_path = tmp_path / "ledger.json"
-        transcript_path = tmp_path / "codex-session.jsonl"
+        codex_home = home / ".codex"
+        transcript_path = codex_home / "sessions/codex-session.jsonl"
+        transcript_path.parent.mkdir(parents=True)
         first_record = b'{"kind":"session_start","message":"missed baseline"}\n'
         second_record = b'{"kind":"stop","message":"complete"}\n'
         transcript_path.write_bytes(first_record + second_record)
         env = {
             "HOME": str(home),
-            "CODEX_HOME": str(home / ".codex"),
+            "CODEX_HOME": str(codex_home),
             "PLUGIN_ROOT": str(plugin_root),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
@@ -3200,6 +3203,87 @@ def test_collect_without_baseline_uploads_new_ledger_sources_from_start(tmp_path
             {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
         )
         assert len(server.trace_batches) == 1
+
+        historical_path = codex_home / "archived_sessions/historical.jsonl"
+        historical_path.parent.mkdir(parents=True)
+        historical_path.write_bytes(b'{"kind":"response","message":"pre-baseline history"}\n')
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--include-active", "--quiet"],
+            env,
+            {},
+        )
+        guarded_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        assert _json_list(guarded_ledger["host_baselines"], "ledger.host_baselines") == []
+        assert len(_json_mapping(guarded_ledger["sources"], "ledger.sources")) == 1
+        assert len(server.trace_batches) == 1
+    finally:
+        server.stop()
+
+
+def test_collect_include_active_uploads_recent_root_source_without_lifecycle(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        codex_home = home / ".codex"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = codex_home / "archived_sessions/recent.jsonl"
+        transcript_path.parent.mkdir(parents=True)
+        baseline_record = b'{"kind":"session_start"}\n'
+        pending_record = b'{"kind":"response","message":"sync now"}\n'
+        transcript_path.write_bytes(baseline_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(codex_home),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--include-active", "--quiet"],
+            env,
+            {},
+        )
+        assert server.trace_batches == []
+        assert not ledger_path.exists()
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {},
+        )
+        transcript_path.write_bytes(baseline_record + pending_record)
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"],
+            env,
+            {},
+        )
+        assert server.trace_batches == []
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--include-active", "--quiet"],
+            env,
+            {},
+        )
+
+        assert len(server.trace_batches) == 1
+        chunk = _json_mapping(_json_list(server.trace_batches[0]["chunks"], "chunks")[0], "chunk")
+        assert "lifecycle_event" not in chunk
+        assert chunk["start_offset"] == len(baseline_record)
+        assert chunk["end_offset"] == len(baseline_record) + len(pending_record)
+        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == pending_record
     finally:
         server.stop()
 
