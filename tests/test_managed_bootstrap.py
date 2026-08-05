@@ -119,9 +119,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert runtime_package_path.is_dir()
         hooks = json.loads((plugin_root / "hooks/hooks.json").read_text())
         hook_events = hooks["hooks"]
-        expected_events = ("SessionStart", "Stop", "SubagentStop")
-        if target == "claude":
-            expected_events = ("SessionStart", "Stop", "SessionEnd", "SubagentStop")
+        expected_events = ("SessionStart", "Stop", "SessionEnd", "SubagentStop")
         assert set(hook_events) == set(expected_events)
         session_start_hook = hook_events["SessionStart"][0]["hooks"][0]
         callback_deadline_match = re.search(
