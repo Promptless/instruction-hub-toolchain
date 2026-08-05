@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Union
 
-RUNTIME_VERSION = "0.2.4"
+RUNTIME_VERSION = "0.2.5"
 
 
 RUNTIME_CHANNEL = "stable"

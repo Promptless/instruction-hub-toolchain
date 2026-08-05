@@ -67,6 +67,7 @@ def _run_collect(
     lifecycle_event: LifecycleEvent,
     hook_context: HookTraceContext,
     baseline: bool,
+    include_active: bool,
     quiet: bool,
 ) -> int:
     deadline = _collect_deadline()
@@ -93,7 +94,11 @@ def _run_collect(
         return 0
 
     source_paths, idle_scan_complete = _collect_source_paths(
-        host, hook_context, lifecycle_event=lifecycle_event, deadline=deadline
+        host,
+        hook_context,
+        lifecycle_event=lifecycle_event,
+        deadline=deadline,
+        include_active=include_active,
     )
     if not source_paths and idle_scan_complete and not baseline:
         # Only a complete scan proves there is nothing to do. A truncated empty scan
@@ -113,6 +118,9 @@ def _run_collect(
             _emit({"status": "trace_upload_skipped", "reason": "ledger_lock_busy", "host": host}, quiet=quiet)
             return 0
         ledger = _load_source_ledger(ledger_path)
+        if include_active and host not in ledger.host_baselines:
+            _emit({"status": "trace_upload_skipped", "reason": "baseline_required", "host": host}, quiet=quiet)
+            return 0
         if baseline:
             host_baselined = host in ledger.host_baselines or _ledger_has_host_source(ledger, host)
             if not host_baselined:

@@ -59,7 +59,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ensure":
         return _run_ensure_command(host, quiet=args.quiet, if_sources=args.if_sources)
     if args.command == "collect":
-        return _run_collect_command(host, lifecycle=args.lifecycle, baseline=args.baseline, quiet=args.quiet)
+        return _run_collect_command(
+            host,
+            lifecycle=args.lifecycle,
+            baseline=args.baseline,
+            include_active=args.include_active,
+            quiet=args.quiet,
+        )
     if args.command == "status":
         return _run_status_command(host)
     if args.command == "enroll":
@@ -96,6 +102,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="On first run, record current source offsets without uploading historical ranges",
     )
+    collect_parser.add_argument(
+        "--include-active",
+        action="store_true",
+        help="Include session files still inside the idle grace period after an established baseline",
+    )
     collect_parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
 
     status_parser = subcommands.add_parser("status", help="Print local host-runtime status as JSON")
@@ -131,11 +142,25 @@ def _run_ensure_command(host: Host, *, quiet: bool, if_sources: bool) -> int:
         _flush_control_output()
 
 
-def _run_collect_command(host: Host, *, lifecycle: str | None, baseline: bool, quiet: bool) -> int:
+def _run_collect_command(
+    host: Host,
+    *,
+    lifecycle: str | None,
+    baseline: bool,
+    include_active: bool,
+    quiet: bool,
+) -> int:
     try:
         event = _lifecycle_event(lifecycle)
         hook_context = _hook_trace_context(_read_hook_context())
-        return _run_collect(host, lifecycle_event=event, hook_context=hook_context, baseline=baseline, quiet=quiet)
+        return _run_collect(
+            host,
+            lifecycle_event=event,
+            hook_context=hook_context,
+            baseline=baseline,
+            include_active=include_active,
+            quiet=quiet,
+        )
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
         _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
         return 0
