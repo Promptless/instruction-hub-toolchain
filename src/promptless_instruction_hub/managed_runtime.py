@@ -200,7 +200,7 @@ def _write_host_runtime_hooks(target_root: Path, target: Harness) -> None:
     if not isinstance(hooks, dict):
         msg = f"{hook_path} field hooks must be a JSON object"
         raise InstructionHubError(msg)
-    for event_name in _host_runtime_hook_events(target):
+    for event_name in _host_runtime_hook_events():
         event_hooks = hooks.setdefault(event_name, [])
         if not isinstance(event_hooks, list):
             msg = f"{hook_path} field hooks.{event_name} must be a JSON array"
@@ -222,10 +222,8 @@ def _existing_hook_config(hook_path: Path) -> dict[str, JsonValue]:
         raise InstructionHubError(msg) from exc
 
 
-def _host_runtime_hook_events(target: Harness) -> tuple[str, ...]:
-    if target == "claude":
-        return ("SessionStart", "Stop", "SessionEnd", "SubagentStop")
-    return ("SessionStart", "Stop", "SubagentStop")
+def _host_runtime_hook_events() -> tuple[str, ...]:
+    return ("SessionStart", "Stop", "SessionEnd", "SubagentStop")
 
 
 def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, JsonValue]:

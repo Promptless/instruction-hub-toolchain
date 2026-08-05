@@ -119,9 +119,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert runtime_package_path.is_dir()
         hooks = json.loads((plugin_root / "hooks/hooks.json").read_text())
         hook_events = hooks["hooks"]
-        expected_events = ("SessionStart", "Stop", "SubagentStop")
-        if target == "claude":
-            expected_events = ("SessionStart", "Stop", "SessionEnd", "SubagentStop")
+        expected_events = ("SessionStart", "Stop", "SessionEnd", "SubagentStop")
         assert set(hook_events) == set(expected_events)
         session_start_hook = hook_events["SessionStart"][0]["hooks"][0]
         callback_deadline_match = re.search(
@@ -2419,28 +2417,33 @@ def test_bootstrap_update_notice_tolerates_unreadable_state(tmp_path: Path) -> N
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    home = tmp_path / "home"
-    # Without the local dogfood gate, a corrupt host-global state file must surface as a
-    # diagnosable bootstrap error before enrollment proceeds.
-    state_path = _host_state_path(home)
-    state_path.parent.mkdir(parents=True)
-    state_path.write_text("{ not valid json")
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        # Without the local dogfood gate, a corrupt host-global state file must surface as a
+        # diagnosable bootstrap error before enrollment proceeds.
+        state_path = _host_state_path(home)
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text("{ not valid json")
 
-    payload, result = _run_bootstrap(
-        hub_root / "dist/codex/core",
-        "codex",
-        {
-            "HOME": str(home),
-            "CODEX_HOME": str(home / ".codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
-            "PROMPTLESS_WORKER_BASE_URL": "https://pig.promptless.ai",
-        },
-        expected_status="error",
-    )
+        payload, result = _run_bootstrap(
+            hub_root / "dist/codex/core",
+            "codex",
+            {
+                "HOME": str(home),
+                "CODEX_HOME": str(home / ".codex"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            },
+            expected_status="error",
+        )
 
-    assert "invalid JSON" in _json_string(payload["message"], "message")
-    assert "Promptless host enrollment failed for Codex" in _json_string(payload["systemMessage"], "systemMessage")
-    assert result.stdout != ""
+        assert "invalid JSON" in _json_string(payload["message"], "message")
+        assert "Promptless host enrollment failed for Codex" in _json_string(payload["systemMessage"], "systemMessage")
+        assert result.stdout != ""
+    finally:
+        server.stop()
 
 
 def test_bootstrap_defers_recording_update_until_notice_surfaces(tmp_path: Path) -> None:
