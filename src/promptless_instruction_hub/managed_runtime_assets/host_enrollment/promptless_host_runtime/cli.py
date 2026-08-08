@@ -23,8 +23,10 @@ from .enrollment import (
     _enroll_host_credential,
     _enrollment_context,
     _forget_cached_host_credential,
+    _host_disabled_by_cached_policy,
     _obtain_host_credential,
     _store_internal_promptless_identity,
+    _store_policy_observation,
 )
 from .host_config import _blocked_result, _ensure_host_config, _has_native_trace_sources
 from .metadata import (
@@ -245,6 +247,9 @@ def _run_version_command(*, json_output: bool) -> int:
 
 
 def _run_ensure(host: Host, *, quiet: bool, if_sources: bool) -> int:
+    if if_sources and _host_disabled_by_cached_policy(_worker_base_url(), host):
+        _emit({"status": "trace_upload_skipped", "reason": "policy_disabled", "host": host}, quiet=quiet)
+        return 0
     if if_sources and not _has_native_trace_sources(host):
         _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
         return 0
@@ -327,6 +332,7 @@ def _run_host_enrollment(
         credential = enrollment_attempt.credential
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
     policy = _validate_signed_policy(signed_policy, host)
+    _store_policy_observation(worker_base_url, policy)
     credential = _credential_with_policy_identity(credential, signed_policy)
     _store_internal_promptless_identity(context, credential)
     trace_upload_endpoint = _worker_url(worker_base_url, "/v0/traces/batches")

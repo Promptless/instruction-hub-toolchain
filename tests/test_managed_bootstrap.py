@@ -2999,6 +2999,69 @@ def test_claude_desktop_ensure_if_sources_skips_without_audit_files(tmp_path: Pa
         server.stop()
 
 
+def test_claude_desktop_skips_when_recent_policy_disables_host(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/claude/core"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude"]))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        audit_path = _claude_desktop_audit_path(home, "local-agent-mode-sessions", "session-1")
+        audit_path.parent.mkdir(parents=True)
+        audit_path.write_bytes(b'{"sessionId":"desktop_session_1","message":"baseline"}\n')
+        env = {
+            "HOME": str(home),
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "claude"], env)
+        _run_bootstrap(plugin_root, "claude", env)
+        policy_request_count = len(server.policy_requests)
+
+        result = subprocess.run(
+            [str(plugin_root / "runtime" / HOST_RUNTIME_BIN), "ensure", "--host", "claude-desktop", "--if-sources"],
+            env=_clean_env(**env),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0
+        payload = _assert_session_start_streams(result.stdout, result.stderr, "trace_upload_skipped")
+        assert payload["reason"] == "policy_disabled"
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "claude-desktop", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {},
+        )
+
+        assert len(server.policy_requests) == policy_request_count
+        assert len(server.session_requests) == 1
+        assert server.trace_batches == []
+
+        state_path = _host_state_path(home)
+        state = _json_mapping(validate_json_value(json.loads(state_path.read_text()), "host state"), "host state")
+        observations = _json_mapping(state["policy_observations"], "policy observations")
+        observation = _json_mapping(next(iter(observations.values())), "policy observation")
+        observation["expires_at"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)).isoformat()
+        state_path.write_text(json.dumps(state))
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "claude-desktop", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {},
+        )
+
+        assert _diagnostic_log_entries(home)[-1]["reason"] == "not_enrolled"
+    finally:
+        server.stop()
+
+
 def test_claude_desktop_collect_skips_without_cached_credential(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
