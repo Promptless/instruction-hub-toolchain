@@ -231,6 +231,8 @@ class HostPolicy:
 
     policy_version: int
     required_bootstrap_version: str | None
+    enabled_hosts: tuple[Host, ...]
+    expires_at: dt.datetime
 
 
 @dataclass(frozen=True)

@@ -33,7 +33,9 @@ from .contracts import (
     HOSTED_ENROLLMENT_APPROVAL_PATH,
     HOSTED_ENROLLMENT_START_PATH,
     HTTP_TIMEOUT_SECONDS,
+    Host,
     HostCredential,
+    HostPolicy,
     HostedEnrollmentRoutes,
     JsonValue,
     OPEN_BROWSER_ENV,
@@ -173,6 +175,57 @@ def _credential_with_policy_identity(credential: HostCredential, payload: dict[s
         deployment_instance_id=credential.deployment_instance_id,
         is_internal_promptless_user=True,
     )
+
+
+def _host_disabled_by_cached_policy(worker_base_url: str, host: Host) -> bool:
+    """Return whether an unexpired validated policy observation omits the host.
+
+    Cached policy can suppress work for a disabled host. It never authorizes work
+    for an enabled host; that still requires a fresh Worker policy response.
+    """
+
+    state = _load_state(_state_path())
+    observations = _json_mapping_or_empty(state.get("policy_observations"))
+    observation = _json_mapping_or_empty(observations.get(_policy_observation_cache_key(worker_base_url)))
+    if _string_value(observation.get("worker_base_url")) != worker_base_url:
+        return False
+    expires_at_text = _string_value(observation.get("expires_at"))
+    if expires_at_text is None:
+        return False
+    try:
+        expires_at = dt.datetime.fromisoformat(expires_at_text.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        return False
+    if expires_at <= dt.datetime.now(dt.timezone.utc):
+        return False
+    enabled_hosts = observation.get("enabled_hosts")
+    if not isinstance(enabled_hosts, list):
+        return False
+    return host not in enabled_hosts
+
+
+def _store_policy_observation(worker_base_url: str, policy: HostPolicy) -> None:
+    state_path = _state_path()
+    with _state_file_lock(state_path):
+        state = _load_state(state_path)
+        observations = _json_mapping_or_empty(state.get("policy_observations"))
+        cache_key = _policy_observation_cache_key(worker_base_url)
+        observation: dict[str, JsonValue] = {
+            "worker_base_url": worker_base_url,
+            "enabled_hosts": list(policy.enabled_hosts),
+            "expires_at": policy.expires_at.isoformat(),
+        }
+        if observations.get(cache_key) == observation:
+            return
+        observations[cache_key] = observation
+        state["policy_observations"] = observations
+        _write_state(state_path, state)
+
+
+def _policy_observation_cache_key(worker_base_url: str) -> str:
+    return hashlib.sha256(worker_base_url.encode()).hexdigest()
 
 
 def _store_internal_promptless_identity(context: EnrollmentContext, credential: HostCredential) -> None:
