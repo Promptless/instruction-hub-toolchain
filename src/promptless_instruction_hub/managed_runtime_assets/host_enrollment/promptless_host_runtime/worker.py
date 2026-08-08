@@ -23,6 +23,8 @@ from .contracts import (
 from .redaction import _redact_json
 from .validation import _datetime_value, _decode_json_object, _int_value, _string_value
 
+_MAX_WORKER_ERROR_RESPONSE_BYTES = 64 * 1024
+
 
 def _worker_url(worker_base_url: str, path: str) -> str:
     return f"{worker_base_url}{path}"
@@ -83,8 +85,10 @@ def _post_json_response(
 
 def _worker_response_error(error: urllib.error.HTTPError, label: str) -> WorkerResponseError:
     try:
-        response_body = error.read()
+        response_body = error.read(_MAX_WORKER_ERROR_RESPONSE_BYTES + 1)
     except OSError:
+        response_body = b""
+    if len(response_body) > _MAX_WORKER_ERROR_RESPONSE_BYTES:
         response_body = b""
     return WorkerResponseError(
         f"{label} request failed with HTTP {error.code}",

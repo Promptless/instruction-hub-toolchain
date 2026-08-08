@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import urllib.error
+from email.message import Message
 from pathlib import Path
 
 import pytest
@@ -15,6 +18,26 @@ from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptles
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.traces import (
     _reconcile_source_sequence_conflict,
 )
+from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.worker import (
+    _MAX_WORKER_ERROR_RESPONSE_BYTES,
+    _worker_response_error,
+)
+
+
+def test_worker_response_error_rejects_oversized_response_body() -> None:
+    response_stream = io.BytesIO(b"x" * (_MAX_WORKER_ERROR_RESPONSE_BYTES + 2))
+    http_error = urllib.error.HTTPError(
+        url="https://worker.example.test/traces/batch",
+        code=409,
+        msg="Conflict",
+        hdrs=Message(),
+        fp=response_stream,
+    )
+
+    error = _worker_response_error(http_error, "trace batch response")
+
+    assert error.response_body == b""
+    assert response_stream.tell() == _MAX_WORKER_ERROR_RESPONSE_BYTES + 1
 
 
 @pytest.mark.parametrize("acknowledge_end", [False, True])
