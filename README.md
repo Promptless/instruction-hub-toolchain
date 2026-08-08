@@ -104,15 +104,16 @@ Claude lifecycle hooks. During dogfood, generated Codex hooks wrap the bundled
 stdlib-only Python runtime with POSIX shell checks. The stable executable in
 `runtime/` delegates to private sibling modules that separate CLI dispatch,
 enrollment, trace collection, host configuration, persistence, and output.
-Generated Claude hooks use
-Claude Code's exec-form hook so Windows installs do not need a POSIX shell; Node
-must be available to start the inline launcher. Startup launchers emit
-schema-safe diagnostics when the host cannot resolve the plugin root, a readable
-managed runtime bundle (the launcher plus its sibling package and CLI entry
-module), or Python 3.9+. Terminal lifecycle launchers stay quiet: they resolve a
-complete runtime bundle under the plugin root, fall back to a complete sibling
-installed version with the same runtime-bundle layout for the same plugin id
-when the recorded root is stale or incomplete, and exit 0 with no output when
+Generated Claude hooks use Claude Code's exec-form hook so Windows installs do
+not need a POSIX shell; Node must be available to start the inline launcher.
+Every launcher starts collection in a detached process that inherits the hook
+input and redirects collection output away from the agent transcript. Startup
+launchers emit schema-safe diagnostics when the host cannot resolve the plugin
+root, a readable managed runtime bundle (the launcher plus its sibling package
+and CLI entry module), or Python 3.9+. Terminal lifecycle launchers stay quiet:
+they resolve a complete runtime bundle under the plugin root, fall back to a
+complete sibling installed version with the same runtime-bundle layout for the
+same plugin id when the recorded root is stale or incomplete, and exit 0 with no output when
 no usable bundle exists.
 
 ```sh
@@ -137,7 +138,9 @@ quiet first baseline for each host; terminal lifecycle hooks (`Stop`,
 `SessionEnd`, and `SubagentStop`) run collection only. Collection uses hook stdin
 transcript references first, accepting snake_case, camelCase, and nested
 `session`/`transcript`/`agent` shapes from Codex- and Claude-style hooks, then
-scans idle host-native transcript roots as a catch-up path. The forward-only
+scans idle host-native transcript roots as a catch-up path. SessionStart waits
+for enrollment and check-in but detaches collection; terminal hooks detach
+collection after resolving the runtime and Python interpreter. The forward-only
 ledger lives at `~/.promptless/instruction-hub/host-runtime-ledger.json` or
 `PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads are authenticated with the
 same host credential and are gated by the `enabled_hosts` policy.
@@ -160,15 +163,10 @@ Support diagnostics are written as bounded, redacted JSONL at
 `~/.promptless/instruction-hub/host-runtime-diagnostics.jsonl` with `0600`
 permissions and without transcript content, tool inputs, or credentials.
 
-Planned follow-on (not yet implemented): move all tree-scale work out of the
-hook path into a detached drainer. Hooks would upload only their own transcript
-increment and then spawn a short-lived, low-priority background process that
-owns the idle sweep and any historical backfill under its own byte/time budget,
-acquiring the ledger lock per batch so live hooks never skip on
-`ledger_lock_busy`. That change should also dissolve the first-run baseline
-into an explicit newest-first backlog policy so pre-enrollment history can be
-uploaded gradually instead of being permanently skipped. Hooks stay the
-scheduler — no launchd/systemd daemon on user machines.
+Hook-triggered collectors still scan idle transcript roots and hold the ledger
+lock across catch-up uploads. The collector process is detached from the hook,
+so that work cannot delay the host, but concurrent collectors can still skip
+when the shared ledger lock is busy.
 
 Host enrollment is per host, not per plugin. The credential and pending approval
 are cached at a single host-global path (`~/.promptless/instruction-hub/`) and
