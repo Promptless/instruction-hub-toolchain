@@ -41,9 +41,11 @@ from .contracts import (
     RuntimeMetadata,
     SourceEvent,
     SourceLedger,
+    TraceSourceSequenceConflict,
     TRANSPORT_BATCH_OVERHEAD_BYTES,
     TRANSPORT_CHUNK_OVERHEAD_BYTES,
     UploadBatch,
+    WorkerResponseError,
 )
 from .enrollment import _cached_host_credential, _enrollment_context, _forget_cached_host_credential
 from .host_config import _claude_desktop_trace_roots, _native_trace_globs
@@ -156,22 +158,33 @@ def _run_collect(
 
         deadline_exceeded = not idle_scan_complete
         try:
-            for batch in _iter_upload_batches(
-                host=host,
-                metadata=metadata,
-                policy=policy,
-                lifecycle_event=lifecycle_event,
-                hook_context=hook_context,
-                ledger=ledger,
-                source_paths=source_paths,
-                deadline=deadline,
-            ):
-                response = _post_upload_batch(upload_url, credential, policy, batch)
-                _advance_ledger_from_response(ledger, source_paths, response)
-                _write_source_ledger(ledger)
-                uploaded_batch_count += 1
-                uploaded_chunk_count += len(batch.events)
-                unparsed_record_count += _optional_int_value(response.get("unparsed_record_count")) or 0
+            while True:
+                reconciled_conflict = False
+                for batch in _iter_upload_batches(
+                    host=host,
+                    metadata=metadata,
+                    policy=policy,
+                    lifecycle_event=lifecycle_event,
+                    hook_context=hook_context,
+                    ledger=ledger,
+                    source_paths=source_paths,
+                    deadline=deadline,
+                ):
+                    try:
+                        response = _post_upload_batch(upload_url, credential, policy, batch)
+                    except TraceSourceSequenceConflict as conflict:
+                        _reconcile_source_sequence_conflict(ledger, batch, conflict)
+                        _write_source_ledger(ledger)
+                        reconciled_conflict = True
+                        break
+                    _advance_ledger_from_response(ledger, source_paths, response)
+                    _write_source_ledger(ledger)
+                    uploaded_batch_count += 1
+                    uploaded_chunk_count += len(batch.events)
+                    unparsed_record_count += _optional_int_value(response.get("unparsed_record_count")) or 0
+                if not reconciled_conflict:
+                    break
+                _ensure_collect_deadline(deadline)
         except CollectDeadlineExceeded:
             deadline_exceeded = True
 
@@ -803,9 +816,104 @@ def _post_upload_batch(
     policy: HostPolicy,
     batch: UploadBatch,
 ) -> dict[str, JsonValue]:
-    response = _post_json_response(upload_url, credential.value, batch.request, label="trace batch response")
+    try:
+        response = _post_json_response(upload_url, credential.value, batch.request, label="trace batch response")
+    except WorkerResponseError as exc:
+        conflict = _trace_source_sequence_conflict(exc, batch)
+        if conflict is None:
+            raise
+        raise conflict from exc
     _validate_upload_response(response, policy, batch)
     return response
+
+
+def _trace_source_sequence_conflict(
+    error: WorkerResponseError,
+    batch: UploadBatch,
+) -> TraceSourceSequenceConflict | None:
+    if error.status_code != 409 or error.response_body == b"":
+        return None
+    try:
+        payload = _decode_json_object(error.response_body, "trace batch error response")
+    except BootstrapError:
+        return None
+    detail = _json_mapping_or_empty(payload.get("detail"))
+    if _string_value(detail.get("code")) != "trace_source_sequence_conflict":
+        return None
+    source = _string_value(detail.get("source"))
+    source_path_hash = _string_value(detail.get("source_path_hash"))
+    requested_start_offset = _optional_int_value(detail.get("requested_start_offset"))
+    requested_end_offset = _optional_int_value(detail.get("requested_end_offset"))
+    acknowledged_offset = _optional_int_value(detail.get("acknowledged_offset"))
+    request_source = _string_value(batch.request.get("source"))
+    if (
+        source not in HOST_VALUES
+        or source != request_source
+        or source_path_hash is None
+        or requested_start_offset is None
+        or requested_end_offset is None
+        or acknowledged_offset is None
+    ):
+        return None
+    matching_event = next(
+        (
+            event
+            for event in batch.events
+            if event.path_hash == source_path_hash
+            and event.start_offset == requested_start_offset
+            and event.end_offset == requested_end_offset
+        ),
+        None,
+    )
+    if matching_event is None:
+        return None
+    return TraceSourceSequenceConflict(
+        source=source,
+        source_path_hash=source_path_hash,
+        requested_start_offset=requested_start_offset,
+        requested_end_offset=requested_end_offset,
+        acknowledged_offset=acknowledged_offset,
+    )
+
+
+def _reconcile_source_sequence_conflict(
+    ledger: SourceLedger,
+    batch: UploadBatch,
+    conflict: TraceSourceSequenceConflict,
+) -> None:
+    event = next(
+        (
+            candidate
+            for candidate in batch.events
+            if candidate.path_hash == conflict.source_path_hash
+            and candidate.start_offset == conflict.requested_start_offset
+            and candidate.end_offset == conflict.requested_end_offset
+        ),
+        None,
+    )
+    if event is None:
+        raise BootstrapError("trace source sequence conflict did not match the rejected upload batch")
+    existing = _json_mapping_or_empty(ledger.sources.get(event.path_hash))
+    local_offset = _optional_int_value(existing.get("end_offset")) or 0
+    if local_offset != conflict.requested_start_offset:
+        raise BootstrapError("trace source sequence conflict did not match the local source ledger")
+    if not conflict.requested_start_offset < conflict.acknowledged_offset < conflict.requested_end_offset:
+        raise BootstrapError("trace source sequence conflict did not identify an interior worker watermark")
+    try:
+        source_size = event.path.stat().st_size
+    except OSError as exc:
+        raise BootstrapError("trace source sequence conflict referenced an unreadable local source") from exc
+    if conflict.acknowledged_offset > source_size:
+        raise BootstrapError("trace source sequence conflict watermark exceeded the local source size")
+    _record_ledger_offset(ledger, event.path, conflict.acknowledged_offset)
+    ledger.drift_reports.append(
+        {
+            "kind": "native_trace_source_watermark_reconciled",
+            "source_path_hash": conflict.source_path_hash,
+            "previous_end_offset": local_offset,
+            "worker_end_offset": conflict.acknowledged_offset,
+        }
+    )
 
 
 def _validate_upload_response(response: dict[str, JsonValue], policy: HostPolicy, batch: UploadBatch) -> None:

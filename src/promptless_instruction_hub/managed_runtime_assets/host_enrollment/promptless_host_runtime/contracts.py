@@ -199,6 +199,42 @@ class BootstrapAuthError(BootstrapError):
     """Host credential was rejected by the worker."""
 
 
+class WorkerResponseError(BootstrapError):
+    """Worker returned a non-authentication HTTP error response."""
+
+    def __init__(self, message: str, *, status_code: int, response_body: bytes) -> None:
+        """Preserve the status and response body for contract-specific handling."""
+
+        self.status_code = status_code
+        self.response_body = response_body
+        super().__init__(message)
+
+
+class TraceSourceSequenceConflict(BootstrapError):
+    """Worker reported its watermark for an exact rejected trace range."""
+
+    def __init__(
+        self,
+        *,
+        source: Host,
+        source_path_hash: str,
+        requested_start_offset: int,
+        requested_end_offset: int,
+        acknowledged_offset: int,
+    ) -> None:
+        """Record the rejected range and worker's authoritative watermark."""
+
+        self.source = source
+        self.source_path_hash = source_path_hash
+        self.requested_start_offset = requested_start_offset
+        self.requested_end_offset = requested_end_offset
+        self.acknowledged_offset = acknowledged_offset
+        super().__init__(
+            f"trace source {source_path_hash} range {requested_start_offset}-{requested_end_offset} "
+            f"conflicts with worker watermark {acknowledged_offset}"
+        )
+
+
 class CollectDeadlineExceeded(BootstrapError):
     """Optional collection work exceeded the hook-safe runtime budget.
 
