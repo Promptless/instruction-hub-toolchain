@@ -59,8 +59,7 @@ _WINDOWS_DETACHED_PROCESS = 0x00000008
 def main(argv: list[str] | None = None) -> int:
     """Run the requested host-runtime command."""
     parser = _build_arg_parser()
-    command_args = sys.argv[1:] if argv is None else argv
-    args = parser.parse_args(command_args)
+    args = parser.parse_args(argv)
     if args.command == "version":
         return _run_version_command(json_output=args.json)
     host = _resolve_host(args.host)
@@ -72,10 +71,17 @@ def main(argv: list[str] | None = None) -> int:
             prepare_baseline=args.prepare_baseline,
         )
     if args.command == "collect":
+        collector_args = _collector_command_args(
+            host,
+            lifecycle=args.lifecycle,
+            baseline=args.baseline,
+            include_active=args.include_active,
+            quiet=args.quiet,
+        )
         if args.detach:
-            return _launch_detached_collect(command_args)
+            return _launch_detached_collect(collector_args)
         if args.supervised:
-            return _supervise_collect(host, command_args)
+            return _supervise_collect(host, collector_args)
         return _run_collect_command(
             host,
             lifecycle=args.lifecycle,
@@ -197,11 +203,32 @@ def _run_collect_command(
         _flush_control_output()
 
 
-def _launch_detached_collect(command_args: list[str]) -> int:
+def _collector_command_args(
+    host: Host,
+    *,
+    lifecycle: str | None,
+    baseline: bool,
+    include_active: bool,
+    quiet: bool,
+) -> list[str]:
+    command_args = ["collect", "--host", host]
+    if lifecycle is not None:
+        command_args.extend(("--lifecycle", lifecycle))
+    if baseline:
+        command_args.append("--baseline")
+    if include_active:
+        command_args.append("--include-active")
+    if quiet:
+        command_args.append("--quiet")
+    return command_args
+
+
+def _launch_detached_collect(collector_args: list[str]) -> int:
     supervisor_args = [
         sys.executable,
         str(Path(sys.argv[0]).resolve()),
-        *("--supervised" if arg == "--detach" else arg for arg in command_args),
+        *collector_args,
+        "--supervised",
     ]
     try:
         _spawn_detached(supervisor_args)
@@ -210,15 +237,15 @@ def _launch_detached_collect(command_args: list[str]) -> int:
     return 0
 
 
-def _supervise_collect(host: Host, command_args: list[str]) -> int:
-    collector_args = [
+def _supervise_collect(host: Host, collector_args: list[str]) -> int:
+    process_args = [
         sys.executable,
         str(Path(sys.argv[0]).resolve()),
-        *(arg for arg in command_args if arg != "--supervised"),
+        *collector_args,
     ]
     try:
         result = subprocess.run(
-            collector_args,
+            process_args,
             stdin=sys.stdin.buffer,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
