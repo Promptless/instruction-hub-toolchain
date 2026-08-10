@@ -165,8 +165,9 @@ permissions and without transcript content, tool inputs, or credentials.
 
 Hook-triggered collectors still scan idle transcript roots and hold the ledger
 lock across catch-up uploads. The collector process is detached from the hook,
-so that work cannot delay the host, but concurrent collectors can still skip
-when the shared ledger lock is busy.
+so that work cannot delay the host. Baseline collections wait for the shared
+ledger lock so every host records its starting offsets. Other collections stay
+non-blocking and can skip when another collector holds the lock.
 
 Host enrollment is per host, not per plugin. The credential and pending approval
 are cached at a single host-global path (`~/.promptless/instruction-hub/`) and

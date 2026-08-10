@@ -49,7 +49,7 @@ from .enrollment import _cached_host_credential, _enrollment_context, _forget_ca
 from .host_config import _claude_desktop_trace_roots, _native_trace_globs
 from .metadata import _dashboard_base_url, _load_runtime_metadata, _plugin_root, _worker_base_url
 from .output import _emit
-from .storage import _atomic_write_text, _ledger_path, _try_lock_state_file, _unlock_state_file
+from .storage import _atomic_write_text, _ledger_path, _lock_state_file, _try_lock_state_file, _unlock_state_file
 from .validation import (
     _decode_json_object,
     _json_mapping_or_empty,
@@ -113,7 +113,7 @@ def _run_collect(
     uploaded_batch_count = 0
     uploaded_chunk_count = 0
     unparsed_record_count = 0
-    with _source_ledger_lock(ledger_path) as lock_acquired:
+    with _source_ledger_lock(ledger_path, wait_for_lock=baseline) as lock_acquired:
         if not lock_acquired:
             _emit({"status": "trace_upload_skipped", "reason": "ledger_lock_busy", "host": host}, quiet=quiet)
             return 0
@@ -397,11 +397,15 @@ def _path_is_relative_to(path: Path, root: Path) -> bool:
 
 
 @contextmanager
-def _source_ledger_lock(path: Path) -> Iterator[bool]:
+def _source_ledger_lock(path: Path, *, wait_for_lock: bool) -> Iterator[bool]:
     lock_path = path.with_name(f"{path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock_file:
-        acquired = _try_lock_state_file(lock_file)
+        if wait_for_lock:
+            _lock_state_file(lock_file)
+            acquired = True
+        else:
+            acquired = _try_lock_state_file(lock_file)
         try:
             yield acquired
         finally:

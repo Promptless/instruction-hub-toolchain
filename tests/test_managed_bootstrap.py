@@ -3226,6 +3226,87 @@ def test_claude_desktop_baseline_is_per_host_with_shared_ledger(tmp_path: Path) 
         server.stop()
 
 
+def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("fcntl lock contention test is POSIX-only")
+    import fcntl
+
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/claude/core"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server.start()
+    processes: list[subprocess.Popen[str]] = []
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        claude_path = home / ".claude/projects/project-1/session.jsonl"
+        desktop_path = _claude_desktop_audit_path(home, "claude-code-sessions", "session-1")
+        claude_path.parent.mkdir(parents=True)
+        desktop_path.parent.mkdir(parents=True)
+        claude_path.write_bytes(b'{"sessionId":"claude_session_1","message":"baseline"}\n')
+        desktop_path.write_bytes(b'{"sessionId":"desktop_session_1","message":"baseline"}\n')
+        env = {
+            "HOME": str(home),
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "claude"], env)
+        _run_runtime_json(plugin_root, ["enroll", "--host", "claude-desktop"], env)
+
+        lock_path = ledger_path.with_name(f"{ledger_path.name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            for host in ("claude", "claude-desktop"):
+                processes.append(
+                    subprocess.Popen(
+                        [
+                            str(plugin_root / "runtime" / HOST_RUNTIME_BIN),
+                            "collect",
+                            "--host",
+                            host,
+                            "--lifecycle",
+                            "session_start",
+                            "--baseline",
+                            "--quiet",
+                        ],
+                        env=_clean_env(**env),
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                )
+
+            policy_deadline = time.monotonic() + 5
+            while len(server.policy_requests) < 2 and time.monotonic() < policy_deadline:
+                time.sleep(0.01)
+            assert len(server.policy_requests) == 2
+            time.sleep(1)
+            assert all(process.poll() is None for process in processes)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=10)
+            assert process.returncode == 0
+            assert stdout == ""
+            assert stderr == ""
+
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        assert set(_json_list(ledger["host_baselines"], "ledger.host_baselines")) == {"claude", "claude-desktop"}
+        assert len(_json_mapping(ledger["sources"], "ledger.sources")) == 2
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        server.stop()
+
+
 def test_collect_without_baseline_uploads_new_ledger_sources_from_start(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
