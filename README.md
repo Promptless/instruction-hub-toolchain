@@ -78,6 +78,11 @@ Customer hubs should usually use `build` for pull requests and `publish` after
 changes merge to the default branch. Use `check` only for repositories that
 intentionally commit generated artifacts on the same branch as source assets.
 
+Every hub must keep the canonical `pig` package in `stable_packages`. `pig init`
+scaffolds that package as the home for scanned shared instructions and the
+Promptless-managed lifecycle integration. Other customer instruction packages
+do not receive managed hooks or runtime files.
+
 ## Hub File Layout
 
 Instruction Hub source config lives at `hub.yaml` in the hub root. Build-generated
@@ -108,9 +113,10 @@ pin to an immutable tag for stricter reproducibility.
 
 ## Managed Host Runtime
 
-The toolchain owns Promptless-managed runtime artifacts that must be injected
-into generated customer plugins, including the host runtime used by Codex and
-Claude lifecycle hooks. During dogfood, generated Codex hooks wrap the bundled
+The toolchain owns Promptless-managed runtime artifacts that are injected into
+the canonical `pig` plugin, including the host runtime used by Codex and
+Claude lifecycle hooks. Other generated plugins receive no toolchain-managed
+runtime or lifecycle hooks. During dogfood, generated Codex hooks wrap the bundled
 stdlib-only Python runtime with POSIX shell checks. The stable executable in
 `runtime/` delegates to private sibling modules that separate CLI dispatch,
 enrollment, trace collection, host configuration, persistence, and output.
@@ -188,15 +194,14 @@ upload pre-enrollment history before a later SessionStart completes the
 baseline. Other collections stay non-blocking and can skip when another
 collector holds the lock.
 
-Host enrollment is per host, not per plugin. The credential and pending approval
-are cached at a single host-global path (`~/.promptless/instruction-hub/`) and
-keyed only on the worker deployment and agent host (claude/codex), so every
-Promptless plugin a user installs from the hub shares one credential. A
-non-blocking, per-credential enrollment-leader lock ensures that when multiple
-plugins start at once, exactly one drives the single browser approval while the
-others reuse the result or defer to a later session. The per-plugin
-`CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA` directories are intentionally not used for this
-state.
+Host enrollment is per host, not per installed `pig` version. The credential
+and pending approval are cached at a single host-global path
+(`~/.promptless/instruction-hub/`) and keyed only on the worker deployment and
+agent host (claude/codex). A non-blocking, per-credential enrollment-leader lock
+ensures that overlapping host starts or plugin upgrades drive at most one browser
+approval while the others reuse the result or defer to a later session. The
+per-plugin `CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA` directories are intentionally not
+used for this state.
 
 Native JSONL ledgers are the only telemetry source: the runtime writes no OTel
 exporter config for either host. Hosts configured by earlier managed bootstraps

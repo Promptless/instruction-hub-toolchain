@@ -16,6 +16,8 @@ SupportMode = Literal["agent-skill", "native", "projected", "unsupported"]
 
 SUPPORTED_HARNESSES: tuple[Harness, ...] = ("claude", "codex", "gemini", "cursor")
 ASSET_KINDS: tuple[AssetKind, ...] = ("skill", "rule", "agent", "command", "hook", "mcp")
+PIG_PACKAGE_ID = "pig"
+PIG_PACKAGE_NAME = "PIG"
 IDENTIFIER_PATTERN = r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
 IDENTIFIER_RE = re.compile(IDENTIFIER_PATTERN)
 SEMVER_RE = re.compile(
@@ -76,7 +78,7 @@ class HubConfig(BaseModel):
     plugin_id: str
     plugin_name: str = Field(min_length=1)
     plugin_version: str
-    stable_packages: list[str] = Field(default_factory=lambda: ["core"], min_length=1)
+    stable_packages: list[str] = Field(default_factory=lambda: [PIG_PACKAGE_ID], min_length=1)
     targets: list[Harness] = Field(default_factory=lambda: list(SUPPORTED_HARNESSES), min_length=1)
 
     @field_validator("plugin_id")
@@ -102,7 +104,11 @@ class HubConfig(BaseModel):
         """Ensure stable package references are valid package IDs."""
 
         _validate_unique(value, "stable_packages")
-        return [validate_identifier(package_id, "stable package id") for package_id in value]
+        package_ids = [validate_identifier(package_id, "stable package id") for package_id in value]
+        if PIG_PACKAGE_ID not in package_ids:
+            msg = f"stable_packages must include the required {PIG_PACKAGE_ID!r} package"
+            raise ValueError(msg)
+        return package_ids
 
     @field_validator("targets")
     @classmethod

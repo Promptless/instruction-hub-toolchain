@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from promptless_instruction_hub.assets import unsupported_support
-from promptless_instruction_hub.config import PACKAGE_DIR, REPO_CONTEXT_PATH
+from promptless_instruction_hub.config import PACKAGE_DIR, REPO_CONTEXT_PATH, load_hub_config
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import (
     JsonValue,
@@ -18,7 +18,13 @@ from promptless_instruction_hub.fs import (
     write_yaml,
 )
 from promptless_instruction_hub.mcp_config import read_mcp_servers
-from promptless_instruction_hub.models import Harness, PackageDefinition, TargetSupport
+from promptless_instruction_hub.models import (
+    PIG_PACKAGE_ID,
+    PIG_PACKAGE_NAME,
+    Harness,
+    PackageDefinition,
+    TargetSupport,
+)
 
 SKILL_SOURCE_DIR = Path(".agents/skills")
 ROOT_MCP_CONFIG_CANDIDATES = (Path(".mcp.json"), Path("mcp.json"), Path("mcp.yaml"), Path("mcp.yml"))
@@ -40,11 +46,12 @@ def scan_hub(hub_root: Path, source_root: Path) -> ScanResult:
 
     root = hub_root.resolve()
     source = source_root.resolve()
+    load_hub_config(root)
     imported_skills = _import_skills(root, source)
     imported_mcps = _import_mcp_configs(root, source)
     imported_asset_refs = [f"skill:{skill_id}" for skill_id in imported_skills]
     imported_asset_refs.extend(f"mcp:{mcp_id}" for mcp_id in imported_mcps)
-    _update_core_package(root, imported_asset_refs)
+    _update_pig_package(root, imported_asset_refs)
     context_files = _inventory_repo_context(root, source)
     return ScanResult(
         imported_skills=tuple(imported_skills),
@@ -121,9 +128,11 @@ def _import_mcp_configs(hub_root: Path, source_root: Path) -> list[str]:
     return imported
 
 
-def _update_core_package(hub_root: Path, imported_asset_refs: list[str]) -> None:
-    package_path = hub_root / PACKAGE_DIR / "core.yaml"
-    raw_package = read_yaml_mapping(package_path) if package_path.exists() else {"id": "core", "name": "Core"}
+def _update_pig_package(hub_root: Path, imported_asset_refs: list[str]) -> None:
+    package_path = hub_root / PACKAGE_DIR / f"{PIG_PACKAGE_ID}.yaml"
+    raw_package = (
+        read_yaml_mapping(package_path) if package_path.exists() else {"id": PIG_PACKAGE_ID, "name": PIG_PACKAGE_NAME}
+    )
     package = PackageDefinition.model_validate(raw_package)
     includes = set(package.includes)
     includes.update(imported_asset_refs)
