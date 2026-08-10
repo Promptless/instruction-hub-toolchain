@@ -60,7 +60,7 @@ BUNDLE_LOAD_ERROR = (
 
 
 def _host_state_path(home: Path) -> Path:
-    """Return the host-global enrollment state file shared by every plugin for one user/home."""
+    """Return the host-global enrollment state file shared by pig installations."""
     return home / HOST_STATE_REL_PATH
 
 
@@ -118,7 +118,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
     build_hub(hub_root)
 
     for target in ("codex", "claude"):
-        plugin_root = hub_root / "dist" / target / "core"
+        plugin_root = hub_root / "dist" / target / "pig"
         bootstrap_path = plugin_root / "runtime" / HOST_RUNTIME_BIN
         runtime_package_path = plugin_root / "runtime" / HOST_RUNTIME_PACKAGE
         assert bootstrap_path.exists()
@@ -1053,11 +1053,11 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert list(runtime_package_path.rglob("__pycache__")) == []
         assert list(runtime_package_path.rglob("*.pyc")) == []
 
-    codex_manifest = json.loads((hub_root / "dist/codex/core/.codex-plugin/plugin.json").read_text())
+    codex_manifest = json.loads((hub_root / "dist/codex/pig/.codex-plugin/plugin.json").read_text())
     assert codex_manifest["hooks"] == "./hooks/hooks.json"
 
     for target in ("cursor", "gemini"):
-        plugin_root = hub_root / "dist" / target / "core"
+        plugin_root = hub_root / "dist" / target / "pig"
         assert not (plugin_root / "runtime" / HOST_RUNTIME_BIN).exists()
         assert not (plugin_root / "runtime" / HOST_RUNTIME_PACKAGE).exists()
         assert not (plugin_root / "hub.managed-runtimes.json").exists()
@@ -1071,7 +1071,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     runtime_path = plugin_root / "runtime" / HOST_RUNTIME_BIN
     home = tmp_path / "home"
 
@@ -1270,7 +1270,7 @@ def test_host_runtime_bundle_digest_tracks_runtime_files_only(tmp_path: Path) ->
     hub_root = tmp_path / "hub"
     init_hub(hub_root)
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     bin_root = plugin_root / "runtime"
     runtime_path = bin_root / HOST_RUNTIME_BIN
     manifest = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
@@ -1301,7 +1301,7 @@ def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -1400,11 +1400,11 @@ def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: 
     home = tmp_path / "home"
 
     result = subprocess.run(
-        [str(hub_root / "dist/codex/core/runtime" / HOST_RUNTIME_BIN), "ensure", "--host", "codex"],
+        [str(hub_root / "dist/codex/pig/runtime" / HOST_RUNTIME_BIN), "ensure", "--host", "codex"],
         env=_clean_env(
             HOME=str(home),
             CODEX_HOME=str(home / ".codex"),
-            PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+            PLUGIN_ROOT=str(hub_root / "dist/codex/pig"),
             PROMPTLESS_WORKER_BASE_URL="http://127.0.0.1:9",
         ),
         text=True,
@@ -1426,11 +1426,11 @@ def test_bootstrap_unreachable_worker_exits_zero_without_config_write(tmp_path: 
     assert not (home / ".codex/config.toml").exists()
 
     quiet_result = subprocess.run(
-        [str(hub_root / "dist/codex/core/runtime" / HOST_RUNTIME_BIN), "ensure", "--host", "codex", "--quiet"],
+        [str(hub_root / "dist/codex/pig/runtime" / HOST_RUNTIME_BIN), "ensure", "--host", "codex", "--quiet"],
         env=_clean_env(
             HOME=str(home),
             CODEX_HOME=str(home / ".codex"),
-            PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+            PLUGIN_ROOT=str(hub_root / "dist/codex/pig"),
             PROMPTLESS_WORKER_BASE_URL="http://127.0.0.1:9",
         ),
         text=True,
@@ -1452,12 +1452,12 @@ def test_bootstrap_runs_without_local_dogfood_gate(tmp_path: Path) -> None:
     try:
         home = tmp_path / "home"
         payload, result = _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -1501,11 +1501,11 @@ def test_bootstrap_welcomes_is_internal_promptless_user_once_per_plugin_version(
         env = {
             "HOME": str(home),
             "CODEX_HOME": str(home / ".codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
-        first_payload, first_result = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
+        first_payload, first_result = _run_bootstrap(hub_root / "dist/codex/pig", "codex", env)
         first_message = _json_string(first_payload["systemMessage"], "systemMessage")
         assert "welcome promptless pigfooder." in first_message
         assert "version: v0.1.0" in first_message
@@ -1536,7 +1536,7 @@ def test_bootstrap_welcomes_is_internal_promptless_user_once_per_plugin_version(
         assert "email" not in credential
 
         second_payload, second_result = _run_bootstrap(
-            hub_root / "dist/codex/core", "codex", env, expected_status="configured"
+            hub_root / "dist/codex/pig", "codex", env, expected_status="configured"
         )
         assert "systemMessage" not in second_payload
         assert second_result.stdout == ""
@@ -1549,7 +1549,7 @@ def test_bootstrap_welcomes_is_internal_promptless_user_once_per_plugin_version(
 
         build_hub(hub_root, plugin_version="0.2.0")
         upgraded_payload, upgraded_result = _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             env,
             expected_status="configured",
@@ -1576,7 +1576,7 @@ def test_bootstrap_welcomes_is_internal_promptless_user_once_per_plugin_version(
         assert upgraded_shown_by_version == {"0.1.0": shown_at, "0.2.0": upgraded_shown_at}
 
         steady_payload, steady_result = _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             env,
             expected_status="configured",
@@ -1617,11 +1617,11 @@ def test_bootstrap_ignores_non_internal_worker_identity(
         env = {
             "HOME": str(home),
             "CODEX_HOME": str(home / ".codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
-        payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
+        payload, _ = _run_bootstrap(hub_root / "dist/codex/pig", "codex", env)
         # A non-internal identity gets the generic first-success confirmation, never the internal welcome.
         message = _json_string(payload["systemMessage"], "systemMessage")
         assert FIRST_SUCCESS_ACTIVE_FRAGMENT in message
@@ -1649,7 +1649,7 @@ def test_cached_credential_trusts_only_persisted_internal_flag(tmp_path: Path) -
     server.start()
     try:
         home = tmp_path / "home"
-        plugin_root = hub_root / "dist/codex/core"
+        plugin_root = hub_root / "dist/codex/pig"
         env = {
             "HOME": str(home),
             "CODEX_HOME": str(home / ".codex"),
@@ -1698,11 +1698,11 @@ def test_bootstrap_welcomes_is_internal_promptless_user_from_poll_response(tmp_p
         env = {
             "HOME": str(home),
             "CODEX_HOME": str(home / ".codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
-        payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", env)
+        payload, _ = _run_bootstrap(hub_root / "dist/codex/pig", "codex", env)
         message = _json_string(payload["systemMessage"], "systemMessage")
         assert "welcome promptless pigfooder." in message
         assert "version: v0.1.0" in message
@@ -1732,12 +1732,12 @@ def test_bootstrap_confirms_first_successful_enrollment_once_per_host(tmp_path: 
         codex_env = {
             "HOME": str(home),
             "CODEX_HOME": str(home / ".codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
         # The first healthy enrollment confirms once and reassures the user no restart is needed.
-        first_payload, first_result = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        first_payload, first_result = _run_bootstrap(hub_root / "dist/codex/pig", "codex", codex_env)
         first_message = _json_string(first_payload["systemMessage"], "systemMessage")
         assert FIRST_SUCCESS_ACTIVE_FRAGMENT in first_message
         assert FIRST_SUCCESS_NO_RESTART_FRAGMENT in first_message
@@ -1759,7 +1759,7 @@ def test_bootstrap_confirms_first_successful_enrollment_once_per_host(tmp_path: 
 
         # A later session for the same host has nothing to say.
         second_payload, second_result = _run_bootstrap(
-            hub_root / "dist/codex/core", "codex", codex_env, expected_status="configured"
+            hub_root / "dist/codex/pig", "codex", codex_env, expected_status="configured"
         )
         assert "systemMessage" not in second_payload
         assert second_result.stdout == ""
@@ -1773,11 +1773,11 @@ def test_bootstrap_confirms_first_successful_enrollment_once_per_host(tmp_path: 
         claude_env = {
             "HOME": str(home),
             "CLAUDE_CONFIG_DIR": str(home / ".claude"),
-            "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-            "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+            "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
-        claude_payload, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
+        claude_payload, _ = _run_bootstrap(hub_root / "dist/claude/pig", "claude", claude_env)
         claude_message = _json_string(claude_payload["systemMessage"], "systemMessage")
         assert FIRST_SUCCESS_ACTIVE_FRAGMENT in claude_message
         assert "Claude Code" in claude_message
@@ -1800,7 +1800,7 @@ def test_reset_clears_first_successful_enrollment_latch(tmp_path: Path) -> None:
     server.start()
     try:
         home = tmp_path / "home"
-        plugin_root = hub_root / "dist/codex/core"
+        plugin_root = hub_root / "dist/codex/pig"
         env = {
             "HOME": str(home),
             "CODEX_HOME": str(home / ".codex"),
@@ -1835,13 +1835,13 @@ def test_bootstrap_surfaces_browser_open_failure(tmp_path: Path) -> None:
     try:
         home = tmp_path / "home"
         payload, _ = _run_bootstrap(
-            hub_root / "dist/claude/core",
+            hub_root / "dist/claude/pig",
             "claude",
             {
                 "HOME": str(home),
                 "CLAUDE_CONFIG_DIR": str(home / ".claude"),
-                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
                 "PROMPTLESS_DASHBOARD_BASE_URL": "https://app.gopromptless.ai",
             },
@@ -1878,13 +1878,13 @@ def test_bootstrap_persists_host_global_state_file(tmp_path: Path) -> None:
         # A per-plugin data dir must NOT relocate the state: host enrollment is host-global so the
         # credential lands at the shared ~/.promptless path regardless of CLAUDE_PLUGIN_DATA.
         _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
                 "PLUGIN_DATA": str(tmp_path / "plugin-data"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -1914,23 +1914,23 @@ def test_bootstrap_concurrent_hosts_preserve_shared_state_file(tmp_path: Path) -
         # enroll in parallel even while writing to the one shared host-global state file.
         home = tmp_path / "home"
         codex_process = _start_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
         claude_process = _start_bootstrap(
-            hub_root / "dist/claude/core",
+            hub_root / "dist/claude/pig",
             "claude",
             {
                 "HOME": str(home),
                 "CLAUDE_CONFIG_DIR": str(home / ".claude"),
-                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -1961,24 +1961,29 @@ def test_bootstrap_concurrent_hosts_preserve_shared_state_file(tmp_path: Path) -
         server.stop()
 
 
-def test_bootstrap_concurrent_same_host_plugins_enroll_once(tmp_path: Path) -> None:
+def test_bootstrap_concurrent_pig_versions_enroll_once(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
     server = _FakeWorkerServer()
     server.start()
-    dev_process: subprocess.Popen[str] | None = None
-    ops_process: subprocess.Popen[str] | None = None
+    older_process: subprocess.Popen[str] | None = None
+    newer_process: subprocess.Popen[str] | None = None
     try:
-        # Two claude plugins from the same hub (distinct plugin/package ids) share one host
-        # credential. Starting both at once must open exactly one browser approval, not one per
-        # plugin -- the regression that previously surfaced two browser windows on session start.
+        # Overlapping starts from two installed pig versions share one host credential.
+        # Starting both at once must open exactly one browser approval.
         home = tmp_path / "home"
-        dev_plugin = _clone_plugin_with_identity(
-            hub_root / "dist/claude/core", tmp_path / "plugin-dev", plugin_id="hub-dev", package_id="dev"
+        older_plugin = _clone_plugin_with_identity(
+            hub_root / "dist/claude/pig",
+            tmp_path / "pig-older",
+            plugin_id="promptless-instruction-hub-pig",
+            package_id="pig",
         )
-        ops_plugin = _clone_plugin_with_identity(
-            hub_root / "dist/claude/core", tmp_path / "plugin-ops", plugin_id="hub-ops", package_id="ops"
+        newer_plugin = _clone_plugin_with_identity(
+            hub_root / "dist/claude/pig",
+            tmp_path / "pig-newer",
+            plugin_id="promptless-instruction-hub-pig",
+            package_id="pig",
         )
 
         def claude_plugin_env(plugin_root: Path) -> dict[str, str]:
@@ -1990,14 +1995,14 @@ def test_bootstrap_concurrent_same_host_plugins_enroll_once(tmp_path: Path) -> N
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             }
 
-        dev_process = _start_bootstrap(dev_plugin, "claude", claude_plugin_env(dev_plugin))
-        ops_process = _start_bootstrap(ops_plugin, "claude", claude_plugin_env(ops_plugin))
+        older_process = _start_bootstrap(older_plugin, "claude", claude_plugin_env(older_plugin))
+        newer_process = _start_bootstrap(newer_plugin, "claude", claude_plugin_env(newer_plugin))
 
-        dev_payload = _read_any_bootstrap_status(dev_process)
-        ops_payload = _read_any_bootstrap_status(ops_process)
+        older_payload = _read_any_bootstrap_status(older_process)
+        newer_payload = _read_any_bootstrap_status(newer_process)
 
         # Exactly one browser approval (one /start) and one shared host credential, no matter
-        # which plugin won the enrollment-leader lock.
+        # which installed version won the enrollment-leader lock.
         assert len(server.session_requests) == 1
         state = json.loads(_host_state_path(home).read_text())
         credentials = _json_mapping(validate_json_value(state["credentials"], "credentials"), "credentials")
@@ -2008,11 +2013,14 @@ def test_bootstrap_concurrent_same_host_plugins_enroll_once(tmp_path: Path) -> N
         # The leader configured the shared host telemetry once; the follower never opened a
         # browser (it either reused the credential or deferred to a later session).
         leader_statuses = {"needs_restart", "configured"}
-        statuses = {_json_string(dev_payload["status"], "status"), _json_string(ops_payload["status"], "status")}
+        statuses = {
+            _json_string(older_payload["status"], "status"),
+            _json_string(newer_payload["status"], "status"),
+        }
         assert statuses & leader_statuses
         assert statuses <= leader_statuses | {"setup_pending"}
     finally:
-        for process in (dev_process, ops_process):
+        for process in (older_process, newer_process):
             if process is not None and process.poll() is None:
                 process.kill()
         server.stop()
@@ -2025,12 +2033,12 @@ def test_bootstrap_rejects_plaintext_non_loopback_worker_base_url(tmp_path: Path
     home = tmp_path / "home"
 
     payload, result = _run_bootstrap(
-        hub_root / "dist/codex/core",
+        hub_root / "dist/codex/pig",
         "codex",
         {
             "HOME": str(home),
             "CODEX_HOME": str(home / ".codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
             "PROMPTLESS_WORKER_BASE_URL": "http://example.com",
             "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES": "0",
         },
@@ -2052,13 +2060,13 @@ def test_bootstrap_reports_browser_launch_failure_without_claiming_browser_opene
     try:
         home = tmp_path / "home"
         payload, result = _run_bootstrap(
-            hub_root / "dist/claude/core",
+            hub_root / "dist/claude/pig",
             "claude",
             {
                 "HOME": str(home),
                 "CLAUDE_CONFIG_DIR": str(home / ".claude"),
-                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
                 "PROMPTLESS_DASHBOARD_BASE_URL": "https://app.gopromptless.ai",
             },
@@ -2101,12 +2109,12 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
     try:
         codex_home = tmp_path / "codex-home"
         _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -2114,13 +2122,13 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
 
         claude_home = tmp_path / "claude-home"
         _run_bootstrap(
-            hub_root / "dist/claude/core",
+            hub_root / "dist/claude/pig",
             "claude",
             {
                 "HOME": str(claude_home),
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
-                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -2132,9 +2140,9 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert codex_callback_state != claude_callback_state
         assert server.session_requests[0]["deployment_instance_id"] == "worker-local-1"
         assert server.session_requests[0]["target"] == "codex"
-        assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-core"
+        assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-pig"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
-        assert server.session_requests[0]["package_id"] == "core"
+        assert server.session_requests[0]["package_id"] == "pig"
         assert server.session_requests[0]["bootstrap_version"] == "0.2.5"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
         assert server.session_requests[0]["pending_callback"] == "1"
@@ -2196,12 +2204,12 @@ def test_bootstrap_rejects_loopback_callback_with_wrong_state(tmp_path: Path) ->
     try:
         home = tmp_path / "home"
         payload, _result = _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="error",
@@ -2240,12 +2248,12 @@ def test_bootstrap_rejects_pending_callback_approval_url_outside_dashboard_route
     try:
         home = tmp_path / "home"
         payload, _result = _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="error",
@@ -2269,11 +2277,11 @@ def test_bootstrap_fails_fast_when_browser_pending_callback_rejects_approval_url
     try:
         home = tmp_path / "home"
         result = subprocess.run(
-            [str(hub_root / "dist/codex/core/runtime" / HOST_RUNTIME_BIN), "ensure", "--host", "codex"],
+            [str(hub_root / "dist/codex/pig/runtime" / HOST_RUNTIME_BIN), "ensure", "--host", "codex"],
             env=_clean_env(
                 HOME=str(home),
                 CODEX_HOME=str(home / ".codex"),
-                PLUGIN_ROOT=str(hub_root / "dist/codex/core"),
+                PLUGIN_ROOT=str(hub_root / "dist/codex/pig"),
                 PROMPTLESS_WORKER_BASE_URL=server.base_url,
                 PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER="1",
                 BROWSER=_async_urlopen_browser_command(tmp_path / "fake-browser.py"),
@@ -2313,12 +2321,12 @@ def test_bootstrap_requires_callback_deployment_instance_id(tmp_path: Path) -> N
     try:
         home = tmp_path / "home"
         payload, _result = _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="error",
@@ -2336,7 +2344,7 @@ def test_bootstrap_missing_managed_runtime_manifest_uses_default_metadata(tmp_pa
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     (plugin_root / "hub.managed-runtimes.json").unlink()
     server = _FakeWorkerServer()
     server.start()
@@ -2379,12 +2387,12 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
         codex_config.write_text(original_codex_config)
 
         _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="needs_restart",
@@ -2409,13 +2417,13 @@ def test_bootstrap_preserves_unrelated_config_and_writes_backups(tmp_path: Path)
         claude_settings.write_text(json.dumps(original_claude_settings))
 
         _run_bootstrap(
-            hub_root / "dist/claude/core",
+            hub_root / "dist/claude/pig",
             "claude",
             {
                 "HOME": str(claude_home),
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
-                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="needs_restart",
@@ -2465,12 +2473,12 @@ def test_bootstrap_removes_managed_host_otel_config(tmp_path: Path) -> None:
         codex_config.write_text(original_codex_config)
 
         codex_payload, _ = _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="needs_restart",
@@ -2517,13 +2525,13 @@ def test_bootstrap_removes_managed_host_otel_config(tmp_path: Path) -> None:
         claude_settings.write_text(json.dumps(original_claude_settings))
 
         claude_payload, _ = _run_bootstrap(
-            hub_root / "dist/claude/core",
+            hub_root / "dist/claude/pig",
             "claude",
             {
                 "HOME": str(claude_home),
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
-                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="needs_restart",
@@ -2563,11 +2571,11 @@ def test_bootstrap_blocks_malformed_managed_codex_config(tmp_path: Path) -> None
         codex_env = {
             "HOME": str(codex_home),
             "CODEX_HOME": str(codex_home / ".codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
         codex_payload, _ = _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             codex_env,
             expected_status="blocked",
@@ -2596,7 +2604,7 @@ def test_bootstrap_blocks_malformed_managed_codex_config(tmp_path: Path) -> None
         # After the user repairs the config by hand, the next session is the real first success
         # and confirms once.
         codex_config.write_text('model = "gpt-5"\n')
-        repaired_payload, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        repaired_payload, _ = _run_bootstrap(hub_root / "dist/codex/pig", "codex", codex_env)
         repaired_message = _json_string(repaired_payload["systemMessage"], "systemMessage")
         assert FIRST_SUCCESS_ACTIVE_FRAGMENT in repaired_message
         repaired_state = _json_mapping(
@@ -2627,10 +2635,41 @@ def test_build_appends_bootstrap_hook_to_existing_hook_asset(tmp_path: Path) -> 
 
     build_hub(hub_root)
 
-    hooks = json.loads((hub_root / "dist/codex/core/hooks/hooks.json").read_text())
+    hooks = json.loads((hub_root / "dist/codex/pig/hooks/hooks.json").read_text())
     session_start = hooks["hooks"]["SessionStart"]
     assert session_start[0]["hooks"][0]["command"] == "existing-hook"
     assert f"runtime/{HOST_RUNTIME_BIN}" in session_start[1]["hooks"][0]["command"]
+
+
+def test_build_leaves_customer_package_hook_unmanaged(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    _write_native_hook_asset(
+        hub_root,
+        {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup",
+                        "hooks": [{"type": "command", "command": "customer-hook"}],
+                    }
+                ]
+            }
+        },
+        package_id="customer",
+    )
+
+    build_hub(hub_root)
+
+    hooks = json.loads((hub_root / "dist/codex/customer/hooks/hooks.json").read_text())
+    assert hooks["hooks"]["SessionStart"] == [
+        {
+            "matcher": "startup",
+            "hooks": [{"type": "command", "command": "customer-hook"}],
+        }
+    ]
+    assert not (hub_root / "dist/codex/customer/runtime").exists()
+    assert not (hub_root / "dist/codex/customer/hub.managed-runtimes.json").exists()
 
 
 def test_build_rejects_malformed_existing_hook_asset(tmp_path: Path) -> None:
@@ -2655,12 +2694,12 @@ def test_bootstrap_leaves_unmanaged_host_config_untouched(tmp_path: Path) -> Non
         codex_config.write_text('[otel]\nenvironment = "local"\n')
 
         _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(codex_home),
                 "CODEX_HOME": str(codex_home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -2675,13 +2714,13 @@ def test_bootstrap_leaves_unmanaged_host_config_untouched(tmp_path: Path) -> Non
         claude_settings.write_text('{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"Authorization=Bearer customer-token"}}\n')
 
         _run_bootstrap(
-            hub_root / "dist/claude/core",
+            hub_root / "dist/claude/pig",
             "claude",
             {
                 "HOME": str(claude_home),
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
-                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -2710,21 +2749,21 @@ def test_bootstrap_surfaces_enrollment_message_only_on_change(tmp_path: Path) ->
         claude_env = {
             "HOME": str(claude_home),
             "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
-            "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-            "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+            "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
         # Removing legacy managed config surfaces a restart prompt naming the host; the
         # steady state is silent.
         first_claude, _ = _run_bootstrap(
-            hub_root / "dist/claude/core", "claude", claude_env, expected_status="needs_restart"
+            hub_root / "dist/claude/pig", "claude", claude_env, expected_status="needs_restart"
         )
         claude_message = _json_string(first_claude["systemMessage"], "systemMessage")
         assert "Claude Code" in claude_message
         assert "removed" in claude_message.lower()
 
-        steady_claude, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
+        steady_claude, _ = _run_bootstrap(hub_root / "dist/claude/pig", "claude", claude_env)
         assert "systemMessage" not in steady_claude
 
         codex_home = tmp_path / "codex-home"
@@ -2736,17 +2775,17 @@ def test_bootstrap_surfaces_enrollment_message_only_on_change(tmp_path: Path) ->
         codex_env = {
             "HOME": str(codex_home),
             "CODEX_HOME": str(codex_home / ".codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
         first_codex, _ = _run_bootstrap(
-            hub_root / "dist/codex/core", "codex", codex_env, expected_status="needs_restart"
+            hub_root / "dist/codex/pig", "codex", codex_env, expected_status="needs_restart"
         )
         codex_message = _json_string(first_codex["systemMessage"], "systemMessage")
         assert "Codex" in codex_message
         assert "removed" in codex_message.lower()
 
-        steady_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        steady_codex, _ = _run_bootstrap(hub_root / "dist/codex/pig", "codex", codex_env)
         assert "systemMessage" not in steady_codex
     finally:
         server.stop()
@@ -2761,13 +2800,13 @@ def test_bootstrap_writes_no_host_config_on_fresh_hosts(tmp_path: Path) -> None:
     try:
         claude_home = tmp_path / "claude-home"
         _run_bootstrap(
-            hub_root / "dist/claude/core",
+            hub_root / "dist/claude/pig",
             "claude",
             {
                 "HOME": str(claude_home),
                 "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
-                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
         )
@@ -2797,14 +2836,14 @@ def test_bootstrap_stdout_stays_codex_schema_safe(tmp_path: Path) -> None:
         codex_env = {
             "HOME": str(tmp_path / "codex-home"),
             "CODEX_HOME": str(tmp_path / "codex-home/.codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
         # Fresh browser enrollment records the start banner in diagnostics but leaves stdout for
         # the final actionable restart message emitted by the managed-config cleanup.
         configured_payload, configured_result = _run_bootstrap(
-            hub_root / "dist/codex/core", "codex", codex_env, expected_status="needs_restart"
+            hub_root / "dist/codex/pig", "codex", codex_env, expected_status="needs_restart"
         )
         configured_stdout = _json_mapping(
             validate_json_value(json.loads(configured_result.stdout), "codex stdout"), "codex stdout"
@@ -2822,9 +2861,7 @@ def test_bootstrap_stdout_stays_codex_schema_safe(tmp_path: Path) -> None:
             assert forbidden_key not in configured_stdout
 
         # Steady state has nothing to say: stdout is empty so Codex treats it as success.
-        _, steady_result = _run_bootstrap(
-            hub_root / "dist/codex/core", "codex", codex_env, expected_status="configured"
-        )
+        _, steady_result = _run_bootstrap(hub_root / "dist/codex/pig", "codex", codex_env, expected_status="configured")
         assert steady_result.stdout == ""
     finally:
         server.stop()
@@ -2840,24 +2877,24 @@ def test_bootstrap_announces_plugin_update_per_host(tmp_path: Path) -> None:
         claude_env = {
             "HOME": str(tmp_path / "claude-home"),
             "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-home/.claude"),
-            "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-            "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+            "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
         codex_env = {
             "HOME": str(tmp_path / "codex-home"),
             "CODEX_HOME": str(tmp_path / "codex-home/.codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
 
         # First install on each host records the version but is not an update, so it shows the
         # one-time first-success confirmation without any version-change notice.
-        first_claude, _ = _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
+        first_claude, _ = _run_bootstrap(hub_root / "dist/claude/pig", "claude", claude_env)
         first_claude_message = _json_string(first_claude["systemMessage"], "systemMessage")
         assert FIRST_SUCCESS_ACTIVE_FRAGMENT in first_claude_message
         assert "updated to" not in first_claude_message
-        first_codex, _ = _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        first_codex, _ = _run_bootstrap(hub_root / "dist/codex/pig", "codex", codex_env)
         first_codex_message = _json_string(first_codex["systemMessage"], "systemMessage")
         assert FIRST_SUCCESS_ACTIVE_FRAGMENT in first_codex_message
         assert "updated to" not in first_codex_message
@@ -2865,20 +2902,20 @@ def test_bootstrap_announces_plugin_update_per_host(tmp_path: Path) -> None:
         # Rebuild the same hub at a newer version, then re-run: each host announces the change once.
         build_hub(hub_root, plugin_version="0.2.0")
         upgraded_claude, _ = _run_bootstrap(
-            hub_root / "dist/claude/core", "claude", claude_env, expected_status="configured"
+            hub_root / "dist/claude/pig", "claude", claude_env, expected_status="configured"
         )
         claude_message = _json_string(upgraded_claude["systemMessage"], "systemMessage")
         assert "0.2.0" in claude_message and "0.1.0" in claude_message
 
         upgraded_codex, _ = _run_bootstrap(
-            hub_root / "dist/codex/core", "codex", codex_env, expected_status="configured"
+            hub_root / "dist/codex/pig", "codex", codex_env, expected_status="configured"
         )
         codex_message = _json_string(upgraded_codex["systemMessage"], "systemMessage")
         assert "0.2.0" in codex_message and "0.1.0" in codex_message
 
         # A subsequent run at the same version is silent again.
         steady_claude, _ = _run_bootstrap(
-            hub_root / "dist/claude/core", "claude", claude_env, expected_status="configured"
+            hub_root / "dist/claude/pig", "claude", claude_env, expected_status="configured"
         )
         assert "systemMessage" not in steady_claude
     finally:
@@ -2900,12 +2937,12 @@ def test_bootstrap_update_notice_tolerates_unreadable_state(tmp_path: Path) -> N
         state_path.write_text("{ not valid json")
 
         payload, result = _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="error",
@@ -2931,8 +2968,8 @@ def test_bootstrap_defers_recording_update_until_notice_surfaces(tmp_path: Path)
             return {
                 "HOME": str(tmp_path / "claude-home"),
                 "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-home/.claude"),
-                "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+                "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": worker_base_url,
             }
 
@@ -2945,14 +2982,14 @@ def test_bootstrap_defers_recording_update_until_notice_surfaces(tmp_path: Path)
             return _json_string(versions["claude"], "last_seen_plugin_versions.claude")
 
         # A first healthy session records v0.1.0 as seen.
-        _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env(server.base_url))
+        _run_bootstrap(hub_root / "dist/claude/pig", "claude", claude_env(server.base_url))
         assert seen_claude_version() == "0.1.0"
 
         # Upgrade, then hit a failing session (unreachable worker): the new version must NOT be
         # marked seen, because its update notice was never surfaced.
         build_hub(hub_root, plugin_version="0.2.0")
         _run_bootstrap(
-            hub_root / "dist/claude/core",
+            hub_root / "dist/claude/pig",
             "claude",
             claude_env("http://127.0.0.1:9"),
             expected_status="error",
@@ -2961,7 +2998,7 @@ def test_bootstrap_defers_recording_update_until_notice_surfaces(tmp_path: Path)
 
         # The next healthy session still surfaces the one-time update notice and records v0.2.0.
         recovered, _ = _run_bootstrap(
-            hub_root / "dist/claude/core", "claude", claude_env(server.base_url), expected_status="configured"
+            hub_root / "dist/claude/pig", "claude", claude_env(server.base_url), expected_status="configured"
         )
         recovered_message = _json_string(recovered["systemMessage"], "systemMessage")
         assert "0.2.0" in recovered_message and "0.1.0" in recovered_message
@@ -2981,24 +3018,24 @@ def test_bootstrap_repeat_runs_stay_configured_without_config_writes(tmp_path: P
         codex_env = {
             "HOME": str(codex_home),
             "CODEX_HOME": str(codex_home / ".codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
-        _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
-        _run_bootstrap(hub_root / "dist/codex/core", "codex", codex_env)
+        _run_bootstrap(hub_root / "dist/codex/pig", "codex", codex_env)
+        _run_bootstrap(hub_root / "dist/codex/pig", "codex", codex_env)
         assert not (codex_home / ".codex/config.toml").exists()
 
         claude_home = tmp_path / "claude-home"
         claude_env = {
             "HOME": str(claude_home),
             "CLAUDE_CONFIG_DIR": str(claude_home / ".claude"),
-            "PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
-            "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
+            "CLAUDE_PLUGIN_ROOT": str(hub_root / "dist/claude/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
-        _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
+        _run_bootstrap(hub_root / "dist/claude/pig", "claude", claude_env)
         settings_path = claude_home / ".claude/settings.json"
-        _run_bootstrap(hub_root / "dist/claude/core", "claude", claude_env)
+        _run_bootstrap(hub_root / "dist/claude/pig", "claude", claude_env)
         assert not settings_path.exists()
         assert [check_in["status"] for check_in in server.check_ins] == [
             "configured",
@@ -3030,11 +3067,11 @@ def test_bootstrap_rejects_invalid_worker_policy(tmp_path: Path, case: str) -> N
         env = {
             "HOME": str(home),
             "CODEX_HOME": str(home / ".codex"),
-            "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+            "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
         }
         _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             env,
             expected_status="error",
@@ -3074,12 +3111,12 @@ def test_bootstrap_ignores_legacy_collector_policy_sections(tmp_path: Path) -> N
         try:
             home = tmp_path / f"home-{len(server.check_ins)}-{server.base_url.rsplit(':', 1)[1]}"
             _run_bootstrap(
-                hub_root / "dist/codex/core",
+                hub_root / "dist/codex/pig",
                 "codex",
                 {
                     "HOME": str(home),
                     "CODEX_HOME": str(home / ".codex"),
-                    "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                    "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                     "PROMPTLESS_WORKER_BASE_URL": server.base_url,
                 },
             )
@@ -3092,7 +3129,7 @@ def test_upload_only_policy_permissions_block_neither_ensure_nor_collect(tmp_pat
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     # Hosted policies still carry the retired plugin_permissions section for older
     # bootstraps. An upload-only grant must not reject config cleanup or, worse,
     # silently drop every lifecycle trace upload for the org.
@@ -3141,12 +3178,12 @@ def test_bootstrap_blocks_when_worker_requires_different_runtime_version(tmp_pat
     try:
         home = tmp_path / "home"
         _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="blocked",
@@ -3170,12 +3207,12 @@ def test_bootstrap_rejects_invalid_check_in_success_response(tmp_path: Path) -> 
     try:
         home = tmp_path / "home"
         payload, _result = _run_bootstrap(
-            hub_root / "dist/codex/core",
+            hub_root / "dist/codex/pig",
             "codex",
             {
                 "HOME": str(home),
                 "CODEX_HOME": str(home / ".codex"),
-                "PLUGIN_ROOT": str(hub_root / "dist/codex/core"),
+                "PLUGIN_ROOT": str(hub_root / "dist/codex/pig"),
                 "PROMPTLESS_WORKER_BASE_URL": server.base_url,
             },
             expected_status="error",
@@ -3191,7 +3228,7 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -3273,7 +3310,7 @@ def test_collect_zero_source_first_baseline_persists_host_marker(tmp_path: Path)
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -3307,7 +3344,7 @@ def test_collect_legacy_host_source_is_treated_as_existing_baseline(tmp_path: Pa
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -3367,7 +3404,7 @@ def test_claude_desktop_discovers_both_audit_stores_under_platform_config_root(t
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/claude/core"
+    plugin_root = hub_root / "dist/claude/pig"
     server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
     server.start()
     try:
@@ -3442,7 +3479,7 @@ def test_claude_desktop_ensure_if_sources_skips_without_audit_files(tmp_path: Pa
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/claude/core"
+    plugin_root = hub_root / "dist/claude/pig"
     server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
     server.start()
     try:
@@ -3485,7 +3522,7 @@ def test_claude_desktop_collect_skips_without_cached_credential(tmp_path: Path) 
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/claude/core"
+    plugin_root = hub_root / "dist/claude/pig"
     server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
     server.start()
     try:
@@ -3516,7 +3553,7 @@ def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> No
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/claude/core"
+    plugin_root = hub_root / "dist/claude/pig"
     server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
     server.start()
     try:
@@ -3579,7 +3616,7 @@ def test_claude_desktop_baseline_is_per_host_with_shared_ledger(tmp_path: Path) 
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/claude/core"
+    plugin_root = hub_root / "dist/claude/pig"
     server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
     server.start()
     try:
@@ -3635,7 +3672,7 @@ def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path)
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/claude/core"
+    plugin_root = hub_root / "dist/claude/pig"
     server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
     server.start()
     processes: list[subprocess.Popen[str]] = []
@@ -3710,7 +3747,7 @@ def test_ensure_prepare_baseline_stops_before_enrollment_when_guard_write_fails(
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -3749,7 +3786,7 @@ def test_baseline_collect_stops_before_policy_when_guard_creation_fails(tmp_path
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -3804,7 +3841,7 @@ def test_baseline_collect_stops_waiting_for_ledger_lock_at_deadline(tmp_path: Pa
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -3881,7 +3918,7 @@ def test_collect_without_baseline_uploads_new_ledger_sources_from_start(tmp_path
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -3960,7 +3997,7 @@ def test_collect_include_active_uploads_recent_root_source_without_lifecycle(tmp
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -4027,7 +4064,7 @@ def test_collect_uploads_subagent_transcript_with_parent_identity(tmp_path: Path
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -4083,7 +4120,7 @@ def test_collect_scopes_lifecycle_event_to_the_hook_subject_file(tmp_path: Path)
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -4149,7 +4186,7 @@ def test_collect_reports_oversized_record_with_content_size_reason(tmp_path: Pat
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -4207,7 +4244,7 @@ def test_collect_reports_oversized_record_with_transport_size_reason(tmp_path: P
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -4274,7 +4311,7 @@ def test_collect_splits_batches_by_transport_size(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -4335,7 +4372,7 @@ def test_collect_skips_unreadable_idle_source_and_uploads_the_rest(tmp_path: Pat
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -4412,7 +4449,7 @@ def test_collect_tolerates_unparsed_record_counts_and_advances_ledger(tmp_path: 
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     # The worker models undecodable ledger lines as informational counts; a nonzero
     # count must never fail the upload or hold the ledger back.
     server = _FakeWorkerServer(unparsed_record_count=2)
@@ -4464,7 +4501,7 @@ def test_collect_skips_when_ledger_lock_is_busy_and_logs_diagnostic(tmp_path: Pa
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -4520,7 +4557,7 @@ def test_zero_deadline_collect_baselines_fully_and_uploads_hook_subject(tmp_path
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -4589,7 +4626,7 @@ def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) ->
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -4673,7 +4710,7 @@ def test_truncated_empty_scan_still_reaches_first_run_baseline(tmp_path: Path) -
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/core"
+    plugin_root = hub_root / "dist/codex/pig"
     server = _FakeWorkerServer()
     server.start()
     try:
@@ -5038,7 +5075,12 @@ def _callback_url_with_state(callback_url: str, state: str) -> str:
     return parsed._replace(query=urlencode(query_pairs)).geturl()
 
 
-def _write_native_hook_asset(hub_root: Path, hooks: dict[str, JsonValue]) -> None:
+def _write_native_hook_asset(
+    hub_root: Path,
+    hooks: dict[str, JsonValue],
+    *,
+    package_id: str = "pig",
+) -> None:
     hooks_path = hub_root / "assets/hooks/hooks.json"
     hooks_path.write_text(json.dumps(hooks))
     (hub_root / "assets/hooks/hooks.asset.yaml").write_text(
@@ -5061,7 +5103,15 @@ def _write_native_hook_asset(hub_root: Path, hooks: dict[str, JsonValue]) -> Non
             ]
         )
     )
-    (hub_root / "packages/core.yaml").write_text("id: core\nname: Core\nincludes:\n  - hook:hooks\n")
+    package_name = "PIG" if package_id == "pig" else package_id.replace("-", " ").title()
+    (hub_root / f"packages/{package_id}.yaml").write_text(
+        f"id: {package_id}\nname: {package_name}\nincludes:\n  - hook:hooks\n"
+    )
+    if package_id != "pig":
+        config_path = hub_root / "hub.yaml"
+        config_path.write_text(
+            config_path.read_text().replace("stable_packages:\n- pig\n", f"stable_packages:\n- pig\n- {package_id}\n")
+        )
 
 
 def _policy_with(**policy_updates: JsonValue) -> dict[str, JsonValue]:

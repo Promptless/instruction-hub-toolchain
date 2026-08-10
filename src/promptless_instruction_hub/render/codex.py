@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from promptless_instruction_hub.fs import write_json
-from promptless_instruction_hub.models import HubConfig, PackageDefinition, StablePackage
+from promptless_instruction_hub.models import PIG_PACKAGE_ID, HubConfig, PackageDefinition, StablePackage
 from promptless_instruction_hub.render.common import (
     RenderedAssets,
     base_plugin_manifest,
@@ -26,6 +26,12 @@ def write_manifest(
 
     manifest = base_plugin_manifest(config, package)
     description = plugin_description(config, package)
+    if package.id == PIG_PACKAGE_ID:
+        long_description = description
+        default_prompt = "Use PIG instructions and lifecycle integration for this session."
+    else:
+        long_description = f"{package.name} distributes governed agent instructions for {config.org}."
+        default_prompt = f"Use {package.name} instructions for this task."
     manifest["author"] = {"name": config.org}
     if rendered.get("skills"):
         manifest["skills"] = "./skills/"
@@ -36,11 +42,11 @@ def write_manifest(
     manifest["interface"] = {
         "displayName": package.name,
         "shortDescription": description,
-        "longDescription": f"{package.name} distributes governed agent instructions for {config.org}.",
+        "longDescription": long_description,
         "developerName": config.org,
         "category": "Productivity",
         "capabilities": _capabilities(target_root, rendered, mcp_server_names),
-        "defaultPrompt": [f"Use {package.name} instructions for this task."],
+        "defaultPrompt": [default_prompt],
     }
     write_json(target_root / ".codex-plugin/plugin.json", manifest)
 

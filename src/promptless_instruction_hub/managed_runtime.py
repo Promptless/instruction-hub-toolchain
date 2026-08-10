@@ -14,7 +14,7 @@ from typing import Literal
 from promptless_instruction_hub.config import MANAGED_RUNTIME_MANIFEST_PATH
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, read_json_mapping, write_json
-from promptless_instruction_hub.models import Harness, HubConfig, PackageDefinition
+from promptless_instruction_hub.models import PIG_PACKAGE_ID, Harness, HubConfig, PackageDefinition
 
 RuntimeStatus = Literal["included"]
 
@@ -117,10 +117,10 @@ def render_managed_runtimes(
     config: HubConfig,
     package: PackageDefinition,
 ) -> tuple[ManagedRuntimeRecord, ...]:
-    """Write managed-runtime metadata and inject supported runtime artifacts for one generated plugin."""
+    """Inject managed runtime artifacts when rendering the PIG package for a supported host."""
 
     plugin_id = f"{config.plugin_id}-{package.id}"
-    if target not in SUPPORTED_HOST_RUNTIME_TARGETS:
+    if package.id != PIG_PACKAGE_ID or target not in SUPPORTED_HOST_RUNTIME_TARGETS:
         return ()
 
     _copy_runtime_bundle(target_root)
