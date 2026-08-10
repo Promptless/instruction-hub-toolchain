@@ -3758,6 +3758,7 @@ def test_collect_skips_when_ledger_lock_is_busy_and_logs_diagnostic(tmp_path: Pa
             {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
         )
         transcript_path.write_bytes(first_record + second_record)
+        policy_request_count = len(server.policy_requests)
 
         lock_path = ledger_path.with_name(f"{ledger_path.name}.lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3772,6 +3773,7 @@ def test_collect_skips_when_ledger_lock_is_busy_and_logs_diagnostic(tmp_path: Pa
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
         assert server.trace_batches == []
+        assert len(server.policy_requests) == policy_request_count
         diagnostics = _diagnostic_log_entries(home)
         assert diagnostics[-1]["status"] == "trace_upload_skipped"
         assert diagnostics[-1]["reason"] == "ledger_lock_busy"
