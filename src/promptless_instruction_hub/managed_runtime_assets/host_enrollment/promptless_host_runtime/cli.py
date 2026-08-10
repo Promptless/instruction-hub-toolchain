@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 from urllib.parse import urlencode
 
 from .contracts import (
@@ -41,18 +45,22 @@ from .notices import (
     _pending_plugin_update,
     _record_plugin_version_seen,
 )
-from .output import _emit, _emit_command_json, _flush_control_output
+from .output import _emit, _emit_command_json, _flush_control_output, _record_collector_failure
 from .redaction import _redact_text
 from .status import _reset_host_state, _status_payload
 from .traces import _hook_trace_context, _lifecycle_event, _prepare_baseline, _read_hook_context, _run_collect
 from .validation import _requires_newer_bootstrap
 from .worker import _get_json, _post_check_in, _validate_signed_policy, _worker_url
 
+_WINDOWS_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_WINDOWS_DETACHED_PROCESS = 0x00000008
+
 
 def main(argv: list[str] | None = None) -> int:
     """Run the requested host-runtime command."""
     parser = _build_arg_parser()
-    args = parser.parse_args(argv)
+    command_args = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(command_args)
     if args.command == "version":
         return _run_version_command(json_output=args.json)
     host = _resolve_host(args.host)
@@ -64,6 +72,10 @@ def main(argv: list[str] | None = None) -> int:
             prepare_baseline=args.prepare_baseline,
         )
     if args.command == "collect":
+        if args.detach:
+            return _launch_detached_collect(command_args)
+        if args.supervised:
+            return _supervise_collect(host, command_args)
         return _run_collect_command(
             host,
             lifecycle=args.lifecycle,
@@ -99,7 +111,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Persist the baseline guard before detached collection",
     )
 
-    collect_parser = subcommands.add_parser("collect", help="Upload native trace JSONL changes")
+    collect_parser = subcommands.add_parser(
+        "collect",
+        help="Upload native trace JSONL changes",
+        allow_abbrev=False,
+    )
     _add_host_argument(collect_parser)
     collect_parser.add_argument(
         "--lifecycle",
@@ -118,6 +134,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Include session files still inside the idle grace period after an established baseline",
     )
     collect_parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
+    collect_execution = collect_parser.add_mutually_exclusive_group()
+    collect_execution.add_argument("--detach", action="store_true", help="Run collection in a detached process")
+    collect_execution.add_argument("--supervised", action="store_true", help=argparse.SUPPRESS)
 
     status_parser = subcommands.add_parser("status", help="Print local host-runtime status as JSON")
     _add_host_argument(status_parser)
@@ -176,6 +195,66 @@ def _run_collect_command(
         return 0
     finally:
         _flush_control_output()
+
+
+def _launch_detached_collect(command_args: list[str]) -> int:
+    supervisor_args = [
+        sys.executable,
+        str(Path(sys.argv[0]).resolve()),
+        *("--supervised" if arg == "--detach" else arg for arg in command_args),
+    ]
+    try:
+        _spawn_detached(supervisor_args)
+    except OSError:
+        return 1
+    return 0
+
+
+def _supervise_collect(host: Host, command_args: list[str]) -> int:
+    collector_args = [
+        sys.executable,
+        str(Path(sys.argv[0]).resolve()),
+        *(arg for arg in command_args if arg != "--supervised"),
+    ]
+    try:
+        result = subprocess.run(
+            collector_args,
+            stdin=sys.stdin.buffer,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError as exc:
+        _record_collector_failure(host, exit_code=None, error_code=_os_error_code(exc))
+        return 1
+    if result.returncode != 0:
+        _record_collector_failure(host, exit_code=result.returncode, error_code=None)
+    return result.returncode
+
+
+def _spawn_detached(args: list[str]) -> None:
+    if os.name == "nt":
+        subprocess.Popen(
+            args,
+            stdin=sys.stdin.buffer,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_WINDOWS_CREATE_NEW_PROCESS_GROUP | _WINDOWS_DETACHED_PROCESS,
+        )
+        return
+    subprocess.Popen(
+        args,
+        stdin=sys.stdin.buffer,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _os_error_code(exc: OSError) -> str:
+    if exc.errno is None:
+        return type(exc).__name__
+    return errno.errorcode.get(exc.errno, str(exc.errno))
 
 
 def _run_status_command(host: Host) -> int:

@@ -83,21 +83,17 @@ def _run_collect(
 
     ledger_path = _ledger_path()
     baseline_pending_path = _baseline_pending_path(ledger_path, host)
-    lock_deadline = deadline
     if baseline:
         try:
             _prepare_baseline(host)
         except OSError:
-            # A detached baseline may safely outlive the collection budget. If its durable
-            # guard cannot be written, waiting for the ledger lock is the only way to prevent
-            # a later terminal hook from uploading pre-enrollment history from offset zero.
-            lock_deadline = float("inf")
             _emit(
                 {"status": "trace_upload_degraded", "reason": "baseline_pending_write_failed", "host": host},
                 quiet=quiet,
             )
+            return 1
 
-    with _source_ledger_lock(ledger_path, wait_for_lock=baseline, deadline=lock_deadline) as lock_acquired:
+    with _source_ledger_lock(ledger_path, wait_for_lock=baseline, deadline=deadline) as lock_acquired:
         if not lock_acquired:
             _emit({"status": "trace_upload_skipped", "reason": "ledger_lock_busy", "host": host}, quiet=quiet)
             return 0
@@ -443,7 +439,11 @@ def _baseline_pending_path(ledger_path: Path, host: Host) -> Path:
 
 def _prepare_baseline(host: Host) -> None:
     ledger_path = _ledger_path()
-    _mark_baseline_pending(_baseline_pending_path(ledger_path, host), host)
+    pending_path = _baseline_pending_path(ledger_path, host)
+    try:
+        pending_path.stat()
+    except FileNotFoundError:
+        _mark_baseline_pending(pending_path, host)
 
 
 def _mark_baseline_pending(path: Path, host: Host) -> None:

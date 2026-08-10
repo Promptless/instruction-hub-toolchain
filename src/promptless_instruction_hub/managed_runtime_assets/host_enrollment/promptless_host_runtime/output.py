@@ -7,9 +7,9 @@ import json
 import sys
 from dataclasses import dataclass
 
-from .contracts import JsonValue, MAX_DIAGNOSTIC_LOG_BYTES
+from .contracts import Host, JsonValue, MAX_DIAGNOSTIC_LOG_BYTES
 from .redaction import _redact_json
-from .storage import _atomic_write_text, _diagnostic_log_path, _last_status_path
+from .storage import _atomic_write_text, _diagnostic_log_path, _last_status_path, _state_file_lock
 from .validation import _string_value
 
 
@@ -136,21 +136,36 @@ def _write_diagnostic_log(diagnostic: dict[str, JsonValue]) -> None:
         path = _diagnostic_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(_redact_json(payload), sort_keys=True) + "\n"
-        if path.exists() and path.stat().st_size + len(line.encode("utf-8")) > MAX_DIAGNOSTIC_LOG_BYTES:
-            rotated_path = path.with_name(f"{path.name}.1")
+        with _state_file_lock(path):
+            if path.exists() and path.stat().st_size + len(line.encode("utf-8")) > MAX_DIAGNOSTIC_LOG_BYTES:
+                rotated_path = path.with_name(f"{path.name}.1")
+                try:
+                    rotated_path.unlink()
+                except FileNotFoundError:
+                    pass
+                path.replace(rotated_path)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
             try:
-                rotated_path.unlink()
-            except FileNotFoundError:
+                path.chmod(0o600)
+            except OSError:
                 pass
-            path.replace(rotated_path)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
     except OSError:
         return
+
+
+def _record_collector_failure(host: Host, *, exit_code: int | None, error_code: str | None) -> None:
+    diagnostic: dict[str, JsonValue] = {
+        "status": "error",
+        "reason": "collector_process_failed",
+        "host": host,
+    }
+    if exit_code is not None:
+        diagnostic["exit_code"] = exit_code
+    if error_code is not None:
+        diagnostic["error_code"] = error_code
+    _write_diagnostic_log(diagnostic)
+    _write_last_status(diagnostic)
 
 
 @dataclass(frozen=True)

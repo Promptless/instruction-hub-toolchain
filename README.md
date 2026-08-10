@@ -118,11 +118,11 @@ the same plugin id when the recorded root is stale or incomplete, and exit 0
 with no output when no usable bundle exists.
 
 ```sh
-sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime ensure --host codex --prepare-baseline; run promptless-host-runtime collect --host codex --lifecycle session_start --baseline --quiet'
-sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle stop --quiet'
-sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle session_end --quiet'
-node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find Python 3.9+; run promptless-host-runtime ensure --host claude --prepare-baseline; run promptless-host-runtime collect --host claude --lifecycle session_start --baseline --quiet; best-effort run promptless-host-runtime ensure --host claude-desktop --if-sources --prepare-baseline; then collect --host claude-desktop only if ensure succeeds' '${CLAUDE_PLUGIN_ROOT}'
-node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host claude --lifecycle session_end --quiet' '${CLAUDE_PLUGIN_ROOT}'
+sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime ensure --host codex --prepare-baseline; run promptless-host-runtime collect --host codex --lifecycle session_start --baseline --detach --quiet'
+sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle stop --detach --quiet'
+sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle session_end --detach --quiet'
+node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find Python 3.9+; run promptless-host-runtime ensure --host claude --prepare-baseline; run promptless-host-runtime collect --host claude --lifecycle session_start --baseline --detach --quiet; best-effort run promptless-host-runtime ensure --host claude-desktop --if-sources --prepare-baseline; then collect --host claude-desktop only if ensure succeeds' '${CLAUDE_PLUGIN_ROOT}'
+node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host claude --lifecycle session_end --detach --quiet' '${CLAUDE_PLUGIN_ROOT}'
 ```
 
 The dogfood host runtime uses `PROMPTLESS_WORKER_BASE_URL` or the default
@@ -164,18 +164,19 @@ failing the run, so one bad idle file cannot block the hook subject's upload.
 Support diagnostics are written as bounded, redacted JSONL at
 `~/.promptless/instruction-hub/host-runtime-diagnostics.jsonl` with `0600`
 permissions and without transcript content, tool inputs, or credentials.
-Detached collector launch and nonzero-exit failures are recorded there and in
-the structured `last-bootstrap-status.json` support status.
+Detached collector nonzero-exit failures are recorded there and in the
+structured `last-bootstrap-status.json` support status.
 
 Hook-triggered collectors still scan idle transcript roots and hold the ledger
 lock across catch-up uploads. The collector process is detached from the hook,
-so that work cannot delay the host. Baseline collections wait for the shared
-ledger lock until the collection deadline. A timed-out baseline leaves a
-durable pending guard. SessionStart creates that guard synchronously before
-detaching the baseline collector, so terminal collections cannot upload
-pre-enrollment history before a later SessionStart completes the baseline.
-Other collections stay non-blocking and can skip when another collector holds
-the lock.
+so that work cannot delay the host or remain in the hook's process group.
+Baseline collections reuse the durable pending guard created by SessionStart
+and wait for the shared ledger lock until the collection deadline. If a missing
+guard cannot be created, collection stops before policy lookup or upload. A
+timed-out baseline leaves the guard in place, so terminal collections cannot
+upload pre-enrollment history before a later SessionStart completes the
+baseline. Other collections stay non-blocking and can skip when another
+collector holds the lock.
 
 Host enrollment is per host, not per plugin. The credential and pending approval
 are cached at a single host-global path (`~/.promptless/instruction-hub/`) and
@@ -199,10 +200,11 @@ The host runtime has one executable entrypoint with subcommands. `ensure` is the
 path that enrolls when needed, removes legacy managed telemetry config, and
 posts a check-in. SessionStart adds `--prepare-baseline` so `ensure` persists the
 guard required before it can detach baseline collection. `collect` is the
-non-blocking native JSONL upload path; pass
-`--include-active` for a user-initiated sweep that includes files still inside
-the idle grace period after SessionStart has established the upload baseline. `enroll`
-acquires only the host credential. `status` prints local JSON without network,
+native JSONL upload path; hooks pass `--detach` so the runtime supervises
+collection outside the hook process group. Pass `--include-active` for a
+user-initiated sweep that includes files still inside the idle grace period
+after SessionStart has established the upload baseline. `enroll` acquires only
+the host credential. `status` prints local JSON without network,
 browser, config writes, or check-ins. `reset --yes` clears cached host
 credentials and pending enrollments while preserving the stable host id,
 last-seen plugin versions, and one internal welcome marker per installed

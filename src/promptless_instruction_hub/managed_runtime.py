@@ -394,59 +394,8 @@ def _node_host_runtime_hook_script(
     ]
     if baseline:
         collect_args.append("'--baseline'")
+    collect_args.append("'--detach'")
     collect_args.append("'--quiet'")
-    collector_wrapper_script = (
-        "const fs = require('fs');\n"
-        "const os = require('os');\n"
-        "const path = require('path');\n"
-        "const { spawn } = require('child_process');\n"
-        "const [command, host, ...args] = process.argv.slice(1);\n"
-        "const collector = spawn(command, args, { stdio: ['inherit', 'ignore', 'ignore'], env: process.env });\n"
-        "let failureRecorded = false;\n"
-        "function recordFailure(details) {\n"
-        "  if (failureRecorded) return;\n"
-        "  failureRecorded = true;\n"
-        "  const diagnosticDirectory = path.join(os.homedir(), '.promptless', 'instruction-hub');\n"
-        "  const diagnosticPath = path.join(diagnosticDirectory, 'host-runtime-diagnostics.jsonl');\n"
-        "  const lastStatusPath = path.join(diagnosticDirectory, 'last-bootstrap-status.json');\n"
-        "  const temporaryStatusPath = path.join(diagnosticDirectory, `.last-bootstrap-status.${process.pid}.tmp`);\n"
-        "  const rotatedPath = `${diagnosticPath}.1`;\n"
-        "  const payload = { status: 'error', reason: 'collector_process_failed', host, ...details, emitted_at: new Date().toISOString() };\n"
-        "  const line = `${JSON.stringify(payload)}\\n`;\n"
-        "  try {\n"
-        "    fs.mkdirSync(diagnosticDirectory, { recursive: true });\n"
-        "    try {\n"
-        "      if (fs.statSync(diagnosticPath).size + Buffer.byteLength(line) > 512 * 1024) {\n"
-        "        try { fs.unlinkSync(rotatedPath); } catch (error) { if (error.code !== 'ENOENT') throw error; }\n"
-        "        fs.renameSync(diagnosticPath, rotatedPath);\n"
-        "      }\n"
-        "    } catch (error) {\n"
-        "      if (error.code !== 'ENOENT') throw error;\n"
-        "    }\n"
-        "    fs.appendFileSync(diagnosticPath, line, { encoding: 'utf8', mode: 0o600 });\n"
-        "    fs.chmodSync(diagnosticPath, 0o600);\n"
-        "    try {\n"
-        "      fs.writeFileSync(temporaryStatusPath, `${JSON.stringify(payload, null, 2)}\\n`, { encoding: 'utf8', mode: 0o600 });\n"
-        "      fs.chmodSync(temporaryStatusPath, 0o600);\n"
-        "      fs.renameSync(temporaryStatusPath, lastStatusPath);\n"
-        "      fs.chmodSync(lastStatusPath, 0o600);\n"
-        "    } finally {\n"
-        "      try { fs.unlinkSync(temporaryStatusPath); } catch (error) { if (error.code !== 'ENOENT') throw error; }\n"
-        "    }\n"
-        "  } catch (error) {\n"
-        "    process.exitCode = 1;\n"
-        "  }\n"
-        "}\n"
-        "collector.once('error', (error) => {\n"
-        "  recordFailure({ error_code: typeof error.code === 'string' ? error.code : 'unknown' });\n"
-        "  process.exitCode = 1;\n"
-        "});\n"
-        "collector.once('exit', (code, signal) => {\n"
-        "  if (code === 0) return;\n"
-        "  recordFailure({ exit_code: code, signal });\n"
-        "  process.exitCode = typeof code === 'number' && code !== 0 ? code : 1;\n"
-        "});\n"
-    )
     ensure_run_script = ""
     if run_ensure:
         ensure_run_script = (
@@ -468,17 +417,16 @@ def _node_host_runtime_hook_script(
             "  if (desktopEnsure.error) {\n"
             "    emitLaunchFailure('claude-desktop', desktopEnsure.error);\n"
             "  } else if (desktopEnsure.status === 0) {\n"
-            "    const desktopCollectArgs = [runtime, 'collect', '--host', 'claude-desktop', '--lifecycle', 'session_start', '--baseline', '--quiet'];\n"
-            "    detachCollector(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], ['ignore', 'ignore', 'ignore'], 'claude-desktop');\n"
+            "    const desktopCollectArgs = [runtime, 'collect', '--host', 'claude-desktop', '--lifecycle', 'session_start', '--baseline', '--detach', '--quiet'];\n"
+            "    launchDetachedCollector(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], ['ignore', 'ignore', 'ignore'], 'claude-desktop');\n"
             "  }\n"
         )
     return (
         "const fs = require('fs');\n"
         "const path = require('path');\n"
-        "const { spawn, spawnSync } = require('child_process');\n"
+        "const { spawnSync } = require('child_process');\n"
         f"const rootEnvNames = {root_env_names};\n"
         f"const bundleRelativePaths = {bundle_relative_paths};\n"
-        f"const collectorWrapperScript = {json.dumps(collector_wrapper_script)};\n"
         f"const emitDiagnostics = {json.dumps(not quiet_failure)};\n"
         f"const allowSiblingRuntime = {json.dumps(allow_sibling_runtime)};\n"
         "function finishWithDiagnostic(payload) {\n"
@@ -489,13 +437,9 @@ def _node_host_runtime_hook_script(
         "  const errorCode = typeof error.code === 'string' ? error.code : 'unknown';\n"
         "  console.error(JSON.stringify({ status: 'error', reason: 'collector_launch_failed', host, error_code: errorCode }));\n"
         "}\n"
-        "function detachCollector(command, args, stdio, host) {\n"
-        "  const wrapperArgs = ['-e', collectorWrapperScript, command, host, ...args];\n"
-        "  const collector = spawn(process.execPath, wrapperArgs, { detached: true, stdio, env: process.env });\n"
-        "  collector.once('spawn', () => {\n"
-        "    collector.unref();\n"
-        "  });\n"
-        "  collector.once('error', (error) => emitLaunchFailure(host, error));\n"
+        "function launchDetachedCollector(command, args, stdio, host) {\n"
+        "  const launcher = spawnSync(command, args, { stdio, env: process.env });\n"
+        "  if (launcher.error) emitLaunchFailure(host, launcher.error);\n"
         "}\n"
         "function runtimeState(candidate) {\n"
         "  const bundleRoot = path.dirname(candidate);\n"
@@ -559,7 +503,7 @@ def _node_host_runtime_hook_script(
         "    continue;\n"
         "  }\n"
         f"{ensure_run_script}"
-        f"  detachCollector(candidate.command, [...candidate.runPrefix, ...collectArgs], ['inherit', 'ignore', 'ignore'], {host!r});\n"
+        f"  launchDetachedCollector(candidate.command, [...candidate.runPrefix, ...collectArgs], ['inherit', 'ignore', 'ignore'], {host!r});\n"
         f"{claude_desktop_collect_script}"
         "  collectorStarted = true;\n"
         "  break;\n"
@@ -581,15 +525,6 @@ def _posix_host_runtime_hook_command(
     allow_sibling_runtime: bool,
 ) -> str:
     collect_baseline_arg = " --baseline" if baseline else ""
-    collect_failure = shlex.quote(
-        json.dumps({"status": "error", "reason": "collector_process_failed", "host": host}, separators=(",", ":"))
-    )
-    record_collect_failure = (
-        'status=$?; if [ "$status" -ne 0 ] && [ -n "${HOME:-}" ]; then '
-        'diagnostic_dir="$HOME/.promptless/instruction-hub"; mkdir -p "$diagnostic_dir" && '
-        f'printf "%s\\n" {collect_failure} >> "$diagnostic_dir/host-runtime-diagnostics.jsonl" && '
-        'chmod 600 "$diagnostic_dir/host-runtime-diagnostics.jsonl"; fi'
-    )
     bundle_relative_paths = " ".join(shlex.quote(path) for path in HOST_RUNTIME_BUNDLE_RELATIVE_PATHS)
     runtime_state_function = (
         "runtime_state() { "
@@ -645,8 +580,8 @@ def _posix_host_runtime_hook_command(
             'status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; '
         )
     collect_command = (
-        f'if [ -n "$python_arg" ]; then (trap "" HUP; "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet <&3; {record_collect_failure}) >/dev/null 2>&1 & '
-        f'else (trap "" HUP; "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet <&3; {record_collect_failure}) >/dev/null 2>&1 & fi; '
+        f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --detach --quiet <&3 >/dev/null 2>&1; '
+        f'else "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --detach --quiet <&3 >/dev/null 2>&1; fi; '
         "exit 0"
     )
     script = (
