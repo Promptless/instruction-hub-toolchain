@@ -75,7 +75,7 @@ jobs:
         run: uv sync --frozen
 
       - name: Run tests
-        run: uv run pytest tests -q
+        run: uv run pytest tests -q -n auto --dist worksteal
 
   local-action:
     runs-on: ubuntu-latest

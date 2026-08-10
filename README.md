@@ -56,6 +56,16 @@ or compare generated files in the source worktree, whether verification
 succeeds or fails. Use `pig build --check` instead when the repository
 intentionally commits generated artifacts and must prove they are current.
 
+## Development
+
+Run the full test suite in parallel:
+
+```bash
+uv run pytest tests -n auto --dist worksteal
+```
+
+Omit the parallel flags when running a single test file or a `-k` selection.
+
 ## Modes
 
 - `build`: validate the hub and run a build without committing generated files.
