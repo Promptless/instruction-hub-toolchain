@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 from urllib.parse import urlencode
 
 from .contracts import (
@@ -41,12 +45,15 @@ from .notices import (
     _pending_plugin_update,
     _record_plugin_version_seen,
 )
-from .output import _emit, _emit_command_json, _flush_control_output
+from .output import _emit, _emit_command_json, _flush_control_output, _record_collector_failure
 from .redaction import _redact_text
 from .status import _reset_host_state, _status_payload
-from .traces import _hook_trace_context, _lifecycle_event, _read_hook_context, _run_collect
+from .traces import _hook_trace_context, _lifecycle_event, _prepare_baseline, _read_hook_context, _run_collect
 from .validation import _requires_newer_bootstrap
 from .worker import _get_json, _post_check_in, _validate_signed_policy, _worker_url
+
+_WINDOWS_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_WINDOWS_DETACHED_PROCESS = 0x00000008
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,8 +64,24 @@ def main(argv: list[str] | None = None) -> int:
         return _run_version_command(json_output=args.json)
     host = _resolve_host(args.host)
     if args.command == "ensure":
-        return _run_ensure_command(host, quiet=args.quiet, if_sources=args.if_sources)
+        return _run_ensure_command(
+            host,
+            quiet=args.quiet,
+            if_sources=args.if_sources,
+            prepare_baseline=args.prepare_baseline,
+        )
     if args.command == "collect":
+        collector_args = _collector_command_args(
+            host,
+            lifecycle=args.lifecycle,
+            baseline=args.baseline,
+            include_active=args.include_active,
+            quiet=args.quiet,
+        )
+        if args.detach:
+            return _launch_detached_collect(host, collector_args)
+        if args.supervised:
+            return _supervise_collect(host, collector_args)
         return _run_collect_command(
             host,
             lifecycle=args.lifecycle,
@@ -88,8 +111,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip enrollment/config when the host has no native trace source files",
     )
+    ensure_parser.add_argument(
+        "--prepare-baseline",
+        action="store_true",
+        help="Persist the baseline guard before detached collection",
+    )
 
-    collect_parser = subcommands.add_parser("collect", help="Upload native trace JSONL changes")
+    collect_parser = subcommands.add_parser(
+        "collect",
+        help="Upload native trace JSONL changes",
+        allow_abbrev=False,
+    )
     _add_host_argument(collect_parser)
     collect_parser.add_argument(
         "--lifecycle",
@@ -108,6 +140,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Include session files still inside the idle grace period after an established baseline",
     )
     collect_parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
+    collect_execution = collect_parser.add_mutually_exclusive_group()
+    collect_execution.add_argument("--detach", action="store_true", help="Run collection in a detached process")
+    collect_execution.add_argument("--supervised", action="store_true", help=argparse.SUPPRESS)
 
     status_parser = subcommands.add_parser("status", help="Print local host-runtime status as JSON")
     _add_host_argument(status_parser)
@@ -128,9 +163,9 @@ def _add_host_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", choices=("auto", "codex", "claude", "claude-desktop"), default="auto")
 
 
-def _run_ensure_command(host: Host, *, quiet: bool, if_sources: bool) -> int:
+def _run_ensure_command(host: Host, *, quiet: bool, if_sources: bool, prepare_baseline: bool) -> int:
     try:
-        return _run_ensure(host, quiet=quiet, if_sources=if_sources)
+        return _run_ensure(host, quiet=quiet, if_sources=if_sources, prepare_baseline=prepare_baseline)
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
         _emit(
             {"status": "error", "host": host, "message": _redact_text(str(exc))},
@@ -166,6 +201,88 @@ def _run_collect_command(
         return 0
     finally:
         _flush_control_output()
+
+
+def _collector_command_args(
+    host: Host,
+    *,
+    lifecycle: str | None,
+    baseline: bool,
+    include_active: bool,
+    quiet: bool,
+) -> list[str]:
+    command_args = ["collect", "--host", host]
+    if lifecycle is not None:
+        command_args.extend(("--lifecycle", lifecycle))
+    if baseline:
+        command_args.append("--baseline")
+    if include_active:
+        command_args.append("--include-active")
+    if quiet:
+        command_args.append("--quiet")
+    return command_args
+
+
+def _launch_detached_collect(host: Host, collector_args: list[str]) -> int:
+    supervisor_args = [
+        sys.executable,
+        str(Path(sys.argv[0]).resolve()),
+        *collector_args,
+        "--supervised",
+    ]
+    try:
+        _spawn_detached(supervisor_args)
+    except OSError as exc:
+        _record_collector_failure(host, exit_code=None, error_code=_os_error_code(exc))
+        return 1
+    return 0
+
+
+def _supervise_collect(host: Host, collector_args: list[str]) -> int:
+    process_args = [
+        sys.executable,
+        str(Path(sys.argv[0]).resolve()),
+        *collector_args,
+    ]
+    try:
+        result = subprocess.run(
+            process_args,
+            stdin=sys.stdin.buffer,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError as exc:
+        _record_collector_failure(host, exit_code=None, error_code=_os_error_code(exc))
+        return 1
+    if result.returncode != 0:
+        _record_collector_failure(host, exit_code=result.returncode, error_code=None)
+    return result.returncode
+
+
+def _spawn_detached(args: list[str]) -> None:
+    if os.name == "nt":
+        subprocess.Popen(
+            args,
+            stdin=sys.stdin.buffer,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_WINDOWS_CREATE_NEW_PROCESS_GROUP | _WINDOWS_DETACHED_PROCESS,
+        )
+        return
+    subprocess.Popen(
+        args,
+        stdin=sys.stdin.buffer,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _os_error_code(exc: OSError) -> str:
+    if exc.errno is None:
+        return type(exc).__name__
+    return errno.errorcode.get(exc.errno, str(exc.errno))
 
 
 def _run_status_command(host: Host) -> int:
@@ -244,7 +361,17 @@ def _run_version_command(*, json_output: bool) -> int:
     return 0
 
 
-def _run_ensure(host: Host, *, quiet: bool, if_sources: bool) -> int:
+def _run_ensure(host: Host, *, quiet: bool, if_sources: bool, prepare_baseline: bool) -> int:
+    if prepare_baseline:
+        try:
+            _prepare_baseline(host)
+        except OSError as exc:
+            _emit(
+                {"status": "error", "host": host, "message": _redact_text(str(exc))},
+                quiet=quiet,
+                internal_welcome_notice=_claim_internal_promptless_welcome(quiet=quiet),
+            )
+            return 1
     if if_sources and not _has_native_trace_sources(host):
         _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
         return 0

@@ -238,9 +238,9 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
     # Promptless-built static native binary so customer machines do not need Python or uv.
-    # SessionStart performs user-visible enrollment, writes config/check-in status, and then runs
-    # a quiet forward-only JSONL baseline. Terminal lifecycle hooks only upload native JSONL
-    # ranges; failures are non-blocking and stay out of the agent transcript.
+    # SessionStart performs user-visible enrollment, writes config/check-in status, and then
+    # launches a detached forward-only JSONL baseline. Terminal lifecycle hooks only launch
+    # detached native JSONL uploads; failures stay out of the agent transcript.
     hook_entry: dict[str, JsonValue] = {
         "hooks": [
             {
@@ -394,11 +394,12 @@ def _node_host_runtime_hook_script(
     ]
     if baseline:
         collect_args.append("'--baseline'")
+    collect_args.append("'--detach'")
     collect_args.append("'--quiet'")
     ensure_run_script = ""
     if run_ensure:
         ensure_run_script = (
-            f"const ensureArgs = [runtime, 'ensure', '--host', {host!r}];\n"
+            f"const ensureArgs = [runtime, 'ensure', '--host', {host!r}, '--prepare-baseline'];\n"
             "  const ensure = spawnSync(candidate.command, [...candidate.runPrefix, ...ensureArgs], { stdio: 'inherit', env: process.env });\n"
             "  if (ensure.error) {\n"
             "    sawBrokenPython = true;\n"
@@ -411,11 +412,13 @@ def _node_host_runtime_hook_script(
         # Desktop ensure is not quiet so pending approval is persisted, but stdout stays
         # suppressed so the best-effort sibling ensure cannot emit a second hook-control object.
         claude_desktop_collect_script = (
-            "  const desktopEnsureArgs = [runtime, 'ensure', '--host', 'claude-desktop', '--if-sources'];\n"
+            "  const desktopEnsureArgs = [runtime, 'ensure', '--host', 'claude-desktop', '--if-sources', '--prepare-baseline'];\n"
             "  const desktopEnsure = spawnSync(candidate.command, [...candidate.runPrefix, ...desktopEnsureArgs], { stdio: ['ignore', 'ignore', 'inherit'], env: process.env });\n"
-            "  if (!desktopEnsure.error && desktopEnsure.status === 0) {\n"
-            "    const desktopCollectArgs = [runtime, 'collect', '--host', 'claude-desktop', '--lifecycle', 'session_start', '--baseline', '--quiet'];\n"
-            "    spawnSync(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], { stdio: ['ignore', 'ignore', 'ignore'], env: process.env });\n"
+            "  if (desktopEnsure.error) {\n"
+            "    emitLaunchFailure('claude-desktop', desktopEnsure.error);\n"
+            "  } else if (desktopEnsure.status === 0) {\n"
+            "    const desktopCollectArgs = [runtime, 'collect', '--host', 'claude-desktop', '--lifecycle', 'session_start', '--baseline', '--detach', '--quiet'];\n"
+            "    launchDetachedCollector(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], ['ignore', 'ignore', 'ignore'], 'claude-desktop');\n"
             "  }\n"
         )
     return (
@@ -429,6 +432,14 @@ def _node_host_runtime_hook_script(
         "function finishWithDiagnostic(payload) {\n"
         "  if (emitDiagnostics) console.log(payload);\n"
         "  process.exit(0);\n"
+        "}\n"
+        "function emitLaunchFailure(host, error) {\n"
+        "  const errorCode = typeof error.code === 'string' ? error.code : 'unknown';\n"
+        "  console.error(JSON.stringify({ status: 'error', reason: 'collector_launch_failed', host, error_code: errorCode }));\n"
+        "}\n"
+        "function launchDetachedCollector(command, args, stdio, host) {\n"
+        "  const launcher = spawnSync(command, args, { stdio, env: process.env });\n"
+        "  if (launcher.error) emitLaunchFailure(host, launcher.error);\n"
         "}\n"
         "function runtimeState(candidate) {\n"
         "  const bundleRoot = path.dirname(candidate);\n"
@@ -479,6 +490,7 @@ def _node_host_runtime_hook_script(
         "];\n"
         "let sawUnsupportedPython = false;\n"
         "let sawBrokenPython = false;\n"
+        "let collectorStarted = false;\n"
         "for (const candidate of candidates) {\n"
         "  const probe = spawnSync(candidate.command, candidate.probeArgs, { stdio: 'ignore' });\n"
         "  if (probe.error) {\n"
@@ -491,19 +503,14 @@ def _node_host_runtime_hook_script(
         "    continue;\n"
         "  }\n"
         f"{ensure_run_script}"
-        "  const collectStdio = emitDiagnostics ? 'inherit' : ['inherit', 'ignore', 'ignore'];\n"
-        "  const collect = spawnSync(candidate.command, [...candidate.runPrefix, ...collectArgs], { stdio: collectStdio, env: process.env });\n"
-        "  if (!emitDiagnostics) process.exit(0);\n"
-        "  if (collect.error) process.exit(1);\n"
-        "  const collectStatus = collect.status === null ? 1 : collect.status;\n"
-        "  if (collectStatus !== 0) process.exit(collectStatus);\n"
+        f"  launchDetachedCollector(candidate.command, [...candidate.runPrefix, ...collectArgs], ['inherit', 'ignore', 'ignore'], {host!r});\n"
         f"{claude_desktop_collect_script}"
-        "  process.exit(0);\n"
+        "  collectorStarted = true;\n"
+        "  break;\n"
         "}\n"
-        f"if (sawUnsupportedPython) finishWithDiagnostic({unsupported_python!r});\n"
-        f"else if (sawBrokenPython) finishWithDiagnostic({broken_python!r});\n"
-        f"else finishWithDiagnostic({missing_python!r});\n"
-        "process.exit(0);\n"
+        f"if (!collectorStarted && sawUnsupportedPython) finishWithDiagnostic({unsupported_python!r});\n"
+        f"else if (!collectorStarted && sawBrokenPython) finishWithDiagnostic({broken_python!r});\n"
+        f"else if (!collectorStarted) finishWithDiagnostic({missing_python!r});\n"
     )
 
 
@@ -568,23 +575,17 @@ def _posix_host_runtime_hook_command(
     ensure_command = ""
     if run_ensure:
         ensure_command = (
-            f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" ensure --host {host}; '
-            f'else "$python_cmd" "$runtime" ensure --host {host}; fi; '
+            f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" ensure --host {host} --prepare-baseline; '
+            f'else "$python_cmd" "$runtime" ensure --host {host} --prepare-baseline; fi; '
             'status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; '
         )
-    if quiet_failure:
-        collect_command = (
-            f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet >/dev/null 2>&1; '
-            f'else "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet >/dev/null 2>&1; fi; '
-            "exit 0"
-        )
-    else:
-        collect_command = (
-            f'if [ -n "$python_arg" ]; then exec "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet; fi; '
-            f'exec "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet'
-        )
+    collect_command = (
+        f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --detach --quiet <&3 >/dev/null 2>&1; '
+        f'else "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --detach --quiet <&3 >/dev/null 2>&1; fi; '
+        "exit 0"
+    )
     script = (
-        f"root={root_expr}; "
+        f"exec 3<&0; root={root_expr}; "
         f'if [ -z "$root" ]; then {missing_root_action}; fi; '
         f"{runtime_state_function}"
         f"{runtime_check}"
