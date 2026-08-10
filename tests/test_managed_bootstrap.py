@@ -193,7 +193,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             "    call_log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             "if sys.argv[1:2] == ['ensure']:\n"
             "    print(json.dumps({'argv': sys.argv[1:]}))\n"
-            "elif sys.argv[1:2] == ['collect'] and '--baseline' not in sys.argv:\n"
+            "elif sys.argv[1:2] == ['collect'] and ('--baseline' not in sys.argv or os.environ.get('PROMPTLESS_STUB_CAPTURE_BASELINE_STDIN') == '1'):\n"
             "    with open(os.environ['PROMPTLESS_STUB_STDIN_LOG'], 'a') as stdin_log:\n"
             "        stdin_log.write(json.dumps({'argv': sys.argv[1:], 'stdin': sys.stdin.read()}) + '\\n')\n"
         )
@@ -235,12 +235,14 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert sorted(stub_calls()) == sorted(expected_calls)
 
         def assert_stdin_entries_eventually(expected_entries: list[dict[str, JsonValue]]) -> None:
+            expected_entries = sorted(expected_entries, key=lambda entry: json.dumps(entry, sort_keys=True))
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
-                if stub_stdin_entries() == expected_entries:
+                actual_entries = sorted(stub_stdin_entries(), key=lambda entry: json.dumps(entry, sort_keys=True))
+                if actual_entries == expected_entries:
                     return
                 time.sleep(0.01)
-            assert stub_stdin_entries() == expected_entries
+            assert sorted(stub_stdin_entries(), key=lambda entry: json.dumps(entry, sort_keys=True)) == expected_entries
 
         def assert_startup_calls() -> None:
             expected_calls = [
@@ -276,6 +278,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             *,
             root: Path,
             home: Path,
+            input_text: str | None = None,
             collect_delay_seconds: float = 0,
         ) -> subprocess.CompletedProcess[str]:
             env_vars = {
@@ -284,12 +287,15 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 "PROMPTLESS_STUB_STDIN_LOG": str(stub_stdin_log),
                 "PROMPTLESS_STUB_COLLECT_DELAY_SECONDS": str(collect_delay_seconds),
             }
+            if input_text is not None:
+                env_vars["PROMPTLESS_STUB_CAPTURE_BASELINE_STDIN"] = "1"
             if target == "claude":
                 env_vars["CLAUDE_PLUGIN_ROOT"] = str(root)
                 return subprocess.run(
                     [session_start_hook["command"], *session_start_hook["args"]],
                     env=_clean_env(**env_vars),
                     text=True,
+                    input=input_text,
                     capture_output=True,
                     check=False,
                 )
@@ -514,7 +520,8 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert hook_command.startswith("sh -c '")
             assert f'runtime="$root/runtime/{HOST_RUNTIME_BIN}"' in hook_command
             assert 'trap "" HUP' in hook_command
-            assert "<&3 >/dev/null 2>&1" in hook_command
+            assert "--quiet <&3; status=$?" in hook_command
+            assert ") >/dev/null 2>&1 &" in hook_command
             assert "runtime_state" in hook_command
             assert "runtime_bundle_dir=${runtime_candidate%/*}" in hook_command
             assert f"{HOST_RUNTIME_PACKAGE}/contracts.py" in hook_command
@@ -618,6 +625,50 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         _assert_hook_argv(delayed_startup_collect, target)
         assert elapsed_seconds < 1
         assert_startup_calls()
+
+        if target == "claude":
+            reset_stub_calls()
+            stdin_payload = json.dumps(
+                {
+                    "session_id": "claude_session_1",
+                    "transcript_path": str(tmp_path / "claude-session.jsonl"),
+                }
+            )
+            session_start_result = startup_hook_result(
+                root=stub_root,
+                home=tmp_path / "claude-session-start-stdin-home",
+                input_text=stdin_payload,
+            )
+            _assert_hook_argv(session_start_result, target)
+            assert_startup_calls()
+            assert_stdin_entries_eventually(
+                [
+                    {
+                        "argv": [
+                            "collect",
+                            "--host",
+                            "claude",
+                            "--lifecycle",
+                            "session_start",
+                            "--baseline",
+                            "--quiet",
+                        ],
+                        "stdin": stdin_payload,
+                    },
+                    {
+                        "argv": [
+                            "collect",
+                            "--host",
+                            "claude-desktop",
+                            "--lifecycle",
+                            "session_start",
+                            "--baseline",
+                            "--quiet",
+                        ],
+                        "stdin": "",
+                    },
+                ]
+            )
 
         for event_name, lifecycle in terminal_events:
             reset_stub_calls()
@@ -3282,12 +3333,9 @@ def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path)
                     )
                 )
 
-            policy_deadline = time.monotonic() + 5
-            while len(server.policy_requests) < 2 and time.monotonic() < policy_deadline:
-                time.sleep(0.01)
-            assert len(server.policy_requests) == 2
             time.sleep(1)
             assert all(process.poll() is None for process in processes)
+            assert server.policy_requests == []
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
         for process in processes:
@@ -3299,6 +3347,7 @@ def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path)
         ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
         assert set(_json_list(ledger["host_baselines"], "ledger.host_baselines")) == {"claude", "claude-desktop"}
         assert len(_json_mapping(ledger["sources"], "ledger.sources")) == 2
+        assert len(server.policy_requests) == 2
     finally:
         for process in processes:
             if process.poll() is None:
@@ -3920,6 +3969,7 @@ def test_collect_skips_when_ledger_lock_is_busy_and_logs_diagnostic(tmp_path: Pa
             {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
         )
         transcript_path.write_bytes(first_record + second_record)
+        policy_request_count = len(server.policy_requests)
 
         lock_path = ledger_path.with_name(f"{ledger_path.name}.lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3934,6 +3984,7 @@ def test_collect_skips_when_ledger_lock_is_busy_and_logs_diagnostic(tmp_path: Pa
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
         assert server.trace_batches == []
+        assert len(server.policy_requests) == policy_request_count
         diagnostics = _diagnostic_log_entries(home)
         assert diagnostics[-1]["status"] == "trace_upload_skipped"
         assert diagnostics[-1]["reason"] == "ledger_lock_busy"

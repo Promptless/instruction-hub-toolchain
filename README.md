@@ -106,15 +106,16 @@ stdlib-only Python runtime with POSIX shell checks. The stable executable in
 enrollment, trace collection, host configuration, persistence, and output.
 Generated Claude hooks use Claude Code's exec-form hook so Windows installs do
 not need a POSIX shell; Node must be available to start the inline launcher.
-Every launcher starts collection in a detached process that inherits the hook
-input and redirects collection output away from the agent transcript. Startup
-launchers emit schema-safe diagnostics when the host cannot resolve the plugin
-root, a readable managed runtime bundle (the launcher plus its sibling package
-and CLI entry module), or Python 3.9+. Terminal lifecycle launchers stay quiet:
-they resolve a complete runtime bundle under the plugin root, fall back to a
-complete sibling installed version with the same runtime-bundle layout for the
-same plugin id when the recorded root is stale or incomplete, and exit 0 with no output when
-no usable bundle exists.
+Every launcher starts its primary host collection in a detached process that
+inherits the hook input and redirects collection output away from the agent
+transcript. The sibling Claude Desktop baseline starts without hook input.
+Startup launchers emit schema-safe diagnostics when the host cannot resolve the
+plugin root, a readable managed runtime bundle (the launcher plus its sibling
+package and CLI entry module), or Python 3.9+. Terminal lifecycle launchers stay
+quiet: they resolve a complete runtime bundle under the plugin root, fall back
+to a complete sibling installed version with the same runtime-bundle layout for
+the same plugin id when the recorded root is stale or incomplete, and exit 0
+with no output when no usable bundle exists.
 
 ```sh
 sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime ensure --host codex; run promptless-host-runtime collect --host codex --lifecycle session_start --baseline --quiet'

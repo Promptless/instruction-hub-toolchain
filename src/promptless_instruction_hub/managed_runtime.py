@@ -413,11 +413,11 @@ def _node_host_runtime_hook_script(
         claude_desktop_collect_script = (
             "  const desktopEnsureArgs = [runtime, 'ensure', '--host', 'claude-desktop', '--if-sources'];\n"
             "  const desktopEnsure = spawnSync(candidate.command, [...candidate.runPrefix, ...desktopEnsureArgs], { stdio: ['ignore', 'ignore', 'inherit'], env: process.env });\n"
-            "  if (!desktopEnsure.error && desktopEnsure.status === 0) {\n"
+            "  if (desktopEnsure.error) {\n"
+            "    emitLaunchFailure('claude-desktop', desktopEnsure.error);\n"
+            "  } else if (desktopEnsure.status === 0) {\n"
             "    const desktopCollectArgs = [runtime, 'collect', '--host', 'claude-desktop', '--lifecycle', 'session_start', '--baseline', '--quiet'];\n"
-            "    const desktopCollect = spawn(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], { detached: true, stdio: ['inherit', 'ignore', 'ignore'], env: process.env });\n"
-            "    desktopCollect.on('error', () => {});\n"
-            "    desktopCollect.unref();\n"
+            "    detachCollector(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], ['ignore', 'ignore', 'ignore'], 'claude-desktop');\n"
             "  }\n"
         )
     return (
@@ -431,6 +431,17 @@ def _node_host_runtime_hook_script(
         "function finishWithDiagnostic(payload) {\n"
         "  if (emitDiagnostics) console.log(payload);\n"
         "  process.exit(0);\n"
+        "}\n"
+        "function emitLaunchFailure(host, error) {\n"
+        "  const errorCode = typeof error.code === 'string' ? error.code : 'unknown';\n"
+        "  console.error(JSON.stringify({ status: 'error', reason: 'collector_launch_failed', host, error_code: errorCode }));\n"
+        "}\n"
+        "function detachCollector(command, args, stdio, host) {\n"
+        "  const collector = spawn(command, args, { detached: true, stdio, env: process.env });\n"
+        "  collector.once('spawn', () => {\n"
+        "    collector.unref();\n"
+        "  });\n"
+        "  collector.once('error', (error) => emitLaunchFailure(host, error));\n"
         "}\n"
         "function runtimeState(candidate) {\n"
         "  const bundleRoot = path.dirname(candidate);\n"
@@ -481,6 +492,7 @@ def _node_host_runtime_hook_script(
         "];\n"
         "let sawUnsupportedPython = false;\n"
         "let sawBrokenPython = false;\n"
+        "let collectorStarted = false;\n"
         "for (const candidate of candidates) {\n"
         "  const probe = spawnSync(candidate.command, candidate.probeArgs, { stdio: 'ignore' });\n"
         "  if (probe.error) {\n"
@@ -493,16 +505,14 @@ def _node_host_runtime_hook_script(
         "    continue;\n"
         "  }\n"
         f"{ensure_run_script}"
-        "  const collect = spawn(candidate.command, [...candidate.runPrefix, ...collectArgs], { detached: true, stdio: ['inherit', 'ignore', 'ignore'], env: process.env });\n"
-        "  collect.on('error', () => {});\n"
-        "  collect.unref();\n"
+        f"  detachCollector(candidate.command, [...candidate.runPrefix, ...collectArgs], ['inherit', 'ignore', 'ignore'], {host!r});\n"
         f"{claude_desktop_collect_script}"
-        "  process.exit(0);\n"
+        "  collectorStarted = true;\n"
+        "  break;\n"
         "}\n"
-        f"if (sawUnsupportedPython) finishWithDiagnostic({unsupported_python!r});\n"
-        f"else if (sawBrokenPython) finishWithDiagnostic({broken_python!r});\n"
-        f"else finishWithDiagnostic({missing_python!r});\n"
-        "process.exit(0);\n"
+        f"if (!collectorStarted && sawUnsupportedPython) finishWithDiagnostic({unsupported_python!r});\n"
+        f"else if (!collectorStarted && sawBrokenPython) finishWithDiagnostic({broken_python!r});\n"
+        f"else if (!collectorStarted) finishWithDiagnostic({missing_python!r});\n"
     )
 
 
@@ -517,6 +527,15 @@ def _posix_host_runtime_hook_command(
     allow_sibling_runtime: bool,
 ) -> str:
     collect_baseline_arg = " --baseline" if baseline else ""
+    collect_failure = shlex.quote(
+        json.dumps({"status": "error", "reason": "collector_process_failed", "host": host}, separators=(",", ":"))
+    )
+    record_collect_failure = (
+        'status=$?; if [ "$status" -ne 0 ] && [ -n "${HOME:-}" ]; then '
+        'diagnostic_dir="$HOME/.promptless/instruction-hub"; mkdir -p "$diagnostic_dir" && '
+        f'printf "%s\\n" {collect_failure} >> "$diagnostic_dir/host-runtime-diagnostics.jsonl" && '
+        'chmod 600 "$diagnostic_dir/host-runtime-diagnostics.jsonl"; fi'
+    )
     bundle_relative_paths = " ".join(shlex.quote(path) for path in HOST_RUNTIME_BUNDLE_RELATIVE_PATHS)
     runtime_state_function = (
         "runtime_state() { "
@@ -572,8 +591,8 @@ def _posix_host_runtime_hook_command(
             'status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; '
         )
     collect_command = (
-        f'if [ -n "$python_arg" ]; then (trap "" HUP; exec "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet <&3 >/dev/null 2>&1) & '
-        f'else (trap "" HUP; exec "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet <&3 >/dev/null 2>&1) & fi; '
+        f'if [ -n "$python_arg" ]; then (trap "" HUP; "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet <&3; {record_collect_failure}) >/dev/null 2>&1 & '
+        f'else (trap "" HUP; "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --quiet <&3; {record_collect_failure}) >/dev/null 2>&1 & fi; '
         "exit 0"
     )
     script = (
