@@ -82,9 +82,30 @@ def _run_collect(
         return 0
 
     ledger_path = _ledger_path()
-    with _source_ledger_lock(ledger_path, wait_for_lock=baseline) as lock_acquired:
+    baseline_pending_path = _baseline_pending_path(ledger_path, host)
+    lock_deadline = deadline
+    if baseline:
+        try:
+            _mark_baseline_pending(baseline_pending_path, host)
+        except OSError:
+            # A detached baseline may safely outlive the collection budget. If its durable
+            # guard cannot be written, waiting for the ledger lock is the only way to prevent
+            # a later terminal hook from uploading pre-enrollment history from offset zero.
+            lock_deadline = float("inf")
+            _emit(
+                {"status": "trace_upload_degraded", "reason": "baseline_pending_write_failed", "host": host},
+                quiet=quiet,
+            )
+
+    with _source_ledger_lock(ledger_path, wait_for_lock=baseline, deadline=lock_deadline) as lock_acquired:
         if not lock_acquired:
             _emit({"status": "trace_upload_skipped", "reason": "ledger_lock_busy", "host": host}, quiet=quiet)
+            return 0
+
+        ledger = _load_source_ledger(ledger_path)
+        host_baselined = host in ledger.host_baselines or _ledger_has_host_source(ledger, host)
+        if not baseline and _baseline_is_pending(baseline_pending_path) and not host_baselined:
+            _emit({"status": "trace_upload_skipped", "reason": "baseline_required", "host": host}, quiet=quiet)
             return 0
 
         policy_url = _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
@@ -118,12 +139,10 @@ def _run_collect(
         uploaded_batch_count = 0
         uploaded_chunk_count = 0
         unparsed_record_count = 0
-        ledger = _load_source_ledger(ledger_path)
         if include_active and host not in ledger.host_baselines:
             _emit({"status": "trace_upload_skipped", "reason": "baseline_required", "host": host}, quiet=quiet)
             return 0
         if baseline:
-            host_baselined = host in ledger.host_baselines or _ledger_has_host_source(ledger, host)
             if not host_baselined:
                 # Baseline discovery records offsets for every known source,
                 # including files still inside the idle grace period. Uploads
@@ -139,6 +158,7 @@ def _run_collect(
                 _baseline_source_offsets(ledger, source_paths)
                 ledger.host_baselines.add(host)
                 _write_source_ledger(ledger)
+                _clear_baseline_pending(baseline_pending_path)
                 _emit(
                     {
                         "status": "trace_upload_baselined",
@@ -149,6 +169,7 @@ def _run_collect(
                     quiet=quiet,
                 )
                 return 0
+            _clear_baseline_pending(baseline_pending_path)
             ledger.host_baselines.add(host)
             ledger.drift_reports.append({"kind": "native_trace_existing_ledger", "host": host, "baseline": False})
         # A new/quarantined ledger seen without --baseline (e.g. a terminal hook after a missed
@@ -398,19 +419,48 @@ def _path_is_relative_to(path: Path, root: Path) -> bool:
 
 
 @contextmanager
-def _source_ledger_lock(path: Path, *, wait_for_lock: bool) -> Iterator[bool]:
+def _source_ledger_lock(path: Path, *, wait_for_lock: bool, deadline: float) -> Iterator[bool]:
     lock_path = path.with_name(f"{path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock_file:
         acquired = _try_lock_state_file(lock_file)
         while wait_for_lock and not acquired:
-            time.sleep(0.05)
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                break
+            time.sleep(min(0.05, remaining_seconds))
             acquired = _try_lock_state_file(lock_file)
         try:
             yield acquired
         finally:
             if acquired:
                 _unlock_state_file(lock_file)
+
+
+def _baseline_pending_path(ledger_path: Path, host: Host) -> Path:
+    return ledger_path.with_name(f"{ledger_path.name}.{host}.baseline-pending")
+
+
+def _mark_baseline_pending(path: Path, host: Host) -> None:
+    payload = {"host": host, "created_at": _utc_now_iso()}
+    _atomic_write_text(path, json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _baseline_is_pending(path: Path) -> bool:
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _clear_baseline_pending(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _load_source_ledger(path: Path) -> SourceLedger:

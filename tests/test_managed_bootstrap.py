@@ -196,6 +196,8 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             "elif sys.argv[1:2] == ['collect'] and ('--baseline' not in sys.argv or os.environ.get('PROMPTLESS_STUB_CAPTURE_BASELINE_STDIN') == '1'):\n"
             "    with open(os.environ['PROMPTLESS_STUB_STDIN_LOG'], 'a') as stdin_log:\n"
             "        stdin_log.write(json.dumps({'argv': sys.argv[1:], 'stdin': sys.stdin.read()}) + '\\n')\n"
+            "if sys.argv[1:2] == ['collect']:\n"
+            "    sys.exit(int(os.environ.get('PROMPTLESS_STUB_COLLECT_EXIT_CODE', '0')))\n"
         )
         stub_runtime.chmod(0o644)
 
@@ -243,6 +245,20 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                     return
                 time.sleep(0.01)
             assert sorted(stub_stdin_entries(), key=lambda entry: json.dumps(entry, sort_keys=True)) == expected_entries
+
+        def last_status_eventually(home: Path) -> dict[str, JsonValue]:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    value = validate_json_value(json.loads(_last_status_path(home).read_text()), "last status")
+                except FileNotFoundError:
+                    time.sleep(0.01)
+                    continue
+                return _json_mapping(value, "last status")
+            return _json_mapping(
+                validate_json_value(json.loads(_last_status_path(home).read_text()), "last status"),
+                "last status",
+            )
 
         def assert_startup_calls() -> None:
             expected_calls = [
@@ -316,6 +332,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             home: Path,
             input_text: str | None = None,
             collect_delay_seconds: float = 0,
+            collect_exit_code: int = 0,
         ) -> subprocess.CompletedProcess[str]:
             hook = hook_events[event_name][0]["hooks"][0]
             env_vars = {
@@ -323,6 +340,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 "PROMPTLESS_STUB_CALL_LOG": str(stub_call_log),
                 "PROMPTLESS_STUB_STDIN_LOG": str(stub_stdin_log),
                 "PROMPTLESS_STUB_COLLECT_DELAY_SECONDS": str(collect_delay_seconds),
+                "PROMPTLESS_STUB_COLLECT_EXIT_CODE": str(collect_exit_code),
             }
             if target == "claude":
                 node_path = shutil.which("node")
@@ -391,6 +409,9 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert "const { spawn, spawnSync } = require('child_process');" in hook_script
             assert "detached: true" in hook_script
             assert ".unref();" in hook_script
+            assert "collectorWrapperScript" in hook_script
+            assert "collector_process_failed" in hook_script
+            assert "spawn(process.execPath, wrapperArgs" in hook_script
             assert "sys.version_info >= (3, 9)" in hook_script
             assert MISSING_PYTHON_MESSAGE in hook_script
             assert UNSUPPORTED_PYTHON_MESSAGE in hook_script
@@ -745,6 +766,27 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                     }
                 ]
             )
+
+            reset_stub_calls()
+            failure_home = tmp_path / "claude-failed-collector-home"
+            started_at = time.monotonic()
+            failed_collect = terminal_hook_result(
+                "Stop",
+                root=stub_root,
+                home=failure_home,
+                collect_exit_code=7,
+            )
+            elapsed_seconds = time.monotonic() - started_at
+            assert_quiet_success(failed_collect)
+            assert elapsed_seconds < 1
+            assert_terminal_calls("stop")
+            last_status = last_status_eventually(failure_home)
+            assert last_status["status"] == "error"
+            assert last_status["reason"] == "collector_process_failed"
+            assert last_status["host"] == "claude"
+            assert last_status["exit_code"] == 7
+            assert _json_string(last_status["emitted_at"], "last_status.emitted_at")
+            assert _last_status_path(failure_home).stat().st_mode & 0o777 == 0o600
 
         metadata = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
         assert not (plugin_root / ".promptless").exists()
@@ -3353,6 +3395,80 @@ def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path)
             if process.poll() is None:
                 process.kill()
                 process.wait()
+        server.stop()
+
+
+def test_baseline_collect_stops_waiting_for_ledger_lock_at_deadline(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("fcntl lock contention test is POSIX-only")
+    import fcntl
+
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = home / ".codex/sessions/pre-enrollment.jsonl"
+        transcript_path.parent.mkdir(parents=True)
+        transcript_path.write_text('{"kind":"response","message":"pre-enrollment history"}\n')
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+            "PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS": "0.1",
+        }
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+
+        lock_path = ledger_path.with_name(f"{ledger_path.name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            started_at = time.monotonic()
+            _run_collect(
+                plugin_root,
+                ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+                env,
+                {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+            )
+            elapsed_seconds = time.monotonic() - started_at
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+        assert elapsed_seconds < 1
+        assert server.policy_requests == []
+        assert not ledger_path.exists()
+
+        pending_path = ledger_path.with_name(f"{ledger_path.name}.codex.baseline-pending")
+        assert pending_path.exists()
+
+        # The deadline-expired baseline remains a durable guard. A terminal hook must not
+        # treat the absent ledger as a missed SessionStart and upload history from offset zero.
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        assert server.policy_requests == []
+        assert server.trace_batches == []
+        assert not ledger_path.exists()
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        assert _json_list(ledger["host_baselines"], "ledger.host_baselines") == ["codex"]
+        assert server.trace_batches == []
+        assert not pending_path.exists()
+    finally:
         server.stop()
 
 
