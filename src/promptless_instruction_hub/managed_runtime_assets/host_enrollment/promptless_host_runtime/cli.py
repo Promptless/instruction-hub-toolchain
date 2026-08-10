@@ -44,7 +44,7 @@ from .notices import (
 from .output import _emit, _emit_command_json, _flush_control_output
 from .redaction import _redact_text
 from .status import _reset_host_state, _status_payload
-from .traces import _hook_trace_context, _lifecycle_event, _read_hook_context, _run_collect
+from .traces import _hook_trace_context, _lifecycle_event, _prepare_baseline, _read_hook_context, _run_collect
 from .validation import _requires_newer_bootstrap
 from .worker import _get_json, _post_check_in, _validate_signed_policy, _worker_url
 
@@ -57,7 +57,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run_version_command(json_output=args.json)
     host = _resolve_host(args.host)
     if args.command == "ensure":
-        return _run_ensure_command(host, quiet=args.quiet, if_sources=args.if_sources)
+        return _run_ensure_command(
+            host,
+            quiet=args.quiet,
+            if_sources=args.if_sources,
+            prepare_baseline=args.prepare_baseline,
+        )
     if args.command == "collect":
         return _run_collect_command(
             host,
@@ -87,6 +92,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--if-sources",
         action="store_true",
         help="Skip enrollment/config when the host has no native trace source files",
+    )
+    ensure_parser.add_argument(
+        "--prepare-baseline",
+        action="store_true",
+        help="Persist the baseline guard before detached collection",
     )
 
     collect_parser = subcommands.add_parser("collect", help="Upload native trace JSONL changes")
@@ -128,9 +138,9 @@ def _add_host_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", choices=("auto", "codex", "claude", "claude-desktop"), default="auto")
 
 
-def _run_ensure_command(host: Host, *, quiet: bool, if_sources: bool) -> int:
+def _run_ensure_command(host: Host, *, quiet: bool, if_sources: bool, prepare_baseline: bool) -> int:
     try:
-        return _run_ensure(host, quiet=quiet, if_sources=if_sources)
+        return _run_ensure(host, quiet=quiet, if_sources=if_sources, prepare_baseline=prepare_baseline)
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
         _emit(
             {"status": "error", "host": host, "message": _redact_text(str(exc))},
@@ -244,7 +254,17 @@ def _run_version_command(*, json_output: bool) -> int:
     return 0
 
 
-def _run_ensure(host: Host, *, quiet: bool, if_sources: bool) -> int:
+def _run_ensure(host: Host, *, quiet: bool, if_sources: bool, prepare_baseline: bool) -> int:
+    if prepare_baseline:
+        try:
+            _prepare_baseline(host)
+        except OSError as exc:
+            _emit(
+                {"status": "error", "host": host, "message": _redact_text(str(exc))},
+                quiet=quiet,
+                internal_welcome_notice=_claim_internal_promptless_welcome(quiet=quiet),
+            )
+            return 1
     if if_sources and not _has_native_trace_sources(host):
         _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
         return 0

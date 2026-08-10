@@ -86,7 +86,7 @@ def _run_collect(
     lock_deadline = deadline
     if baseline:
         try:
-            _mark_baseline_pending(baseline_pending_path, host)
+            _prepare_baseline(host)
         except OSError:
             # A detached baseline may safely outlive the collection budget. If its durable
             # guard cannot be written, waiting for the ledger lock is the only way to prevent
@@ -439,6 +439,11 @@ def _source_ledger_lock(path: Path, *, wait_for_lock: bool, deadline: float) -> 
 
 def _baseline_pending_path(ledger_path: Path, host: Host) -> Path:
     return ledger_path.with_name(f"{ledger_path.name}.{host}.baseline-pending")
+
+
+def _prepare_baseline(host: Host) -> None:
+    ledger_path = _ledger_path()
+    _mark_baseline_pending(_baseline_pending_path(ledger_path, host), host)
 
 
 def _mark_baseline_pending(path: Path, host: Host) -> None:

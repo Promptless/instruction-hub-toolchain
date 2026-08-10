@@ -101,7 +101,7 @@ def _assert_hook_system_message(result: subprocess.CompletedProcess[str], messag
 
 
 def _assert_hook_argv(result: subprocess.CompletedProcess[str], target: str) -> None:
-    _assert_hook_output(result, {"argv": ["ensure", "--host", target]})
+    _assert_hook_output(result, {"argv": ["ensure", "--host", target, "--prepare-baseline"]})
 
 
 def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
@@ -176,6 +176,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         stub_runtime = stub_root / "runtime" / HOST_RUNTIME_BIN
         stub_runtime_package = stub_root / "runtime" / HOST_RUNTIME_PACKAGE
         stub_call_log = tmp_path / f"{target}-stub-calls.jsonl"
+        stub_attempt_log = tmp_path / f"{target}-stub-attempts.jsonl"
         stub_stdin_log = tmp_path / f"{target}-stub-stdin.jsonl"
         stub_runtime.parent.mkdir(parents=True)
         assert f"{HOST_RUNTIME_PACKAGE}/contracts.py" in HOST_RUNTIME_BUNDLE_RELATIVE_PATHS
@@ -187,12 +188,27 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             stub_path.write_text("")
         stub_runtime.write_text(
             "import json, os, sys, time\n"
+            "host = sys.argv[sys.argv.index('--host') + 1] if '--host' in sys.argv else ''\n"
+            "baseline_guard = os.environ['PROMPTLESS_STUB_CALL_LOG'] + '.' + host + '.baseline-pending'\n"
+            "attempt_log_path = os.environ.get('PROMPTLESS_STUB_ATTEMPT_LOG')\n"
+            "if attempt_log_path:\n"
+            "    with open(attempt_log_path, 'a') as attempt_log:\n"
+            "        attempt_log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "ensure_failed = sys.argv[1:2] == ['ensure'] and os.environ.get('PROMPTLESS_STUB_ENSURE_FAILURE_HOST') == host\n"
+            "if sys.argv[1:2] == ['ensure'] and '--prepare-baseline' in sys.argv and not ensure_failed:\n"
+            "    time.sleep(float(os.environ.get('PROMPTLESS_STUB_ENSURE_GUARD_DELAY_SECONDS', '0')))\n"
+            "    with open(baseline_guard, 'w') as guard:\n"
+            "        guard.write('pending\\n')\n"
+            "if sys.argv[1:2] == ['collect'] and '--baseline' in sys.argv and not os.path.exists(baseline_guard):\n"
+            "    sys.exit(96)\n"
             "if sys.argv[1:2] == ['collect']:\n"
             "    time.sleep(float(os.environ.get('PROMPTLESS_STUB_COLLECT_DELAY_SECONDS', '0')))\n"
             "with open(os.environ['PROMPTLESS_STUB_CALL_LOG'], 'a') as call_log:\n"
             "    call_log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             "if sys.argv[1:2] == ['ensure']:\n"
             "    print(json.dumps({'argv': sys.argv[1:]}))\n"
+            "    if ensure_failed:\n"
+            "        sys.exit(1)\n"
             "elif sys.argv[1:2] == ['collect'] and ('--baseline' not in sys.argv or os.environ.get('PROMPTLESS_STUB_CAPTURE_BASELINE_STDIN') == '1'):\n"
             "    with open(os.environ['PROMPTLESS_STUB_STDIN_LOG'], 'a') as stdin_log:\n"
             "        stdin_log.write(json.dumps({'argv': sys.argv[1:], 'stdin': sys.stdin.read()}) + '\\n')\n"
@@ -215,12 +231,20 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
 
         def reset_stub_calls() -> None:
             stub_call_log.unlink(missing_ok=True)
+            stub_attempt_log.unlink(missing_ok=True)
             stub_stdin_log.unlink(missing_ok=True)
+            for guarded_host in ("codex", "claude", "claude-desktop"):
+                Path(f"{stub_call_log}.{guarded_host}.baseline-pending").unlink(missing_ok=True)
 
         def stub_calls() -> list[list[str]]:
             if not stub_call_log.exists():
                 return []
             return [json.loads(line) for line in stub_call_log.read_text().splitlines()]
+
+        def stub_attempts() -> list[list[str]]:
+            if not stub_attempt_log.exists():
+                return []
+            return [json.loads(line) for line in stub_attempt_log.read_text().splitlines()]
 
         def stub_stdin_entries() -> list[dict[str, JsonValue]]:
             if not stub_stdin_log.exists():
@@ -262,13 +286,13 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
 
         def assert_startup_calls() -> None:
             expected_calls = [
-                ["ensure", "--host", target],
+                ["ensure", "--host", target, "--prepare-baseline"],
                 ["collect", "--host", target, "--lifecycle", "session_start", "--baseline", "--quiet"],
             ]
             if target == "claude":
                 expected_calls.extend(
                     [
-                        ["ensure", "--host", "claude-desktop", "--if-sources"],
+                        ["ensure", "--host", "claude-desktop", "--if-sources", "--prepare-baseline"],
                         [
                             "collect",
                             "--host",
@@ -296,13 +320,19 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             home: Path,
             input_text: str | None = None,
             collect_delay_seconds: float = 0,
+            ensure_guard_delay_seconds: float = 0,
+            ensure_failure_host: str | None = None,
         ) -> subprocess.CompletedProcess[str]:
             env_vars = {
                 "HOME": str(home),
                 "PROMPTLESS_STUB_CALL_LOG": str(stub_call_log),
+                "PROMPTLESS_STUB_ATTEMPT_LOG": str(stub_attempt_log),
                 "PROMPTLESS_STUB_STDIN_LOG": str(stub_stdin_log),
                 "PROMPTLESS_STUB_COLLECT_DELAY_SECONDS": str(collect_delay_seconds),
+                "PROMPTLESS_STUB_ENSURE_GUARD_DELAY_SECONDS": str(ensure_guard_delay_seconds),
             }
+            if ensure_failure_host is not None:
+                env_vars["PROMPTLESS_STUB_ENSURE_FAILURE_HOST"] = ensure_failure_host
             if input_text is not None:
                 env_vars["PROMPTLESS_STUB_CAPTURE_BASELINE_STDIN"] = "1"
             if target == "claude":
@@ -536,7 +566,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         else:
             hook_command = session_start_hook["command"]
             assert "root=${PLUGIN_ROOT:-}" in hook_command
-            assert '"$runtime" ensure --host codex' in hook_command
+            assert '"$runtime" ensure --host codex --prepare-baseline' in hook_command
             assert '"$runtime" collect --host codex --lifecycle session_start --baseline --quiet' in hook_command
             assert hook_command.startswith("sh -c '")
             assert f'runtime="$root/runtime/{HOST_RUNTIME_BIN}"' in hook_command
@@ -640,12 +670,51 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         delayed_startup_collect = startup_hook_result(
             root=stub_root,
             home=tmp_path / f"{target}-delayed-startup-collect-home",
-            collect_delay_seconds=2,
+            collect_delay_seconds=3,
+            ensure_guard_delay_seconds=0.3,
         )
         elapsed_seconds = time.monotonic() - started_at
         _assert_hook_argv(delayed_startup_collect, target)
-        assert elapsed_seconds < 1
+        assert elapsed_seconds < 2
+        assert Path(f"{stub_call_log}.{target}.baseline-pending").exists()
+        if target == "claude":
+            assert Path(f"{stub_call_log}.claude-desktop.baseline-pending").exists()
         assert_startup_calls()
+
+        reset_stub_calls()
+        failed_primary_ensure = startup_hook_result(
+            root=stub_root,
+            home=tmp_path / f"{target}-failed-primary-ensure-home",
+            ensure_failure_host=target,
+        )
+        assert failed_primary_ensure.returncode == 1
+        time.sleep(0.5)
+        assert stub_calls() == [["ensure", "--host", target, "--prepare-baseline"]]
+        assert stub_attempts() == [["ensure", "--host", target, "--prepare-baseline"]]
+
+        if target == "claude":
+            reset_stub_calls()
+            failed_desktop_ensure = startup_hook_result(
+                root=stub_root,
+                home=tmp_path / "claude-failed-desktop-ensure-home",
+                ensure_failure_host="claude-desktop",
+            )
+            _assert_hook_argv(failed_desktop_ensure, target)
+            assert_calls_eventually(
+                [
+                    ["ensure", "--host", "claude", "--prepare-baseline"],
+                    ["collect", "--host", "claude", "--lifecycle", "session_start", "--baseline", "--quiet"],
+                    ["ensure", "--host", "claude-desktop", "--if-sources", "--prepare-baseline"],
+                ]
+            )
+            time.sleep(0.5)
+            assert sorted(stub_attempts()) == sorted(
+                [
+                    ["ensure", "--host", "claude", "--prepare-baseline"],
+                    ["collect", "--host", "claude", "--lifecycle", "session_start", "--baseline", "--quiet"],
+                    ["ensure", "--host", "claude-desktop", "--if-sources", "--prepare-baseline"],
+                ]
+            )
 
         if target == "claude":
             reset_stub_calls()
@@ -3149,12 +3218,21 @@ def test_claude_desktop_ensure_if_sources_skips_without_audit_files(tmp_path: Pa
     server.start()
     try:
         home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
         result = subprocess.run(
-            [str(plugin_root / "runtime" / HOST_RUNTIME_BIN), "ensure", "--host", "claude-desktop", "--if-sources"],
+            [
+                str(plugin_root / "runtime" / HOST_RUNTIME_BIN),
+                "ensure",
+                "--host",
+                "claude-desktop",
+                "--if-sources",
+                "--prepare-baseline",
+            ],
             env=_clean_env(
                 HOME=str(home),
                 CLAUDE_PLUGIN_ROOT=str(plugin_root),
                 PROMPTLESS_WORKER_BASE_URL=server.base_url,
+                PROMPTLESS_HOST_RUNTIME_LEDGER=str(ledger_path),
             ),
             text=True,
             capture_output=True,
@@ -3169,6 +3247,7 @@ def test_claude_desktop_ensure_if_sources_skips_without_audit_files(tmp_path: Pa
         assert server.session_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
+        assert ledger_path.with_name(f"{ledger_path.name}.claude-desktop.baseline-pending").exists()
     finally:
         server.stop()
 
@@ -3398,6 +3477,45 @@ def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path)
         server.stop()
 
 
+def test_ensure_prepare_baseline_stops_before_enrollment_when_guard_write_fails(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        invalid_ledger_parent = tmp_path / "not-a-directory"
+        invalid_ledger_parent.write_text("file")
+        result = subprocess.run(
+            [
+                str(plugin_root / "runtime" / HOST_RUNTIME_BIN),
+                "ensure",
+                "--host",
+                "codex",
+                "--prepare-baseline",
+            ],
+            env=_clean_env(
+                HOME=str(home),
+                CODEX_HOME=str(home / ".codex"),
+                PLUGIN_ROOT=str(plugin_root),
+                PROMPTLESS_WORKER_BASE_URL=server.base_url,
+                PROMPTLESS_HOST_RUNTIME_LEDGER=str(invalid_ledger_parent / "ledger.json"),
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 1
+        assert server.session_requests == []
+        assert server.policy_requests == []
+        assert server.check_ins == []
+    finally:
+        server.stop()
+
+
 def test_baseline_collect_stops_waiting_for_ledger_lock_at_deadline(tmp_path: Path) -> None:
     if os.name == "nt":
         pytest.skip("fcntl lock contention test is POSIX-only")
@@ -3423,7 +3541,11 @@ def test_baseline_collect_stops_waiting_for_ledger_lock_at_deadline(tmp_path: Pa
             "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
             "PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS": "0.1",
         }
-        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_bootstrap(plugin_root, "codex", env, prepare_baseline=True)
+
+        pending_path = ledger_path.with_name(f"{ledger_path.name}.codex.baseline-pending")
+        assert pending_path.exists()
+        server.policy_requests.clear()
 
         lock_path = ledger_path.with_name(f"{ledger_path.name}.lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3443,7 +3565,6 @@ def test_baseline_collect_stops_waiting_for_ledger_lock_at_deadline(tmp_path: Pa
         assert server.policy_requests == []
         assert not ledger_path.exists()
 
-        pending_path = ledger_path.with_name(f"{ledger_path.name}.codex.baseline-pending")
         assert pending_path.exists()
 
         # The deadline-expired baseline remains a durable guard. A terminal hook must not
@@ -4383,9 +4504,13 @@ def _run_bootstrap(
     env: dict[str, str],
     *,
     expected_status: str = "configured",
+    prepare_baseline: bool = False,
 ) -> tuple[dict[str, JsonValue], subprocess.CompletedProcess[str]]:
+    args = [str(plugin_root / "runtime" / HOST_RUNTIME_BIN), "ensure", "--host", host]
+    if prepare_baseline:
+        args.append("--prepare-baseline")
     result = subprocess.run(
-        [str(plugin_root / "runtime" / HOST_RUNTIME_BIN), "ensure", "--host", host],
+        args,
         env=_clean_env(**env),
         text=True,
         capture_output=True,

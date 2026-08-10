@@ -450,7 +450,7 @@ def _node_host_runtime_hook_script(
     ensure_run_script = ""
     if run_ensure:
         ensure_run_script = (
-            f"const ensureArgs = [runtime, 'ensure', '--host', {host!r}];\n"
+            f"const ensureArgs = [runtime, 'ensure', '--host', {host!r}, '--prepare-baseline'];\n"
             "  const ensure = spawnSync(candidate.command, [...candidate.runPrefix, ...ensureArgs], { stdio: 'inherit', env: process.env });\n"
             "  if (ensure.error) {\n"
             "    sawBrokenPython = true;\n"
@@ -463,7 +463,7 @@ def _node_host_runtime_hook_script(
         # Desktop ensure is not quiet so pending approval is persisted, but stdout stays
         # suppressed so the best-effort sibling ensure cannot emit a second hook-control object.
         claude_desktop_collect_script = (
-            "  const desktopEnsureArgs = [runtime, 'ensure', '--host', 'claude-desktop', '--if-sources'];\n"
+            "  const desktopEnsureArgs = [runtime, 'ensure', '--host', 'claude-desktop', '--if-sources', '--prepare-baseline'];\n"
             "  const desktopEnsure = spawnSync(candidate.command, [...candidate.runPrefix, ...desktopEnsureArgs], { stdio: ['ignore', 'ignore', 'inherit'], env: process.env });\n"
             "  if (desktopEnsure.error) {\n"
             "    emitLaunchFailure('claude-desktop', desktopEnsure.error);\n"
@@ -640,8 +640,8 @@ def _posix_host_runtime_hook_command(
     ensure_command = ""
     if run_ensure:
         ensure_command = (
-            f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" ensure --host {host}; '
-            f'else "$python_cmd" "$runtime" ensure --host {host}; fi; '
+            f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" ensure --host {host} --prepare-baseline; '
+            f'else "$python_cmd" "$runtime" ensure --host {host} --prepare-baseline; fi; '
             'status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; '
         )
     collect_command = (
