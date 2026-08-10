@@ -90,43 +90,44 @@ def _run_collect(
         _emit({"status": "trace_upload_skipped", "reason": "not_enrolled", "host": host}, quiet=quiet)
         return 0
 
-    policy_url = _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
-    try:
-        signed_policy = _get_json(policy_url, credential.value, label="policy response")
-    except BootstrapAuthError:
-        _forget_cached_host_credential(context)
-        _emit({"status": "trace_upload_skipped", "reason": "credential_rejected", "host": host}, quiet=quiet)
-        return 0
-    policy = _validate_signed_policy(signed_policy, host)
-    _store_policy_observation(worker_base_url, policy)
-    if _requires_newer_bootstrap(policy.required_bootstrap_version, RUNTIME_VERSION):
-        _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
-        return 0
-
-    source_paths, idle_scan_complete = _collect_source_paths(
-        host,
-        hook_context,
-        lifecycle_event=lifecycle_event,
-        deadline=deadline,
-        include_active=include_active,
-    )
-    if not source_paths and idle_scan_complete and not baseline:
-        # Only a complete scan proves there is nothing to do. A truncated empty scan
-        # must fall through so a first-run --baseline can rerun the inventory
-        # unmetered; returning here would leave the ledger uncreated and later
-        # terminal hooks would upload pre-enrollment history from offset 0.
-        _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
-        return 0
-
-    upload_url = _worker_url(worker_base_url, f"/v0/traces/batches?{urlencode({'target': host})}")
     ledger_path = _ledger_path()
-    uploaded_batch_count = 0
-    uploaded_chunk_count = 0
-    unparsed_record_count = 0
     with _source_ledger_lock(ledger_path) as lock_acquired:
         if not lock_acquired:
             _emit({"status": "trace_upload_skipped", "reason": "ledger_lock_busy", "host": host}, quiet=quiet)
             return 0
+
+        policy_url = _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
+        try:
+            signed_policy = _get_json(policy_url, credential.value, label="policy response")
+        except BootstrapAuthError:
+            _forget_cached_host_credential(context)
+            _emit({"status": "trace_upload_skipped", "reason": "credential_rejected", "host": host}, quiet=quiet)
+            return 0
+        policy = _validate_signed_policy(signed_policy, host)
+        _store_policy_observation(worker_base_url, policy)
+        if _requires_newer_bootstrap(policy.required_bootstrap_version, RUNTIME_VERSION):
+            _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
+            return 0
+
+        source_paths, idle_scan_complete = _collect_source_paths(
+            host,
+            hook_context,
+            lifecycle_event=lifecycle_event,
+            deadline=deadline,
+            include_active=include_active,
+        )
+        if not source_paths and idle_scan_complete and not baseline:
+            # Only a complete scan proves there is nothing to do. A truncated empty scan
+            # must fall through so a first-run --baseline can rerun the inventory
+            # unmetered; returning here would leave the ledger uncreated and later
+            # terminal hooks would upload pre-enrollment history from offset 0.
+            _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
+            return 0
+
+        upload_url = _worker_url(worker_base_url, f"/v0/traces/batches?{urlencode({'target': host})}")
+        uploaded_batch_count = 0
+        uploaded_chunk_count = 0
+        unparsed_record_count = 0
         ledger = _load_source_ledger(ledger_path)
         if include_active and host not in ledger.host_baselines:
             _emit({"status": "trace_upload_skipped", "reason": "baseline_required", "host": host}, quiet=quiet)
