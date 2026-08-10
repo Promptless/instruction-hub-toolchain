@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -2657,6 +2658,56 @@ def test_upload_only_policy_permissions_block_neither_ensure_nor_collect(tmp_pat
         assert chunk["start_offset"] == 0
         assert chunk["end_offset"] == len(record)
     finally:
+        server.stop()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not enforce POSIX directory write permissions")
+def test_policy_observation_write_failure_blocks_neither_ensure_nor_collect(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/core"
+    server = _FakeWorkerServer()
+    server.start()
+    state_directory: Path | None = None
+    original_state_directory_mode: int | None = None
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        record = b'{"kind":"stop","message":"read-only policy observation"}\n'
+        transcript_path.write_bytes(record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_bootstrap(plugin_root, "codex", env)
+        state_path = _host_state_path(home)
+        state = _json_mapping(validate_json_value(json.loads(state_path.read_text()), "host state"), "host state")
+        state.pop("policy_observations")
+        state_path.write_text(json.dumps(state))
+
+        state_directory = state_path.parent
+        original_state_directory_mode = stat.S_IMODE(state_directory.stat().st_mode)
+        state_directory.chmod(0o555)
+
+        _run_bootstrap(plugin_root, "codex", env)
+        assert server.check_ins[-1]["status"] == "configured"
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+        )
+        assert len(server.trace_batches) == 1
+    finally:
+        if state_directory is not None and original_state_directory_mode is not None:
+            state_directory.chmod(original_state_directory_mode)
         server.stop()
 
 

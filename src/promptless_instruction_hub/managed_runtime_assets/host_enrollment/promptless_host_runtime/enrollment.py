@@ -207,21 +207,33 @@ def _host_disabled_by_cached_policy(worker_base_url: str, host: Host) -> bool:
 
 
 def _store_policy_observation(worker_base_url: str, policy: HostPolicy) -> None:
-    state_path = _state_path()
-    with _state_file_lock(state_path):
-        state = _load_state(state_path)
-        observations = _json_mapping_or_empty(state.get("policy_observations"))
-        cache_key = _policy_observation_cache_key(worker_base_url)
-        observation: dict[str, JsonValue] = {
-            "worker_base_url": worker_base_url,
-            "enabled_hosts": list(policy.enabled_hosts),
-            "expires_at": policy.expires_at.isoformat(),
-        }
-        if observations.get(cache_key) == observation:
-            return
-        observations[cache_key] = observation
-        state["policy_observations"] = observations
-        _write_state(state_path, state)
+    """Best-effort persist a negative policy observation without blocking work on storage failures."""
+    try:
+        state_path = _state_path()
+        with _state_file_lock(state_path):
+            state = _load_state(state_path)
+            observations = _json_mapping_or_empty(state.get("policy_observations"))
+            cache_key = _policy_observation_cache_key(worker_base_url)
+            observation: dict[str, JsonValue] = {
+                "worker_base_url": worker_base_url,
+                "enabled_hosts": list(policy.enabled_hosts),
+                "expires_at": policy.expires_at.isoformat(),
+            }
+            if observations.get(cache_key) == observation:
+                return
+            observations[cache_key] = observation
+            state["policy_observations"] = observations
+            _write_state(state_path, state)
+    except (OSError, BootstrapError) as exc:
+        _emit(
+            {
+                "status": "policy_observation_not_stored",
+                "reason": "host_state_unavailable",
+                "message": str(exc),
+            },
+            quiet=True,
+        )
+        return
 
 
 def _policy_observation_cache_key(worker_base_url: str) -> str:
