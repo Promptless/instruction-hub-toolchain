@@ -3113,6 +3113,59 @@ def test_claude_desktop_skips_when_recent_policy_disables_host(tmp_path: Path) -
         server.stop()
 
 
+def test_claude_desktop_ignores_disabled_policy_from_replaced_credential(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/claude/core"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude"]))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        audit_path = _claude_desktop_audit_path(home, "local-agent-mode-sessions", "session-1")
+        audit_path.parent.mkdir(parents=True)
+        audit_path.write_bytes(b'{"sessionId":"desktop_session_1","message":"baseline"}\n')
+        env = {
+            "HOME": str(home),
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "claude"], env)
+        _run_bootstrap(plugin_root, "claude", env)
+        _run_runtime_json(plugin_root, ["reset", "--host", "claude", "--yes"], env)
+
+        _FakeWorkerHandler.poll_response = _approved_poll_response(credential_id="33333333-3333-4333-8333-333333333333")
+        _FakeWorkerHandler.policy_response = _signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"])
+        _run_runtime_json(plugin_root, ["enroll", "--host", "claude"], env)
+        policy_request_count = len(server.policy_requests)
+
+        result = subprocess.run(
+            [str(plugin_root / "runtime" / HOST_RUNTIME_BIN), "ensure", "--host", "claude-desktop", "--if-sources"],
+            env=_clean_env(**env),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0
+        payload = _assert_session_start_streams(result.stdout, result.stderr, "configured")
+        assert payload["host"] == "claude-desktop"
+        assert len(server.policy_requests) == policy_request_count + 1
+        assert server.policy_requests[-1] == "/v0/host-enrollment/policy?target=claude-desktop"
+
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "claude-desktop", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {},
+        )
+        assert len(server.policy_requests) == policy_request_count + 2
+        assert server.policy_requests[-1] == "/v0/host-enrollment/policy?target=claude-desktop"
+    finally:
+        server.stop()
+
+
 def test_claude_desktop_collect_skips_without_cached_credential(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")

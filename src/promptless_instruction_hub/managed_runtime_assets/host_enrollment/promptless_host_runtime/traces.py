@@ -50,6 +50,7 @@ from .enrollment import (
     _enrollment_context,
     _forget_cached_host_credential,
     _host_disabled_by_cached_policy,
+    _policy_observation_enrollment_host,
     _store_policy_observation,
 )
 from .host_config import _claude_desktop_trace_roots, _native_trace_globs
@@ -80,11 +81,16 @@ def _run_collect(
     plugin_root = _plugin_root()
     metadata = _load_runtime_metadata(plugin_root, host)
     worker_base_url = _worker_base_url()
-    if _host_disabled_by_cached_policy(worker_base_url, host):
+    dashboard_base_url = _dashboard_base_url()
+    policy_host = _policy_observation_enrollment_host(host)
+    policy_metadata = metadata if policy_host == host else _load_runtime_metadata(plugin_root, policy_host)
+    policy_context = _enrollment_context(worker_base_url, dashboard_base_url, policy_metadata)
+    if _host_disabled_by_cached_policy(policy_context, host):
         _emit({"status": "trace_upload_skipped", "reason": "policy_disabled", "host": host}, quiet=quiet)
         return 0
-    dashboard_base_url = _dashboard_base_url()
-    context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+    context = (
+        policy_context if policy_host == host else _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+    )
     credential = _cached_host_credential(context)
     if credential is None:
         _emit({"status": "trace_upload_skipped", "reason": "not_enrolled", "host": host}, quiet=quiet)
@@ -104,7 +110,7 @@ def _run_collect(
             _emit({"status": "trace_upload_skipped", "reason": "credential_rejected", "host": host}, quiet=quiet)
             return 0
         policy = _validate_signed_policy(signed_policy, host)
-        _store_policy_observation(worker_base_url, policy)
+        _store_policy_observation(context, credential, policy)
         if _requires_newer_bootstrap(policy.required_bootstrap_version, RUNTIME_VERSION):
             _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
             return 0

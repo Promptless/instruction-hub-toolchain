@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from .contracts import (
     BootstrapAuthError,
     BootstrapError,
+    EnrollmentContext,
     Host,
     MANAGED_RUNTIME_ID,
     RUNTIME_CHANNEL,
@@ -25,6 +26,7 @@ from .enrollment import (
     _forget_cached_host_credential,
     _host_disabled_by_cached_policy,
     _obtain_host_credential,
+    _policy_observation_enrollment_host,
     _store_internal_promptless_identity,
     _store_policy_observation,
 )
@@ -247,9 +249,6 @@ def _run_version_command(*, json_output: bool) -> int:
 
 
 def _run_ensure(host: Host, *, quiet: bool, if_sources: bool) -> int:
-    if if_sources and _host_disabled_by_cached_policy(_worker_base_url(), host):
-        _emit({"status": "trace_upload_skipped", "reason": "policy_disabled", "host": host}, quiet=quiet)
-        return 0
     if if_sources and not _has_native_trace_sources(host):
         _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
         return 0
@@ -259,11 +258,28 @@ def _run_ensure(host: Host, *, quiet: bool, if_sources: bool) -> int:
     # so a later failure re-announces it on the next healthy session.
     plugin_root = _plugin_root()
     metadata = _load_runtime_metadata(plugin_root, host)
+    worker_base_url = _worker_base_url()
+    dashboard_base_url = _dashboard_base_url()
+    if if_sources:
+        policy_host = _policy_observation_enrollment_host(host)
+        policy_metadata = metadata if policy_host == host else _load_runtime_metadata(plugin_root, policy_host)
+        policy_context = _enrollment_context(worker_base_url, dashboard_base_url, policy_metadata)
+        if _host_disabled_by_cached_policy(policy_context, host):
+            _emit({"status": "trace_upload_skipped", "reason": "policy_disabled", "host": host}, quiet=quiet)
+            return 0
+        context = (
+            policy_context
+            if policy_host == host
+            else _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+        )
+    else:
+        context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
     pending_update = _pending_plugin_update(metadata)
     update_notice = pending_update.notice if pending_update is not None else None
     exit_code = _run_host_enrollment(
         host,
         metadata,
+        context,
         quiet=quiet,
         update_notice=update_notice,
         plugin_version_updated=update_notice is not None,
@@ -279,14 +295,13 @@ def _run_ensure(host: Host, *, quiet: bool, if_sources: bool) -> int:
 def _run_host_enrollment(
     host: Host,
     metadata: RuntimeMetadata,
+    context: EnrollmentContext,
     *,
     quiet: bool,
     update_notice: str | None,
     plugin_version_updated: bool,
 ) -> int:
-    worker_base_url = _worker_base_url()
-    dashboard_base_url = _dashboard_base_url()
-    context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+    worker_base_url = context.worker_base_url
     enrollment_attempt = _obtain_host_credential(context, quiet=quiet)
     if enrollment_attempt.credential is None:
         _emit(
@@ -332,7 +347,7 @@ def _run_host_enrollment(
         credential = enrollment_attempt.credential
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
     policy = _validate_signed_policy(signed_policy, host)
-    _store_policy_observation(worker_base_url, policy)
+    _store_policy_observation(context, credential, policy)
     credential = _credential_with_policy_identity(credential, signed_policy)
     _store_internal_promptless_identity(context, credential)
     trace_upload_endpoint = _worker_url(worker_base_url, "/v0/traces/batches")

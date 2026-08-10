@@ -146,8 +146,13 @@ def _obtain_host_credential(context: EnrollmentContext, *, quiet: bool) -> Enrol
 
 
 def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None:
-    state_path = _state_path()
-    state = _load_state(state_path)
+    return _host_credential_from_state(context, _load_state(_state_path()))
+
+
+def _host_credential_from_state(
+    context: EnrollmentContext,
+    state: dict[str, JsonValue],
+) -> HostCredential | None:
     credentials = _json_mapping_or_empty(state.get("credentials"))
     cached_credential = _json_mapping_or_empty(credentials.get(_credential_cache_key(context)))
     credential_value = _string_value(cached_credential.get("value"))
@@ -177,17 +182,29 @@ def _credential_with_policy_identity(credential: HostCredential, payload: dict[s
     )
 
 
-def _host_disabled_by_cached_policy(worker_base_url: str, host: Host) -> bool:
+def _policy_observation_enrollment_host(host: Host) -> Host:
+    """Return the enrollment host whose policy observation governs optional work for this host."""
+    return "claude" if host == "claude-desktop" else host
+
+
+def _host_disabled_by_cached_policy(
+    context: EnrollmentContext,
+    host: Host,
+) -> bool:
     """Return whether an unexpired validated policy observation omits the host.
 
     Cached policy can suppress work for a disabled host. It never authorizes work
-    for an enabled host; that still requires a fresh Worker policy response.
+    for an enabled host; that still requires a fresh Worker policy response. The
+    observation must match the credential currently enrolled for this policy host.
     """
 
     state = _load_state(_state_path())
+    credential = _host_credential_from_state(context, state)
+    if credential is None:
+        return False
     observations = _json_mapping_or_empty(state.get("policy_observations"))
-    observation = _json_mapping_or_empty(observations.get(_policy_observation_cache_key(worker_base_url)))
-    if _string_value(observation.get("worker_base_url")) != worker_base_url:
+    observation = _json_mapping_or_empty(observations.get(_policy_observation_cache_key(context, credential)))
+    if _string_value(observation.get("worker_base_url")) != context.worker_base_url:
         return False
     expires_at_text = _string_value(observation.get("expires_at"))
     if expires_at_text is None:
@@ -206,16 +223,20 @@ def _host_disabled_by_cached_policy(worker_base_url: str, host: Host) -> bool:
     return host not in enabled_hosts
 
 
-def _store_policy_observation(worker_base_url: str, policy: HostPolicy) -> None:
+def _store_policy_observation(
+    context: EnrollmentContext,
+    credential: HostCredential,
+    policy: HostPolicy,
+) -> None:
     """Best-effort persist a negative policy observation without blocking work on storage failures."""
     try:
         state_path = _state_path()
         with _state_file_lock(state_path):
             state = _load_state(state_path)
             observations = _json_mapping_or_empty(state.get("policy_observations"))
-            cache_key = _policy_observation_cache_key(worker_base_url)
+            cache_key = _policy_observation_cache_key(context, credential)
             observation: dict[str, JsonValue] = {
-                "worker_base_url": worker_base_url,
+                "worker_base_url": context.worker_base_url,
                 "enabled_hosts": list(policy.enabled_hosts),
                 "expires_at": policy.expires_at.isoformat(),
             }
@@ -236,8 +257,13 @@ def _store_policy_observation(worker_base_url: str, policy: HostPolicy) -> None:
         return
 
 
-def _policy_observation_cache_key(worker_base_url: str) -> str:
-    return hashlib.sha256(worker_base_url.encode()).hexdigest()
+def _policy_observation_cache_key(context: EnrollmentContext, credential: HostCredential) -> str:
+    cache_material = {
+        "credential_cache_key": _credential_cache_key(context),
+        "credential_id": credential.credential_id,
+        "credential_value_sha256": hashlib.sha256(credential.value.encode()).hexdigest(),
+    }
+    return hashlib.sha256(json.dumps(cache_material, sort_keys=True).encode()).hexdigest()
 
 
 def _store_internal_promptless_identity(context: EnrollmentContext, credential: HostCredential) -> None:
