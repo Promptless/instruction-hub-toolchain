@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
             quiet=args.quiet,
         )
         if args.detach:
-            return _launch_detached_collect(collector_args)
+            return _launch_detached_collect(host, collector_args)
         if args.supervised:
             return _supervise_collect(host, collector_args)
         return _run_collect_command(
@@ -223,7 +223,7 @@ def _collector_command_args(
     return command_args
 
 
-def _launch_detached_collect(collector_args: list[str]) -> int:
+def _launch_detached_collect(host: Host, collector_args: list[str]) -> int:
     supervisor_args = [
         sys.executable,
         str(Path(sys.argv[0]).resolve()),
@@ -232,7 +232,8 @@ def _launch_detached_collect(collector_args: list[str]) -> int:
     ]
     try:
         _spawn_detached(supervisor_args)
-    except OSError:
+    except OSError as exc:
+        _record_collector_failure(host, exit_code=None, error_code=_os_error_code(exc))
         return 1
     return 0
 

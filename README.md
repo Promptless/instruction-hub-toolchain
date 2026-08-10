@@ -174,8 +174,8 @@ failing the run, so one bad idle file cannot block the hook subject's upload.
 Support diagnostics are written as bounded, redacted JSONL at
 `~/.promptless/instruction-hub/host-runtime-diagnostics.jsonl` with `0600`
 permissions and without transcript content, tool inputs, or credentials.
-Detached collector nonzero-exit failures are recorded there and in the
-structured `last-bootstrap-status.json` support status.
+Detached collector launch and nonzero-exit failures are recorded there and in
+the structured `last-bootstrap-status.json` support status.
 
 Hook-triggered collectors still scan idle transcript roots and hold the ledger
 lock across catch-up uploads. The collector process is detached from the hook,

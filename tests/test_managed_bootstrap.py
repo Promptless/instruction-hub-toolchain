@@ -33,6 +33,9 @@ from promptless_instruction_hub.managed_runtime import (
     MISSING_RUNTIME_ROOT_MESSAGE,
     UNSUPPORTED_PYTHON_MESSAGE,
 )
+from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime import (
+    cli as host_runtime_cli,
+)
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.contracts import (
     MAX_DIAGNOSTIC_LOG_BYTES,
 )
@@ -1226,6 +1229,41 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     assert internal_import.stdout == ""
     assert "ImportError: sentinel internal import" in internal_import.stderr
     assert BUNDLE_LOAD_ERROR.strip() not in internal_import.stderr
+
+
+@pytest.mark.parametrize("execution_mode", ("detached", "supervised"))
+def test_collector_process_creation_failure_is_persisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    execution_mode: str,
+) -> None:
+    home = tmp_path / "home"
+    hook_input_path = tmp_path / "hook-input.json"
+    hook_input_path.write_text("{}")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(host_runtime_cli.sys, "executable", str(tmp_path / "missing-python"))
+    collector_args = ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"]
+
+    with hook_input_path.open() as hook_input:
+        monkeypatch.setattr(host_runtime_cli.sys, "stdin", hook_input)
+        if execution_mode == "detached":
+            return_code = host_runtime_cli._launch_detached_collect("codex", collector_args)
+        else:
+            return_code = host_runtime_cli._supervise_collect("codex", collector_args)
+
+    assert return_code == 1
+    diagnostic = _diagnostic_log_entries(home)
+    assert len(diagnostic) == 1
+    assert diagnostic[0]["status"] == "error"
+    assert diagnostic[0]["reason"] == "collector_process_failed"
+    assert diagnostic[0]["host"] == "codex"
+    assert diagnostic[0]["error_code"] == "ENOENT"
+    last_status = json.loads(_last_status_path(home).read_text())
+    assert last_status["reason"] == "collector_process_failed"
+    assert last_status["host"] == "codex"
+    assert last_status["error_code"] == "ENOENT"
+    assert _diagnostic_log_path(home).stat().st_mode & 0o777 == 0o600
+    assert _last_status_path(home).stat().st_mode & 0o777 == 0o600
 
 
 def test_host_runtime_bundle_digest_tracks_runtime_files_only(tmp_path: Path) -> None:
