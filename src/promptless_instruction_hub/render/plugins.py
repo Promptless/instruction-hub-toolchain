@@ -38,7 +38,9 @@ def render_target_plugins(
             mcp_servers = collect_mcp_servers(target, assets)
             if mcp_servers:
                 write_mcp_config(target_root, target, mcp_servers)
-            render_managed_skills(target_root, target, stable_package.definition)
+            rendered.setdefault("skills", []).extend(
+                render_managed_skills(target_root, target, config, stable_package.definition)
+            )
             managed_runtimes.extend(render_managed_runtimes(target_root, target, config, stable_package.definition))
             _write_manifest(target_root, target, config, stable_package.definition, rendered, mcp_servers)
     if "codex" in config.targets:

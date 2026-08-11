@@ -10,6 +10,7 @@ from promptless_instruction_hub.models import PIG_PACKAGE_ID, HubConfig, Package
 from promptless_instruction_hub.render.common import (
     RenderedAssets,
     base_plugin_manifest,
+    marketplace_name,
     package_plugin_id,
     plugin_description,
 )
@@ -55,7 +56,7 @@ def write_marketplace(output_root: Path, config: HubConfig, packages: Sequence[S
     """Write the Codex repository marketplace manifest."""
 
     marketplace = {
-        "name": f"{config.plugin_id}-marketplace",
+        "name": marketplace_name(config),
         "interface": {"displayName": f"{config.plugin_name} Marketplace"},
         "plugins": [
             {

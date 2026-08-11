@@ -114,11 +114,12 @@ pin to an immutable tag for stricter reproducibility.
 ## Managed PIG Assets
 
 The toolchain injects the harness-specific `update-instruction-hub-mid-session`
-skill into the canonical `pig` plugin for Codex and Claude. It updates only the
-Promptless Instruction Hub marketplace and its installed plugins. Codex uses
-its marketplace upgrade and skill refresh operations; Claude updates each
-installed plugin at its original scope and uses `/reload-plugins` to apply the
-changes without restarting.
+skill into the canonical `pig` plugin for Codex and Claude. Each generated copy
+is scoped to its hub's generated marketplace name, so customer-specific names,
+repository URLs, and checkout locations are not hardcoded. Each hub's generated
+PIG plugin receives its own scoped copy. Codex uses its marketplace upgrade and
+skill refresh operations; Claude updates each installed plugin at its original
+scope and uses `/reload-plugins` to apply the changes without restarting.
 
 ### Managed Host Runtime
 

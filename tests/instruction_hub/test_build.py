@@ -88,13 +88,17 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     assert (hub_root / "dist/claude/pig/runtime/promptless-host-runtime").exists()
     codex_update_skill = (hub_root / "dist/codex/pig/skills/update-instruction-hub-mid-session/SKILL.md").read_text()
     assert "# Update Instruction Hub Mid-session" in codex_update_skill
+    assert "generated marketplace name `promptless-instruction-hub-marketplace`" in codex_update_skill
     assert "codex plugin marketplace upgrade promptless-instruction-hub-marketplace --json" in codex_update_skill
     assert "skills/list" in codex_update_skill
+    assert "{{ instruction_hub_" not in codex_update_skill
     claude_update_skill = (hub_root / "dist/claude/pig/skills/update-instruction-hub-mid-session/SKILL.md").read_text()
     assert "# Update Instruction Hub Mid-session" in claude_update_skill
+    assert "generated marketplace name `promptless-instruction-hub-marketplace`" in claude_update_skill
     assert "claude plugin marketplace update promptless-instruction-hub-marketplace" in claude_update_skill
     assert "claude plugin update <id> --scope <scope>" in claude_update_skill
     assert "/reload-plugins" in claude_update_skill
+    assert "{{ instruction_hub_" not in claude_update_skill
     for target in ("cursor", "gemini"):
         assert not (hub_root / "dist" / target / "pig/skills/update-instruction-hub-mid-session").exists()
     cursor_manifest = json.loads((hub_root / "dist/cursor/pig/.cursor-plugin/plugin.json").read_text())
@@ -313,6 +317,7 @@ def test_build_renders_projected_rules_native_cursor_rules_and_mcp_assets(tmp_pa
                 "stable_packages:",
                 "  - pig",
                 "targets:",
+                "  - claude",
                 "  - codex",
                 "  - cursor",
                 "",
@@ -362,6 +367,16 @@ def test_build_renders_projected_rules_native_cursor_rules_and_mcp_assets(tmp_pa
     build_hub(hub_root)
 
     assert (hub_root / "dist/codex/pig/projected/codex/team-style.md").read_text().startswith("# Team Style")
+    update_skill = (hub_root / "dist/codex/pig/skills/update-instruction-hub-mid-session/SKILL.md").read_text()
+    assert "generated marketplace name `acme-instruction-hub-marketplace`" in update_skill
+    assert "codex plugin marketplace upgrade acme-instruction-hub-marketplace --json" in update_skill
+    assert "promptless-instruction-hub-marketplace" not in update_skill
+    claude_update_skill = (hub_root / "dist/claude/pig/skills/update-instruction-hub-mid-session/SKILL.md").read_text()
+    assert "generated marketplace name `acme-instruction-hub-marketplace`" in claude_update_skill
+    assert "claude plugin marketplace update acme-instruction-hub-marketplace" in claude_update_skill
+    assert "promptless-instruction-hub-marketplace" not in claude_update_skill
+    claude_manifest = json.loads((hub_root / "dist/claude/pig/.claude-plugin/plugin.json").read_text())
+    assert claude_manifest["skills"] == "./skills/"
     assert "alwaysApply: false" in (hub_root / "dist/cursor/pig/rules/team-style.mdc").read_text()
     codex_mcp_config = json.loads((hub_root / "dist/codex/pig/.mcp.json").read_text())
     assert codex_mcp_config["mcpServers"]["trace-reporter"]["env"]["PROMPTLESS_API_KEY"] == "${PROMPTLESS_API_KEY}"

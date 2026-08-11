@@ -10,6 +10,7 @@ from promptless_instruction_hub.models import HubConfig, PackageDefinition, Stab
 from promptless_instruction_hub.render.common import (
     RenderedAssets,
     base_plugin_manifest,
+    marketplace_name,
     package_plugin_id,
     plugin_description,
 )
@@ -42,7 +43,7 @@ def write_marketplace(output_root: Path, config: HubConfig, packages: Sequence[S
     """Write the Claude Code repository marketplace manifest."""
 
     marketplace = {
-        "name": f"{config.plugin_id}-marketplace",
+        "name": marketplace_name(config),
         "owner": {"name": config.org},
         "description": f"{config.plugin_name} marketplace.",
         "plugins": [
