@@ -16,7 +16,6 @@ from .contracts import (
     Host,
     HostCredential,
     HostPolicy,
-    HOST_VALUES,
     JsonValue,
     RuntimeMetadata,
 )
@@ -123,10 +122,9 @@ def _validate_signed_policy(payload: dict[str, JsonValue], host: Host) -> HostPo
     if expires_at <= dt.datetime.now(dt.timezone.utc):
         raise BootstrapError("policy has expired")
     policy_version = _int_value(policy_value.get("policy_version"), "policy.policy_version")
-    enabled_host_values = policy_value.get("enabled_hosts")
-    if not isinstance(enabled_host_values, list) or host not in enabled_host_values:
+    enabled_hosts = policy_value.get("enabled_hosts")
+    if not isinstance(enabled_hosts, list) or host not in enabled_hosts:
         raise BootstrapError(f"policy does not enable {host}")
-    enabled_hosts = tuple(candidate for candidate in HOST_VALUES if candidate in enabled_host_values)
     # plugin_permissions is deliberately ignored: the runtime no longer writes user config
     # beyond deleting its own legacy managed blocks, so there is no capability to gate. A
     # policy carrying the retired field still validates while hosted/worker phase it out.
@@ -134,6 +132,4 @@ def _validate_signed_policy(payload: dict[str, JsonValue], host: Host) -> HostPo
     return HostPolicy(
         policy_version=policy_version,
         required_bootstrap_version=required_bootstrap_version,
-        enabled_hosts=enabled_hosts,
-        expires_at=expires_at,
     )

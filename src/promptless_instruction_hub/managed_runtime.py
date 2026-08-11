@@ -408,15 +408,9 @@ def _node_host_runtime_hook_script(
         )
     claude_desktop_collect_script = ""
     if collect_claude_desktop:
-        # Desktop ensure is not quiet so pending approval is persisted, but stdout stays
-        # suppressed so the best-effort sibling ensure cannot emit a second hook-control object.
         claude_desktop_collect_script = (
-            "  const desktopEnsureArgs = [runtime, 'ensure', '--host', 'claude-desktop', '--if-sources'];\n"
-            "  const desktopEnsure = spawnSync(candidate.command, [...candidate.runPrefix, ...desktopEnsureArgs], { stdio: ['ignore', 'ignore', 'inherit'], env: process.env });\n"
-            "  if (!desktopEnsure.error && desktopEnsure.status === 0) {\n"
-            "    const desktopCollectArgs = [runtime, 'collect', '--host', 'claude-desktop', '--lifecycle', 'session_start', '--baseline', '--quiet'];\n"
-            "    spawnSync(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], { stdio: ['ignore', 'ignore', 'ignore'], env: process.env });\n"
-            "  }\n"
+            "  const desktopCollectArgs = [runtime, 'collect', '--host', 'claude-desktop', '--lifecycle', 'session_start', '--baseline', '--if-sources', '--quiet'];\n"
+            "  spawnSync(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], { stdio: ['ignore', 'ignore', 'ignore'], env: process.env });\n"
         )
     return (
         "const fs = require('fs');\n"

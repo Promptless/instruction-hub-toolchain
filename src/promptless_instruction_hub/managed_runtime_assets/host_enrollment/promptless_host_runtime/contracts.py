@@ -154,9 +154,9 @@ INTERNAL_PROMPTLESS_WELCOME_MESSAGE_LINES = (
 )
 
 
-# Latch for the one-time "enrollment succeeded" confirmation, keyed by target
-# (claude/claude-desktop/codex) so each host is confirmed once. Fired for every user on the first
-# healthy enrollment, unlike the internal-only pigfooder welcome above.
+# Latch for the one-time "enrollment succeeded" confirmation, keyed by enrollment target
+# (claude/codex) so each host is confirmed once. Fired for every user on the first healthy
+# enrollment, unlike the internal-only pigfooder welcome above.
 FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY = "first_enrollment_success_shown_at_by_target"
 
 
@@ -164,6 +164,11 @@ Host = Literal["codex", "claude", "claude-desktop"]
 
 
 HOST_VALUES = ("codex", "claude", "claude-desktop")
+
+
+def _enrollment_host(host: Host) -> Host:
+    """Return the host identity used for enrollment, credentials, and policy."""
+    return "claude" if host == "claude-desktop" else host
 
 
 ConfigStatus = Literal["blocked", "needs_restart", "configured"]
@@ -231,8 +236,6 @@ class HostPolicy:
 
     policy_version: int
     required_bootstrap_version: str | None
-    enabled_hosts: tuple[Host, ...]
-    expires_at: dt.datetime
 
 
 @dataclass(frozen=True)

@@ -33,9 +33,7 @@ from .contracts import (
     HOSTED_ENROLLMENT_APPROVAL_PATH,
     HOSTED_ENROLLMENT_START_PATH,
     HTTP_TIMEOUT_SECONDS,
-    Host,
     HostCredential,
-    HostPolicy,
     HostedEnrollmentRoutes,
     JsonValue,
     OPEN_BROWSER_ENV,
@@ -146,13 +144,7 @@ def _obtain_host_credential(context: EnrollmentContext, *, quiet: bool) -> Enrol
 
 
 def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None:
-    return _host_credential_from_state(context, _load_state(_state_path()))
-
-
-def _host_credential_from_state(
-    context: EnrollmentContext,
-    state: dict[str, JsonValue],
-) -> HostCredential | None:
+    state = _load_state(_state_path())
     credentials = _json_mapping_or_empty(state.get("credentials"))
     cached_credential = _json_mapping_or_empty(credentials.get(_credential_cache_key(context)))
     credential_value = _string_value(cached_credential.get("value"))
@@ -180,90 +172,6 @@ def _credential_with_policy_identity(credential: HostCredential, payload: dict[s
         deployment_instance_id=credential.deployment_instance_id,
         is_internal_promptless_user=True,
     )
-
-
-def _policy_observation_enrollment_host(host: Host) -> Host:
-    """Return the enrollment host whose policy observation governs optional work for this host."""
-    return "claude" if host == "claude-desktop" else host
-
-
-def _host_disabled_by_cached_policy(
-    context: EnrollmentContext,
-    host: Host,
-) -> bool:
-    """Return whether an unexpired validated policy observation omits the host.
-
-    Cached policy can suppress work for a disabled host. It never authorizes work
-    for an enabled host; that still requires a fresh Worker policy response. The
-    observation must match the credential currently enrolled for this policy host.
-    """
-
-    state = _load_state(_state_path())
-    credential = _host_credential_from_state(context, state)
-    if credential is None:
-        return False
-    observations = _json_mapping_or_empty(state.get("policy_observations"))
-    observation = _json_mapping_or_empty(observations.get(_policy_observation_cache_key(context, credential)))
-    if _string_value(observation.get("worker_base_url")) != context.worker_base_url:
-        return False
-    expires_at_text = _string_value(observation.get("expires_at"))
-    if expires_at_text is None:
-        return False
-    try:
-        expires_at = dt.datetime.fromisoformat(expires_at_text.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
-        return False
-    if expires_at <= dt.datetime.now(dt.timezone.utc):
-        return False
-    enabled_hosts = observation.get("enabled_hosts")
-    if not isinstance(enabled_hosts, list):
-        return False
-    return host not in enabled_hosts
-
-
-def _store_policy_observation(
-    context: EnrollmentContext,
-    credential: HostCredential,
-    policy: HostPolicy,
-) -> None:
-    """Best-effort persist a negative policy observation without blocking work on storage failures."""
-    try:
-        state_path = _state_path()
-        with _state_file_lock(state_path):
-            state = _load_state(state_path)
-            observations = _json_mapping_or_empty(state.get("policy_observations"))
-            cache_key = _policy_observation_cache_key(context, credential)
-            observation: dict[str, JsonValue] = {
-                "worker_base_url": context.worker_base_url,
-                "enabled_hosts": list(policy.enabled_hosts),
-                "expires_at": policy.expires_at.isoformat(),
-            }
-            if observations.get(cache_key) == observation:
-                return
-            observations[cache_key] = observation
-            state["policy_observations"] = observations
-            _write_state(state_path, state)
-    except (OSError, BootstrapError) as exc:
-        _emit(
-            {
-                "status": "policy_observation_not_stored",
-                "reason": "host_state_unavailable",
-                "message": str(exc),
-            },
-            quiet=True,
-        )
-        return
-
-
-def _policy_observation_cache_key(context: EnrollmentContext, credential: HostCredential) -> str:
-    cache_material = {
-        "credential_cache_key": _credential_cache_key(context),
-        "credential_id": credential.credential_id,
-        "credential_value_sha256": hashlib.sha256(credential.value.encode()).hexdigest(),
-    }
-    return hashlib.sha256(json.dumps(cache_material, sort_keys=True).encode()).hexdigest()
 
 
 def _store_internal_promptless_identity(context: EnrollmentContext, credential: HostCredential) -> None:

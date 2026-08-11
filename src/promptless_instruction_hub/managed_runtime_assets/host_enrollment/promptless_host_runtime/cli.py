@@ -18,17 +18,15 @@ from .contracts import (
     RUNTIME_EXECUTABLE,
     RUNTIME_VERSION,
     RuntimeMetadata,
+    _enrollment_host,
 )
 from .enrollment import (
     _credential_with_policy_identity,
     _enroll_host_credential,
     _enrollment_context,
     _forget_cached_host_credential,
-    _host_disabled_by_cached_policy,
     _obtain_host_credential,
-    _policy_observation_enrollment_host,
     _store_internal_promptless_identity,
-    _store_policy_observation,
 )
 from .host_config import _blocked_result, _ensure_host_config, _has_native_trace_sources
 from .metadata import (
@@ -68,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
             lifecycle=args.lifecycle,
             baseline=args.baseline,
             include_active=args.include_active,
+            if_sources=args.if_sources,
             quiet=args.quiet,
         )
     if args.command == "status":
@@ -111,6 +110,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include session files still inside the idle grace period after an established baseline",
     )
+    collect_parser.add_argument(
+        "--if-sources",
+        action="store_true",
+        help="Skip collection when the host has no native trace source files",
+    )
     collect_parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
 
     status_parser = subcommands.add_parser("status", help="Print local host-runtime status as JSON")
@@ -152,9 +156,13 @@ def _run_collect_command(
     lifecycle: str | None,
     baseline: bool,
     include_active: bool,
+    if_sources: bool,
     quiet: bool,
 ) -> int:
     try:
+        if if_sources and not _has_native_trace_sources(host):
+            _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
+            return 0
         event = _lifecycle_event(lifecycle)
         hook_context = _hook_trace_context(_read_hook_context())
         return _run_collect(
@@ -185,7 +193,8 @@ def _run_status_command(host: Host) -> int:
 def _run_enroll_command(host: Host) -> int:
     try:
         plugin_root = _plugin_root()
-        metadata = _load_runtime_metadata(plugin_root, host)
+        enrollment_target = _enrollment_host(host)
+        metadata = _load_runtime_metadata(plugin_root, enrollment_target)
         worker_base_url = _worker_base_url()
         dashboard_base_url = _dashboard_base_url()
         context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
@@ -195,7 +204,7 @@ def _run_enroll_command(host: Host) -> int:
                 {
                     "status": "setup_pending",
                     "reason": enrollment_attempt.reason or "approval_pending",
-                    "host": host,
+                    "host": enrollment_target,
                 }
             )
             return 0
@@ -203,7 +212,7 @@ def _run_enroll_command(host: Host) -> int:
         _emit_command_json(
             {
                 "status": "enrolled",
-                "host": host,
+                "host": enrollment_target,
                 "credential_id": credential.credential_id,
                 "deployment_instance_id": credential.deployment_instance_id or context.deployment_instance_id,
                 "host_instance_id": context.host_instance_id,
@@ -257,27 +266,15 @@ def _run_ensure(host: Host, *, quiet: bool, if_sources: bool) -> int:
     # `systemMessage`. The new version is recorded only after the hook output is emitted below,
     # so a later failure re-announces it on the next healthy session.
     plugin_root = _plugin_root()
-    metadata = _load_runtime_metadata(plugin_root, host)
+    enrollment_target = _enrollment_host(host)
+    metadata = _load_runtime_metadata(plugin_root, enrollment_target)
     worker_base_url = _worker_base_url()
     dashboard_base_url = _dashboard_base_url()
-    if if_sources:
-        policy_host = _policy_observation_enrollment_host(host)
-        policy_metadata = metadata if policy_host == host else _load_runtime_metadata(plugin_root, policy_host)
-        policy_context = _enrollment_context(worker_base_url, dashboard_base_url, policy_metadata)
-        if _host_disabled_by_cached_policy(policy_context, host):
-            _emit({"status": "trace_upload_skipped", "reason": "policy_disabled", "host": host}, quiet=quiet)
-            return 0
-        context = (
-            policy_context
-            if policy_host == host
-            else _enrollment_context(worker_base_url, dashboard_base_url, metadata)
-        )
-    else:
-        context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+    context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
     pending_update = _pending_plugin_update(metadata)
     update_notice = pending_update.notice if pending_update is not None else None
     exit_code = _run_host_enrollment(
-        host,
+        enrollment_target,
         metadata,
         context,
         quiet=quiet,
@@ -347,7 +344,6 @@ def _run_host_enrollment(
         credential = enrollment_attempt.credential
         signed_policy = _get_json(policy_url, credential.value, label="policy response")
     policy = _validate_signed_policy(signed_policy, host)
-    _store_policy_observation(context, credential, policy)
     credential = _credential_with_policy_identity(credential, signed_policy)
     _store_internal_promptless_identity(context, credential)
     trace_upload_endpoint = _worker_url(worker_base_url, "/v0/traces/batches")
