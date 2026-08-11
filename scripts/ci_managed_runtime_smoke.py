@@ -133,7 +133,7 @@ def _build_hub(toolchain: Sequence[os.PathLike[str] | str], workspace: Path) -> 
     hub_root = workspace / "hub"
     _run([*toolchain, "init", "--hub", hub_root, "--org", "Artifact Smoke"], cwd=workspace)
     _run([*toolchain, "build", "--hub", hub_root], cwd=workspace)
-    plugin_root = hub_root / "dist" / "codex" / "core"
+    plugin_root = hub_root / "dist" / "codex" / "pig"
     if not plugin_root.is_dir():
         raise AssertionError(f"installed toolchain did not build the Codex plugin at {plugin_root}")
     return plugin_root
@@ -378,6 +378,78 @@ def _two_process_lock_smoke(bin_root: Path, runtime_python: Path, workspace: Pat
                 process.communicate(timeout=5)
 
 
+def _detach_launcher(bin_root: Path, started: Path, release: Path, captured_stdin: Path) -> None:
+    sys.path.insert(0, str(bin_root))
+    runtime_cli = importlib.import_module(f"{RUNTIME_PACKAGE}.cli")
+    spawn_detached = getattr(runtime_cli, "_spawn_detached")
+    spawn_detached(
+        [
+            sys.executable,
+            "-S",
+            str(Path(__file__).resolve()),
+            "_detach-child",
+            str(started),
+            str(release),
+            str(captured_stdin),
+        ]
+    )
+
+
+def _detach_child(started: Path, release: Path, captured_stdin: Path) -> None:
+    started.write_text("started\n")
+    deadline = time.monotonic() + 15
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError("detached child timed out waiting for release")
+        time.sleep(0.02)
+    captured_stdin.write_text(sys.stdin.read())
+
+
+def _detached_process_smoke(bin_root: Path, runtime_python: Path, workspace: Path) -> None:
+    started = workspace / "detached-started"
+    release = workspace / "detached-release"
+    captured_stdin = workspace / "detached-stdin"
+    input_text = "hook stdin remains available after launcher exit\n"
+    launcher = subprocess.run(
+        [
+            str(runtime_python),
+            "-S",
+            str(Path(__file__).resolve()),
+            "_detach-launcher",
+            str(bin_root),
+            str(started),
+            str(release),
+            str(captured_stdin),
+        ],
+        cwd=workspace,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+    if launcher.returncode != 0:
+        raise AssertionError(
+            f"detach launcher failed ({launcher.returncode})\nstdout:\n{launcher.stdout}\nstderr:\n{launcher.stderr}"
+        )
+    deadline = time.monotonic() + 10
+    while not started.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError("detached child did not start after launcher exit")
+        time.sleep(0.02)
+    if captured_stdin.exists():
+        raise AssertionError("detached child completed before its release signal")
+    release.write_text("release\n")
+    deadline = time.monotonic() + 10
+    while not captured_stdin.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError("detached child did not complete after launcher exit")
+        time.sleep(0.02)
+    if captured_stdin.read_text() != input_text:
+        raise AssertionError("detached child did not preserve launcher stdin")
+
+
 def _platform_smoke(runtime_python: Path, *, require_windows: bool) -> None:
     if require_windows and os.name != "nt":
         raise AssertionError(f"Windows lock smoke ran on os.name={os.name!r}")
@@ -387,7 +459,8 @@ def _platform_smoke(runtime_python: Path, *, require_windows: bool) -> None:
         plugin_root = _build_hub([sys.executable, "-m", "promptless_instruction_hub.cli"], workspace)
         _verify_generated_runtime(plugin_root, runtime_python, toolchain_version, workspace)
         _two_process_lock_smoke(plugin_root / "runtime", runtime_python, workspace)
-    print(f"validated generated runtime and two-process state lock on os.name={os.name}")
+        _detached_process_smoke(plugin_root / "runtime", runtime_python, workspace)
+    print(f"validated generated runtime, state lock, and detachment on os.name={os.name}")
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -409,6 +482,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         child.add_argument("state_path", type=Path)
         child.add_argument("signal_a", type=Path)
         child.add_argument("signal_b", type=Path)
+    detach_launcher = subcommands.add_parser("_detach-launcher", help=argparse.SUPPRESS)
+    detach_launcher.add_argument("bin_root", type=Path)
+    detach_launcher.add_argument("started", type=Path)
+    detach_launcher.add_argument("release", type=Path)
+    detach_launcher.add_argument("captured_stdin", type=Path)
+    detach_child = subcommands.add_parser("_detach-child", help=argparse.SUPPRESS)
+    detach_child.add_argument("started", type=Path)
+    detach_child.add_argument("release", type=Path)
+    detach_child.add_argument("captured_stdin", type=Path)
     return parser.parse_args(argv)
 
 
@@ -418,6 +500,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         _artifact_smoke(args.dist.resolve(), args.uv.resolve(), args.runtime_python.resolve())
     elif args.command == "platform":
         _platform_smoke(args.runtime_python.resolve(), require_windows=args.require_windows)
+    elif args.command == "_detach-launcher":
+        _detach_launcher(args.bin_root, args.started, args.release, args.captured_stdin)
+    elif args.command == "_detach-child":
+        _detach_child(args.started, args.release, args.captured_stdin)
     elif args.command == "_lock-holder":
         _lock_child(args.bin_root, args.state_path, args.signal_a, args.signal_b, holder=True)
     else:

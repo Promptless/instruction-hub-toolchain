@@ -78,6 +78,11 @@ Customer hubs should usually use `build` for pull requests and `publish` after
 changes merge to the default branch. Use `check` only for repositories that
 intentionally commit generated artifacts on the same branch as source assets.
 
+Every hub must keep the canonical `pig` package in `stable_packages`. `pig init`
+scaffolds that package as the home for scanned shared instructions and the
+Promptless-managed lifecycle integration. Other customer instruction packages
+do not receive managed hooks or runtime files.
+
 ## Hub File Layout
 
 Instruction Hub source config lives at `hub.yaml` in the hub root. Build-generated
@@ -108,29 +113,32 @@ pin to an immutable tag for stricter reproducibility.
 
 ## Managed Host Runtime
 
-The toolchain owns Promptless-managed runtime artifacts that must be injected
-into generated customer plugins, including the host runtime used by Codex and
-Claude lifecycle hooks. During dogfood, generated Codex hooks wrap the bundled
+The toolchain owns Promptless-managed runtime artifacts that are injected into
+the canonical `pig` plugin, including the host runtime used by Codex and
+Claude lifecycle hooks. Other generated plugins receive no toolchain-managed
+runtime or lifecycle hooks. During dogfood, generated Codex hooks wrap the bundled
 stdlib-only Python runtime with POSIX shell checks. The stable executable in
 `runtime/` delegates to private sibling modules that separate CLI dispatch,
 enrollment, trace collection, host configuration, persistence, and output.
-Generated Claude hooks use
-Claude Code's exec-form hook so Windows installs do not need a POSIX shell; Node
-must be available to start the inline launcher. Startup launchers emit
-schema-safe diagnostics when the host cannot resolve the plugin root, a readable
-managed runtime bundle (the launcher plus its sibling package and CLI entry
-module), or Python 3.9+. Terminal lifecycle launchers stay quiet: they resolve a
-complete runtime bundle under the plugin root, fall back to a complete sibling
-installed version with the same runtime-bundle layout for the same plugin id
-when the recorded root is stale or incomplete, and exit 0 with no output when
-no usable bundle exists.
+Generated Claude hooks use Claude Code's exec-form hook so Windows installs do
+not need a POSIX shell; Node must be available to start the inline launcher.
+Every launcher starts its primary host collection in a detached process that
+inherits the hook input and redirects collection output away from the agent
+transcript. The sibling Claude Desktop baseline starts without hook input.
+Startup launchers emit schema-safe diagnostics when the host cannot resolve the
+plugin root, a readable managed runtime bundle (the launcher plus its sibling
+package and CLI entry module), or Python 3.9+. Terminal lifecycle launchers stay
+quiet: they resolve a complete runtime bundle under the plugin root, fall back
+to a complete sibling installed version with the same runtime-bundle layout for
+the same plugin id when the recorded root is stale or incomplete, and exit 0
+with no output when no usable bundle exists.
 
 ```sh
-sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime ensure --host codex; run promptless-host-runtime collect --host codex --lifecycle session_start --baseline --quiet'
-sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle stop --quiet'
-sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle session_end --quiet'
-node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find Python 3.9+; run promptless-host-runtime ensure --host claude; run promptless-host-runtime collect --host claude --lifecycle session_start --baseline --quiet; best-effort run promptless-host-runtime ensure --host claude-desktop --if-sources; then collect --host claude-desktop only if ensure succeeds' '${CLAUDE_PLUGIN_ROOT}'
-node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host claude --lifecycle session_end --quiet' '${CLAUDE_PLUGIN_ROOT}'
+sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime ensure --host codex --prepare-baseline; run promptless-host-runtime collect --host codex --lifecycle session_start --baseline --detach --quiet'
+sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle stop --detach --quiet'
+sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle session_end --detach --quiet'
+node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find Python 3.9+; run promptless-host-runtime ensure --host claude --prepare-baseline; run promptless-host-runtime collect --host claude --lifecycle session_start --baseline --detach --quiet; best-effort run promptless-host-runtime ensure --host claude-desktop --if-sources --prepare-baseline; then collect --host claude-desktop only if ensure succeeds' '${CLAUDE_PLUGIN_ROOT}'
+node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host claude --lifecycle session_end --detach --quiet' '${CLAUDE_PLUGIN_ROOT}'
 ```
 
 The dogfood host runtime uses `PROMPTLESS_WORKER_BASE_URL` or the default
@@ -147,7 +155,10 @@ quiet first baseline for each host; terminal lifecycle hooks (`Stop`,
 `SessionEnd`, and `SubagentStop`) run collection only. Collection uses hook stdin
 transcript references first, accepting snake_case, camelCase, and nested
 `session`/`transcript`/`agent` shapes from Codex- and Claude-style hooks, then
-scans idle host-native transcript roots as a catch-up path. The forward-only
+scans idle host-native transcript roots as a catch-up path. SessionStart creates
+a durable pending guard before it waits for enrollment and check-in, then
+detaches collection; terminal hooks detach
+collection after resolving the runtime and Python interpreter. The forward-only
 ledger lives at `~/.promptless/instruction-hub/host-runtime-ledger.json` or
 `PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads are authenticated with the
 same host credential and are gated by the `enabled_hosts` policy.
@@ -169,26 +180,28 @@ failing the run, so one bad idle file cannot block the hook subject's upload.
 Support diagnostics are written as bounded, redacted JSONL at
 `~/.promptless/instruction-hub/host-runtime-diagnostics.jsonl` with `0600`
 permissions and without transcript content, tool inputs, or credentials.
+Detached collector launch and nonzero-exit failures are recorded there and in
+the structured `last-bootstrap-status.json` support status.
 
-Planned follow-on (not yet implemented): move all tree-scale work out of the
-hook path into a detached drainer. Hooks would upload only their own transcript
-increment and then spawn a short-lived, low-priority background process that
-owns the idle sweep and any historical backfill under its own byte/time budget,
-acquiring the ledger lock per batch so live hooks never skip on
-`ledger_lock_busy`. That change should also dissolve the first-run baseline
-into an explicit newest-first backlog policy so pre-enrollment history can be
-uploaded gradually instead of being permanently skipped. Hooks stay the
-scheduler — no launchd/systemd daemon on user machines.
+Hook-triggered collectors still scan idle transcript roots and hold the ledger
+lock across catch-up uploads. The collector process is detached from the hook,
+so that work cannot delay the host or remain in the hook's process group.
+Baseline collections reuse the durable pending guard created by SessionStart
+and wait for the shared ledger lock until the collection deadline. If a missing
+guard cannot be created, collection stops before policy lookup or upload. A
+timed-out baseline leaves the guard in place, so terminal collections cannot
+upload pre-enrollment history before a later SessionStart completes the
+baseline. Other collections stay non-blocking and can skip when another
+collector holds the lock.
 
-Host enrollment is per host, not per plugin. The credential and pending approval
-are cached at a single host-global path (`~/.promptless/instruction-hub/`) and
-keyed only on the worker deployment and agent host (claude/codex), so every
-Promptless plugin a user installs from the hub shares one credential. A
-non-blocking, per-credential enrollment-leader lock ensures that when multiple
-plugins start at once, exactly one drives the single browser approval while the
-others reuse the result or defer to a later session. The per-plugin
-`CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA` directories are intentionally not used for this
-state.
+Host enrollment is per host, not per installed `pig` version. The credential
+and pending approval are cached at a single host-global path
+(`~/.promptless/instruction-hub/`) and keyed only on the worker deployment and
+agent host (claude/codex). A non-blocking, per-credential enrollment-leader lock
+ensures that overlapping host starts or plugin upgrades drive at most one browser
+approval while the others reuse the result or defer to a later session. The
+per-plugin `CLAUDE_PLUGIN_DATA`/`PLUGIN_DATA` directories are intentionally not
+used for this state.
 
 Native JSONL ledgers are the only telemetry source: the runtime writes no OTel
 exporter config for either host. Hosts configured by earlier managed bootstraps
@@ -200,10 +213,13 @@ ignored.
 
 The host runtime has one executable entrypoint with subcommands. `ensure` is the hook-safe
 path that enrolls when needed, removes legacy managed telemetry config, and
-posts a check-in. `collect` is the non-blocking native JSONL upload path; pass
-`--include-active` for a user-initiated sweep that includes files still inside
-the idle grace period after SessionStart has established the upload baseline. `enroll`
-acquires only the host credential. `status` prints local JSON without network,
+posts a check-in. SessionStart adds `--prepare-baseline` so `ensure` persists the
+guard required before it can detach baseline collection. `collect` is the
+native JSONL upload path; hooks pass `--detach` so the runtime supervises
+collection outside the hook process group. Pass `--include-active` for a
+user-initiated sweep that includes files still inside the idle grace period
+after SessionStart has established the upload baseline. `enroll` acquires only
+the host credential. `status` prints local JSON without network,
 browser, config writes, or check-ins. `reset --yes` clears cached host
 credentials and pending enrollments while preserving the stable host id,
 last-seen plugin versions, and one internal welcome marker per installed

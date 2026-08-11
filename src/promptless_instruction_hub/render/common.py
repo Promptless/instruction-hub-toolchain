@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from promptless_instruction_hub.fs import JsonValue
-from promptless_instruction_hub.models import HubConfig, PackageDefinition
+from promptless_instruction_hub.models import PIG_PACKAGE_ID, HubConfig, PackageDefinition
 
 RenderedAssets = dict[str, list[str]]
 
@@ -29,6 +29,8 @@ def package_plugin_id(config: HubConfig, package: PackageDefinition) -> str:
 def plugin_description(config: HubConfig, package: PackageDefinition) -> str:
     """Return the stable user-facing plugin description."""
 
+    if package.id == PIG_PACKAGE_ID:
+        return f"Promptless Instruction Governance instructions and lifecycle integration for {config.org}."
     return f"Governed agent instructions for {config.org}: {package.name}."
 
 

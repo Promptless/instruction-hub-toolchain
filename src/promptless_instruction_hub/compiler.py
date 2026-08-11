@@ -10,7 +10,7 @@ from pathlib import Path
 from promptless_instruction_hub.config import CONFIG_PATH, PACKAGE_DIR, RELEASE_MANIFEST_PATH, STABLE_CHANNEL_PATH
 from promptless_instruction_hub.errors import BuildCheckFailedError
 from promptless_instruction_hub.fs import JsonValue, replace_tree, trees_equal, write_yaml
-from promptless_instruction_hub.models import HubConfig
+from promptless_instruction_hub.models import PIG_PACKAGE_ID, PIG_PACKAGE_NAME, HubConfig
 from promptless_instruction_hub.release.manifests import build_release_manifest, write_release_files
 from promptless_instruction_hub.render.plugins import embed_release_manifest, render_target_plugins
 from promptless_instruction_hub.validate.hub import ValidationResult, validate_hub
@@ -78,8 +78,8 @@ def init_hub(
     )
     _write_file_if_missing(root / CONFIG_PATH, config.model_dump())
     _write_file_if_missing(
-        root / PACKAGE_DIR / "core.yaml",
-        {"id": "core", "name": "Core", "owners": [], "includes": []},
+        root / PACKAGE_DIR / f"{PIG_PACKAGE_ID}.yaml",
+        {"id": PIG_PACKAGE_ID, "name": PIG_PACKAGE_NAME, "owners": [], "includes": []},
     )
     for relative_dir in (
         "assets/skills",
