@@ -111,7 +111,16 @@ Action releases are tagged with immutable versions such as `v0.1.0` and a moving
 major pointer such as `v0`. Customer workflows can use `@v0` for minor updates or
 pin to an immutable tag for stricter reproducibility.
 
-## Managed Host Runtime
+## Managed PIG Assets
+
+The toolchain injects the harness-specific `update-instruction-hub-mid-session`
+skill into the canonical `pig` plugin for Codex and Claude. It updates only the
+Promptless Instruction Hub marketplace and its installed plugins. Codex uses
+its marketplace upgrade and skill refresh operations; Claude updates each
+installed plugin at its original scope and uses `/reload-plugins` to apply the
+changes without restarting.
+
+### Managed Host Runtime
 
 The toolchain owns Promptless-managed runtime artifacts that are injected into
 the canonical `pig` plugin, including the host runtime used by Codex and

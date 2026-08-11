@@ -86,6 +86,17 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     assert (hub_root / "dist/codex/pig/runtime/promptless-host-runtime").exists()
     assert (hub_root / "dist/claude/pig/hooks/hooks.json").exists()
     assert (hub_root / "dist/claude/pig/runtime/promptless-host-runtime").exists()
+    codex_update_skill = (hub_root / "dist/codex/pig/skills/update-instruction-hub-mid-session/SKILL.md").read_text()
+    assert "# Update Instruction Hub Mid-session" in codex_update_skill
+    assert "codex plugin marketplace upgrade promptless-instruction-hub-marketplace --json" in codex_update_skill
+    assert "skills/list" in codex_update_skill
+    claude_update_skill = (hub_root / "dist/claude/pig/skills/update-instruction-hub-mid-session/SKILL.md").read_text()
+    assert "# Update Instruction Hub Mid-session" in claude_update_skill
+    assert "claude plugin marketplace update promptless-instruction-hub-marketplace" in claude_update_skill
+    assert "claude plugin update <id> --scope <scope>" in claude_update_skill
+    assert "/reload-plugins" in claude_update_skill
+    for target in ("cursor", "gemini"):
+        assert not (hub_root / "dist" / target / "pig/skills/update-instruction-hub-mid-session").exists()
     cursor_manifest = json.loads((hub_root / "dist/cursor/pig/.cursor-plugin/plugin.json").read_text())
     assert cursor_manifest["name"] == "promptless-instruction-hub-pig"
     assert cursor_manifest["displayName"] == "PIG"
@@ -157,6 +168,9 @@ def test_build_renders_stable_packages_as_separate_marketplace_plugins(tmp_path:
         assert not (hub_root / "dist" / target / "dev" / "hooks/hooks.json").exists()
         assert not (hub_root / "dist" / target / "ops" / "hooks/hooks.json").exists()
         assert (hub_root / "dist" / target / "pig" / "hooks/hooks.json").exists()
+        assert not (hub_root / "dist" / target / "dev/skills/update-instruction-hub-mid-session").exists()
+        assert not (hub_root / "dist" / target / "ops/skills/update-instruction-hub-mid-session").exists()
+        assert (hub_root / "dist" / target / "pig/skills/update-instruction-hub-mid-session/SKILL.md").exists()
 
     codex_marketplace = json.loads((hub_root / ".agents/plugins/marketplace.json").read_text())
     assert [(plugin["name"], plugin["source"]["path"]) for plugin in codex_marketplace["plugins"]] == [
