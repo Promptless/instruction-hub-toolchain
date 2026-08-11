@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Union
 
-RUNTIME_VERSION = "0.2.5"
+RUNTIME_VERSION = "0.2.6"
 
 
 RUNTIME_CHANNEL = "stable"
@@ -38,6 +38,9 @@ MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
 
 
 MANAGED_RUNTIME_MANIFEST = Path("hub.managed-runtimes.json")
+
+
+RELEASE_MANIFEST = Path("hub.release.json")
 
 
 STATE_FILE_NAME = "host-enrollment-state.json"
@@ -77,6 +80,9 @@ CHUNK_TARGET_BYTES = 4 * 1024 * 1024
 
 
 MAX_UPLOAD_CHUNKS_PER_BATCH = 200
+
+
+MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH = 200
 
 
 # Per-request wire budget measured on the encoded body, distinct from the decoded
@@ -221,9 +227,20 @@ class RuntimeMetadata:
     bootstrap_version: str
     toolchain_version: str
     plugin_id: str
+    plugin_name: str
     plugin_version: str
     package_id: str
     target: Host
+
+
+@dataclass(frozen=True)
+class InstalledInstructionHubRelease:
+    """Validated identity of the Instruction Hub installed beside this runtime."""
+
+    plugin_id: str
+    plugin_name: str
+    plugin_version: str
+    release_id: str
 
 
 @dataclass(frozen=True)

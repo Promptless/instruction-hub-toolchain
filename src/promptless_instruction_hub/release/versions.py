@@ -53,6 +53,7 @@ MANAGED_RUNTIME_KEYS = frozenset(
         "package_id",
         "path",
         "plugin_id",
+        "plugin_name",
         "plugin_version",
         "sha256",
         "status",
@@ -61,6 +62,7 @@ MANAGED_RUNTIME_KEYS = frozenset(
         "version",
     }
 )
+LEGACY_MANAGED_RUNTIME_KEYS = MANAGED_RUNTIME_KEYS - {"plugin_name"}
 SUPPORT_KEYS = frozenset({"mode", "reason"})
 SUPPORT_MODES = frozenset({"agent-skill", "native", "projected", "unsupported"})
 HOST_RUNTIME_ID = "host-runtime"
@@ -442,7 +444,10 @@ def _validate_managed_runtimes(manifest_path: Path, runtimes: list[JsonValue], k
     for index, runtime_value in enumerate(runtimes):
         runtime = _require_mapping_value(manifest_path, runtime_value, f"{key_path}[{index}]")
         runtime_path = f"{key_path}[{index}]"
-        _require_exact_keys(manifest_path, runtime, runtime_path, MANAGED_RUNTIME_KEYS)
+        if set(runtime) not in {MANAGED_RUNTIME_KEYS, LEGACY_MANAGED_RUNTIME_KEYS}:
+            expected = ", ".join(sorted(MANAGED_RUNTIME_KEYS))
+            msg = f"{manifest_path}: {runtime_path} must contain exactly these keys: {expected}"
+            raise ValueError(msg)
         runtime_id = runtime["id"]
         if not isinstance(runtime_id, str) or runtime_id not in PREVIOUS_RELEASE_MANAGED_RUNTIME_IDS:
             msg = f"{manifest_path}: {runtime_path}.id must be host-runtime or host-enrollment-bootstrap"
@@ -454,7 +459,7 @@ def _validate_managed_runtimes(manifest_path: Path, runtimes: list[JsonValue], k
         if target not in {"claude", "codex"}:
             msg = f"{manifest_path}: {runtime_path}.target must be claude or codex"
             raise ValueError(msg)
-        for string_key in MANAGED_RUNTIME_KEYS - {"id", "status", "target", "sha256"}:
+        for string_key in set(runtime) - {"id", "status", "target", "sha256"}:
             value = runtime[string_key]
             if not isinstance(value, str) or not value:
                 msg = f"{manifest_path}: {runtime_path}.{string_key} must be a non-empty string"

@@ -108,6 +108,7 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     assert {runtime["plugin_id"] for runtime in release_manifest["managed_runtimes"]} == {
         "promptless-instruction-hub-pig"
     }
+    assert {runtime["plugin_name"] for runtime in release_manifest["managed_runtimes"]} == {"PIG"}
     assert {asset["title"] for asset in release_manifest["assets"]} == {"Repository MCP Servers", "Review Docs"}
 
 

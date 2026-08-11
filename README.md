@@ -163,6 +163,29 @@ ledger lives at `~/.promptless/instruction-hub/host-runtime-ledger.json` or
 `PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads are authenticated with the
 same host credential and are gated by the `enabled_hosts` policy.
 
+When a SessionStart hook identifies an exact transcript path and session, the
+collector validates the installed plugin's `hub.release.json` and durably marks
+the source offset where that release begins to govern new bytes. Uploads retain
+their original raw chunks and add customer-local analysis-context snapshots for
+the marker intersections. Each snapshot carries the package-scoped `plugin_id`
+and display `plugin_name` of the plugin whose embedded runtime is executing,
+plus the hub-wide `plugin_version` and content-derived `release_id`. The runtime
+identity must match the content-validated release manifest. A release may list
+other package plugins, but the collector does not claim those siblings are
+installed. The marker is written before upload so retries preserve the same
+boundary and capture timestamp. Idle catch-up sources and ambiguous sessions
+receive no release assertion; missing provenance means unknown, not that no
+Instruction Hub release was installed.
+
+Snapshot-heavy uploads page at existing chunk boundaries to stay within the
+worker's 200-snapshot request limit. If one complete-record chunk alone crosses
+more than 200 release boundaries, collection fails before upload instead of
+acknowledging bytes whose provenance was omitted.
+
+Roll out the fully compatible worker first, with empty release fields omitted
+when it calls Hosted Runtime. Deploy Hosted Runtime next, then this collector
+version last; older native upload models reject unknown fields.
+
 Quiet collection stays hook-safe: it never writes status JSON to stdout, and it
 fails open if the ledger lock is busy. The collection deadline (default 25
 seconds, overridable with `PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS`) is
