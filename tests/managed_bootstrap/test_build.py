@@ -35,6 +35,7 @@ from .helpers import (
     _assert_hook_argv,
     _assert_hook_system_message,
     _assert_no_promptless_directory,
+    _claude_desktop_audit_path,
     _clean_env,
     _diagnostic_log_entries,
     _diagnostic_log_path,
@@ -136,6 +137,11 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         stub_runtime.write_text(
             "import json, os, sys, time\n"
             "if sys.argv[1:2] == ['collect'] and ('--detach' in sys.argv or '--supervised' in sys.argv):\n"
+            "    host = sys.argv[sys.argv.index('--host') + 1]\n"
+            "    if '--detach' in sys.argv and '--baseline' in sys.argv:\n"
+            "        baseline_guard = os.environ['PROMPTLESS_STUB_CALL_LOG'] + '.' + host + '.baseline-pending'\n"
+            "        with open(baseline_guard, 'w') as guard:\n"
+            "            guard.write('pending\\n')\n"
             "    from promptless_host_runtime.cli import main\n"
             "    sys.exit(main(sys.argv[1:]))\n"
             "host = sys.argv[sys.argv.index('--host') + 1] if '--host' in sys.argv else ''\n"
@@ -244,15 +250,14 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 "last status",
             )
 
-        def assert_startup_calls() -> None:
+        def assert_startup_calls(*, include_desktop: bool = False) -> None:
             expected_calls = [
                 ["ensure", "--host", target, "--prepare-baseline"],
                 ["collect", "--host", target, "--lifecycle", "session_start", "--baseline", "--quiet"],
             ]
-            if target == "claude":
+            if target == "claude" and include_desktop:
                 expected_calls.extend(
                     [
-                        ["ensure", "--host", "claude-desktop", "--if-sources", "--prepare-baseline"],
                         [
                             "collect",
                             "--host",
@@ -260,6 +265,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                             "--lifecycle",
                             "session_start",
                             "--baseline",
+                            "--if-sources",
                             "--quiet",
                         ],
                     ]
@@ -296,6 +302,9 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             if input_text is not None:
                 env_vars["PROMPTLESS_STUB_CAPTURE_BASELINE_STDIN"] = "1"
             if target == "claude":
+                desktop_audit_path = _claude_desktop_audit_path(home, "local-agent-mode-sessions", "session-1")
+                desktop_audit_path.parent.mkdir(parents=True, exist_ok=True)
+                desktop_audit_path.write_text('{"sessionId":"desktop_session_1"}\n')
                 env_vars["CLAUDE_PLUGIN_ROOT"] = str(root)
                 return subprocess.run(
                     [session_start_hook["command"], *session_start_hook["args"]],
@@ -410,9 +419,10 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert "'--quiet'" in hook_script
             assert "'claude-desktop'" in hook_script
             assert "'--if-sources'" in hook_script
-            assert "desktopEnsure" in hook_script
+            assert "desktopEnsure" not in hook_script
+            assert "const desktopCollectArgs" in hook_script
             assert "timeout: 5000" not in hook_script
-            assert "['ignore', 'ignore', 'inherit']" in hook_script
+            assert "['ignore', 'ignore', 'ignore']" in hook_script
 
             node_path = shutil.which("node")
             assert node_path is not None
@@ -701,7 +711,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert Path(f"{stub_call_log}.{target}.baseline-pending").exists()
         if target == "claude":
             assert Path(f"{stub_call_log}.claude-desktop.baseline-pending").exists()
-        assert_startup_calls()
+        assert_startup_calls(include_desktop=target == "claude")
 
         reset_stub_calls()
         failed_primary_ensure = startup_hook_result(
@@ -713,30 +723,6 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         time.sleep(0.5)
         assert stub_calls() == [["ensure", "--host", target, "--prepare-baseline"]]
         assert stub_attempts() == [["ensure", "--host", target, "--prepare-baseline"]]
-
-        if target == "claude":
-            reset_stub_calls()
-            failed_desktop_ensure = startup_hook_result(
-                root=stub_root,
-                home=tmp_path / "claude-failed-desktop-ensure-home",
-                ensure_failure_host="claude-desktop",
-            )
-            _assert_hook_argv(failed_desktop_ensure, target)
-            assert_calls_eventually(
-                [
-                    ["ensure", "--host", "claude", "--prepare-baseline"],
-                    ["collect", "--host", "claude", "--lifecycle", "session_start", "--baseline", "--quiet"],
-                    ["ensure", "--host", "claude-desktop", "--if-sources", "--prepare-baseline"],
-                ]
-            )
-            time.sleep(0.5)
-            assert sorted(stub_attempts()) == sorted(
-                [
-                    ["ensure", "--host", "claude", "--prepare-baseline"],
-                    ["collect", "--host", "claude", "--lifecycle", "session_start", "--baseline", "--quiet"],
-                    ["ensure", "--host", "claude-desktop", "--if-sources", "--prepare-baseline"],
-                ]
-            )
 
         if target == "claude":
             reset_stub_calls()
@@ -752,7 +738,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 input_text=stdin_payload,
             )
             _assert_hook_argv(session_start_result, target)
-            assert_startup_calls()
+            assert_startup_calls(include_desktop=True)
             assert_stdin_entries_eventually(
                 [
                     {
@@ -775,6 +761,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                             "--lifecycle",
                             "session_start",
                             "--baseline",
+                            "--if-sources",
                             "--quiet",
                         ],
                         "stdin": "",

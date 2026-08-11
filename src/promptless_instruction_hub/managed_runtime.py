@@ -409,17 +409,9 @@ def _node_host_runtime_hook_script(
         )
     claude_desktop_collect_script = ""
     if collect_claude_desktop:
-        # Desktop ensure is not quiet so pending approval is persisted, but stdout stays
-        # suppressed so the best-effort sibling ensure cannot emit a second hook-control object.
         claude_desktop_collect_script = (
-            "  const desktopEnsureArgs = [runtime, 'ensure', '--host', 'claude-desktop', '--if-sources', '--prepare-baseline'];\n"
-            "  const desktopEnsure = spawnSync(candidate.command, [...candidate.runPrefix, ...desktopEnsureArgs], { stdio: ['ignore', 'ignore', 'inherit'], env: process.env });\n"
-            "  if (desktopEnsure.error) {\n"
-            "    emitLaunchFailure('claude-desktop', desktopEnsure.error);\n"
-            "  } else if (desktopEnsure.status === 0) {\n"
-            "    const desktopCollectArgs = [runtime, 'collect', '--host', 'claude-desktop', '--lifecycle', 'session_start', '--baseline', '--detach', '--quiet'];\n"
-            "    launchDetachedCollector(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], ['ignore', 'ignore', 'ignore'], 'claude-desktop');\n"
-            "  }\n"
+            "  const desktopCollectArgs = [runtime, 'collect', '--host', 'claude-desktop', '--lifecycle', 'session_start', '--baseline', '--if-sources', '--detach', '--quiet'];\n"
+            "  launchDetachedCollector(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], ['ignore', 'ignore', 'ignore'], 'claude-desktop');\n"
         )
     return (
         "const fs = require('fs');\n"

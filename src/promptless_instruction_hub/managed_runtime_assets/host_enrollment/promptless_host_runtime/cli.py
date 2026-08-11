@@ -21,6 +21,7 @@ from .contracts import (
     RUNTIME_EXECUTABLE,
     RUNTIME_VERSION,
     RuntimeMetadata,
+    _enrollment_host,
 )
 from .enrollment import (
     _credential_with_policy_identity,
@@ -76,10 +77,17 @@ def main(argv: list[str] | None = None) -> int:
             lifecycle=args.lifecycle,
             baseline=args.baseline,
             include_active=args.include_active,
+            if_sources=args.if_sources,
             quiet=args.quiet,
         )
         if args.detach:
-            return _launch_detached_collect(host, collector_args)
+            return _launch_detached_collect(
+                host,
+                collector_args,
+                baseline=args.baseline,
+                if_sources=args.if_sources,
+                quiet=args.quiet,
+            )
         if args.supervised:
             return _supervise_collect(host, collector_args)
         return _run_collect_command(
@@ -87,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
             lifecycle=args.lifecycle,
             baseline=args.baseline,
             include_active=args.include_active,
+            if_sources=args.if_sources,
             quiet=args.quiet,
         )
     if args.command == "status":
@@ -139,6 +148,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include session files still inside the idle grace period after an established baseline",
     )
+    collect_parser.add_argument(
+        "--if-sources",
+        action="store_true",
+        help="Skip collection when the host has no native trace source files",
+    )
     collect_parser.add_argument("--quiet", action="store_true", help="Suppress hook status output")
     collect_execution = collect_parser.add_mutually_exclusive_group()
     collect_execution.add_argument("--detach", action="store_true", help="Run collection in a detached process")
@@ -183,9 +197,13 @@ def _run_collect_command(
     lifecycle: str | None,
     baseline: bool,
     include_active: bool,
+    if_sources: bool,
     quiet: bool,
 ) -> int:
     try:
+        if if_sources and not _has_native_trace_sources(host):
+            _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
+            return 0
         event = _lifecycle_event(lifecycle)
         hook_context = _hook_trace_context(_read_hook_context())
         return _run_collect(
@@ -209,6 +227,7 @@ def _collector_command_args(
     lifecycle: str | None,
     baseline: bool,
     include_active: bool,
+    if_sources: bool,
     quiet: bool,
 ) -> list[str]:
     command_args = ["collect", "--host", host]
@@ -218,12 +237,33 @@ def _collector_command_args(
         command_args.append("--baseline")
     if include_active:
         command_args.append("--include-active")
+    if if_sources:
+        command_args.append("--if-sources")
     if quiet:
         command_args.append("--quiet")
     return command_args
 
 
-def _launch_detached_collect(host: Host, collector_args: list[str]) -> int:
+def _launch_detached_collect(
+    host: Host,
+    collector_args: list[str],
+    *,
+    baseline: bool = False,
+    if_sources: bool = False,
+    quiet: bool = False,
+) -> int:
+    if if_sources and not _has_native_trace_sources(host):
+        _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
+        return 0
+    if baseline:
+        try:
+            _prepare_baseline(host)
+        except OSError:
+            _emit(
+                {"status": "trace_upload_degraded", "reason": "baseline_pending_write_failed", "host": host},
+                quiet=quiet,
+            )
+            return 1
     supervisor_args = [
         sys.executable,
         str(Path(sys.argv[0]).resolve()),
@@ -298,7 +338,8 @@ def _run_status_command(host: Host) -> int:
 def _run_enroll_command(host: Host) -> int:
     try:
         plugin_root = _plugin_root()
-        metadata = _load_runtime_metadata(plugin_root, host)
+        enrollment_target = _enrollment_host(host)
+        metadata = _load_runtime_metadata(plugin_root, enrollment_target)
         worker_base_url = _worker_base_url()
         dashboard_base_url = _dashboard_base_url()
         context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
@@ -308,7 +349,7 @@ def _run_enroll_command(host: Host) -> int:
                 {
                     "status": "setup_pending",
                     "reason": enrollment_attempt.reason or "approval_pending",
-                    "host": host,
+                    "host": enrollment_target,
                 }
             )
             return 0
@@ -316,7 +357,7 @@ def _run_enroll_command(host: Host) -> int:
         _emit_command_json(
             {
                 "status": "enrolled",
-                "host": host,
+                "host": enrollment_target,
                 "credential_id": credential.credential_id,
                 "deployment_instance_id": credential.deployment_instance_id or context.deployment_instance_id,
                 "host_instance_id": context.host_instance_id,
@@ -380,11 +421,12 @@ def _run_ensure(host: Host, *, quiet: bool, if_sources: bool, prepare_baseline: 
     # `systemMessage`. The new version is recorded only after the hook output is emitted below,
     # so a later failure re-announces it on the next healthy session.
     plugin_root = _plugin_root()
-    metadata = _load_runtime_metadata(plugin_root, host)
+    enrollment_target = _enrollment_host(host)
+    metadata = _load_runtime_metadata(plugin_root, enrollment_target)
     pending_update = _pending_plugin_update(metadata)
     update_notice = pending_update.notice if pending_update is not None else None
     exit_code = _run_host_enrollment(
-        host,
+        enrollment_target,
         metadata,
         quiet=quiet,
         update_notice=update_notice,

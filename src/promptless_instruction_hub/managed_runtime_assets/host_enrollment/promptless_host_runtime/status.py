@@ -10,6 +10,7 @@ from .contracts import (
     RUNTIME_CHANNEL,
     RUNTIME_EXECUTABLE,
     RUNTIME_VERSION,
+    _enrollment_host,
 )
 from .host_config import _host_config_status
 from .metadata import _self_sha256
@@ -20,8 +21,9 @@ from .validation import _json_mapping_or_empty, _string_value
 def _status_payload(host: Host) -> dict[str, JsonValue]:
     state_path = _state_path()
     state = _load_state(state_path)
-    credentials = _credential_statuses_for_host(state, host)
-    pending_counts = _pending_enrollment_counts(state, host)
+    enrollment_target = _enrollment_host(host)
+    credentials = _credential_statuses_for_host(state, enrollment_target)
+    pending_counts = _pending_enrollment_counts(state, enrollment_target)
     seen_versions = _json_mapping_or_empty(state.get("last_seen_plugin_versions"))
     return {
         "status": "ok",
@@ -41,7 +43,7 @@ def _status_payload(host: Host) -> dict[str, JsonValue]:
             "credentials": credentials,
             "pending_enrollment_count": pending_counts[0],
             "legacy_pending_enrollment_count": pending_counts[1],
-            "last_seen_plugin_version": _string_value(seen_versions.get(host)),
+            "last_seen_plugin_version": _string_value(seen_versions.get(enrollment_target)),
         },
         "config": _host_config_status(host),
     }
@@ -82,6 +84,10 @@ def _pending_enrollment_counts(state: dict[str, JsonValue], host: Host) -> tuple
 
 
 def _reset_host_state(host: Host) -> tuple[int, int]:
+    enrollment_target = _enrollment_host(host)
+    reset_targets = {enrollment_target}
+    if enrollment_target == "claude":
+        reset_targets.add("claude-desktop")
     state_path = _state_path()
     with _state_file_lock(state_path):
         state = _load_state(state_path)
@@ -90,7 +96,7 @@ def _reset_host_state(host: Host) -> tuple[int, int]:
         credentials_removed = 0
         for key, credential_value in credentials.items():
             credential = _json_mapping_or_empty(credential_value)
-            if _string_value(credential.get("target")) == host:
+            if _string_value(credential.get("target")) in reset_targets:
                 credentials_removed += 1
                 continue
             kept_credentials[key] = credential_value
@@ -102,7 +108,7 @@ def _reset_host_state(host: Host) -> tuple[int, int]:
         for key, pending_value in pending_enrollments.items():
             pending = _json_mapping_or_empty(pending_value)
             target = _string_value(pending.get("target"))
-            if target == host or target is None:
+            if target in reset_targets or target is None:
                 pending_removed += 1
                 continue
             kept_pending[key] = pending_value
@@ -111,8 +117,12 @@ def _reset_host_state(host: Host) -> tuple[int, int]:
         # Re-arm the one-time first-success confirmation: a reset makes the next enrollment a
         # genuine first success for this host, so it should confirm again.
         shown_targets = _json_mapping_or_empty(state.get(FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY))
-        if host in shown_targets:
-            del shown_targets[host]
+        reset_latch = False
+        for target in reset_targets:
+            if target in shown_targets:
+                del shown_targets[target]
+                reset_latch = True
+        if reset_latch:
             state[FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY] = shown_targets
 
         _write_state(state_path, state)

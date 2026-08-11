@@ -44,8 +44,13 @@ from .contracts import (
     TRANSPORT_BATCH_OVERHEAD_BYTES,
     TRANSPORT_CHUNK_OVERHEAD_BYTES,
     UploadBatch,
+    _enrollment_host,
 )
-from .enrollment import _cached_host_credential, _enrollment_context, _forget_cached_host_credential
+from .enrollment import (
+    _cached_host_credential,
+    _enrollment_context,
+    _forget_cached_host_credential,
+)
 from .host_config import _claude_desktop_trace_roots, _native_trace_globs
 from .metadata import _dashboard_base_url, _load_runtime_metadata, _plugin_root, _worker_base_url
 from .output import _emit
@@ -75,7 +80,11 @@ def _run_collect(
     metadata = _load_runtime_metadata(plugin_root, host)
     worker_base_url = _worker_base_url()
     dashboard_base_url = _dashboard_base_url()
-    context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
+    enrollment_target = _enrollment_host(host)
+    enrollment_metadata = (
+        metadata if enrollment_target == host else _load_runtime_metadata(plugin_root, enrollment_target)
+    )
+    context = _enrollment_context(worker_base_url, dashboard_base_url, enrollment_metadata)
     credential = _cached_host_credential(context)
     if credential is None:
         _emit({"status": "trace_upload_skipped", "reason": "not_enrolled", "host": host}, quiet=quiet)
@@ -104,14 +113,17 @@ def _run_collect(
             _emit({"status": "trace_upload_skipped", "reason": "baseline_required", "host": host}, quiet=quiet)
             return 0
 
-        policy_url = _worker_url(worker_base_url, f"/v0/host-enrollment/policy?{urlencode({'target': host})}")
+        policy_url = _worker_url(
+            worker_base_url,
+            f"/v0/host-enrollment/policy?{urlencode({'target': enrollment_target})}",
+        )
         try:
             signed_policy = _get_json(policy_url, credential.value, label="policy response")
         except BootstrapAuthError:
             _forget_cached_host_credential(context)
             _emit({"status": "trace_upload_skipped", "reason": "credential_rejected", "host": host}, quiet=quiet)
             return 0
-        policy = _validate_signed_policy(signed_policy, host)
+        policy = _validate_signed_policy(signed_policy, enrollment_target)
         if _requires_newer_bootstrap(policy.required_bootstrap_version, RUNTIME_VERSION):
             _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
             return 0

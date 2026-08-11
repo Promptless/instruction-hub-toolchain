@@ -144,8 +144,7 @@ def _obtain_host_credential(context: EnrollmentContext, *, quiet: bool) -> Enrol
 
 
 def _cached_host_credential(context: EnrollmentContext) -> HostCredential | None:
-    state_path = _state_path()
-    state = _load_state(state_path)
+    state = _load_state(_state_path())
     credentials = _json_mapping_or_empty(state.get("credentials"))
     cached_credential = _json_mapping_or_empty(credentials.get(_credential_cache_key(context)))
     credential_value = _string_value(cached_credential.get("value"))

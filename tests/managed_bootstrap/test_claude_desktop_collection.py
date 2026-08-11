@@ -15,11 +15,13 @@ from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.fs import validate_json_value
 
 from .helpers import (
+    FIRST_SUCCESS_SHOWN_KEY,
     HOST_RUNTIME_BIN,
     _FakeWorkerServer,
     _assert_session_start_streams,
     _claude_desktop_audit_path,
     _clean_env,
+    _host_state_path,
     _json_list,
     _json_mapping,
     _json_string,
@@ -35,7 +37,7 @@ def test_claude_desktop_discovers_both_audit_stores_under_platform_config_root(t
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
     plugin_root = hub_root / "dist/claude/pig"
-    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude"]))
     server.start()
     try:
         home = tmp_path / "home"
@@ -110,7 +112,7 @@ def test_claude_desktop_ensure_if_sources_skips_without_audit_files(tmp_path: Pa
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
     plugin_root = hub_root / "dist/claude/pig"
-    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude"]))
     server.start()
     try:
         home = tmp_path / "home"
@@ -148,12 +150,116 @@ def test_claude_desktop_ensure_if_sources_skips_without_audit_files(tmp_path: Pa
         server.stop()
 
 
+def test_claude_desktop_ensure_uses_shared_claude_enrollment_and_policy(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/claude/pig"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude"]))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        audit_path = _claude_desktop_audit_path(home, "local-agent-mode-sessions", "session-1")
+        audit_path.parent.mkdir(parents=True)
+        audit_path.write_bytes(b'{"sessionId":"desktop_session_1","message":"baseline"}\n')
+        env = {
+            "HOME": str(home),
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        result = subprocess.run(
+            [str(plugin_root / "runtime" / HOST_RUNTIME_BIN), "ensure", "--host", "claude-desktop", "--if-sources"],
+            env=_clean_env(**env),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0
+        payload = _assert_session_start_streams(result.stdout, result.stderr, "configured")
+        assert payload["host"] == "claude"
+        assert [request["target"] for request in server.session_requests] == ["claude"]
+        assert server.policy_requests == ["/v0/host-enrollment/policy?target=claude"]
+        assert len(server.check_ins) == 1
+        assert server.check_ins[0]["host"] == "claude"
+        effective_config = _json_mapping(server.check_ins[0]["effective_config"], "effective config")
+        assert effective_config["host"] == "claude"
+
+        enroll_payload, _ = _run_runtime_json(plugin_root, ["enroll", "--host", "claude"], env)
+        assert enroll_payload["host"] == "claude"
+        assert len(server.session_requests) == 1
+
+        desktop_status, _ = _run_runtime_json(plugin_root, ["status", "--host", "claude-desktop"], env)
+        status_state = _json_mapping(desktop_status["state"], "desktop status state")
+        assert status_state["credential_count"] == 1
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("reset_host", ["claude", "claude-desktop"])
+def test_claude_reset_clears_shared_and_legacy_desktop_enrollment_state(
+    tmp_path: Path,
+    reset_host: str,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/claude/pig"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude"]))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        env = {
+            "HOME": str(home),
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "claude-desktop"], env)
+        state_path = _host_state_path(home)
+        state = json.loads(state_path.read_text())
+        state["credentials"]["legacy-desktop"] = {
+            "target": "claude-desktop",
+            "value": "legacy-desktop-credential",
+        }
+        state["pending_enrollments"] = {
+            "legacy-desktop": {"target": "claude-desktop"},
+            "unrelated-codex": {"target": "codex"},
+        }
+        state[FIRST_SUCCESS_SHOWN_KEY] = {
+            "claude": "2026-08-10T00:00:00Z",
+            "claude-desktop": "2026-08-10T00:00:00Z",
+            "codex": "2026-08-10T00:00:00Z",
+        }
+        state_path.write_text(json.dumps(state))
+
+        reset_payload, _ = _run_runtime_json(plugin_root, ["reset", "--host", reset_host, "--yes"], env)
+
+        assert reset_payload == {
+            "credentials_removed": 2,
+            "host": reset_host,
+            "pending_enrollments_removed": 1,
+            "status": "reset",
+        }
+        reset_state = json.loads(state_path.read_text())
+        assert reset_state["credentials"] == {}
+        assert reset_state["pending_enrollments"] == {"unrelated-codex": {"target": "codex"}}
+        assert reset_state[FIRST_SUCCESS_SHOWN_KEY] == {"codex": "2026-08-10T00:00:00Z"}
+
+        desktop_status, _ = _run_runtime_json(plugin_root, ["status", "--host", "claude-desktop"], env)
+        desktop_state = _json_mapping(desktop_status["state"], "desktop status state")
+        assert desktop_state["credential_count"] == 0
+        assert desktop_state["pending_enrollment_count"] == 0
+    finally:
+        server.stop()
+
+
 def test_claude_desktop_collect_skips_without_cached_credential(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
     plugin_root = hub_root / "dist/claude/pig"
-    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude"]))
     server.start()
     try:
         home = tmp_path / "home"
@@ -184,7 +290,7 @@ def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> No
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
     plugin_root = hub_root / "dist/claude/pig"
-    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude"]))
     server.start()
     try:
         home = tmp_path / "home"
@@ -203,7 +309,7 @@ def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> No
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "claude-desktop"], env)
-        assert server.session_requests[-1]["target"] == "claude-desktop"
+        assert server.session_requests[-1]["target"] == "claude"
 
         _run_collect(
             plugin_root,
@@ -223,6 +329,10 @@ def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> No
         )
 
         assert len(server.trace_batches) == 1
+        assert server.policy_requests == [
+            "/v0/host-enrollment/policy?target=claude",
+            "/v0/host-enrollment/policy?target=claude",
+        ]
         batch = server.trace_batches[0]
         assert batch["source"] == "claude-desktop"
         assert batch["host"] == "claude-desktop"
@@ -247,7 +357,7 @@ def test_claude_desktop_baseline_is_per_host_with_shared_ledger(tmp_path: Path) 
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
     plugin_root = hub_root / "dist/claude/pig"
-    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude"]))
     server.start()
     try:
         home = tmp_path / "home"
@@ -289,7 +399,7 @@ def test_claude_desktop_baseline_is_per_host_with_shared_ledger(tmp_path: Path) 
         assert set(_json_list(ledger["host_baselines"], "ledger.host_baselines")) == {"claude", "claude-desktop"}
         sources = _json_mapping(ledger["sources"], "ledger.sources")
         assert len(sources) == 2
-        assert [request["target"] for request in server.session_requests] == ["claude", "claude-desktop"]
+        assert [request["target"] for request in server.session_requests] == ["claude"]
     finally:
         server.stop()
 
@@ -303,7 +413,7 @@ def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path)
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
     plugin_root = hub_root / "dist/claude/pig"
-    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude", "claude-desktop"]))
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude"]))
     server.start()
     processes: list[subprocess.Popen[str]] = []
     try:
