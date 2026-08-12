@@ -118,8 +118,9 @@ skill into the canonical `pig` plugin for Codex and Claude. Each generated copy
 is scoped to its hub's generated marketplace name, so customer-specific names,
 repository URLs, and checkout locations are not hardcoded. Each hub's generated
 PIG plugin receives its own scoped copy. Codex uses its marketplace upgrade and
-skill refresh operations; Claude updates each installed plugin at its original
-scope and uses `/reload-plugins` to apply the changes without restarting.
+skill refresh host operations, stopping if those current-session actions are
+unavailable; Claude updates each installed plugin at its original scope and uses
+`/reload-plugins` to apply the changes without restarting.
 
 ### Managed Host Runtime
 

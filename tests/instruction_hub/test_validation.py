@@ -60,6 +60,18 @@ def test_validate_rejects_unknown_package_refs(tmp_path: Path) -> None:
         validate_hub(hub_root)
 
 
+def test_validate_rejects_authored_update_instruction_hub_skill_in_pig(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    skill_root = hub_root / "assets/skills/update-instruction-hub"
+    init_hub(hub_root)
+    skill_root.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Customer updater\n")
+    (hub_root / "packages/pig.yaml").write_text("id: pig\nname: PIG\nincludes:\n  - skill:update-instruction-hub\n")
+
+    with pytest.raises(InstructionHubError, match="reserved managed asset 'skill:update-instruction-hub'"):
+        validate_hub(hub_root)
+
+
 def test_validate_merges_sparse_target_support_with_defaults(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root)

@@ -90,7 +90,8 @@ def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) 
     assert "name: update-instruction-hub\n" in codex_update_skill
     assert "# Update Instruction Hub\n" in codex_update_skill
     assert "generated marketplace name `promptless-instruction-hub-marketplace`" in codex_update_skill
-    assert "codex plugin marketplace upgrade promptless-instruction-hub-marketplace --json" in codex_update_skill
+    assert "marketplaceName` set to `promptless-instruction-hub-marketplace`" in codex_update_skill
+    assert "refreshes only the configured Git marketplace snapshot" in codex_update_skill
     assert "skills/list" in codex_update_skill
     assert "{{ instruction_hub_" not in codex_update_skill
     claude_update_skill = (hub_root / "dist/claude/pig/skills/update-instruction-hub/SKILL.md").read_text()
@@ -371,7 +372,7 @@ def test_build_renders_projected_rules_native_cursor_rules_and_mcp_assets(tmp_pa
     assert (hub_root / "dist/codex/pig/projected/codex/team-style.md").read_text().startswith("# Team Style")
     update_skill = (hub_root / "dist/codex/pig/skills/update-instruction-hub/SKILL.md").read_text()
     assert "generated marketplace name `acme-instruction-hub-marketplace`" in update_skill
-    assert "codex plugin marketplace upgrade acme-instruction-hub-marketplace --json" in update_skill
+    assert "marketplaceName` set to `acme-instruction-hub-marketplace`" in update_skill
     assert "promptless-instruction-hub-marketplace" not in update_skill
     claude_update_skill = (hub_root / "dist/claude/pig/skills/update-instruction-hub/SKILL.md").read_text()
     assert "generated marketplace name `acme-instruction-hub-marketplace`" in claude_update_skill

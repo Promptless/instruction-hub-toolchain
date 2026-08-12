@@ -9,7 +9,14 @@ from promptless_instruction_hub.assets import load_assets, validate_no_literal_s
 from promptless_instruction_hub.config import load_hub_config, load_packages
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.mcp_config import read_mcp_servers
-from promptless_instruction_hub.models import HubConfig, LoadedAsset, PackageDefinition, StablePackage
+from promptless_instruction_hub.models import (
+    PIG_PACKAGE_ID,
+    UPDATE_INSTRUCTION_HUB_SKILL_ID,
+    HubConfig,
+    LoadedAsset,
+    PackageDefinition,
+    StablePackage,
+)
 
 SUPPORT_MODES_BY_ASSET_TYPE = {
     "skill": {"agent-skill", "native", "projected", "unsupported"},
@@ -48,6 +55,7 @@ def validate_hub(hub_root: Path) -> ValidationResult:
     validate_no_literal_secrets(root)
     _validate_target_support(config, assets)
     _validate_mcp_assets(assets)
+    _validate_managed_skill_reservations(packages)
     stable_packages = _resolve_stable_packages(config, packages, assets)
     return ValidationResult(
         config=config,
@@ -80,6 +88,14 @@ def _validate_mcp_assets(assets: dict[str, LoadedAsset]) -> None:
     for asset in assets.values():
         if asset.type == "mcp":
             read_mcp_servers(asset.path, default_server_name=asset.id)
+
+
+def _validate_managed_skill_reservations(packages: dict[str, PackageDefinition]) -> None:
+    pig_package = packages.get(PIG_PACKAGE_ID)
+    reserved_ref = f"skill:{UPDATE_INSTRUCTION_HUB_SKILL_ID}"
+    if pig_package is not None and reserved_ref in pig_package.includes:
+        msg = f"package {PIG_PACKAGE_ID!r} cannot include reserved managed asset {reserved_ref!r}"
+        raise InstructionHubError(msg)
 
 
 def _resolve_stable_packages(

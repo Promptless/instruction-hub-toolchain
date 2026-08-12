@@ -6,10 +6,15 @@ import shutil
 from pathlib import Path
 
 from promptless_instruction_hub.errors import InstructionHubError
-from promptless_instruction_hub.models import PIG_PACKAGE_ID, Harness, HubConfig, PackageDefinition
+from promptless_instruction_hub.models import (
+    PIG_PACKAGE_ID,
+    UPDATE_INSTRUCTION_HUB_SKILL_ID,
+    Harness,
+    HubConfig,
+    PackageDefinition,
+)
 from promptless_instruction_hub.render.common import marketplace_name
 
-UPDATE_INSTRUCTION_HUB_SKILL_ID = "update-instruction-hub"
 SUPPORTED_MANAGED_SKILL_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 
 _ASSET_ROOT = Path(__file__).parent / "managed_skill_assets"
@@ -35,7 +40,8 @@ def render_managed_skills(
 
     destination = target_root / "skills" / skill_id
     if destination.exists():
-        shutil.rmtree(destination)
+        msg = f"managed skill {skill_id!r} conflicts with an authored skill in package {package.id!r}"
+        raise InstructionHubError(msg)
     shutil.copytree(source, destination)
     _render_update_skill_template(destination / "SKILL.md", config)
     return (skill_id,)
