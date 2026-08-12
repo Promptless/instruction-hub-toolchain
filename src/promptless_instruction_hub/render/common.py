@@ -26,6 +26,12 @@ def package_plugin_id(config: HubConfig, package: PackageDefinition) -> str:
     return f"{config.plugin_id}-{package.id}"
 
 
+def marketplace_name(config: HubConfig) -> str:
+    """Return the canonical marketplace name for an Instruction Hub."""
+
+    return f"{config.plugin_id}-marketplace"
+
+
 def plugin_description(config: HubConfig, package: PackageDefinition) -> str:
     """Return the stable user-facing plugin description."""
 

@@ -18,6 +18,7 @@ SUPPORTED_HARNESSES: tuple[Harness, ...] = ("claude", "codex", "gemini", "cursor
 ASSET_KINDS: tuple[AssetKind, ...] = ("skill", "rule", "agent", "command", "hook", "mcp")
 PIG_PACKAGE_ID = "pig"
 PIG_PACKAGE_NAME = "PIG"
+UPDATE_INSTRUCTION_HUB_SKILL_ID = "update-instruction-hub"
 IDENTIFIER_PATTERN = r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
 IDENTIFIER_RE = re.compile(IDENTIFIER_PATTERN)
 SEMVER_RE = re.compile(
