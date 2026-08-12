@@ -309,9 +309,10 @@ def _launch_detached_collect(
         sys.executable,
         str(Path(sys.argv[0]).resolve()),
         *collector_args,
-        "--release-marker-captured",
-        "--supervised",
     ]
+    if event == "session_start":
+        supervisor_args.append("--release-marker-captured")
+    supervisor_args.append("--supervised")
     try:
         with tempfile.TemporaryFile(mode="w+b") as preserved_stdin:
             binary_stdin = cast(BinaryIO, preserved_stdin)
