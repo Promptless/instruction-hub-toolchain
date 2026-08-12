@@ -113,7 +113,7 @@ pin to an immutable tag for stricter reproducibility.
 
 ## Managed PIG Assets
 
-The toolchain injects the harness-specific `update-instruction-hub-mid-session`
+The toolchain injects the harness-specific `update-instruction-hub`
 skill into the canonical `pig` plugin for Codex and Claude. Each generated copy
 is scoped to its hub's generated marketplace name, so customer-specific names,
 repository URLs, and checkout locations are not hardcoded. Each hub's generated

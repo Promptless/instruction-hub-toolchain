@@ -9,7 +9,7 @@ from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.models import PIG_PACKAGE_ID, Harness, HubConfig, PackageDefinition
 from promptless_instruction_hub.render.common import marketplace_name
 
-UPDATE_INSTRUCTION_HUB_SKILL_ID = "update-instruction-hub-mid-session"
+UPDATE_INSTRUCTION_HUB_SKILL_ID = "update-instruction-hub"
 SUPPORTED_MANAGED_SKILL_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 
 _ASSET_ROOT = Path(__file__).parent / "managed_skill_assets"

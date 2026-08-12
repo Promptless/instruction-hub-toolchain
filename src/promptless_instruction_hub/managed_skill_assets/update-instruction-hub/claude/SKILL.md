@@ -1,9 +1,9 @@
 ---
-name: update-instruction-hub-mid-session
-description: Use when asked to update, refresh, or reload this Instruction Hub and its installed plugins without ending an active Claude Code session.
+name: update-instruction-hub
+description: Update this Instruction Hub's marketplace and installed plugins, then reload them in the current Claude Code session. Use when asked to update, refresh, or reload this Instruction Hub.
 ---
 
-# Update Instruction Hub Mid-session
+# Update Instruction Hub
 
 ## Entry Criteria
 
