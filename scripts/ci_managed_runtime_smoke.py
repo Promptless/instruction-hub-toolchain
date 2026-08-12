@@ -391,7 +391,8 @@ def _detach_launcher(bin_root: Path, started: Path, release: Path, captured_stdi
             str(started),
             str(release),
             str(captured_stdin),
-        ]
+        ],
+        stdin=sys.stdin.buffer,
     )
 
 

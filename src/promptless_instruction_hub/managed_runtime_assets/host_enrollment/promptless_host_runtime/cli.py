@@ -7,9 +7,11 @@ import errno
 import os
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import BinaryIO, cast
 from urllib.parse import urlencode
 
 from .contracts import (
@@ -34,6 +36,7 @@ from .enrollment import (
 from .host_config import _blocked_result, _ensure_host_config, _has_native_trace_sources
 from .metadata import (
     _dashboard_base_url,
+    _load_installed_instruction_hub_release,
     _load_runtime_metadata,
     _plugin_root,
     _resolve_host,
@@ -49,7 +52,17 @@ from .notices import (
 from .output import _emit, _emit_command_json, _flush_control_output, _record_collector_failure
 from .redaction import _redact_text
 from .status import _reset_host_state, _status_payload
-from .traces import _hook_trace_context, _lifecycle_event, _prepare_baseline, _read_hook_context, _run_collect
+from .storage import _ledger_path
+from .traces import (
+    _collect_deadline,
+    _hook_trace_context,
+    _lifecycle_event,
+    _persist_session_release_marker,
+    _prepare_baseline,
+    _read_hook_context,
+    _read_hook_input,
+    _run_collect,
+)
 from .validation import _requires_newer_bootstrap
 from .worker import _get_json, _post_check_in, _validate_signed_policy, _worker_url
 
@@ -79,11 +92,13 @@ def main(argv: list[str] | None = None) -> int:
             include_active=args.include_active,
             if_sources=args.if_sources,
             quiet=args.quiet,
+            release_marker_captured=args.release_marker_captured,
         )
         if args.detach:
             return _launch_detached_collect(
                 host,
                 collector_args,
+                lifecycle=args.lifecycle,
                 baseline=args.baseline,
                 if_sources=args.if_sources,
                 quiet=args.quiet,
@@ -97,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
             include_active=args.include_active,
             if_sources=args.if_sources,
             quiet=args.quiet,
+            release_marker_captured=args.release_marker_captured,
         )
     if args.command == "status":
         return _run_status_command(host)
@@ -157,6 +173,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     collect_execution = collect_parser.add_mutually_exclusive_group()
     collect_execution.add_argument("--detach", action="store_true", help="Run collection in a detached process")
     collect_execution.add_argument("--supervised", action="store_true", help=argparse.SUPPRESS)
+    collect_parser.add_argument("--release-marker-captured", action="store_true", help=argparse.SUPPRESS)
 
     status_parser = subcommands.add_parser("status", help="Print local host-runtime status as JSON")
     _add_host_argument(status_parser)
@@ -199,6 +216,7 @@ def _run_collect_command(
     include_active: bool,
     if_sources: bool,
     quiet: bool,
+    release_marker_captured: bool,
 ) -> int:
     try:
         if if_sources and not _has_native_trace_sources(host):
@@ -213,6 +231,7 @@ def _run_collect_command(
             baseline=baseline,
             include_active=include_active,
             quiet=quiet,
+            release_marker_captured=release_marker_captured,
         )
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
         _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
@@ -229,6 +248,7 @@ def _collector_command_args(
     include_active: bool,
     if_sources: bool,
     quiet: bool,
+    release_marker_captured: bool,
 ) -> list[str]:
     command_args = ["collect", "--host", host]
     if lifecycle is not None:
@@ -241,6 +261,8 @@ def _collector_command_args(
         command_args.append("--if-sources")
     if quiet:
         command_args.append("--quiet")
+    if release_marker_captured:
+        command_args.append("--release-marker-captured")
     return command_args
 
 
@@ -248,10 +270,29 @@ def _launch_detached_collect(
     host: Host,
     collector_args: list[str],
     *,
+    lifecycle: str | None,
     baseline: bool = False,
     if_sources: bool = False,
     quiet: bool = False,
 ) -> int:
+    try:
+        hook_input = _read_hook_input()
+        event = _lifecycle_event(lifecycle)
+        hook_context = _hook_trace_context(_read_hook_context(hook_input))
+        if event == "session_start":
+            plugin_root = _plugin_root()
+            metadata = _load_runtime_metadata(plugin_root, host)
+            installed_release = _load_installed_instruction_hub_release(plugin_root, metadata)
+            _persist_session_release_marker(
+                _ledger_path(),
+                lifecycle_event=event,
+                hook_context=hook_context,
+                installed_release=installed_release,
+                deadline=_collect_deadline(),
+            )
+    except (BootstrapError, OSError, ValueError) as exc:
+        _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
+        return 1
     if if_sources and not _has_native_trace_sources(host):
         _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
         return 0
@@ -268,10 +309,16 @@ def _launch_detached_collect(
         sys.executable,
         str(Path(sys.argv[0]).resolve()),
         *collector_args,
-        "--supervised",
     ]
+    if event == "session_start":
+        supervisor_args.append("--release-marker-captured")
+    supervisor_args.append("--supervised")
     try:
-        _spawn_detached(supervisor_args)
+        with tempfile.TemporaryFile(mode="w+b") as preserved_stdin:
+            binary_stdin = cast(BinaryIO, preserved_stdin)
+            binary_stdin.write(hook_input)
+            binary_stdin.seek(0)
+            _spawn_detached(supervisor_args, stdin=binary_stdin)
     except OSError as exc:
         _record_collector_failure(host, exit_code=None, error_code=_os_error_code(exc))
         return 1
@@ -300,11 +347,11 @@ def _supervise_collect(host: Host, collector_args: list[str]) -> int:
     return result.returncode
 
 
-def _spawn_detached(args: list[str]) -> None:
+def _spawn_detached(args: list[str], *, stdin: BinaryIO) -> None:
     if os.name == "nt":
         subprocess.Popen(
             args,
-            stdin=sys.stdin.buffer,
+            stdin=stdin,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=_WINDOWS_CREATE_NEW_PROCESS_GROUP | _WINDOWS_DETACHED_PROCESS,
@@ -312,7 +359,7 @@ def _spawn_detached(args: list[str]) -> None:
         return
     subprocess.Popen(
         args,
-        stdin=sys.stdin.buffer,
+        stdin=stdin,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,

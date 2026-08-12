@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 
@@ -67,7 +68,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     )
     assert payload["id"] == "host-runtime"
     assert payload["name"] == HOST_RUNTIME_BIN
-    assert payload["version"] == "0.2.5"
+    assert payload["version"] == "0.2.6"
     assert payload["channel"] == "stable"
     manifest = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
     bundle_sha256 = _runtime_bundle_sha256(plugin_root / "runtime")
@@ -99,7 +100,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert text_version.returncode == 0
-    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.5\n"
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.6\n"
     assert text_version.stderr == ""
 
     poison_root = tmp_path / "poison-pythonpath"
@@ -127,7 +128,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert poisoned_pythonpath.returncode == 0
-    assert json.loads(poisoned_pythonpath.stdout)["version"] == "0.2.5"
+    assert json.loads(poisoned_pythonpath.stdout)["version"] == "0.2.6"
     assert poisoned_pythonpath.stderr == ""
     assert not poison_marker.exists()
 
@@ -211,7 +212,11 @@ def test_collector_process_creation_failure_is_persisted(
     with hook_input_path.open() as hook_input:
         monkeypatch.setattr(host_runtime_cli.sys, "stdin", hook_input)
         if execution_mode == "detached":
-            return_code = host_runtime_cli._launch_detached_collect("codex", collector_args)
+            return_code = host_runtime_cli._launch_detached_collect(
+                "codex",
+                collector_args,
+                lifecycle="stop",
+            )
         else:
             return_code = host_runtime_cli._supervise_collect("codex", collector_args)
 
@@ -228,6 +233,56 @@ def test_collector_process_creation_failure_is_persisted(
     assert last_status["error_code"] == "ENOENT"
     assert _diagnostic_log_path(home).stat().st_mode & 0o777 == 0o600
     assert _last_status_path(home).stat().st_mode & 0o777 == 0o600
+
+
+def test_detached_session_start_persists_boundary_before_spawn_and_preserves_stdin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root, plugin_version="1.2.3")
+    plugin_root = hub_root / "dist/codex/pig"
+    transcript_path = tmp_path / "session.jsonl"
+    before_launch = b'{"kind":"existing"}\n'
+    after_launch = b'{"kind":"appended-after-launch"}\n'
+    transcript_path.write_bytes(before_launch)
+    ledger_path = tmp_path / "ledger.json"
+    hook_input_path = tmp_path / "hook-input.json"
+    hook_input_path.write_text(json.dumps({"session_id": "session-1", "transcript_path": str(transcript_path)}))
+    raw_hook_input = hook_input_path.read_bytes()
+    spawned_args: list[str] = []
+    spawned_stdin = b""
+
+    def spawn_detached(args: list[str], *, stdin: BinaryIO) -> None:
+        nonlocal spawned_stdin
+        spawned_args.extend(args)
+        spawned_stdin = stdin.read()
+        transcript_path.write_bytes(before_launch + after_launch)
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+    monkeypatch.setenv("PLUGIN_ROOT", str(plugin_root))
+    monkeypatch.setenv("PROMPTLESS_HOST_RUNTIME_LEDGER", str(ledger_path))
+    monkeypatch.setattr(host_runtime_cli, "_spawn_detached", spawn_detached)
+    collector_args = ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"]
+
+    with hook_input_path.open() as hook_input:
+        monkeypatch.setattr(host_runtime_cli.sys, "stdin", hook_input)
+        return_code = host_runtime_cli._launch_detached_collect(
+            "codex",
+            collector_args,
+            lifecycle="session_start",
+        )
+
+    assert return_code == 0
+    assert spawned_stdin == raw_hook_input
+    assert spawned_args.count("--release-marker-captured") == 1
+    ledger = json.loads(ledger_path.read_text())
+    source = next(iter(ledger["sources"].values()))
+    marker = source["instruction_hub_release_markers"][0]
+    assert marker["start_offset"] == len(before_launch)
+    assert marker["session_id"] == "session-1"
 
 
 def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:

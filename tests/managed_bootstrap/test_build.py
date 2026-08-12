@@ -253,7 +253,16 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         def assert_startup_calls(*, include_desktop: bool = False) -> None:
             expected_calls = [
                 ["ensure", "--host", target, "--prepare-baseline"],
-                ["collect", "--host", target, "--lifecycle", "session_start", "--baseline", "--quiet"],
+                [
+                    "collect",
+                    "--host",
+                    target,
+                    "--lifecycle",
+                    "session_start",
+                    "--baseline",
+                    "--quiet",
+                    "--release-marker-captured",
+                ],
             ]
             if target == "claude" and include_desktop:
                 expected_calls.extend(
@@ -267,6 +276,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                             "--baseline",
                             "--if-sources",
                             "--quiet",
+                            "--release-marker-captured",
                         ],
                     ]
                 )
@@ -750,6 +760,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                             "session_start",
                             "--baseline",
                             "--quiet",
+                            "--release-marker-captured",
                         ],
                         "stdin": stdin_payload,
                     },
@@ -763,6 +774,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                             "--baseline",
                             "--if-sources",
                             "--quiet",
+                            "--release-marker-captured",
                         ],
                         "stdin": "",
                     },
@@ -972,7 +984,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert runtime["id"] == "host-runtime"
         assert runtime["status"] == "included"
         assert runtime["target"] == target
-        assert runtime["version"] == "0.2.5"
+        assert runtime["version"] == "0.2.6"
         assert runtime["channel"] == "stable"
         assert runtime["path"] == f"runtime/{HOST_RUNTIME_BIN}"
         assert runtime["sha256"] == _runtime_bundle_sha256(plugin_root / "runtime")

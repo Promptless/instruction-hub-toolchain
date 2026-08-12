@@ -93,6 +93,7 @@
           "package_id",
           "path",
           "plugin_id",
+          "plugin_name",
           "plugin_version",
           "sha256",
           "status",
@@ -110,11 +111,18 @@
           },
           "plugin_id": {
             "type": "string",
+            "maxLength": 120,
             "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+          },
+          "plugin_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
           },
           "plugin_version": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "maxLength": 80
           },
           "status": {
             "const": "included"

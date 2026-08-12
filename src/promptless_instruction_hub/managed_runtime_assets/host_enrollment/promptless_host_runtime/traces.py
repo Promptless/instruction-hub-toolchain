@@ -13,6 +13,7 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -29,8 +30,10 @@ from .contracts import (
     HostPolicy,
     HOST_VALUES,
     IDLE_SESSION_GRACE_SECONDS,
+    InstalledInstructionHubRelease,
     JsonValue,
     LifecycleEvent,
+    MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH,
     MAX_RECORD_BYTES,
     MAX_STDIN_BYTES,
     MAX_TRACE_BATCH_BYTES,
@@ -52,11 +55,18 @@ from .enrollment import (
     _forget_cached_host_credential,
 )
 from .host_config import _claude_desktop_trace_roots, _native_trace_globs
-from .metadata import _dashboard_base_url, _load_runtime_metadata, _plugin_root, _worker_base_url
+from .metadata import (
+    _dashboard_base_url,
+    _load_installed_instruction_hub_release,
+    _load_runtime_metadata,
+    _plugin_root,
+    _worker_base_url,
+)
 from .output import _emit
 from .storage import _atomic_write_text, _ledger_path, _try_lock_state_file, _unlock_state_file
 from .validation import (
     _decode_json_object,
+    _is_kebab_case_identifier,
     _json_mapping_or_empty,
     _non_empty,
     _optional_int_value,
@@ -64,6 +74,39 @@ from .validation import (
     _string_value,
 )
 from .worker import _get_json, _post_json_response, _validate_signed_policy, _worker_url
+
+
+_INSTRUCTION_HUB_RELEASE_MARKERS_KEY = "instruction_hub_release_markers"
+
+
+@dataclass(frozen=True)
+class _InstructionHubReleaseMarker:
+    """Installed release known to govern bytes starting at one source offset."""
+
+    start_offset: int
+    session_id: str
+    captured_at: str
+    release: InstalledInstructionHubRelease
+
+
+@dataclass(frozen=True)
+class _InstructionHubReleaseSnapshotRange:
+    """One proven source interval governed by an installed release marker."""
+
+    source_path_hash: str
+    session_id: str
+    start_offset: int
+    end_offset: int
+    captured_at: str
+    release: InstalledInstructionHubRelease
+
+
+@dataclass(frozen=True)
+class _SessionReleaseBoundary:
+    """Resolved transcript and byte boundary captured by SessionStart."""
+
+    path: Path
+    size: int
 
 
 def _run_collect(
@@ -74,10 +117,21 @@ def _run_collect(
     baseline: bool,
     include_active: bool,
     quiet: bool,
+    release_marker_captured: bool = False,
 ) -> int:
     deadline = _collect_deadline()
     plugin_root = _plugin_root()
     metadata = _load_runtime_metadata(plugin_root, host)
+    installed_release = _load_installed_instruction_hub_release(plugin_root, metadata)
+    ledger_path = _ledger_path()
+    if not release_marker_captured:
+        _persist_session_release_marker(
+            ledger_path,
+            lifecycle_event=lifecycle_event,
+            hook_context=hook_context,
+            installed_release=installed_release,
+            deadline=deadline,
+        )
     worker_base_url = _worker_base_url()
     dashboard_base_url = _dashboard_base_url()
     enrollment_target = _enrollment_host(host)
@@ -90,7 +144,6 @@ def _run_collect(
         _emit({"status": "trace_upload_skipped", "reason": "not_enrolled", "host": host}, quiet=quiet)
         return 0
 
-    ledger_path = _ledger_path()
     baseline_pending_path = _baseline_pending_path(ledger_path, host)
     if baseline:
         try:
@@ -229,14 +282,20 @@ def _lifecycle_event(value: str | None) -> LifecycleEvent:
     return "session_start"
 
 
-def _read_hook_context() -> dict[str, JsonValue]:
+def _read_hook_input() -> bytes:
     if sys.stdin.isatty():
-        return {}
+        return b""
     body = sys.stdin.buffer.read(MAX_STDIN_BYTES + 1)
-    if body == b"":
-        return {}
     if len(body) > MAX_STDIN_BYTES:
         raise BootstrapError("hook stdin JSON exceeds maximum supported size")
+    return body
+
+
+def _read_hook_context(body: bytes | None = None) -> dict[str, JsonValue]:
+    if body is None:
+        body = _read_hook_input()
+    if body == b"":
+        return {}
     return _decode_json_object(body, "hook stdin")
 
 
@@ -401,6 +460,8 @@ def _idle_root_scan_paths(
 
 def _ledger_has_host_source(ledger: SourceLedger, host: Host) -> bool:
     for source in ledger.sources.values():
+        if source.get("provenance_only") is True:
+            continue
         path_text = _string_value(source.get("path"))
         if path_text is None:
             continue
@@ -561,6 +622,242 @@ def _baseline_source_offsets(ledger: SourceLedger, source_paths: tuple[Path, ...
         _record_ledger_offset(ledger, path, end_offset)
 
 
+def _persist_session_release_marker(
+    ledger_path: Path,
+    *,
+    lifecycle_event: LifecycleEvent,
+    hook_context: HookTraceContext,
+    installed_release: InstalledInstructionHubRelease | None,
+    deadline: float,
+) -> None:
+    """Capture and durably record the exact SessionStart byte boundary."""
+
+    boundary = _session_release_boundary(
+        lifecycle_event=lifecycle_event,
+        hook_context=hook_context,
+        installed_release=installed_release,
+    )
+    if boundary is None:
+        return
+    with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=deadline) as lock_acquired:
+        if not lock_acquired:
+            raise CollectDeadlineExceeded("timed out persisting native trace release provenance")
+        ledger = _load_source_ledger(ledger_path)
+        if _record_session_release_marker(
+            ledger,
+            lifecycle_event=lifecycle_event,
+            hook_context=hook_context,
+            installed_release=installed_release,
+            boundary=boundary,
+        ):
+            # Persist before credentials, policy fetches, uploads, or detached launch.
+            # Retries then retain the same provenance and capture timestamp.
+            _write_source_ledger(ledger)
+
+
+def _session_release_boundary(
+    *,
+    lifecycle_event: LifecycleEvent,
+    hook_context: HookTraceContext,
+    installed_release: InstalledInstructionHubRelease | None,
+) -> _SessionReleaseBoundary | None:
+    if (
+        lifecycle_event != "session_start"
+        or installed_release is None
+        or hook_context.session_id is None
+        or len(hook_context.session_id) > 220
+        or hook_context.transcript_path is None
+    ):
+        return None
+    try:
+        path = hook_context.transcript_path.expanduser().resolve(strict=False)
+    except OSError:
+        path = hook_context.transcript_path.expanduser().absolute()
+    try:
+        current_size = path.stat().st_size
+    except OSError:
+        return None
+    return _SessionReleaseBoundary(path=path, size=current_size)
+
+
+def _record_session_release_marker(
+    ledger: SourceLedger,
+    *,
+    lifecycle_event: LifecycleEvent,
+    hook_context: HookTraceContext,
+    installed_release: InstalledInstructionHubRelease | None,
+    boundary: _SessionReleaseBoundary | None = None,
+) -> bool:
+    """Persist release provenance only for an exact SessionStart source and session."""
+
+    if (
+        lifecycle_event != "session_start"
+        or installed_release is None
+        or hook_context.session_id is None
+        or len(hook_context.session_id) > 220
+        or hook_context.transcript_path is None
+    ):
+        return False
+    if boundary is None:
+        boundary = _session_release_boundary(
+            lifecycle_event=lifecycle_event,
+            hook_context=hook_context,
+            installed_release=installed_release,
+        )
+    if boundary is None:
+        return False
+    path = boundary.path
+    current_size = boundary.size
+
+    path_hash = _path_hash(path)
+    existing_source = ledger.sources.get(path_hash)
+    source = dict(_json_mapping_or_empty(existing_source))
+    start_offset = current_size
+    previous_offset = _optional_int_value(source.get("end_offset")) or 0
+    markers = list(_instruction_hub_release_markers(source))
+    latest_marker_offset = markers[-1].start_offset if markers else 0
+    if max(previous_offset, latest_marker_offset) > current_size:
+        ledger.drift_reports.append(
+            {
+                "kind": "native_trace_source_rewound",
+                "source_path_hash": path_hash,
+                "previous_end_offset": previous_offset,
+                "current_size": current_size,
+            }
+        )
+        ledger.reset_sources.add(path_hash)
+        source["end_offset"] = 0
+        markers = []
+        start_offset = 0
+
+    if (
+        markers
+        and markers[-1].start_offset <= current_size
+        and markers[-1].session_id == hook_context.session_id
+        and markers[-1].release == installed_release
+    ):
+        return False
+
+    marker = _InstructionHubReleaseMarker(
+        start_offset=start_offset,
+        session_id=hook_context.session_id,
+        captured_at=_utc_now_iso(),
+        release=installed_release,
+    )
+    for existing in markers:
+        if existing.start_offset != start_offset:
+            continue
+        if existing.session_id == marker.session_id and existing.release == marker.release:
+            return False
+        markers = [candidate for candidate in markers if candidate.start_offset != start_offset]
+        break
+    markers.append(marker)
+    markers.sort(key=lambda candidate: candidate.start_offset)
+    source.update(
+        {
+            "path": str(path),
+            "end_offset": _optional_int_value(source.get("end_offset")) or 0,
+            "updated_at": _utc_now_iso(),
+            _INSTRUCTION_HUB_RELEASE_MARKERS_KEY: [_release_marker_payload(value) for value in markers],
+        }
+    )
+    if existing_source is None:
+        source["provenance_only"] = True
+    ledger.sources[path_hash] = source
+    return True
+
+
+def _instruction_hub_release_markers(
+    source: dict[str, JsonValue],
+) -> tuple[_InstructionHubReleaseMarker, ...]:
+    raw_markers = source.get(_INSTRUCTION_HUB_RELEASE_MARKERS_KEY)
+    if not isinstance(raw_markers, list):
+        return ()
+    markers: list[_InstructionHubReleaseMarker] = []
+    seen_offsets: set[int] = set()
+    conflicting_offsets: set[int] = set()
+    for raw_marker in raw_markers:
+        marker_value = _json_mapping_or_empty(raw_marker)
+        start_offset = _optional_int_value(marker_value.get("start_offset"))
+        session_id = _non_empty(_string_value(marker_value.get("session_id")))
+        captured_at = _non_empty(_string_value(marker_value.get("captured_at")))
+        release_value = _json_mapping_or_empty(marker_value.get("release"))
+        plugin_id = _non_empty(_string_value(release_value.get("plugin_id")))
+        plugin_name = _non_empty(_string_value(release_value.get("plugin_name")))
+        plugin_version = _non_empty(_string_value(release_value.get("plugin_version")))
+        release_id = _non_empty(_string_value(release_value.get("release_id")))
+        if (
+            start_offset is None
+            or start_offset < 0
+            or session_id is None
+            or captured_at is None
+            or not _timezone_aware_iso_datetime(captured_at)
+            or len(session_id) > 220
+            or plugin_id is None
+            or len(plugin_id) > 120
+            or not _is_kebab_case_identifier(plugin_id)
+            or plugin_name is None
+            or len(plugin_name) > 200
+            or plugin_version is None
+            or len(plugin_version) > 80
+            or release_id is None
+            or len(release_id) > 120
+            or not _release_id_matches_plugin_version(release_id, plugin_version)
+        ):
+            continue
+        if start_offset in seen_offsets:
+            conflicting_offsets.add(start_offset)
+            continue
+        seen_offsets.add(start_offset)
+        markers.append(
+            _InstructionHubReleaseMarker(
+                start_offset=start_offset,
+                session_id=session_id,
+                captured_at=captured_at,
+                release=InstalledInstructionHubRelease(
+                    plugin_id=plugin_id,
+                    plugin_name=plugin_name,
+                    plugin_version=plugin_version,
+                    release_id=release_id,
+                ),
+            )
+        )
+    return tuple(
+        sorted(
+            (marker for marker in markers if marker.start_offset not in conflicting_offsets),
+            key=lambda m: m.start_offset,
+        )
+    )
+
+
+def _release_id_matches_plugin_version(release_id: str, plugin_version: str) -> bool:
+    prefix = f"{plugin_version}+"
+    suffix = release_id[len(prefix) :] if release_id.startswith(prefix) else ""
+    return len(suffix) == 12 and all(character in "0123456789abcdef" for character in suffix)
+
+
+def _timezone_aware_iso_datetime(value: str) -> bool:
+    try:
+        parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _release_marker_payload(marker: _InstructionHubReleaseMarker) -> dict[str, JsonValue]:
+    return {
+        "start_offset": marker.start_offset,
+        "session_id": marker.session_id,
+        "captured_at": marker.captured_at,
+        "release": {
+            "plugin_id": marker.release.plugin_id,
+            "plugin_name": marker.release.plugin_name,
+            "plugin_version": marker.release.plugin_version,
+            "release_id": marker.release.release_id,
+        },
+    }
+
+
 def _iter_upload_batches(
     *,
     host: Host,
@@ -586,6 +883,7 @@ def _iter_upload_batches(
     pending_payloads: list[dict[str, JsonValue]] = []
     pending_decoded_bytes = 0
     pending_transport_bytes = 0
+    pending_snapshot_count = 0
     yielded_batch = False
     for event in _iter_source_events(ledger, source_paths):
         if yielded_batch:
@@ -607,10 +905,17 @@ def _iter_upload_batches(
             )
             payload = _chunk_payload(event, chunk_lifecycle)
             chunk_transport_bytes = _chunk_transport_bytes(payload)
+        event_snapshot_count = len(_analysis_context_snapshot_ranges(ledger, (event,)))
+        if event_snapshot_count > MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH:
+            raise BootstrapError(
+                "one native trace JSONL range intersects more than "
+                f"{MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH} instruction-hub release ranges"
+            )
         next_decoded_bytes = pending_decoded_bytes + event.byte_count
         next_transport_bytes = pending_transport_bytes + chunk_transport_bytes
         if pending_payloads and (
             len(pending_payloads) >= MAX_UPLOAD_CHUNKS_PER_BATCH
+            or pending_snapshot_count + event_snapshot_count > MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH
             or next_decoded_bytes > MAX_TRACE_BATCH_BYTES
             or next_transport_bytes > transport_budget
         ):
@@ -620,6 +925,7 @@ def _iter_upload_batches(
                 policy=policy,
                 lifecycle_event=lifecycle_event,
                 hook_context=hook_context,
+                ledger=ledger,
                 events=tuple(pending_events),
                 chunks=tuple(pending_payloads),
             )
@@ -628,10 +934,12 @@ def _iter_upload_batches(
             pending_payloads = []
             pending_decoded_bytes = 0
             pending_transport_bytes = 0
+            pending_snapshot_count = 0
         pending_events.append(event)
         pending_payloads.append(payload)
         pending_decoded_bytes += event.byte_count
         pending_transport_bytes += chunk_transport_bytes
+        pending_snapshot_count += event_snapshot_count
     if pending_events:
         yield _upload_batch(
             host=host,
@@ -639,6 +947,7 @@ def _iter_upload_batches(
             policy=policy,
             lifecycle_event=lifecycle_event,
             hook_context=hook_context,
+            ledger=ledger,
             events=tuple(pending_events),
             chunks=tuple(pending_payloads),
         )
@@ -665,6 +974,10 @@ def _iter_source_events(ledger: SourceLedger, source_paths: tuple[Path, ...]) ->
                 }
             )
             ledger.reset_sources.add(path_hash)
+            if source is not None:
+                reset_source = dict(source)
+                reset_source.pop(_INSTRUCTION_HUB_RELEASE_MARKERS_KEY, None)
+                ledger.sources[path_hash] = reset_source
             start_offset = 0
         if start_offset == file_size:
             continue
@@ -808,6 +1121,7 @@ def _upload_batch(
     policy: HostPolicy,
     lifecycle_event: LifecycleEvent,
     hook_context: HookTraceContext,
+    ledger: SourceLedger,
     events: tuple[SourceEvent, ...],
     chunks: tuple[dict[str, JsonValue], ...],
 ) -> UploadBatch:
@@ -821,8 +1135,97 @@ def _upload_batch(
         "uploaded_at": _utc_now_iso(),
         "chunks": list(chunks),
     }
+    snapshots = _analysis_context_snapshots(ledger, events)
+    if snapshots:
+        request["snapshots"] = snapshots
     request.update(_native_request_context(hook_context, lifecycle_event))
     return UploadBatch(request=request, events=events)
+
+
+def _analysis_context_snapshots(
+    ledger: SourceLedger,
+    events: tuple[SourceEvent, ...],
+) -> list[dict[str, JsonValue]]:
+    """Intersect JSONL chunks with durable markers without changing upload ranges."""
+
+    ranges = _analysis_context_snapshot_ranges(ledger, events)
+    if len(ranges) > MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH:
+        raise BootstrapError(
+            "native trace batch intersects more than "
+            f"{MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH} instruction-hub release ranges"
+        )
+    return [_snapshot_range_payload(value) for value in ranges]
+
+
+def _analysis_context_snapshot_ranges(
+    ledger: SourceLedger,
+    events: tuple[SourceEvent, ...],
+) -> list[_InstructionHubReleaseSnapshotRange]:
+    ranges: list[_InstructionHubReleaseSnapshotRange] = []
+    for event in events:
+        if event.kind != "jsonl_range":
+            continue
+        source = ledger.sources.get(event.path_hash)
+        if source is None or _string_value(source.get("path")) != str(event.path):
+            continue
+        markers = _instruction_hub_release_markers(source)
+        for index, marker in enumerate(markers):
+            marker_end = markers[index + 1].start_offset if index + 1 < len(markers) else event.end_offset
+            start_offset = max(event.start_offset, marker.start_offset)
+            end_offset = min(event.end_offset, marker_end)
+            if end_offset <= start_offset:
+                continue
+            candidate = _InstructionHubReleaseSnapshotRange(
+                source_path_hash=event.path_hash,
+                session_id=marker.session_id,
+                start_offset=start_offset,
+                end_offset=end_offset,
+                captured_at=marker.captured_at,
+                release=marker.release,
+            )
+            if ranges and _snapshot_ranges_are_coalescible(ranges[-1], candidate):
+                previous = ranges[-1]
+                ranges[-1] = _InstructionHubReleaseSnapshotRange(
+                    source_path_hash=previous.source_path_hash,
+                    session_id=previous.session_id,
+                    start_offset=previous.start_offset,
+                    end_offset=candidate.end_offset,
+                    captured_at=previous.captured_at,
+                    release=previous.release,
+                )
+            else:
+                ranges.append(candidate)
+    return ranges
+
+
+def _snapshot_ranges_are_coalescible(
+    first: _InstructionHubReleaseSnapshotRange,
+    second: _InstructionHubReleaseSnapshotRange,
+) -> bool:
+    return (
+        first.source_path_hash == second.source_path_hash
+        and first.session_id == second.session_id
+        and first.release == second.release
+        and first.captured_at == second.captured_at
+        and first.end_offset == second.start_offset
+    )
+
+
+def _snapshot_range_payload(value: _InstructionHubReleaseSnapshotRange) -> dict[str, JsonValue]:
+    return {
+        "schema_version": 1,
+        "source_path_hash": value.source_path_hash,
+        "session_id": value.session_id,
+        "start_offset": value.start_offset,
+        "end_offset": value.end_offset,
+        "captured_at": value.captured_at,
+        "installed_instruction_hub_release": {
+            "plugin_id": value.release.plugin_id,
+            "plugin_name": value.release.plugin_name,
+            "plugin_version": value.release.plugin_version,
+            "release_id": value.release.release_id,
+        },
+    }
 
 
 def _native_request_context(hook_context: HookTraceContext, lifecycle_event: LifecycleEvent) -> dict[str, JsonValue]:
@@ -938,11 +1341,16 @@ def _record_ledger_offset(ledger: SourceLedger, path: Path, end_offset: int) -> 
     path_hash = _path_hash(path)
     existing = _json_mapping_or_empty(ledger.sources.get(path_hash))
     previous_offset = 0 if path_hash in ledger.reset_sources else (_optional_int_value(existing.get("end_offset")) or 0)
-    ledger.sources[path_hash] = {
-        "path": str(path),
-        "end_offset": max(previous_offset, end_offset),
-        "updated_at": _utc_now_iso(),
-    }
+    updated_source = dict(existing)
+    updated_source.update(
+        {
+            "path": str(path),
+            "end_offset": max(previous_offset, end_offset),
+            "updated_at": _utc_now_iso(),
+        }
+    )
+    updated_source.pop("provenance_only", None)
+    ledger.sources[path_hash] = updated_source
 
 
 def _path_hash(path: Path) -> str:

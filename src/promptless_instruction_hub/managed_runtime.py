@@ -33,7 +33,7 @@ HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS = 390
 HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS = HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS * 2
 HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS = HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
 HOST_RUNTIME_CHANNEL = "stable"
-HOST_RUNTIME_VERSION = "0.2.5"
+HOST_RUNTIME_VERSION = "0.2.6"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
 SUPPORTED_HOST_RUNTIME_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 MISSING_RUNTIME_ROOT_MESSAGE = (
@@ -76,6 +76,7 @@ class ManagedRuntimeRecord:
     target: Harness
     package_id: str
     plugin_id: str
+    plugin_name: str
     plugin_version: str
     toolchain_version: str
     channel: str | None = None
@@ -92,6 +93,7 @@ class ManagedRuntimeRecord:
             "id": self.id,
             "package_id": self.package_id,
             "plugin_id": self.plugin_id,
+            "plugin_name": self.plugin_name,
             "plugin_version": self.plugin_version,
             "status": self.status,
             "target": self.target,
@@ -131,6 +133,7 @@ def render_managed_runtimes(
         target=target,
         package_id=package.id,
         plugin_id=plugin_id,
+        plugin_name=package.name,
         plugin_version=config.plugin_version,
         toolchain_version=_toolchain_version(),
         channel=HOST_RUNTIME_CHANNEL,

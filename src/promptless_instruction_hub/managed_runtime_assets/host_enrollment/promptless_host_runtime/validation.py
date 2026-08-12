@@ -12,6 +12,10 @@ from urllib.parse import SplitResult, urlsplit
 from .contracts import BootstrapError, INTERNAL_PROMPTLESS_EMAIL_DOMAIN, JsonValue, TEST_URL_OVERRIDE_ENV
 
 
+def _is_kebab_case_identifier(value: str) -> bool:
+    return re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", value) is not None
+
+
 def _requires_newer_bootstrap(required: str | None, current: str) -> bool:
     if required is None:
         return False
