@@ -2,21 +2,29 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import urllib.error
 from email.message import Message
 from pathlib import Path
 
 import pytest
 
+from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime import (
+    traces as trace_runtime,
+)
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.contracts import (
     BootstrapError,
     SourceEvent,
     SourceLedger,
+    TraceSourceRangeProof,
     TraceSourceSequenceConflict,
     UploadBatch,
+    WorkerResponseError,
 )
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.traces import (
+    _iter_source_events,
     _reconcile_source_sequence_conflict,
+    _trace_source_sequence_conflict,
 )
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.worker import (
     _MAX_WORKER_ERROR_RESPONSE_BYTES,
@@ -38,6 +46,58 @@ def test_worker_response_error_rejects_oversized_response_body() -> None:
 
     assert error.response_body == b""
     assert response_stream.tell() == _MAX_WORKER_ERROR_RESPONSE_BYTES + 1
+
+
+def test_sequence_conflict_without_a_range_proof_is_not_reconciled(tmp_path: Path) -> None:
+    source_path = tmp_path / "session.jsonl"
+    content = b'{"kind":"session_start"}\n{"kind":"stop"}\n'
+    source_path.write_bytes(content)
+    path_hash = hashlib.sha256(str(source_path).encode()).hexdigest()
+    event = SourceEvent(
+        kind="jsonl_range",
+        path=source_path,
+        path_hash=path_hash,
+        start_offset=0,
+        end_offset=len(content),
+        byte_count=len(content),
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        content=content,
+    )
+    batch = UploadBatch(request={"source": "codex"}, events=(event,))
+    error = WorkerResponseError(
+        "conflict",
+        status_code=409,
+        response_body=json.dumps(
+            {
+                "detail": {
+                    "code": "trace_source_sequence_conflict",
+                    "source": "codex",
+                    "source_path_hash": path_hash,
+                    "requested_start_offset": 0,
+                    "requested_end_offset": len(content),
+                    "acknowledged_offset": content.index(b'{"kind":"stop"}'),
+                    "acknowledged_range": None,
+                }
+            }
+        ).encode(),
+    )
+
+    assert _trace_source_sequence_conflict(error, batch) is None
+
+
+def test_baseline_does_not_hide_a_source_that_changes_before_its_identity_is_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "session.jsonl"
+    source_path.write_text('{"kind":"session_start"}\n')
+    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=True, sources={})
+    monkeypatch.setattr(trace_runtime, "_source_prefix_sha256", lambda _path, _offset: None)
+
+    with pytest.raises(BootstrapError, match="changed before its acknowledged offset"):
+        trace_runtime._baseline_source_offsets(ledger, (source_path,))
+
+    assert ledger.sources == {}
 
 
 @pytest.mark.parametrize("acknowledge_end", [False, True])
@@ -69,9 +129,125 @@ def test_sequence_conflict_does_not_reconcile_a_non_interior_watermark(
         requested_start_offset=0,
         requested_end_offset=end_offset,
         acknowledged_offset=acknowledged_offset,
+        acknowledged_range=TraceSourceRangeProof(
+            start_offset=0,
+            end_offset=acknowledged_offset,
+            content_sha256=hashlib.sha256(content[:acknowledged_offset]).hexdigest(),
+        ),
     )
 
     with pytest.raises(BootstrapError, match="interior worker watermark"):
         _reconcile_source_sequence_conflict(ledger, batch, conflict)
 
     assert ledger.sources == {}
+
+
+def test_sequence_conflict_reconciles_only_when_committed_bytes_match(tmp_path: Path) -> None:
+    source_path = tmp_path / "session.jsonl"
+    committed = b'{"kind":"session_start"}\n'
+    pending = b'{"kind":"stop"}\n'
+    content = committed + pending
+    source_path.write_bytes(content)
+    path_hash = hashlib.sha256(str(source_path).encode()).hexdigest()
+    event = SourceEvent(
+        kind="jsonl_range",
+        path=source_path,
+        path_hash=path_hash,
+        start_offset=0,
+        end_offset=len(content),
+        byte_count=len(content),
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        content=content,
+    )
+    batch = UploadBatch(request={"source": "codex"}, events=(event,))
+    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=True, sources={})
+    conflict = TraceSourceSequenceConflict(
+        source="codex",
+        source_path_hash=path_hash,
+        requested_start_offset=0,
+        requested_end_offset=len(content),
+        acknowledged_offset=len(committed),
+        acknowledged_range=TraceSourceRangeProof(
+            start_offset=0,
+            end_offset=len(committed),
+            content_sha256=hashlib.sha256(committed).hexdigest(),
+        ),
+    )
+
+    _reconcile_source_sequence_conflict(ledger, batch, conflict)
+
+    assert ledger.sources[path_hash]["end_offset"] == len(committed)
+    assert ledger.sources[path_hash]["prefix_sha256"] == hashlib.sha256(committed).hexdigest()
+
+
+def test_sequence_conflict_rejects_a_replaced_source_with_the_same_size(tmp_path: Path) -> None:
+    source_path = tmp_path / "session.jsonl"
+    committed = b'{"kind":"session_start","message":"docs"}\n'
+    pending = b'{"kind":"stop"}\n'
+    content = committed + pending
+    source_path.write_bytes(content)
+    path_hash = hashlib.sha256(str(source_path).encode()).hexdigest()
+    event = SourceEvent(
+        kind="jsonl_range",
+        path=source_path,
+        path_hash=path_hash,
+        start_offset=0,
+        end_offset=len(content),
+        byte_count=len(content),
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        content=content,
+    )
+    batch = UploadBatch(request={"source": "codex"}, events=(event,))
+    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=True, sources={})
+    conflict = TraceSourceSequenceConflict(
+        source="codex",
+        source_path_hash=path_hash,
+        requested_start_offset=0,
+        requested_end_offset=len(content),
+        acknowledged_offset=len(committed),
+        acknowledged_range=TraceSourceRangeProof(
+            start_offset=0,
+            end_offset=len(committed),
+            content_sha256=hashlib.sha256(committed).hexdigest(),
+        ),
+    )
+    source_path.write_bytes(content.replace(b"docs", b"code"))
+
+    with pytest.raises(BootstrapError, match="proof did not match the local source bytes"):
+        _reconcile_source_sequence_conflict(ledger, batch, conflict)
+
+    assert ledger.sources == {}
+
+
+def test_source_scan_restarts_when_an_acknowledged_prefix_changes_at_the_same_path(tmp_path: Path) -> None:
+    source_path = tmp_path / "session.jsonl"
+    original = b'{"kind":"session_start","message":"docs"}\n'
+    replacement = original.replace(b"docs", b"code")
+    source_path.write_bytes(replacement)
+    path_hash = hashlib.sha256(str(source_path).encode()).hexdigest()
+    ledger = SourceLedger(
+        path=tmp_path / "ledger.json",
+        is_new=False,
+        sources={
+            path_hash: {
+                "path": str(source_path),
+                "end_offset": len(original),
+                "prefix_sha256": hashlib.sha256(original).hexdigest(),
+            }
+        },
+    )
+
+    events = list(_iter_source_events(ledger, (source_path,)))
+
+    assert [(event.start_offset, event.end_offset, event.content) for event in events] == [
+        (0, len(replacement), replacement)
+    ]
+    assert path_hash in ledger.reset_sources
+    assert ledger.drift_reports == [
+        {
+            "kind": "native_trace_source_identity_changed",
+            "source_path_hash": path_hash,
+            "previous_end_offset": len(original),
+            "current_size": len(replacement),
+        }
+    ]

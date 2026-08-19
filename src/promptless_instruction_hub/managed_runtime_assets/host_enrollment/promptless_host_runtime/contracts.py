@@ -76,7 +76,9 @@ MAX_RECORD_BYTES = 10 * 1024 * 1024
 CHUNK_TARGET_BYTES = 4 * 1024 * 1024
 
 
-MAX_UPLOAD_CHUNKS_PER_BATCH = 200
+# The worker commits one source chunk per transaction. Keep the request at that
+# same boundary so a rejection cannot hide committed siblings from the ledger.
+MAX_UPLOAD_CHUNKS_PER_BATCH = 1
 
 
 # This soft request target fits one established 4 MiB source range after
@@ -214,6 +216,15 @@ class WorkerResponseError(BootstrapError):
         super().__init__(message)
 
 
+@dataclass(frozen=True)
+class TraceSourceRangeProof:
+    """Worker digest for the committed source bytes ending at its watermark."""
+
+    start_offset: int
+    end_offset: int
+    content_sha256: str
+
+
 class TraceSourceSequenceConflict(BootstrapError):
     """Worker reported its watermark for an exact rejected trace range."""
 
@@ -225,14 +236,16 @@ class TraceSourceSequenceConflict(BootstrapError):
         requested_start_offset: int,
         requested_end_offset: int,
         acknowledged_offset: int,
+        acknowledged_range: TraceSourceRangeProof,
     ) -> None:
-        """Record the rejected range and worker's authoritative watermark."""
+        """Record the rejected range and proof of the worker's committed prefix."""
 
         self.source = source
         self.source_path_hash = source_path_hash
         self.requested_start_offset = requested_start_offset
         self.requested_end_offset = requested_end_offset
         self.acknowledged_offset = acknowledged_offset
+        self.acknowledged_range = acknowledged_range
         super().__init__(
             f"trace source {source_path_hash} range {requested_start_offset}-{requested_end_offset} "
             f"conflicts with worker watermark {acknowledged_offset}"
