@@ -73,7 +73,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     )
     assert payload["id"] == "host-runtime"
     assert payload["name"] == HOST_RUNTIME_BIN
-    assert payload["version"] == "0.2.8"
+    assert payload["version"] == "0.2.9"
     assert payload["channel"] == "stable"
     manifest = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
     bundle_sha256 = _runtime_bundle_sha256(plugin_root / "runtime")
@@ -105,7 +105,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert text_version.returncode == 0
-    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.8\n"
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.9\n"
     assert text_version.stderr == ""
 
     poison_root = tmp_path / "poison-pythonpath"
@@ -133,7 +133,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert poisoned_pythonpath.returncode == 0
-    assert json.loads(poisoned_pythonpath.stdout)["version"] == "0.2.8"
+    assert json.loads(poisoned_pythonpath.stdout)["version"] == "0.2.9"
     assert poisoned_pythonpath.stderr == ""
     assert not poison_marker.exists()
 

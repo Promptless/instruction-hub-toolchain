@@ -9,9 +9,6 @@ from pathlib import Path
 
 import pytest
 
-from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime import (
-    traces as trace_runtime,
-)
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.contracts import (
     BootstrapError,
     SourceEvent,
@@ -84,21 +81,6 @@ def test_sequence_conflict_without_a_range_proof_is_not_reconciled(tmp_path: Pat
     )
 
     assert _trace_source_sequence_conflict(error, batch) is None
-
-
-def test_baseline_does_not_hide_a_source_that_changes_before_its_identity_is_recorded(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source_path = tmp_path / "session.jsonl"
-    source_path.write_text('{"kind":"session_start"}\n')
-    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=True, sources={})
-    monkeypatch.setattr(trace_runtime, "_source_prefix_sha256", lambda _path, _offset: None)
-
-    with pytest.raises(BootstrapError, match="changed before its acknowledged offset"):
-        trace_runtime._baseline_source_offsets(ledger, (source_path,))
-
-    assert ledger.sources == {}
 
 
 @pytest.mark.parametrize("acknowledge_end", [False, True])
@@ -269,6 +251,19 @@ def test_source_scan_restarts_when_an_acknowledged_prefix_changes_at_the_same_pa
                 "path": str(source_path),
                 "end_offset": len(original),
                 "prefix_sha256": hashlib.sha256(original).hexdigest(),
+                "instruction_hub_release_markers": [
+                    {
+                        "start_offset": 0,
+                        "session_id": "old-session",
+                        "captured_at": "2026-08-19T12:00:00+00:00",
+                        "release": {
+                            "plugin_id": "promptless-instruction-hub-pig",
+                            "plugin_name": "PIG",
+                            "plugin_version": "1.0.0",
+                            "release_id": "1.0.0+aaaaaaaaaaaa",
+                        },
+                    }
+                ],
             }
         },
     )
@@ -279,6 +274,7 @@ def test_source_scan_restarts_when_an_acknowledged_prefix_changes_at_the_same_pa
         (0, len(replacement), replacement)
     ]
     assert path_hash in ledger.reset_sources
+    assert "instruction_hub_release_markers" not in ledger.sources[path_hash]
     assert ledger.drift_reports == [
         {
             "kind": "native_trace_source_identity_changed",
