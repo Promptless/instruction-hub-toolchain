@@ -165,6 +165,7 @@ FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY = "first_enrollment_success_shown_at_by_targe
 
 
 Host = Literal["codex", "claude", "claude-desktop"]
+HOST_VALUES = ("codex", "claude", "claude-desktop")
 
 
 def _enrollment_host(host: Host) -> Host:

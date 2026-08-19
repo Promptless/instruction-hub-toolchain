@@ -29,6 +29,7 @@ from .contracts import (
     Host,
     HostCredential,
     HostPolicy,
+    HOST_VALUES,
     IDLE_SESSION_GRACE_SECONDS,
     JsonValue,
     LifecycleEvent,
@@ -703,6 +704,11 @@ def _iter_source_events(ledger: SourceLedger, source_paths: tuple[Path, ...]) ->
                             }
                         )
                         ledger.reset_sources.add(path_hash)
+                        if source is not None:
+                            reset_source = dict(source)
+                            reset_source.pop("instruction_hub_release_markers", None)
+                            reset_source.pop("provenance_only", None)
+                            ledger.sources[path_hash] = reset_source
                         start_offset = 0
                         handle.seek(0)
                         source_prefix_digest = cast(_HashState, hashlib.sha256())
