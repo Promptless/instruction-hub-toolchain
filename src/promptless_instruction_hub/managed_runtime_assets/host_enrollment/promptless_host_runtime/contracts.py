@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Union
+from typing import Callable, Literal, Union
 
 RUNTIME_VERSION = "0.2.9"
 
@@ -381,6 +381,7 @@ class SourceEvent:
     content_sha256: str | None = None
     content: bytes | None = None
     oversized_reason: OversizedReason | None = None
+    source_prefix_sha256_at: Callable[[int], str] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
