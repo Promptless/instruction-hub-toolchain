@@ -41,6 +41,7 @@ from .contracts import (
     SourceEvent,
     SourceLedger,
     TARGET_TRANSPORT_BATCH_BYTES,
+    TraceSourceRangeProof,
     TraceSourceSequenceConflict,
     UploadBatch,
     WorkerResponseError,
@@ -655,6 +656,20 @@ def _iter_source_events(ledger: SourceLedger, source_paths: tuple[Path, ...]) ->
             file_size = path.stat().st_size
         except OSError:
             continue
+        prefix_sha256 = _string_value(source.get("prefix_sha256")) if source is not None else None
+        if start_offset > 0 and prefix_sha256 is not None:
+            current_prefix_sha256 = _source_prefix_sha256(path, start_offset)
+            if current_prefix_sha256 != prefix_sha256:
+                ledger.drift_reports.append(
+                    {
+                        "kind": "native_trace_source_identity_changed",
+                        "source_path_hash": path_hash,
+                        "previous_end_offset": start_offset,
+                        "current_size": file_size,
+                    }
+                )
+                ledger.reset_sources.add(path_hash)
+                start_offset = 0
         if start_offset > file_size:
             ledger.drift_reports.append(
                 {
@@ -902,6 +917,10 @@ def _trace_source_sequence_conflict(
     requested_start_offset = _optional_int_value(detail.get("requested_start_offset"))
     requested_end_offset = _optional_int_value(detail.get("requested_end_offset"))
     acknowledged_offset = _optional_int_value(detail.get("acknowledged_offset"))
+    acknowledged_range = _json_mapping_or_empty(detail.get("acknowledged_range"))
+    acknowledged_range_start = _optional_int_value(acknowledged_range.get("start_offset"))
+    acknowledged_range_end = _optional_int_value(acknowledged_range.get("end_offset"))
+    acknowledged_range_sha256 = _string_value(acknowledged_range.get("content_sha256"))
     request_source = _string_value(batch.request.get("source"))
     if (
         source not in HOST_VALUES
@@ -910,6 +929,13 @@ def _trace_source_sequence_conflict(
         or requested_start_offset is None
         or requested_end_offset is None
         or acknowledged_offset is None
+        or acknowledged_range_start is None
+        or acknowledged_range_end is None
+        or acknowledged_range_sha256 is None
+        or acknowledged_range_start != requested_start_offset
+        or acknowledged_range_end != acknowledged_offset
+        or len(acknowledged_range_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in acknowledged_range_sha256)
     ):
         return None
     matching_event = next(
@@ -930,6 +956,11 @@ def _trace_source_sequence_conflict(
         requested_start_offset=requested_start_offset,
         requested_end_offset=requested_end_offset,
         acknowledged_offset=acknowledged_offset,
+        acknowledged_range=TraceSourceRangeProof(
+            start_offset=acknowledged_range_start,
+            end_offset=acknowledged_range_end,
+            content_sha256=acknowledged_range_sha256,
+        ),
     )
 
 
@@ -956,12 +987,22 @@ def _reconcile_source_sequence_conflict(
         raise BootstrapError("trace source sequence conflict did not match the local source ledger")
     if not conflict.requested_start_offset < conflict.acknowledged_offset < conflict.requested_end_offset:
         raise BootstrapError("trace source sequence conflict did not identify an interior worker watermark")
+    proof = conflict.acknowledged_range
+    if proof.start_offset != local_offset or proof.end_offset != conflict.acknowledged_offset:
+        raise BootstrapError("trace source sequence conflict proof did not match the local source range")
+    local_prefix_sha256 = _string_value(existing.get("prefix_sha256"))
+    if local_prefix_sha256 is not None and _source_prefix_sha256(event.path, local_offset) != local_prefix_sha256:
+        raise BootstrapError("trace source identity changed before watermark reconciliation")
     try:
-        source_size = event.path.stat().st_size
+        with event.path.open("rb") as source_file:
+            source_file.seek(proof.start_offset)
+            acknowledged_content = source_file.read(proof.end_offset - proof.start_offset)
     except OSError as exc:
         raise BootstrapError("trace source sequence conflict referenced an unreadable local source") from exc
-    if conflict.acknowledged_offset > source_size:
-        raise BootstrapError("trace source sequence conflict watermark exceeded the local source size")
+    if len(acknowledged_content) != proof.end_offset - proof.start_offset:
+        raise BootstrapError("trace source sequence conflict proof exceeded the local source size")
+    if hashlib.sha256(acknowledged_content).hexdigest() != proof.content_sha256:
+        raise BootstrapError("trace source sequence conflict proof did not match the local source bytes")
     _record_ledger_offset(ledger, event.path, conflict.acknowledged_offset)
     ledger.drift_reports.append(
         {
@@ -1032,17 +1073,40 @@ def _record_ledger_offset(ledger: SourceLedger, path: Path, end_offset: int) -> 
     path_hash = _path_hash(path)
     existing = _json_mapping_or_empty(ledger.sources.get(path_hash))
     previous_offset = 0 if path_hash in ledger.reset_sources else (_optional_int_value(existing.get("end_offset")) or 0)
+    recorded_offset = max(previous_offset, end_offset)
+    prefix_sha256 = _source_prefix_sha256(path, recorded_offset)
+    if prefix_sha256 is None:
+        raise BootstrapError("trace source changed before its acknowledged offset could be recorded")
     updated_source = dict(existing)
     updated_source.update(
         {
             "path": str(path),
-            "end_offset": max(previous_offset, end_offset),
+            "end_offset": recorded_offset,
+            "prefix_sha256": prefix_sha256,
             "updated_at": _utc_now_iso(),
         }
     )
     updated_source.pop("provenance_only", None)
     updated_source.pop("instruction_hub_release_markers", None)
     ledger.sources[path_hash] = updated_source
+
+
+def _source_prefix_sha256(path: Path, end_offset: int) -> str | None:
+    """Hash exactly the source prefix represented by one local ledger offset."""
+
+    digest = hashlib.sha256()
+    remaining = end_offset
+    try:
+        with path.open("rb") as source_file:
+            while remaining > 0:
+                block = source_file.read(min(remaining, 1024 * 1024))
+                if block == b"":
+                    return None
+                digest.update(block)
+                remaining -= len(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
 
 
 def _path_hash(path: Path) -> str:
