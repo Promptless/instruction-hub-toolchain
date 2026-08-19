@@ -22,6 +22,7 @@ from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptles
     WorkerResponseError,
 )
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.traces import (
+    _advance_ledger_from_response,
     _iter_source_events,
     _reconcile_source_sequence_conflict,
     _trace_source_sequence_conflict,
@@ -148,19 +149,10 @@ def test_sequence_conflict_reconciles_only_when_committed_bytes_match(tmp_path: 
     pending = b'{"kind":"stop"}\n'
     content = committed + pending
     source_path.write_bytes(content)
-    path_hash = hashlib.sha256(str(source_path).encode()).hexdigest()
-    event = SourceEvent(
-        kind="jsonl_range",
-        path=source_path,
-        path_hash=path_hash,
-        start_offset=0,
-        end_offset=len(content),
-        byte_count=len(content),
-        content_sha256=hashlib.sha256(content).hexdigest(),
-        content=content,
-    )
-    batch = UploadBatch(request={"source": "codex"}, events=(event,))
     ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=True, sources={})
+    event = next(_iter_source_events(ledger, (source_path,)))
+    path_hash = event.path_hash
+    batch = UploadBatch(request={"source": "codex"}, events=(event,))
     conflict = TraceSourceSequenceConflict(
         source="codex",
         source_path_hash=path_hash,
@@ -180,25 +172,43 @@ def test_sequence_conflict_reconciles_only_when_committed_bytes_match(tmp_path: 
     assert ledger.sources[path_hash]["prefix_sha256"] == hashlib.sha256(committed).hexdigest()
 
 
-def test_sequence_conflict_rejects_a_replaced_source_with_the_same_size(tmp_path: Path) -> None:
+def test_sequence_conflict_rejects_a_watermark_inside_a_record(tmp_path: Path) -> None:
+    source_path = tmp_path / "session.jsonl"
+    content = b'{"kind":"session_start"}\n'
+    source_path.write_bytes(content)
+    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=True, sources={})
+    event = next(_iter_source_events(ledger, (source_path,)))
+    batch = UploadBatch(request={"source": "codex"}, events=(event,))
+    acknowledged_offset = content.index(b"session_start")
+    conflict = TraceSourceSequenceConflict(
+        source="codex",
+        source_path_hash=event.path_hash,
+        requested_start_offset=0,
+        requested_end_offset=len(content),
+        acknowledged_offset=acknowledged_offset,
+        acknowledged_range=TraceSourceRangeProof(
+            start_offset=0,
+            end_offset=acknowledged_offset,
+            content_sha256=hashlib.sha256(content[:acknowledged_offset]).hexdigest(),
+        ),
+    )
+
+    with pytest.raises(BootstrapError, match="record boundary"):
+        _reconcile_source_sequence_conflict(ledger, batch, conflict)
+
+    assert ledger.sources == {}
+
+
+def test_sequence_conflict_uses_the_uploaded_snapshot_after_the_source_is_replaced(tmp_path: Path) -> None:
     source_path = tmp_path / "session.jsonl"
     committed = b'{"kind":"session_start","message":"docs"}\n'
     pending = b'{"kind":"stop"}\n'
     content = committed + pending
     source_path.write_bytes(content)
-    path_hash = hashlib.sha256(str(source_path).encode()).hexdigest()
-    event = SourceEvent(
-        kind="jsonl_range",
-        path=source_path,
-        path_hash=path_hash,
-        start_offset=0,
-        end_offset=len(content),
-        byte_count=len(content),
-        content_sha256=hashlib.sha256(content).hexdigest(),
-        content=content,
-    )
-    batch = UploadBatch(request={"source": "codex"}, events=(event,))
     ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=True, sources={})
+    event = next(_iter_source_events(ledger, (source_path,)))
+    path_hash = event.path_hash
+    batch = UploadBatch(request={"source": "codex"}, events=(event,))
     conflict = TraceSourceSequenceConflict(
         source="codex",
         source_path_hash=path_hash,
@@ -213,10 +223,36 @@ def test_sequence_conflict_rejects_a_replaced_source_with_the_same_size(tmp_path
     )
     source_path.write_bytes(content.replace(b"docs", b"code"))
 
-    with pytest.raises(BootstrapError, match="proof did not match the local source bytes"):
-        _reconcile_source_sequence_conflict(ledger, batch, conflict)
+    _reconcile_source_sequence_conflict(ledger, batch, conflict)
 
-    assert ledger.sources == {}
+    assert ledger.sources[path_hash]["end_offset"] == len(committed)
+    assert ledger.sources[path_hash]["prefix_sha256"] == hashlib.sha256(committed).hexdigest()
+
+
+def test_successful_ack_uses_the_uploaded_snapshot_after_the_source_disappears(tmp_path: Path) -> None:
+    source_path = tmp_path / "session.jsonl"
+    content = b'{"kind":"session_start"}\n'
+    source_path.write_bytes(content)
+    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=True, sources={})
+    event = next(_iter_source_events(ledger, (source_path,)))
+    batch = UploadBatch(request={"source": "codex"}, events=(event,))
+    response = {
+        "acknowledged_ranges": [
+            {
+                "kind": event.kind,
+                "source_path_hash": event.path_hash,
+                "start_offset": event.start_offset,
+                "end_offset": event.end_offset,
+                "content_sha256": event.content_sha256,
+            }
+        ]
+    }
+    source_path.unlink()
+
+    _advance_ledger_from_response(ledger, batch, response)
+
+    assert ledger.sources[event.path_hash]["end_offset"] == len(content)
+    assert ledger.sources[event.path_hash]["prefix_sha256"] == hashlib.sha256(content).hexdigest()
 
 
 def test_source_scan_restarts_when_an_acknowledged_prefix_changes_at_the_same_path(tmp_path: Path) -> None:
