@@ -76,7 +76,7 @@ MAX_TRACE_BATCH_BYTES = 10 * 1024 * 1024
 MAX_RECORD_BYTES = 10 * 1024 * 1024
 
 
-CHUNK_TARGET_BYTES = 4 * 1024 * 1024
+CHUNK_TARGET_BYTES = 256 * 1024
 
 
 MAX_UPLOAD_CHUNKS_PER_BATCH = 200
@@ -85,12 +85,15 @@ MAX_UPLOAD_CHUNKS_PER_BATCH = 200
 MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH = 200
 
 
-# Per-request wire budget measured on the encoded body, distinct from the decoded
-# MAX_TRACE_BATCH_BYTES: high-entropy content grows ~4/3 under gzip+base64, so raw
-# size alone cannot bound a request. The worker's HTTP body limit is configurable
-# (256 MiB shipped); bounding here makes collector request size an invariant instead
-# of a property of content entropy. CHUNK_TARGET_BYTES * 4/3 must stay well under
-# this budget so multi-line ranges never overflow it; only single oversized lines do.
+# Ordinary requests stay below this encoded-body target so trace catch-up cannot
+# monopolize a lifecycle hook. A single JSONL record is indivisible and may exceed
+# the target, but it must remain below the hard transport limit.
+TARGET_TRANSPORT_BATCH_BYTES = 512 * 1024
+
+
+# Hard per-request wire limit measured on the encoded body, distinct from the
+# decoded MAX_TRACE_BATCH_BYTES. High-entropy content grows under gzip+base64, so
+# raw size alone cannot prove a request is sendable.
 MAX_TRANSPORT_BATCH_BYTES = 10 * 1024 * 1024
 
 
@@ -213,10 +216,9 @@ class BootstrapAuthError(BootstrapError):
 class CollectDeadlineExceeded(BootstrapError):
     """Optional collection work exceeded the hook-safe runtime budget.
 
-    The deadline meters catch-up work only: the idle root scan and upload
-    batches after the first. Hook-subject path collection, the first-run
-    baseline inventory, and the first pending batch always run so a hook can
-    never be starved of its own transcript by tree-scale work.
+    The deadline meters idle catch-up work. Current-transcript uploads and the
+    first-run baseline inventory run separately so tree-scale work cannot
+    prevent a lifecycle hook from uploading its own transcript.
     """
 
 

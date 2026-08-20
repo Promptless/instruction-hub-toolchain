@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptles
     InstalledInstructionHubRelease,
     JsonValue,
     RuntimeMetadata,
+    SourceEvent,
     SourceLedger,
     UploadBatch,
 )
@@ -25,6 +27,7 @@ from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptles
 )
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.traces import (
     _instruction_hub_release_markers,
+    _iter_source_events,
     _iter_upload_batches,
     _ledger_has_host_source,
     _load_source_ledger,
@@ -335,12 +338,12 @@ def test_terminal_and_subagent_hooks_do_not_smear_release_onto_unmarked_sources(
         home = tmp_path / "home"
         codex_home = home / ".codex"
         ledger_path = tmp_path / "ledger.json"
-        subject_path = tmp_path / "subject.jsonl"
+        transcript_path = tmp_path / "current.jsonl"
         idle_path = codex_home / "sessions/idle.jsonl"
         idle_path.parent.mkdir(parents=True)
-        subject_baseline = b'{"kind":"session_start"}\n'
+        transcript_baseline = b'{"kind":"session_start"}\n'
         idle_baseline = b'{"kind":"other_session"}\n'
-        subject_path.write_bytes(subject_baseline)
+        transcript_path.write_bytes(transcript_baseline)
         idle_path.write_bytes(idle_baseline)
         stale = time.time() - (13 * 60 * 60)
         os.utime(idle_path, (stale, stale))
@@ -357,26 +360,26 @@ def test_terminal_and_subagent_hooks_do_not_smear_release_onto_unmarked_sources(
             plugin_root,
             ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
             env,
-            {"session_id": "subject-session", "transcript_path": str(subject_path)},
+            {"session_id": "current-session", "transcript_path": str(transcript_path)},
         )
-        subject_path.write_bytes(subject_baseline + b'{"kind":"stop"}\n')
+        transcript_path.write_bytes(transcript_baseline + b'{"kind":"stop"}\n')
         idle_path.write_bytes(idle_baseline + b'{"kind":"idle_tail"}\n')
         os.utime(idle_path, (stale, stale))
         _run_collect(
             plugin_root,
             ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
             env,
-            {"session_id": "subject-session", "transcript_path": str(subject_path)},
+            {"session_id": "current-session", "transcript_path": str(transcript_path)},
         )
 
-        subject_batch = server.trace_batches[0]
-        subject_snapshots = [
-            _json_mapping(value, "snapshot") for value in _json_list(subject_batch["snapshots"], "snapshots")
+        transcript_batch = server.trace_batches[0]
+        transcript_snapshots = [
+            _json_mapping(value, "snapshot") for value in _json_list(transcript_batch["snapshots"], "snapshots")
         ]
-        subject_hash = hashlib.sha256(str(subject_path.resolve()).encode()).hexdigest()
+        transcript_hash = hashlib.sha256(str(transcript_path.resolve()).encode()).hexdigest()
         idle_hash = hashlib.sha256(str(idle_path.resolve()).encode()).hexdigest()
-        assert {snapshot["source_path_hash"] for snapshot in subject_snapshots} == {subject_hash}
-        assert idle_hash not in {snapshot["source_path_hash"] for snapshot in subject_snapshots}
+        assert {snapshot["source_path_hash"] for snapshot in transcript_snapshots} == {transcript_hash}
+        assert idle_hash not in {snapshot["source_path_hash"] for snapshot in transcript_snapshots}
 
         agent_path = tmp_path / "subagent.jsonl"
         agent_path.write_bytes(b'{"kind":"agent_stop"}\n')
@@ -472,38 +475,50 @@ def test_persisted_markers_split_snapshot_ranges_without_changing_upload_batch(
     assert _ledger_has_host_source(persisted, "codex")
 
 
-def test_expired_deadline_uploads_subject_then_resumes_idle_catch_up(tmp_path: Path) -> None:
-    subject_path = (tmp_path / "subject.jsonl").resolve()
+def test_current_transcript_upload_finishes_before_expired_idle_catch_up(tmp_path: Path) -> None:
+    transcript_path = (tmp_path / "current.jsonl").resolve()
     idle_path = (tmp_path / "idle.jsonl").resolve()
-    subject_record = b'{"kind":"subject"}\n'
+    transcript_record = b'{"kind":"current"}\n'
     idle_record = b'{"kind":"idle"}\n'
-    subject_path.write_bytes(subject_record)
+    transcript_path.write_bytes(transcript_record)
     idle_path.write_bytes(idle_record)
     ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=False, sources={})
-    _record_ledger_offset(ledger, subject_path, 0)
+    _record_ledger_offset(ledger, transcript_path, 0)
     _record_ledger_offset(ledger, idle_path, 0)
-    hook_context = HookTraceContext(subject_path, None, "session-1", None, None, None)
+    hook_context = HookTraceContext(transcript_path, None, "session-1", None, None, None)
 
-    batches = _iter_upload_batches(
-        host="codex",
-        metadata=_metadata("1.0.0"),
-        policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
-        lifecycle_event="stop",
-        hook_context=hook_context,
-        ledger=ledger,
-        source_paths=(subject_path, idle_path),
-        deadline=0,
+    current_batches = list(
+        _iter_upload_batches(
+            host="codex",
+            metadata=_metadata("1.0.0"),
+            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+            lifecycle_event="stop",
+            hook_context=hook_context,
+            ledger=ledger,
+            source_paths=(transcript_path,),
+            deadline=float("inf"),
+        )
     )
-
-    subject_batch = next(batches)
-    assert [event.path for event in subject_batch.events] == [subject_path]
-    _record_ledger_offset(ledger, subject_path, subject_batch.events[-1].end_offset)
+    assert len(current_batches) == 1
+    assert [event.path for event in current_batches[0].events] == [transcript_path]
+    _record_ledger_offset(ledger, transcript_path, current_batches[0].events[-1].end_offset)
     with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
-        next(batches)
+        list(
+            _iter_upload_batches(
+                host="codex",
+                metadata=_metadata("1.0.0"),
+                policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+                lifecycle_event="stop",
+                hook_context=hook_context,
+                ledger=ledger,
+                source_paths=(idle_path,),
+                deadline=0,
+            )
+        )
 
-    subject_hash = hashlib.sha256(str(subject_path).encode()).hexdigest()
+    transcript_hash = hashlib.sha256(str(transcript_path).encode()).hexdigest()
     idle_hash = hashlib.sha256(str(idle_path).encode()).hexdigest()
-    assert ledger.sources[subject_hash]["end_offset"] == len(subject_record)
+    assert ledger.sources[transcript_hash]["end_offset"] == len(transcript_record)
     assert ledger.sources[idle_hash]["end_offset"] == 0
 
     resumed_batches = list(
@@ -514,7 +529,7 @@ def test_expired_deadline_uploads_subject_then_resumes_idle_catch_up(tmp_path: P
             lifecycle_event="stop",
             hook_context=hook_context,
             ledger=ledger,
-            source_paths=(subject_path, idle_path),
+            source_paths=(idle_path,),
             deadline=float("inf"),
         )
     )
@@ -522,18 +537,24 @@ def test_expired_deadline_uploads_subject_then_resumes_idle_catch_up(tmp_path: P
     assert [event.path for event in resumed_batches[0].events] == [idle_path]
 
 
-def test_expired_deadline_defers_idle_catch_up_when_subject_is_up_to_date(tmp_path: Path) -> None:
-    subject_path = (tmp_path / "subject.jsonl").resolve()
+def test_expired_deadline_stops_before_idle_source_iteration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     idle_path = (tmp_path / "idle.jsonl").resolve()
-    subject_record = b'{"kind":"subject"}\n'
-    idle_record = b'{"kind":"idle"}\n'
-    subject_path.write_bytes(subject_record)
-    idle_path.write_bytes(idle_record)
+    idle_path.write_bytes(b'{"kind":"incomplete"}')
     ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=False, sources={})
-    _record_ledger_offset(ledger, subject_path, len(subject_record))
     _record_ledger_offset(ledger, idle_path, 0)
-    hook_context = HookTraceContext(subject_path, None, "session-1", None, None, None)
+    iterated_paths: list[Path] = []
+    original_iter_source_events = _iter_source_events
 
+    def track_iterated_paths(source_ledger: SourceLedger, paths: tuple[Path, ...]) -> Iterator[SourceEvent]:
+        for path in paths:
+            iterated_paths.append(path)
+            yield from original_iter_source_events(source_ledger, (path,))
+
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces._iter_source_events",
+        track_iterated_paths,
+    )
     with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
         list(
             _iter_upload_batches(
@@ -541,42 +562,24 @@ def test_expired_deadline_defers_idle_catch_up_when_subject_is_up_to_date(tmp_pa
                 metadata=_metadata("1.0.0"),
                 policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
                 lifecycle_event="stop",
-                hook_context=hook_context,
+                hook_context=HookTraceContext(None, None, None, None, None, None),
                 ledger=ledger,
-                source_paths=(subject_path, idle_path),
+                source_paths=(idle_path,),
                 deadline=0,
             )
         )
-
-    resumed_batches = list(
-        _iter_upload_batches(
-            host="codex",
-            metadata=_metadata("1.0.0"),
-            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
-            lifecycle_event="stop",
-            hook_context=hook_context,
-            ledger=ledger,
-            source_paths=(subject_path, idle_path),
-            deadline=float("inf"),
-        )
-    )
-    assert len(resumed_batches) == 1
-    assert [event.path for event in resumed_batches[0].events] == [idle_path]
+    assert iterated_paths == []
 
 
 def test_idle_catch_up_checks_deadline_between_source_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    subject_path = (tmp_path / "subject.jsonl").resolve()
     first_idle_path = (tmp_path / "first-idle.jsonl").resolve()
     second_idle_path = (tmp_path / "second-idle.jsonl").resolve()
-    subject_record = b'{"kind":"subject"}\n'
-    subject_path.write_bytes(subject_record)
     first_idle_path.write_bytes(b'{"kind":"first_idle"}\n')
     second_idle_path.write_bytes(b'{"kind":"second_idle"}\n')
     ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=False, sources={})
-    _record_ledger_offset(ledger, subject_path, len(subject_record))
     _record_ledger_offset(ledger, first_idle_path, 0)
     _record_ledger_offset(ledger, second_idle_path, 0)
-    monotonic_values = iter((1.0, 3.0))
+    monotonic_values = iter((1.0, 1.0, 3.0))
     monkeypatch.setattr(
         "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
         "promptless_host_runtime.traces.time.monotonic",
@@ -590,9 +593,9 @@ def test_idle_catch_up_checks_deadline_between_source_events(tmp_path: Path, mon
                 metadata=_metadata("1.0.0"),
                 policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
                 lifecycle_event="stop",
-                hook_context=HookTraceContext(subject_path, None, "session-1", None, None, None),
+                hook_context=HookTraceContext(None, None, None, None, None, None),
                 ledger=ledger,
-                source_paths=(subject_path, first_idle_path, second_idle_path),
+                source_paths=(first_idle_path, second_idle_path),
                 deadline=2.0,
             )
         )
@@ -601,8 +604,8 @@ def test_idle_catch_up_checks_deadline_between_source_events(tmp_path: Path, mon
 @pytest.mark.parametrize(
     ("idle_path_count", "max_chunks", "monotonic_values"),
     (
-        pytest.param(1, None, (1.0, 3.0), id="final-batch"),
-        pytest.param(2, 1, (1.0, 1.0, 3.0), id="batch-cap"),
+        pytest.param(1, None, (1.0, 1.0, 3.0), id="final-batch"),
+        pytest.param(2, 1, (1.0, 1.0, 1.0, 1.0, 3.0), id="batch-cap"),
     ),
 )
 def test_idle_catch_up_rechecks_deadline_before_upload(
@@ -612,12 +615,8 @@ def test_idle_catch_up_rechecks_deadline_before_upload(
     max_chunks: int | None,
     monotonic_values: tuple[float, ...],
 ) -> None:
-    subject_path = (tmp_path / "subject.jsonl").resolve()
-    subject_record = b'{"kind":"subject"}\n'
-    subject_path.write_bytes(subject_record)
     idle_paths = tuple((tmp_path / f"idle-{index}.jsonl").resolve() for index in range(idle_path_count))
     ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=False, sources={})
-    _record_ledger_offset(ledger, subject_path, len(subject_record))
     for idle_path in idle_paths:
         idle_path.write_bytes(b'{"kind":"idle"}\n')
         _record_ledger_offset(ledger, idle_path, 0)
@@ -641,9 +640,9 @@ def test_idle_catch_up_rechecks_deadline_before_upload(
                 metadata=_metadata("1.0.0"),
                 policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
                 lifecycle_event="stop",
-                hook_context=HookTraceContext(subject_path, None, "session-1", None, None, None),
+                hook_context=HookTraceContext(None, None, None, None, None, None),
                 ledger=ledger,
-                source_paths=(subject_path, *idle_paths),
+                source_paths=idle_paths,
                 deadline=2.0,
             )
         )

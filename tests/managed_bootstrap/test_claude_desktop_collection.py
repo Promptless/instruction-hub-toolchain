@@ -107,6 +107,81 @@ def test_claude_desktop_discovers_both_audit_stores_under_platform_config_root(t
         server.stop()
 
 
+def test_claude_uploads_current_transcript_before_idle_history_with_release_snapshot(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/claude/pig"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude"]))
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        project_root = home / ".claude/projects/project-1"
+        transcript_path = project_root / "current-session.jsonl"
+        idle_path = project_root / "idle-session.jsonl"
+        project_root.mkdir(parents=True)
+        transcript_baseline = b'{"sessionId":"current","message":"baseline"}\n'
+        idle_baseline = b'{"sessionId":"idle","message":"baseline"}\n'
+        transcript_path.write_bytes(transcript_baseline)
+        idle_path.write_bytes(idle_baseline)
+        env = {
+            "HOME": str(home),
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "claude"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "claude", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "current", "transcript_path": str(transcript_path)},
+        )
+
+        transcript_extra = b'{"sessionId":"current","message":"stop"}\n'
+        idle_extra = b'{"sessionId":"idle","message":"catch-up"}\n'
+        transcript_path.write_bytes(transcript_baseline + transcript_extra)
+        idle_path.write_bytes(idle_baseline + idle_extra)
+        stale_time = time.time() - (13 * 60 * 60)
+        os.utime(idle_path, (stale_time, stale_time))
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "claude", "--lifecycle", "stop", "--quiet"],
+            env,
+            {"session_id": "current", "transcript_path": str(transcript_path)},
+        )
+
+        assert len(server.trace_batches) == 2
+        transcript_batch, idle_batch = server.trace_batches
+        transcript_chunk = _json_mapping(
+            _json_list(transcript_batch["chunks"], "transcript_batch.chunks")[0], "transcript_chunk"
+        )
+        idle_chunk = _json_mapping(_json_list(idle_batch["chunks"], "idle_batch.chunks")[0], "idle_chunk")
+        assert transcript_batch["host"] == "claude"
+        assert transcript_chunk["lifecycle_event"] == "stop"
+        assert (
+            gzip.decompress(base64.b64decode(_json_string(transcript_chunk["content_base64"], "content_base64")))
+            == transcript_extra
+        )
+        snapshots = _json_list(transcript_batch["snapshots"], "transcript_batch.snapshots")
+        assert len(snapshots) == 1
+        snapshot = _json_mapping(snapshots[0], "snapshot")
+        assert snapshot["source_path_hash"] == transcript_chunk["source_path_hash"]
+        assert snapshot["session_id"] == "current"
+        assert _json_mapping(
+            snapshot["installed_instruction_hub_release"], "snapshot.installed_instruction_hub_release"
+        )["release_id"]
+        assert "lifecycle_event" not in idle_chunk
+        assert (
+            gzip.decompress(base64.b64decode(_json_string(idle_chunk["content_base64"], "content_base64")))
+            == idle_extra
+        )
+    finally:
+        server.stop()
+
+
 def test_claude_desktop_ensure_if_sources_skips_without_audit_files(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
