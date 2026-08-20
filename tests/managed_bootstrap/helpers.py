@@ -148,11 +148,8 @@ def _run_bootstrap(
     env: dict[str, str],
     *,
     expected_status: str = "configured",
-    prepare_baseline: bool = False,
 ) -> tuple[dict[str, JsonValue], subprocess.CompletedProcess[str]]:
     args = [str(plugin_root / "runtime" / HOST_RUNTIME_BIN), "ensure", "--host", host]
-    if prepare_baseline:
-        args.append("--prepare-baseline")
     result = subprocess.run(
         args,
         env=_clean_env(**env),

@@ -40,9 +40,6 @@ MANAGED_END = "# END PROMPTLESS MANAGED HOST ENROLLMENT"
 MANAGED_RUNTIME_MANIFEST = Path("hub.managed-runtimes.json")
 
 
-RELEASE_MANIFEST = Path("hub.release.json")
-
-
 STATE_FILE_NAME = "host-enrollment-state.json"
 
 
@@ -80,9 +77,6 @@ CHUNK_TARGET_BYTES = 4 * 1024 * 1024
 
 
 MAX_UPLOAD_CHUNKS_PER_BATCH = 200
-
-
-MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH = 200
 
 
 # This soft request target fits one established 4 MiB source range after
@@ -171,9 +165,6 @@ FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY = "first_enrollment_success_shown_at_by_targe
 Host = Literal["codex", "claude", "claude-desktop"]
 
 
-HOST_VALUES = ("codex", "claude", "claude-desktop")
-
-
 def _enrollment_host(host: Host) -> Host:
     """Return the host identity used for enrollment, credentials, and policy."""
     return "claude" if host == "claude-desktop" else host
@@ -213,12 +204,11 @@ class BootstrapAuthError(BootstrapError):
 
 
 class CollectDeadlineExceeded(BootstrapError):
-    """Optional collection work exceeded the hook-safe runtime budget.
+    """Trace collection exceeded its bounded runtime budget.
 
     The first pending current-transcript batch receives its own deadline, and
-    the first-run baseline inventory runs separately. Remaining current-
-    transcript and idle catch-up work share a fresh deadline so later hooks can
-    resume it safely.
+    remaining current-transcript and idle catch-up work share a fresh deadline
+    so later hooks can resume it safely.
     """
 
 
@@ -233,16 +223,6 @@ class RuntimeMetadata:
     plugin_version: str
     package_id: str
     target: Host
-
-
-@dataclass(frozen=True)
-class InstalledInstructionHubRelease:
-    """Validated identity of the Instruction Hub installed beside this runtime."""
-
-    plugin_id: str
-    plugin_name: str
-    plugin_version: str
-    release_id: str
 
 
 @dataclass(frozen=True)
@@ -369,6 +349,5 @@ class SourceLedger:
     path: Path
     is_new: bool
     sources: dict[str, dict[str, JsonValue]]
-    host_baselines: set[str] = field(default_factory=set)
     reset_sources: set[str] = field(default_factory=set)
     drift_reports: list[dict[str, JsonValue]] = field(default_factory=list)

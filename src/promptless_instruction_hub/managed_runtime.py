@@ -25,10 +25,9 @@ HOST_RUNTIME_PACKAGE = "promptless_host_runtime"
 # Directory (relative to a plugin root) that the runtime bundle is copied into.
 # Intentionally not "bin": claude.ai-hosted plugins must not ship a top-level bin/.
 HOST_RUNTIME_OUTPUT_DIR = "runtime"
-# SessionStart only captures local release/baseline state and launches a detached
-# enrollment + collection supervisor. The 30-second ceiling leaves room for the
-# existing 25-second ledger-lock deadline without putting browser or network waits
-# on the hook's critical path.
+# SessionStart only validates the local runtime, launches a detached enrollment and
+# collection supervisor, and emits already-pending notices. Browser, network, trace
+# discovery, and ledger work stay off the hook's critical path.
 HOST_RUNTIME_SESSION_START_HOOK_TIMEOUT_SECONDS = 30
 HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS = 390
 HOST_RUNTIME_CHANNEL = "stable"
@@ -240,9 +239,8 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
     # Promptless-built static native binary so customer machines do not need Python or uv.
-    # SessionStart durably captures its release/baseline boundary and then launches detached
-    # enrollment, config/check-in reconciliation, and forward-only JSONL collection. Terminal
-    # lifecycle hooks only launch detached native JSONL uploads.
+    # SessionStart launches detached enrollment, config/check-in reconciliation, and JSONL
+    # collection. Terminal lifecycle hooks only launch detached native JSONL uploads.
     hook_entry: dict[str, JsonValue] = {
         "hooks": [
             {
@@ -273,10 +271,8 @@ def _host_runtime_start_hook_command(target: Harness, *, lifecycle: str) -> dict
         return _claude_host_runtime_hook_command(
             lifecycle=lifecycle,
             run_ensure=True,
-            baseline=True,
             quiet_failure=False,
             allow_sibling_runtime=False,
-            collect_claude_desktop=True,
         )
     return {
         "command": _posix_host_runtime_hook_command(
@@ -284,7 +280,6 @@ def _host_runtime_start_hook_command(target: Harness, *, lifecycle: str) -> dict
             host="codex",
             lifecycle=lifecycle,
             run_ensure=True,
-            baseline=True,
             quiet_failure=False,
             allow_sibling_runtime=False,
         ),
@@ -296,10 +291,8 @@ def _host_runtime_terminal_hook_command(target: Harness, *, lifecycle: str) -> d
         return _claude_host_runtime_hook_command(
             lifecycle=lifecycle,
             run_ensure=False,
-            baseline=False,
             quiet_failure=True,
             allow_sibling_runtime=True,
-            collect_claude_desktop=False,
         )
     return {
         "command": _posix_host_runtime_hook_command(
@@ -307,7 +300,6 @@ def _host_runtime_terminal_hook_command(target: Harness, *, lifecycle: str) -> d
             host="codex",
             lifecycle=lifecycle,
             run_ensure=False,
-            baseline=False,
             quiet_failure=True,
             allow_sibling_runtime=True,
         ),
@@ -341,10 +333,8 @@ def _claude_host_runtime_hook_command(
     *,
     lifecycle: str,
     run_ensure: bool,
-    baseline: bool,
     quiet_failure: bool,
     allow_sibling_runtime: bool,
-    collect_claude_desktop: bool,
 ) -> dict[str, JsonValue]:
     return {
         "command": "node",
@@ -355,10 +345,8 @@ def _claude_host_runtime_hook_command(
                 host="claude",
                 lifecycle=lifecycle,
                 run_ensure=run_ensure,
-                baseline=baseline,
                 quiet_failure=quiet_failure,
                 allow_sibling_runtime=allow_sibling_runtime,
-                collect_claude_desktop=collect_claude_desktop,
             ),
             "${CLAUDE_PLUGIN_ROOT}",
         ],
@@ -371,10 +359,8 @@ def _node_host_runtime_hook_script(
     host: Harness,
     lifecycle: str,
     run_ensure: bool,
-    baseline: bool,
     quiet_failure: bool,
     allow_sibling_runtime: bool,
-    collect_claude_desktop: bool,
 ) -> str:
     root_env_names = json.dumps(list(root_envs), separators=(",", ":"))
     bundle_relative_paths = json.dumps(HOST_RUNTIME_BUNDLE_RELATIVE_PATHS, separators=(",", ":"))
@@ -389,15 +375,7 @@ def _node_host_runtime_hook_script(
         runtime_args.extend(("'session-start'", "'--host'", repr(host), "'--detach'"))
     else:
         runtime_args.extend(("'collect'", "'--host'", repr(host), "'--lifecycle'", repr(lifecycle)))
-        if baseline:
-            runtime_args.append("'--baseline'")
         runtime_args.extend(("'--detach'", "'--quiet'"))
-    claude_desktop_start_script = ""
-    if collect_claude_desktop:
-        claude_desktop_start_script = (
-            "  const desktopStartArgs = [runtime, 'session-start', '--host', 'claude-desktop', '--if-sources', '--detach'];\n"
-            "  launchRuntime(candidate.command, [...candidate.runPrefix, ...desktopStartArgs], ['ignore', 'ignore', 'ignore'], 'claude-desktop');\n"
-        )
     return (
         "const fs = require('fs');\n"
         "const path = require('path');\n"
@@ -482,7 +460,6 @@ def _node_host_runtime_hook_script(
         "  }\n"
         f"  runtimeStarted = launchRuntime(candidate.command, [...candidate.runPrefix, ...runtimeArgs], ['inherit', 'inherit', 'inherit'], {host!r});\n"
         "  if (!runtimeStarted && emitDiagnostics) process.exit(1);\n"
-        f"{claude_desktop_start_script}"
         "  break;\n"
         "}\n"
         f"if (!runtimeStarted && sawUnsupportedPython) finishWithDiagnostic({unsupported_python!r});\n"
@@ -497,11 +474,9 @@ def _posix_host_runtime_hook_command(
     host: Harness,
     lifecycle: str,
     run_ensure: bool,
-    baseline: bool,
     quiet_failure: bool,
     allow_sibling_runtime: bool,
 ) -> str:
-    collect_baseline_arg = " --baseline" if baseline else ""
     bundle_relative_paths = " ".join(shlex.quote(path) for path in HOST_RUNTIME_BUNDLE_RELATIVE_PATHS)
     runtime_state_function = (
         "runtime_state() { "
@@ -558,8 +533,8 @@ def _posix_host_runtime_hook_command(
         )
     else:
         runtime_command = (
-            f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --detach --quiet <&3 >/dev/null 2>&1; '
-            f'else "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --detach --quiet <&3 >/dev/null 2>&1; fi; '
+            f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle} --detach --quiet <&3 >/dev/null 2>&1; '
+            f'else "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle} --detach --quiet <&3 >/dev/null 2>&1; fi; '
             "exit 0"
         )
     script = (

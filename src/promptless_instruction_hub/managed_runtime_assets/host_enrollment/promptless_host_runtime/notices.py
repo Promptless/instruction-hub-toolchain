@@ -152,7 +152,7 @@ def _claim_first_enrollment_success_notice(host: Host, *, status: ConfigStatus, 
     repair. Enrollment writes nothing the running host must reload (the credential lives in
     the host-global state file and traces upload out-of-process from the hooks), so the message
     is a plain confirmation rather than a restart prompt; the needs_restart branch adds its own
-    restart instruction, so this stays generic there to avoid contradicting it. A quiet baseline
+    restart instruction, so this stays generic there to avoid contradicting it. A quiet detached
     run returns None without claiming the latch, leaving the notice for the next visible session.
     """
 

@@ -443,7 +443,7 @@ def test_bootstrap_confirms_first_successful_enrollment_once_per_host(tmp_path: 
         server.stop()
 
 
-def test_background_ensure_records_status_without_consuming_user_notices(tmp_path: Path) -> None:
+def test_session_start_supervisor_records_status_without_consuming_user_notices(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -460,8 +460,15 @@ def test_background_ensure_records_status_without_consuming_user_notices(tmp_pat
         }
 
         background = subprocess.run(
-            [str(plugin_root / "runtime" / HOST_RUNTIME_BIN), "ensure", "--host", "codex", "--background"],
+            [
+                str(plugin_root / "runtime" / HOST_RUNTIME_BIN),
+                "session-start",
+                "--host",
+                "codex",
+                "--supervised",
+            ],
             env=_clean_env(**env),
+            input="{}",
             text=True,
             capture_output=True,
             check=False,
@@ -479,7 +486,6 @@ def test_background_ensure_records_status_without_consuming_user_notices(tmp_pat
         )
         assert FIRST_SUCCESS_SHOWN_KEY not in state
         assert _json_mapping(state[PENDING_FIRST_SUCCESS_KEY], "pending first-success") == {"codex": "configured"}
-        assert _json_mapping(state["last_seen_plugin_versions"], "last seen versions")["codex"] == "0.1.0"
 
         foreground_payload, _ = _run_bootstrap(plugin_root, "codex", env)
         foreground_message = _json_string(foreground_payload["systemMessage"], "systemMessage")

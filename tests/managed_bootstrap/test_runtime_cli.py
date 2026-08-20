@@ -220,7 +220,6 @@ def test_collector_process_creation_failure_is_persisted(
             return_code = host_runtime_cli._launch_detached_collect(
                 "codex",
                 collector_args,
-                lifecycle="stop",
             )
         else:
             return_code = host_runtime_cli._supervise_collect("codex", collector_args)
@@ -240,7 +239,7 @@ def test_collector_process_creation_failure_is_persisted(
     assert _last_status_path(home).stat().st_mode & 0o777 == 0o600
 
 
-def test_detached_session_start_persists_guard_and_boundary_before_spawn_and_preserves_stdin(
+def test_detached_session_start_only_spawns_supervisor_and_preserves_stdin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -277,12 +276,7 @@ def test_detached_session_start_persists_guard_and_boundary_before_spawn_and_pre
     assert return_code == 0
     assert spawned_stdin == raw_hook_input
     assert spawned_args[-4:] == ["session-start", "--host", "codex", "--supervised"]
-    assert ledger_path.with_name("ledger.json.codex.baseline-pending").is_file()
-    ledger = json.loads(ledger_path.read_text())
-    source = next(iter(ledger["sources"].values()))
-    marker = source["instruction_hub_release_markers"][0]
-    assert marker["start_offset"] == len(before_launch)
-    assert marker["session_id"] == "session-1"
+    assert not ledger_path.exists()
 
 
 def test_session_start_launcher_emits_and_claims_local_notices_once(
@@ -361,7 +355,7 @@ def test_session_start_launcher_emits_and_claims_local_notices_once(
     assert len(spawned_args) == 2
 
 
-def test_session_start_supervisor_records_ensure_process_creation_failure(
+def test_session_start_supervisor_records_ensure_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -369,7 +363,12 @@ def test_session_start_supervisor_records_ensure_process_creation_failure(
     hook_input_path = tmp_path / "hook-input.json"
     hook_input_path.write_text("{}")
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr(host_runtime_cli.sys, "executable", str(tmp_path / "missing-python"))
+
+    def fail_ensure(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        raise FileNotFoundError(2, "missing runtime dependency")
+
+    monkeypatch.setattr(host_runtime_cli, "_run_ensure", fail_ensure)
 
     with hook_input_path.open() as hook_input:
         monkeypatch.setattr(host_runtime_cli.sys, "stdin", hook_input)
