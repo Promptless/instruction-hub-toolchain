@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import socket
 import urllib.error
 import urllib.request
 
@@ -37,6 +38,12 @@ def _get_json(url: str, token: str | None, *, label: str) -> dict[str, JsonValue
         if exc.code in {401, 403}:
             raise BootstrapAuthError(f"{label} request failed with HTTP {exc.code}") from exc
         raise BootstrapError(f"{label} request failed with HTTP {exc.code}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise _worker_timeout_error(label) from exc
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise _worker_timeout_error(label) from exc
+        raise
     return _decode_json_object(body, label)
 
 
@@ -78,6 +85,19 @@ def _post_json_response(
         if exc.code in {401, 403}:
             raise BootstrapAuthError(f"{label} request failed with HTTP {exc.code}") from exc
         raise BootstrapError(f"{label} request failed with HTTP {exc.code}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise _worker_timeout_error(label) from exc
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise _worker_timeout_error(label) from exc
+        raise
+
+
+def _worker_timeout_error(label: str) -> BootstrapError:
+    return BootstrapError(
+        f"Promptless worker did not respond within {HTTP_TIMEOUT_SECONDS} seconds while waiting for the {label}. "
+        "Retry shortly; if it persists, check the worker's health and workload."
+    )
 
 
 def _auth_headers(token: str | None) -> dict[str, str]:
