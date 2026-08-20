@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Union
 
-RUNTIME_VERSION = "0.2.7"
+RUNTIME_VERSION = "0.2.8"
 
 
 RUNTIME_CHANNEL = "stable"
@@ -85,19 +85,16 @@ MAX_UPLOAD_CHUNKS_PER_BATCH = 200
 MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH = 200
 
 
-# Per-request wire budget measured on the encoded body, distinct from the decoded
-# MAX_TRACE_BATCH_BYTES: high-entropy content grows ~4/3 under gzip+base64, so raw
-# size alone cannot bound a request. The worker's HTTP body limit is configurable
-# (256 MiB shipped); bounding here makes collector request size an invariant instead
-# of a property of content entropy. CHUNK_TARGET_BYTES * 4/3 must stay well under
-# this budget so multi-line ranges never overflow it; only single oversized lines do.
+# This soft request target fits one established 4 MiB source range after
+# gzip/base64 encoding while splitting accumulated catch-up well below the hard
+# transport limit. An indivisible range may exceed the target, but not the limit.
+TARGET_TRANSPORT_BATCH_BYTES = 6 * 1024 * 1024
+
+
+# Hard per-request wire limit measured on the encoded body, distinct from the
+# decoded MAX_TRACE_BATCH_BYTES. High-entropy content grows under gzip+base64, so
+# raw size alone cannot prove a request is sendable.
 MAX_TRANSPORT_BATCH_BYTES = 10 * 1024 * 1024
-
-
-TRANSPORT_CHUNK_OVERHEAD_BYTES = 1024
-
-
-TRANSPORT_BATCH_OVERHEAD_BYTES = 16 * 1024
 
 
 MAX_DIAGNOSTIC_LOG_BYTES = 512 * 1024
@@ -213,10 +210,10 @@ class BootstrapAuthError(BootstrapError):
 class CollectDeadlineExceeded(BootstrapError):
     """Optional collection work exceeded the hook-safe runtime budget.
 
-    The deadline meters catch-up work only: the idle root scan and upload
-    batches after the first. Hook-subject path collection, the first-run
-    baseline inventory, and the first pending batch always run so a hook can
-    never be starved of its own transcript by tree-scale work.
+    The first pending current-transcript batch receives its own deadline, and
+    the first-run baseline inventory runs separately. Remaining current-
+    transcript and idle catch-up work share a fresh deadline so later hooks can
+    resume it safely.
     """
 
 
