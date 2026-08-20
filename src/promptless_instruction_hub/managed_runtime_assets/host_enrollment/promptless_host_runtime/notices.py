@@ -14,6 +14,7 @@ from .contracts import (
     INTERNAL_PROMPTLESS_WELCOME_MESSAGE_LINES,
     INTERNAL_PROMPTLESS_WELCOME_SHOWN_AT_KEY,
     INTERNAL_PROMPTLESS_WELCOME_SHOWN_VERSIONS_KEY,
+    PENDING_FIRST_ENROLLMENT_SUCCESS_KEY,
     RuntimeMetadata,
 )
 from .output import HOST_DISPLAY_NAMES
@@ -33,6 +34,14 @@ class PendingPluginUpdate:
     target: str
     version: str
     notice: str | None
+
+
+@dataclass(frozen=True)
+class FirstEnrollmentSuccessNotice:
+    """A claimed deferred enrollment result and its user-facing notice."""
+
+    status: ConfigStatus
+    notice: str
 
 
 def _pending_plugin_update(metadata: RuntimeMetadata) -> PendingPluginUpdate | None:
@@ -147,22 +156,75 @@ def _claim_first_enrollment_success_notice(host: Host, *, status: ConfigStatus, 
     run returns None without claiming the latch, leaving the notice for the next visible session.
     """
 
-    message = _first_enrollment_success_message(host, status=status)
-    if quiet or message is None:
+    if quiet:
         return None
+    claimed = _claim_first_enrollment_success(host, status=status)
+    return claimed.notice if claimed is not None else None
+
+
+def _defer_first_enrollment_success_notice(host: Host, *, status: ConfigStatus) -> None:
+    """Persist a healthy detached enrollment result for the next visible SessionStart."""
+
+    if _first_enrollment_success_message(host, status=status) is None:
+        return
     try:
         state_path = _state_path()
         with _state_file_lock(state_path):
             state = _load_state(state_path)
             shown_targets = _json_mapping_or_empty(state.get(FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY))
             if _string_value(shown_targets.get(host)) is not None:
+                return
+            pending_targets = _json_mapping_or_empty(state.get(PENDING_FIRST_ENROLLMENT_SUCCESS_KEY))
+            pending_targets[host] = status
+            state[PENDING_FIRST_ENROLLMENT_SUCCESS_KEY] = pending_targets
+            _write_state(state_path, state)
+    except (OSError, BootstrapError):
+        return
+
+
+def _claim_deferred_first_enrollment_success_notice(host: Host) -> FirstEnrollmentSuccessNotice | None:
+    """Claim and return the enrollment success left by a detached ensure run."""
+
+    return _claim_first_enrollment_success(host, status=None)
+
+
+def _claim_first_enrollment_success(
+    host: Host,
+    *,
+    status: ConfigStatus | None,
+) -> FirstEnrollmentSuccessNotice | None:
+    try:
+        state_path = _state_path()
+        with _state_file_lock(state_path):
+            state = _load_state(state_path)
+            pending_targets = _json_mapping_or_empty(state.get(PENDING_FIRST_ENROLLMENT_SUCCESS_KEY))
+            if status is None:
+                status = _healthy_config_status(pending_targets.get(host))
+                if status is None:
+                    return None
+            message = _first_enrollment_success_message(host, status=status)
+            if message is None:
+                return None
+
+            shown_targets = _json_mapping_or_empty(state.get(FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY))
+            if _string_value(shown_targets.get(host)) is not None:
                 return None
             shown_targets[host] = dt.datetime.now(dt.timezone.utc).isoformat()
+            pending_targets.pop(host, None)
             state[FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY] = shown_targets
+            state[PENDING_FIRST_ENROLLMENT_SUCCESS_KEY] = pending_targets
             _write_state(state_path, state)
     except (OSError, BootstrapError):
         return None
-    return message
+    return FirstEnrollmentSuccessNotice(status=status, notice=message)
+
+
+def _healthy_config_status(value: object) -> ConfigStatus | None:
+    if value == "configured":
+        return "configured"
+    if value == "needs_restart":
+        return "needs_restart"
+    return None
 
 
 def _first_enrollment_success_message(host: Host, *, status: ConfigStatus) -> str | None:

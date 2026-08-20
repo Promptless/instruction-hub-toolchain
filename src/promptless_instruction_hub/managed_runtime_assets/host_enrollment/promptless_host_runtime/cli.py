@@ -44,8 +44,10 @@ from .metadata import (
     _worker_base_url,
 )
 from .notices import (
+    _claim_deferred_first_enrollment_success_notice,
     _claim_first_enrollment_success_notice,
     _claim_internal_promptless_welcome,
+    _defer_first_enrollment_success_notice,
     _pending_plugin_update,
     _record_plugin_version_seen,
 )
@@ -355,7 +357,33 @@ def _launch_detached_session_start(host: Host, *, if_sources: bool) -> int:
         binary_stdin.write(hook_input)
         binary_stdin.seek(0)
         _spawn_detached(supervisor_args, stdin=binary_stdin)
+    enrollment_target = _enrollment_host(host)
+    enrollment_metadata = (
+        metadata if enrollment_target == host else _load_runtime_metadata(plugin_root, enrollment_target)
+    )
+    _emit_pending_session_start_notices(enrollment_target, enrollment_metadata)
     return 0
+
+
+def _emit_pending_session_start_notices(host: Host, metadata: RuntimeMetadata) -> None:
+    pending_update = _pending_plugin_update(metadata)
+    update_notice = pending_update.notice if pending_update is not None else None
+    first_success = _claim_deferred_first_enrollment_success_notice(host)
+    internal_welcome = _claim_internal_promptless_welcome(
+        quiet=False,
+        plugin_version=metadata.plugin_version,
+        version_updated=update_notice is not None,
+    )
+    if update_notice is not None or first_success is not None or internal_welcome is not None:
+        status = first_success.status if first_success is not None else "notice"
+        _emit(
+            {"status": status, "host": host, "needs_restart": status == "needs_restart"},
+            update_notice=update_notice,
+            first_success_notice=first_success.notice if first_success is not None else None,
+            internal_welcome_notice=internal_welcome,
+        )
+    if pending_update is not None:
+        _record_plugin_version_seen(pending_update)
 
 
 def _supervise_session_start(host: Host, *, if_sources: bool) -> int:
@@ -654,6 +682,7 @@ def _run_host_enrollment(
     plugin_version_updated: bool,
     claim_notices: bool,
 ) -> int:
+    notice_quiet = quiet or not claim_notices
     worker_base_url = _worker_base_url()
     dashboard_base_url = _dashboard_base_url()
     context = _enrollment_context(worker_base_url, dashboard_base_url, metadata)
@@ -668,7 +697,7 @@ def _run_host_enrollment(
             quiet=quiet,
             update_notice=update_notice,
             internal_welcome_notice=_claim_internal_promptless_welcome(
-                quiet=quiet or not claim_notices,
+                quiet=notice_quiet,
                 plugin_version=metadata.plugin_version,
                 version_updated=plugin_version_updated,
             ),
@@ -693,7 +722,7 @@ def _run_host_enrollment(
                 quiet=quiet,
                 update_notice=update_notice,
                 internal_welcome_notice=_claim_internal_promptless_welcome(
-                    quiet=quiet or not claim_notices,
+                    quiet=notice_quiet,
                     plugin_version=metadata.plugin_version,
                     version_updated=plugin_version_updated,
                 ),
@@ -723,7 +752,7 @@ def _run_host_enrollment(
             update_notice=update_notice,
             internal_welcome_notice=_claim_internal_promptless_welcome(
                 credential=credential,
-                quiet=quiet or not claim_notices,
+                quiet=notice_quiet,
                 plugin_version=metadata.plugin_version,
                 version_updated=plugin_version_updated,
             ),
@@ -732,18 +761,23 @@ def _run_host_enrollment(
 
     result = _ensure_host_config(host, trace_upload_endpoint=trace_upload_endpoint)
     _post_check_in(check_in_url, credential, host, metadata, policy, result)
+    first_success_notice = None
+    if claim_notices:
+        first_success_notice = _claim_first_enrollment_success_notice(
+            host,
+            status=result.status,
+            quiet=quiet,
+        )
+    else:
+        _defer_first_enrollment_success_notice(host, status=result.status)
     _emit(
         {"status": result.status, "host": host, "needs_restart": result.needs_restart},
         quiet=quiet,
         update_notice=update_notice,
-        first_success_notice=_claim_first_enrollment_success_notice(
-            host,
-            status=result.status,
-            quiet=quiet or not claim_notices,
-        ),
+        first_success_notice=first_success_notice,
         internal_welcome_notice=_claim_internal_promptless_welcome(
             credential=credential,
-            quiet=quiet or not claim_notices,
+            quiet=notice_quiet,
             plugin_version=metadata.plugin_version,
             version_updated=plugin_version_updated,
         ),

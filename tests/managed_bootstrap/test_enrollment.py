@@ -21,6 +21,7 @@ from .helpers import (
     HOST_RUNTIME_BIN,
     INTERNAL_WELCOME_SHOWN_AT_KEY,
     INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY,
+    PENDING_FIRST_SUCCESS_KEY,
     _FakeWorkerServer,
     _approved_poll_response,
     _assert_session_start_streams,
@@ -477,6 +478,7 @@ def test_background_ensure_records_status_without_consuming_user_notices(tmp_pat
             "host state",
         )
         assert FIRST_SUCCESS_SHOWN_KEY not in state
+        assert _json_mapping(state[PENDING_FIRST_SUCCESS_KEY], "pending first-success") == {"codex": "configured"}
         assert _json_mapping(state["last_seen_plugin_versions"], "last seen versions")["codex"] == "0.1.0"
 
         foreground_payload, _ = _run_bootstrap(plugin_root, "codex", env)
@@ -487,6 +489,7 @@ def test_background_ensure_records_status_without_consuming_user_notices(tmp_pat
             "host state",
         )
         assert "codex" in _json_mapping(foreground_state[FIRST_SUCCESS_SHOWN_KEY], "first-success shown")
+        assert _json_mapping(foreground_state[PENDING_FIRST_SUCCESS_KEY], "pending first-success") == {}
         assert _json_mapping(foreground_state["last_seen_plugin_versions"], "last seen versions")["codex"] == "0.1.0"
     finally:
         server.stop()

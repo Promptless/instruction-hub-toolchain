@@ -160,6 +160,11 @@ INTERNAL_PROMPTLESS_WELCOME_MESSAGE_LINES = (
 )
 
 
+# A detached enrollment records its first healthy result here so the next synchronous
+# SessionStart launcher can render it without repeating network work.
+PENDING_FIRST_ENROLLMENT_SUCCESS_KEY = "pending_first_enrollment_success_by_target"
+
+
 # Latch for the one-time "enrollment succeeded" confirmation, keyed by enrollment target
 # (claude/codex) so each host is confirmed once. Fired for every user on the first healthy
 # enrollment, unlike the internal-only pigfooder welcome above.

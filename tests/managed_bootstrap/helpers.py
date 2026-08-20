@@ -26,6 +26,7 @@ DIAGNOSTIC_LOG_REL_PATH = Path(".promptless/instruction-hub/host-runtime-diagnos
 INTERNAL_WELCOME_SHOWN_AT_KEY = "internal_promptless_welcome_shown_at"
 INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY = "internal_promptless_welcome_shown_at_by_version"
 FIRST_SUCCESS_SHOWN_KEY = "first_enrollment_success_shown_at_by_target"
+PENDING_FIRST_SUCCESS_KEY = "pending_first_enrollment_success_by_target"
 FIRST_SUCCESS_ACTIVE_FRAGMENT = "telemetry is now active for"
 FIRST_SUCCESS_NO_RESTART_FRAGMENT = "No restart or plugin reload is needed."
 BROWSER_ENROLLMENT_MESSAGE = (

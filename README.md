@@ -163,7 +163,9 @@ host credential to fetch `/v0/host-enrollment/policy?target=...` and post
 SessionStart never waits for browser approval or worker requests. It records
 the local release boundary and baseline-pending guard, launches a detached
 supervisor, and returns. The supervisor runs enrollment and reconciliation
-before its baseline collection. On Linux, enrollment does not invoke a browser
+before its baseline collection. A later SessionStart emits and claims any
+pending plugin-update, first-enrollment, and internal-user notices using local
+state only. On Linux, enrollment does not invoke a browser
 when `DISPLAY`, `WAYLAND_DISPLAY`, `MIR_SOCKET`, and `WSL_INTEROP` are all
 absent; set `PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER=1` to force a browser
 attempt or `0` to disable one explicitly. Detached enrollment outcomes remain

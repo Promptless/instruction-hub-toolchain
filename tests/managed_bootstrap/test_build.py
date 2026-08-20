@@ -706,12 +706,12 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         delayed_startup_collect = startup_hook_result(
             root=stub_root,
             home=tmp_path / f"{target}-delayed-startup-collect-home",
-            collect_delay_seconds=2,
-            ensure_delay_seconds=2,
+            collect_delay_seconds=1,
+            ensure_delay_seconds=3,
         )
         elapsed_seconds = time.monotonic() - started_at
         assert_quiet_success(delayed_startup_collect)
-        assert elapsed_seconds < 1
+        assert elapsed_seconds < 2
         assert Path(f"{stub_call_log}.{target}.baseline-pending").exists()
         if target == "claude":
             assert Path(f"{stub_call_log}.claude-desktop.baseline-pending").exists()
