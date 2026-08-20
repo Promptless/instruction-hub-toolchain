@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import datetime as dt
 import glob
 import gzip
@@ -11,6 +12,7 @@ import json
 import os
 import sys
 import time
+import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -191,15 +193,55 @@ def _run_collect(
         _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
         return 0
 
+    upload_url = _worker_url(worker_base_url, f"/v0/traces/batches?{urlencode({'target': host})}")
     current_transcript_paths = _current_transcript_paths(hook_context, lifecycle_event)
     if baseline:
         source_paths: tuple[Path, ...] = ()
-        if not host_baselined:
+        baseline_needs_offsets = not host_baselined
+        if baseline_needs_offsets:
             # Baseline discovery records offsets for every known source, including
             # files still inside the idle grace period. The unmetered scan runs
             # without the ledger lock so release-marker capture remains available.
             idle_source_paths, _ = _idle_root_scan_paths(host, deadline=float("inf"), include_active=True)
             source_paths = _ordered_unique_source_paths(current_transcript_paths, idle_source_paths)
+
+            with _source_ledger_lock(
+                ledger_path,
+                wait_for_lock=True,
+                deadline=_collect_deadline(),
+            ) as lock_acquired:
+                if not lock_acquired:
+                    _emit(
+                        {"status": "trace_upload_partial", "reason": "collection_deadline_exceeded", "host": host},
+                        quiet=quiet,
+                    )
+                    return 0
+                ledger = _load_source_ledger(ledger_path)
+                pending_source_paths = _in_flight_source_paths(ledger, host)
+
+            if pending_source_paths:
+                try:
+                    _upload_source_paths(
+                        pending_source_paths,
+                        upload_url=upload_url,
+                        credential=credential,
+                        host=host,
+                        metadata=metadata,
+                        policy=policy,
+                        lifecycle_event=lifecycle_event,
+                        hook_context=hook_context,
+                        ledger_path=ledger_path,
+                        deadline=first_current_batch_deadline,
+                        drain_in_flight=True,
+                    )
+                except CollectDeadlineExceeded:
+                    _emit(
+                        {"status": "trace_upload_partial", "reason": "collection_deadline_exceeded", "host": host},
+                        quiet=quiet,
+                    )
+                    return 0
+
+        baseline_blocked_by_in_flight = False
         with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=_collect_deadline()) as lock_acquired:
             if not lock_acquired:
                 _emit(
@@ -209,8 +251,13 @@ def _run_collect(
                 return 0
             ledger = _load_source_ledger(ledger_path)
             host_baselined = host in ledger.host_baselines or _ledger_has_host_source(ledger, host)
-            if not host_baselined:
-                _baseline_source_offsets(ledger, source_paths)
+            if host in ledger.host_baselines:
+                baseline_needs_offsets = False
+            if baseline_needs_offsets and ledger.in_flight_batches.get(host):
+                baseline_blocked_by_in_flight = True
+            elif baseline_needs_offsets:
+                never_started_paths = tuple(path for path in source_paths if not _source_has_upload_state(ledger, path))
+                _baseline_source_offsets(ledger, never_started_paths)
                 ledger.host_baselines.add(host)
                 _write_source_ledger(ledger)
                 _clear_baseline_pending(baseline_pending_path)
@@ -218,7 +265,7 @@ def _run_collect(
                     {
                         "status": "trace_upload_baselined",
                         "host": host,
-                        "source_count": len(source_paths),
+                        "source_count": len(never_started_paths),
                         "drift_report_count": len(ledger.drift_reports),
                     },
                     quiet=quiet,
@@ -227,12 +274,17 @@ def _run_collect(
             if host not in ledger.host_baselines:
                 ledger.host_baselines.add(host)
                 _write_source_ledger(ledger)
+        if baseline_blocked_by_in_flight:
+            _emit(
+                {"status": "trace_upload_partial", "reason": "pending_acknowledgement", "host": host},
+                quiet=quiet,
+            )
+            return 0
         _clear_baseline_pending(baseline_pending_path)
 
     # A new/quarantined ledger seen without --baseline (e.g. a terminal hook after a missed
     # SessionStart or a corrupt-ledger reset) must not baseline: that would skip the completed
     # transcript entirely. Fall through so unknown sources upload from offset 0.
-    upload_url = _worker_url(worker_base_url, f"/v0/traces/batches?{urlencode({'target': host})}")
     uploaded_batch_count = 0
     uploaded_chunk_count = 0
     unparsed_record_count = 0
@@ -296,10 +348,6 @@ def _run_collect(
         all_source_paths = _ordered_unique_source_paths(current_transcript_paths, discovered_idle_paths)
         idle_source_paths = all_source_paths[len(current_transcript_paths) :]
         deadline_exceeded = not idle_scan_complete
-    if not current_transcript_paths and not idle_source_paths and idle_scan_complete:
-        _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
-        return 0
-
     if not deadline_exceeded:
         try:
             idle_counts = _upload_source_paths(
@@ -313,6 +361,7 @@ def _run_collect(
                 hook_context=hook_context,
                 ledger_path=ledger_path,
                 deadline=catch_up_deadline,
+                drain_in_flight=True,
             )
             uploaded_batch_count += idle_counts[0]
             uploaded_chunk_count += idle_counts[1]
@@ -320,6 +369,16 @@ def _run_collect(
             unreadable_source_hashes.update(idle_counts[3])
         except CollectDeadlineExceeded:
             deadline_exceeded = True
+
+    if (
+        uploaded_batch_count == 0
+        and not current_transcript_paths
+        and not idle_source_paths
+        and idle_scan_complete
+        and not deadline_exceeded
+    ):
+        _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
+        return 0
 
     payload: dict[str, JsonValue] = {
         "status": "trace_upload_partial" if deadline_exceeded else "trace_upload_complete",
@@ -643,24 +702,33 @@ def _load_source_ledger(path: Path) -> SourceLedger:
             host = _string_value(raw_host)
             if host in HOST_VALUES:
                 host_baselines.add(host)
+    in_flight_batches: dict[Host, list[InFlightUploadBatch]] = {}
+    if "in_flight_batches" in value:
+        in_flight_batches = _load_in_flight_batches(value.get("in_flight_batches"))
     return SourceLedger(
         path=path,
         is_new=False,
         sources=valid_sources,
         host_baselines=host_baselines,
-        in_flight_batches=_load_in_flight_batches(value.get("in_flight_batches")),
+        in_flight_batches=in_flight_batches,
     )
 
 
 def _load_in_flight_batches(value: JsonValue | None) -> dict[Host, list[InFlightUploadBatch]]:
+    if not isinstance(value, dict) or not value:
+        raise BootstrapError("native trace ledger has an invalid in-flight upload journal")
     batches_by_host: dict[Host, list[InFlightUploadBatch]] = {}
-    for raw_host, raw_batches in _json_mapping_or_empty(value).items():
+    for raw_host, raw_batches in value.items():
         host = _host_value(raw_host)
-        if host is None or not isinstance(raw_batches, list):
-            continue
-        batches = [batch for raw_batch in raw_batches if (batch := _in_flight_batch_value(raw_batch)) is not None]
-        if batches:
-            batches_by_host[host] = batches
+        if host is None or not isinstance(raw_batches, list) or not raw_batches:
+            raise BootstrapError("native trace ledger has an invalid in-flight upload journal")
+        batches: list[InFlightUploadBatch] = []
+        for raw_batch in raw_batches:
+            batch = _in_flight_batch_value(raw_batch)
+            if batch is None:
+                raise BootstrapError("native trace ledger has an invalid in-flight upload journal")
+            batches.append(batch)
+        batches_by_host[host] = batches
     return batches_by_host
 
 
@@ -703,6 +771,7 @@ def _in_flight_event_value(value: JsonValue) -> InFlightSourceEvent | None:
     end_offset = _optional_int_value(event.get("end_offset"))
     byte_count = _optional_int_value(event.get("byte_count"))
     content_sha256 = _string_value(event.get("content_sha256"))
+    content_gzip_base64 = _string_value(event.get("content_gzip_base64"))
     oversized_reason_value = _string_value(event.get("oversized_reason"))
     oversized_reason: OversizedReason | None = None
     if oversized_reason_value == "content_size":
@@ -725,6 +794,16 @@ def _in_flight_event_value(value: JsonValue) -> InFlightSourceEvent | None:
         or any(character not in "0123456789abcdef" for character in content_sha256)
         or (kind == "jsonl_range" and oversized_reason is not None)
         or (kind == "oversized_record" and oversized_reason is None)
+        or (kind == "jsonl_range" and content_gzip_base64 is None)
+        or (kind == "oversized_record" and content_gzip_base64 is not None)
+    ):
+        return None
+    content = _gunzip_base64(content_gzip_base64) if content_gzip_base64 is not None else None
+    if kind == "jsonl_range" and (
+        content is None
+        or len(content) != byte_count
+        or hashlib.sha256(content).hexdigest() != content_sha256
+        or not content.endswith(b"\n")
     ):
         return None
     path = Path(path_value)
@@ -738,6 +817,7 @@ def _in_flight_event_value(value: JsonValue) -> InFlightSourceEvent | None:
         end_offset=end_offset,
         byte_count=byte_count,
         content_sha256=content_sha256,
+        content=content,
         oversized_reason=oversized_reason,
     )
 
@@ -833,6 +913,8 @@ def _in_flight_event_payload(event: InFlightSourceEvent) -> dict[str, JsonValue]
         "byte_count": event.byte_count,
         "content_sha256": event.content_sha256,
     }
+    if event.content is not None:
+        payload["content_gzip_base64"] = _gzip_base64(event.content)
     if event.oversized_reason is not None:
         payload["oversized_reason"] = event.oversized_reason
     return payload
@@ -845,6 +927,15 @@ def _baseline_source_offsets(ledger: SourceLedger, source_paths: tuple[Path, ...
         except OSError:
             continue
         _record_ledger_offset(ledger, path, end_offset)
+
+
+def _source_has_upload_state(ledger: SourceLedger, path: Path) -> bool:
+    source = ledger.sources.get(_path_hash(path))
+    return (
+        source is not None
+        and source.get("provenance_only") is not True
+        and _string_value(source.get("path")) == str(path)
+    )
 
 
 def _persist_session_release_marker(
@@ -1209,6 +1300,7 @@ def _upload_source_paths(
     ledger_path: Path,
     deadline: float,
     batch_limit: int | None = None,
+    drain_in_flight: bool = False,
 ) -> tuple[int, int, int, frozenset[str]]:
     """Upload paths with one ledger-locked request and acknowledgement at a time."""
 
@@ -1216,26 +1308,35 @@ def _upload_source_paths(
     uploaded_chunk_count = 0
     unparsed_record_count = 0
     unreadable_source_hashes: set[str] = set()
-    while source_paths and (batch_limit is None or uploaded_batch_count < batch_limit):
+    while batch_limit is None or uploaded_batch_count < batch_limit:
         _ensure_collect_deadline(deadline)
         with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=deadline) as lock_acquired:
             if not lock_acquired:
                 raise CollectDeadlineExceeded("native trace collection exceeded deadline waiting for ledger lock")
             ledger = _load_source_ledger(ledger_path)
-            in_flight_batch = _next_in_flight_batch(ledger, host, source_paths)
+            in_flight_batch = _next_in_flight_batch(
+                ledger,
+                host,
+                source_paths,
+                include_unmatched=drain_in_flight,
+            )
             if in_flight_batch is None:
-                batch = next(
-                    _iter_upload_batches(
-                        host=host,
-                        metadata=metadata,
-                        policy=policy,
-                        lifecycle_event=lifecycle_event,
-                        hook_context=hook_context,
-                        ledger=ledger,
-                        source_paths=source_paths,
-                        deadline=deadline,
-                    ),
-                    None,
+                batch = (
+                    next(
+                        _iter_upload_batches(
+                            host=host,
+                            metadata=metadata,
+                            policy=policy,
+                            lifecycle_event=lifecycle_event,
+                            hook_context=hook_context,
+                            ledger=ledger,
+                            source_paths=source_paths,
+                            deadline=deadline,
+                        ),
+                        None,
+                    )
+                    if source_paths
+                    else None
                 )
             else:
                 batch = _restore_in_flight_upload_batch(
@@ -1268,7 +1369,7 @@ def _upload_source_paths(
                 _write_source_ledger(ledger)
             _ensure_collect_deadline(deadline)
             response = _post_upload_batch(upload_url, credential, policy, batch)
-            _advance_ledger_from_response(ledger, source_paths, response)
+            _advance_ledger_from_response(ledger, batch, response)
             _clear_in_flight_batch(ledger, host, in_flight_batch)
             _write_source_ledger(ledger)
         uploaded_batch_count += 1
@@ -1281,12 +1382,20 @@ def _next_in_flight_batch(
     ledger: SourceLedger,
     host: Host,
     source_paths: tuple[Path, ...],
+    *,
+    include_unmatched: bool,
 ) -> InFlightUploadBatch | None:
     paths_by_hash = {_path_hash(path): path for path in source_paths}
     for batch in ledger.in_flight_batches.get(host, []):
-        if all(paths_by_hash.get(event.path_hash) == event.path for event in batch.events):
+        if include_unmatched or any(paths_by_hash.get(event.path_hash) == event.path for event in batch.events):
             return batch
     return None
+
+
+def _in_flight_source_paths(ledger: SourceLedger, host: Host) -> tuple[Path, ...]:
+    return _ordered_unique_source_paths(
+        tuple(event.path for batch in ledger.in_flight_batches.get(host, []) for event in batch.events)
+    )
 
 
 def _record_in_flight_batch(
@@ -1301,6 +1410,8 @@ def _record_in_flight_batch(
     for event in batch.events:
         if event.content_sha256 is None:
             raise BootstrapError("native trace event missing content hash")
+        if event.kind == "jsonl_range" and event.content is None:
+            raise BootstrapError("native trace range missing content for durable retry")
         events.append(
             InFlightSourceEvent(
                 kind=event.kind,
@@ -1310,6 +1421,7 @@ def _record_in_flight_batch(
                 end_offset=event.end_offset,
                 byte_count=event.byte_count,
                 content_sha256=event.content_sha256,
+                content=event.content,
                 oversized_reason=event.oversized_reason,
             )
         )
@@ -1358,25 +1470,8 @@ def _restore_in_flight_upload_batch(
 
 
 def _restore_in_flight_source_event(event: InFlightSourceEvent) -> SourceEvent:
-    if event.kind == "oversized_record":
-        return SourceEvent(
-            kind=event.kind,
-            path=event.path,
-            path_hash=event.path_hash,
-            start_offset=event.start_offset,
-            end_offset=event.end_offset,
-            byte_count=event.byte_count,
-            content_sha256=event.content_sha256,
-            oversized_reason=event.oversized_reason,
-        )
-    try:
-        with event.path.open("rb") as handle:
-            handle.seek(event.start_offset)
-            content = handle.read(event.byte_count)
-    except OSError as exc:
-        raise BootstrapError("persisted native trace range is no longer readable") from exc
-    if len(content) != event.byte_count or hashlib.sha256(content).hexdigest() != event.content_sha256:
-        raise BootstrapError("persisted native trace range content changed before acknowledgement")
+    if event.kind == "jsonl_range" and event.content is None:
+        raise BootstrapError("persisted native trace range is missing retry content")
     return SourceEvent(
         kind=event.kind,
         path=event.path,
@@ -1385,7 +1480,8 @@ def _restore_in_flight_source_event(event: InFlightSourceEvent) -> SourceEvent:
         end_offset=event.end_offset,
         byte_count=event.byte_count,
         content_sha256=event.content_sha256,
-        content=content,
+        content=event.content,
+        oversized_reason=event.oversized_reason,
     )
 
 
@@ -1548,6 +1644,14 @@ def _chunk_payload(event: SourceEvent, lifecycle_event: LifecycleEvent | None) -
 
 def _gzip_base64(content: bytes) -> str:
     return base64.b64encode(gzip.compress(content, mtime=0)).decode("ascii")
+
+
+def _gunzip_base64(content_gzip_base64: str) -> bytes | None:
+    try:
+        compressed = base64.b64decode(content_gzip_base64, validate=True)
+        return gzip.decompress(compressed)
+    except (binascii.Error, EOFError, OSError, zlib.error):
+        return None
 
 
 def _upload_batch(
@@ -1746,23 +1850,24 @@ def _validate_upload_response(response: dict[str, JsonValue], policy: HostPolicy
 
 def _advance_ledger_from_response(
     ledger: SourceLedger,
-    source_paths: tuple[Path, ...],
+    batch: UploadBatch,
     response: dict[str, JsonValue],
 ) -> None:
-    paths_by_hash = {_path_hash(path): path for path in source_paths}
+    events_by_range = {(event.path_hash, event.start_offset, event.end_offset): event for event in batch.events}
     acknowledged_ranges = response.get("acknowledged_ranges")
     if not isinstance(acknowledged_ranges, list):
         raise BootstrapError("trace batch response acknowledged_ranges must be a list")
     for value in acknowledged_ranges:
         acknowledged = _json_mapping_or_empty(value)
         source_path_hash = _string_value(acknowledged.get("source_path_hash"))
+        start_offset = _optional_int_value(acknowledged.get("start_offset"))
         end_offset = _optional_int_value(acknowledged.get("end_offset"))
-        if source_path_hash is None or end_offset is None:
+        if source_path_hash is None or start_offset is None or end_offset is None:
             raise BootstrapError("trace batch response acknowledged range is malformed")
-        path = paths_by_hash.get(source_path_hash)
-        if path is None:
-            raise BootstrapError("trace batch response acknowledged unknown source")
-        _record_ledger_offset(ledger, path, end_offset)
+        event = events_by_range.get((source_path_hash, start_offset, end_offset))
+        if event is None:
+            raise BootstrapError("trace batch response acknowledged unknown source range")
+        _record_ledger_offset(ledger, event.path, end_offset)
 
 
 def _expected_acknowledged_ranges(events: tuple[SourceEvent, ...]) -> list[dict[str, JsonValue]]:

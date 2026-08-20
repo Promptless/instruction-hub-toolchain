@@ -365,6 +365,7 @@ class InFlightSourceEvent:
     end_offset: int
     byte_count: int
     content_sha256: str
+    content: bytes | None = None
     oversized_reason: OversizedReason | None = None
 
 
