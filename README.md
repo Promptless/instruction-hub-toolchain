@@ -224,21 +224,24 @@ the structured `last-bootstrap-status.json` support status.
 
 Policy reads and transcript-root scans run without the ledger lock. Each upload
 transaction reloads the ledger and durably records its exact ranges, compressed
-range content, and hook context before posting. A lost response therefore
-replays the same request even if a source grows, changes, disappears, or falls
-out of discovery. An exact acknowledgement advances the source offsets, clears
-the pending request, and releases the lock before the next request. A baseline
-settles pending requests before it records offsets and never baselines a source
-whose upload already started. SessionStart can therefore persist a release
-marker between catch-up requests, and the next request includes that marker
-instead of overwriting it from stale state. The
-collector process is detached from the hook, so catch-up work cannot delay the
-host or remain in the hook's process group. Baseline collections reuse the
-durable pending guard created by SessionStart and wait for the shared ledger lock
-until the collection deadline. If a missing guard cannot be created, collection
-stops before policy lookup or upload. A timed-out baseline leaves the guard in
-place, so terminal collections cannot upload pre-enrollment history before a
-later SessionStart completes the baseline.
+range content, hook context, and release snapshots before posting. A lost
+response therefore replays the same trace payload even if a source grows,
+changes, disappears, or falls out of discovery. An exact acknowledgement
+advances the source offsets, clears the pending request, and releases the lock
+before the next request. A baseline settles pending requests before it records
+offsets and never baselines a source whose upload already started. SessionStart
+can therefore persist a release marker between catch-up requests, and the next
+request includes that marker without changing an already-attempted payload. If
+a durable pending upload cannot be reconstructed exactly, collection fails
+closed, preserves the ledger for recovery, and records a failed collector
+status for operator intervention. The collector process is detached from the
+hook, so catch-up work cannot delay the host or remain in the hook's process
+group. Baseline collections reuse the durable pending guard created by
+SessionStart and wait for the shared ledger lock until the collection deadline.
+If a missing guard cannot be created, collection stops before policy lookup or
+upload. A timed-out baseline leaves the guard in place, so terminal collections
+cannot upload pre-enrollment history before a later SessionStart completes the
+baseline.
 
 Host enrollment is per host, not per installed `pig` version. The credential
 and pending approval are cached at a single host-global path

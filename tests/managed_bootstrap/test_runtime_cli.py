@@ -13,6 +13,9 @@ from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime import (
     cli as host_runtime_cli,
 )
+from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.contracts import (
+    InvalidUploadJournalError,
+)
 
 from .helpers import (
     BUNDLE_LOAD_ERROR,
@@ -233,6 +236,31 @@ def test_collector_process_creation_failure_is_persisted(
     assert last_status["error_code"] == "ENOENT"
     assert _diagnostic_log_path(home).stat().st_mode & 0o777 == 0o600
     assert _last_status_path(home).stat().st_mode & 0o777 == 0o600
+
+
+def test_invalid_upload_journal_returns_collector_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(host_runtime_cli, "_read_hook_context", lambda: {})
+
+    def fail_collect(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        raise InvalidUploadJournalError("invalid pending upload")
+
+    monkeypatch.setattr(host_runtime_cli, "_run_collect", fail_collect)
+
+    assert (
+        host_runtime_cli._run_collect_command(
+            "codex",
+            lifecycle="stop",
+            baseline=False,
+            include_active=False,
+            if_sources=False,
+            quiet=True,
+            release_marker_captured=True,
+        )
+        == 1
+    )
 
 
 def test_detached_session_start_persists_boundary_before_spawn_and_preserves_stdin(

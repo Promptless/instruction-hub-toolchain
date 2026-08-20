@@ -18,6 +18,7 @@ from .contracts import (
     BootstrapAuthError,
     BootstrapError,
     Host,
+    InvalidUploadJournalError,
     MANAGED_RUNTIME_ID,
     RUNTIME_CHANNEL,
     RUNTIME_EXECUTABLE,
@@ -233,6 +234,17 @@ def _run_collect_command(
             quiet=quiet,
             release_marker_captured=release_marker_captured,
         )
+    except InvalidUploadJournalError as exc:
+        _emit(
+            {
+                "status": "error",
+                "reason": "invalid_upload_journal",
+                "host": host,
+                "message": _redact_text(str(exc)),
+            },
+            quiet=quiet,
+        )
+        return 1
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
         _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
         return 0

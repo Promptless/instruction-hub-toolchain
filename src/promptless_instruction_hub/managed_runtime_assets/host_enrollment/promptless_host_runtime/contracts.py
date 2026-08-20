@@ -91,6 +91,12 @@ MAX_UPLOAD_CHUNKS_PER_BATCH = 200
 MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH = 200
 
 
+MAX_SESSION_ID_LENGTH = 220
+
+
+MAX_AGENT_CONTEXT_LENGTH = 160
+
+
 # This soft request target fits one established 4 MiB source range after
 # gzip/base64 encoding while splitting accumulated catch-up well below the hard
 # transport limit. An indivisible range may exceed the target, but not the limit.
@@ -213,6 +219,10 @@ class BootstrapAuthError(BootstrapError):
     """Host credential was rejected by the worker."""
 
 
+class InvalidUploadJournalError(BootstrapError):
+    """A pending native trace upload cannot be reconstructed safely."""
+
+
 class CollectDeadlineExceeded(BootstrapError):
     """Optional collection work exceeded the hook-safe runtime budget.
 
@@ -243,6 +253,18 @@ class InstalledInstructionHubRelease:
     plugin_name: str
     plugin_version: str
     release_id: str
+
+
+@dataclass(frozen=True)
+class InstructionHubReleaseSnapshot:
+    """One proven source interval governed by an installed Instruction Hub release."""
+
+    source_path_hash: str
+    session_id: str
+    start_offset: int
+    end_offset: int
+    captured_at: str
+    release: InstalledInstructionHubRelease
 
 
 @dataclass(frozen=True)
@@ -376,6 +398,7 @@ class InFlightUploadBatch:
     lifecycle_event: LifecycleEvent
     hook_context: HookTraceContext
     events: tuple[InFlightSourceEvent, ...]
+    snapshots: tuple[InstructionHubReleaseSnapshot, ...]
 
 
 @dataclass(frozen=True)
@@ -384,6 +407,7 @@ class UploadBatch:
 
     request: dict[str, JsonValue]
     events: tuple[SourceEvent, ...]
+    snapshots: tuple[InstructionHubReleaseSnapshot, ...]
 
 
 @dataclass
