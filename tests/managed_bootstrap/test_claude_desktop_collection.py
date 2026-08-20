@@ -170,9 +170,23 @@ def test_claude_uploads_current_transcript_before_idle_history_with_release_snap
         snapshot = _json_mapping(snapshots[0], "snapshot")
         assert snapshot["source_path_hash"] == transcript_chunk["source_path_hash"]
         assert snapshot["session_id"] == "current"
+        release_manifest = _json_mapping(
+            validate_json_value(json.loads((plugin_root / "hub.release.json").read_text()), "hub.release.json"),
+            "hub.release.json",
+        )
+        claude_runtime = next(
+            _json_mapping(runtime, "hub.release.json.managed_runtimes[]")
+            for runtime in _json_list(release_manifest["managed_runtimes"], "hub.release.json.managed_runtimes")
+            if _json_mapping(runtime, "hub.release.json.managed_runtimes[]").get("target") == "claude"
+        )
         assert _json_mapping(
             snapshot["installed_instruction_hub_release"], "snapshot.installed_instruction_hub_release"
-        )["release_id"]
+        ) == {
+            "plugin_id": claude_runtime["plugin_id"],
+            "plugin_name": claude_runtime["plugin_name"],
+            "plugin_version": claude_runtime["plugin_version"],
+            "release_id": release_manifest["release_id"],
+        }
         assert "lifecycle_event" not in idle_chunk
         assert (
             gzip.decompress(base64.b64decode(_json_string(idle_chunk["content_base64"], "content_base64")))

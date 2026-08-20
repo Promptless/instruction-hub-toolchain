@@ -76,7 +76,7 @@ MAX_TRACE_BATCH_BYTES = 10 * 1024 * 1024
 MAX_RECORD_BYTES = 10 * 1024 * 1024
 
 
-CHUNK_TARGET_BYTES = 256 * 1024
+CHUNK_TARGET_BYTES = 4 * 1024 * 1024
 
 
 MAX_UPLOAD_CHUNKS_PER_BATCH = 200
@@ -85,22 +85,16 @@ MAX_UPLOAD_CHUNKS_PER_BATCH = 200
 MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH = 200
 
 
-# Ordinary requests stay below this encoded-body target so trace catch-up cannot
-# monopolize a lifecycle hook. A single JSONL record is indivisible and may exceed
-# the target, but it must remain below the hard transport limit.
-TARGET_TRANSPORT_BATCH_BYTES = 512 * 1024
+# This soft request target fits one established 4 MiB source range after
+# gzip/base64 encoding while splitting accumulated catch-up well below the hard
+# transport limit. An indivisible range may exceed the target, but not the limit.
+TARGET_TRANSPORT_BATCH_BYTES = 6 * 1024 * 1024
 
 
 # Hard per-request wire limit measured on the encoded body, distinct from the
 # decoded MAX_TRACE_BATCH_BYTES. High-entropy content grows under gzip+base64, so
 # raw size alone cannot prove a request is sendable.
 MAX_TRANSPORT_BATCH_BYTES = 10 * 1024 * 1024
-
-
-TRANSPORT_CHUNK_OVERHEAD_BYTES = 1024
-
-
-TRANSPORT_BATCH_OVERHEAD_BYTES = 16 * 1024
 
 
 MAX_DIAGNOSTIC_LOG_BYTES = 512 * 1024
@@ -216,9 +210,9 @@ class BootstrapAuthError(BootstrapError):
 class CollectDeadlineExceeded(BootstrapError):
     """Optional collection work exceeded the hook-safe runtime budget.
 
-    The deadline meters idle catch-up work. Current-transcript uploads and the
-    first-run baseline inventory run separately so tree-scale work cannot
-    prevent a lifecycle hook from uploading its own transcript.
+    The first pending current-transcript batch and the first-run baseline
+    inventory run separately. Remaining current-transcript and idle catch-up
+    work share the deadline so later hooks can resume it safely.
     """
 
 

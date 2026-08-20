@@ -678,7 +678,7 @@ def test_collect_keeps_ordinary_requests_under_transport_target(tmp_path: Path) 
         transcript_path = tmp_path / "codex-session.jsonl"
         baseline_record = b'{"kind":"session_start"}\n'
         pending_records = [
-            b'{"kind":"note","payload":"' + base64.b64encode(os.urandom(150_000)) + b'"}\n' for _ in range(8)
+            b'{"kind":"note","payload":"' + base64.b64encode(os.urandom(600_000)) + b'"}\n' for _ in range(10)
         ]
         transcript_path.write_bytes(baseline_record)
         env = {
@@ -1015,7 +1015,7 @@ def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) ->
         )
 
         pending_records = [
-            b'{"kind":"note","payload":"' + base64.b64encode(os.urandom(150_000)) + b'"}\n' for _ in range(8)
+            b'{"kind":"note","payload":"' + base64.b64encode(os.urandom(600_000)) + b'"}\n' for _ in range(10)
         ]
         appended_body = b"".join(pending_records)
         idle_extra = b'{"kind":"idle_tail"}\n'
@@ -1030,10 +1030,10 @@ def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) ->
             {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
         )
 
-        # Every current-transcript batch lands and is acknowledged before the
-        # expired deadline stops idle catch-up.
-        assert len(server.trace_batches) > 1
-        current_batch_count = len(server.trace_batches)
+        # The first current-transcript batch lands and is acknowledged even when
+        # the shared catch-up deadline has already expired.
+        assert len(server.trace_batches) == 1
+        first_attempt_batch = server.trace_batches[0]
         assert all(
             {_json_mapping(chunk, "chunk")["source_path_hash"] for chunk in _json_list(batch["chunks"], "batch.chunks")}
             == {hashlib.sha256(str(transcript_path.resolve()).encode()).hexdigest()}
@@ -1042,7 +1042,7 @@ def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) ->
         diagnostics = _diagnostic_log_entries(home)
         assert diagnostics[-1]["status"] == "trace_upload_partial"
         assert diagnostics[-1]["reason"] == "collection_deadline_exceeded"
-        assert diagnostics[-1]["batch_count"] == current_batch_count
+        assert diagnostics[-1]["batch_count"] == 1
         truncated_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
         truncated_sources = [
             _json_mapping(source, "source")
@@ -1051,7 +1051,12 @@ def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) ->
         truncated_offsets = {
             _json_string(source["path"], "source.path"): source["end_offset"] for source in truncated_sources
         }
-        assert truncated_offsets[str(transcript_path.resolve())] == transcript_path.stat().st_size
+        first_attempt_end_offset = max(
+            _json_int(_json_mapping(chunk, "chunk")["end_offset"], "chunk.end_offset")
+            for chunk in _json_list(first_attempt_batch["chunks"], "batch.chunks")
+        )
+        assert len(first_record) < first_attempt_end_offset < transcript_path.stat().st_size
+        assert truncated_offsets[str(transcript_path.resolve())] == first_attempt_end_offset
         assert truncated_offsets[str(idle_path.resolve())] == len(idle_baseline_record)
 
         _run_collect(
@@ -1061,7 +1066,8 @@ def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) ->
             {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
         )
 
-        # The next collect resumes idle catch-up from its independent watermark.
+        # The next collect resumes the exact current-transcript suffix before it
+        # starts the independent idle catch-up phase.
         diagnostics = _diagnostic_log_entries(home)
         assert diagnostics[-1]["status"] == "trace_upload_complete"
         drained_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
@@ -1076,10 +1082,12 @@ def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) ->
             str(transcript_path.resolve()): transcript_path.stat().st_size,
             str(idle_path.resolve()): idle_path.stat().st_size,
         }
+        transcript_hash = hashlib.sha256(str(transcript_path.resolve()).encode()).hexdigest()
         uploaded_chunks = [
             _json_mapping(chunk, "chunk")
-            for batch in server.trace_batches[:current_batch_count]
+            for batch in server.trace_batches
             for chunk in _json_list(_json_mapping(batch, "batch")["chunks"], "batch.chunks")
+            if _json_mapping(chunk, "chunk")["source_path_hash"] == transcript_hash
         ]
         uploaded_chunks.sort(key=lambda chunk: _json_int(chunk["start_offset"], "chunk.start_offset"))
         reassembled = b"".join(
@@ -1087,9 +1095,14 @@ def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) ->
             for chunk in uploaded_chunks
         )
         assert reassembled == appended_body
-        catch_up_chunks = _json_list(server.trace_batches[-1]["chunks"], "batch.chunks")
+        catch_up_chunks = [
+            _json_mapping(chunk, "chunk")
+            for batch in server.trace_batches
+            for chunk in _json_list(batch["chunks"], "batch.chunks")
+            if _json_mapping(chunk, "chunk")["source_path_hash"] != transcript_hash
+        ]
         assert len(catch_up_chunks) == 1
-        catch_up_chunk = _json_mapping(catch_up_chunks[0], "chunk")
+        catch_up_chunk = catch_up_chunks[0]
         assert (
             gzip.decompress(base64.b64decode(_json_string(catch_up_chunk["content_base64"], "content"))) == idle_extra
         )

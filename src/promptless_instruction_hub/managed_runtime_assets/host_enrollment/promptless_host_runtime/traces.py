@@ -45,8 +45,6 @@ from .contracts import (
     SourceEvent,
     SourceLedger,
     TARGET_TRANSPORT_BATCH_BYTES,
-    TRANSPORT_BATCH_OVERHEAD_BYTES,
-    TRANSPORT_CHUNK_OVERHEAD_BYTES,
     UploadBatch,
     _enrollment_host,
 )
@@ -158,7 +156,10 @@ def _run_collect(
 
     with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=_collect_deadline()) as lock_acquired:
         if not lock_acquired:
-            _emit({"status": "trace_upload_skipped", "reason": "ledger_lock_busy", "host": host}, quiet=quiet)
+            _emit(
+                {"status": "trace_upload_partial", "reason": "collection_deadline_exceeded", "host": host},
+                quiet=quiet,
+            )
             return 0
 
         ledger = _load_source_ledger(ledger_path)
@@ -167,33 +168,44 @@ def _run_collect(
             _emit({"status": "trace_upload_skipped", "reason": "baseline_required", "host": host}, quiet=quiet)
             return 0
 
-        policy_url = _worker_url(
-            worker_base_url,
-            f"/v0/host-enrollment/policy?{urlencode({'target': enrollment_target})}",
-        )
-        try:
-            signed_policy = _get_json(policy_url, credential.value, label="policy response")
-        except BootstrapAuthError:
-            _forget_cached_host_credential(context)
-            _emit({"status": "trace_upload_skipped", "reason": "credential_rejected", "host": host}, quiet=quiet)
-            return 0
-        policy = _validate_signed_policy(signed_policy, enrollment_target)
-        if _requires_newer_bootstrap(policy.required_bootstrap_version, RUNTIME_VERSION):
-            _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
-            return 0
-
         if include_active and host not in ledger.host_baselines:
             _emit({"status": "trace_upload_skipped", "reason": "baseline_required", "host": host}, quiet=quiet)
             return 0
-        current_transcript_paths = _current_transcript_paths(hook_context, lifecycle_event)
-        if baseline:
+
+    policy_url = _worker_url(
+        worker_base_url,
+        f"/v0/host-enrollment/policy?{urlencode({'target': enrollment_target})}",
+    )
+    try:
+        signed_policy = _get_json(policy_url, credential.value, label="policy response")
+    except BootstrapAuthError:
+        _forget_cached_host_credential(context)
+        _emit({"status": "trace_upload_skipped", "reason": "credential_rejected", "host": host}, quiet=quiet)
+        return 0
+    policy = _validate_signed_policy(signed_policy, enrollment_target)
+    if _requires_newer_bootstrap(policy.required_bootstrap_version, RUNTIME_VERSION):
+        _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
+        return 0
+
+    current_transcript_paths = _current_transcript_paths(hook_context, lifecycle_event)
+    if baseline:
+        source_paths: tuple[Path, ...] = ()
+        if not host_baselined:
+            # Baseline discovery records offsets for every known source, including
+            # files still inside the idle grace period. The unmetered scan runs
+            # without the ledger lock so release-marker capture remains available.
+            idle_source_paths, _ = _idle_root_scan_paths(host, deadline=float("inf"), include_active=True)
+            source_paths = _ordered_unique_source_paths(current_transcript_paths, idle_source_paths)
+        with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=_collect_deadline()) as lock_acquired:
+            if not lock_acquired:
+                _emit(
+                    {"status": "trace_upload_partial", "reason": "collection_deadline_exceeded", "host": host},
+                    quiet=quiet,
+                )
+                return 0
+            ledger = _load_source_ledger(ledger_path)
+            host_baselined = host in ledger.host_baselines or _ledger_has_host_source(ledger, host)
             if not host_baselined:
-                # Baseline discovery records offsets for every known source,
-                # including files still inside the idle grace period. Uploads
-                # keep the idle filter; baselines must not skip fresh audit
-                # files and then mark their later bytes as pre-enrollment.
-                idle_source_paths, _ = _idle_root_scan_paths(host, deadline=float("inf"), include_active=True)
-                source_paths = _ordered_unique_source_paths(current_transcript_paths, idle_source_paths)
                 _baseline_source_offsets(ledger, source_paths)
                 ledger.host_baselines.add(host)
                 _write_source_ledger(ledger)
@@ -208,18 +220,41 @@ def _run_collect(
                     quiet=quiet,
                 )
                 return 0
-            _clear_baseline_pending(baseline_pending_path)
-            ledger.host_baselines.add(host)
-            ledger.drift_reports.append({"kind": "native_trace_existing_ledger", "host": host, "baseline": False})
-        # A new/quarantined ledger seen without --baseline (e.g. a terminal hook after a missed
-        # SessionStart or a corrupt-ledger reset) must not baseline: that would skip the completed
-        # transcript entirely. Fall through so unknown sources upload from offset 0.
+            if host not in ledger.host_baselines:
+                ledger.host_baselines.add(host)
+                _write_source_ledger(ledger)
+        _clear_baseline_pending(baseline_pending_path)
 
-        upload_url = _worker_url(worker_base_url, f"/v0/traces/batches?{urlencode({'target': host})}")
-        uploaded_batch_count = 0
-        uploaded_chunk_count = 0
-        unparsed_record_count = 0
+    # A new/quarantined ledger seen without --baseline (e.g. a terminal hook after a missed
+    # SessionStart or a corrupt-ledger reset) must not baseline: that would skip the completed
+    # transcript entirely. Fall through so unknown sources upload from offset 0.
+    upload_url = _worker_url(worker_base_url, f"/v0/traces/batches?{urlencode({'target': host})}")
+    uploaded_batch_count = 0
+    uploaded_chunk_count = 0
+    unparsed_record_count = 0
+    unreadable_source_hashes: set[str] = set()
 
+    first_current_counts = _upload_source_paths(
+        current_transcript_paths,
+        upload_url=upload_url,
+        credential=credential,
+        host=host,
+        metadata=metadata,
+        policy=policy,
+        lifecycle_event=lifecycle_event,
+        hook_context=hook_context,
+        ledger_path=ledger_path,
+        deadline=float("inf"),
+        batch_limit=1,
+    )
+    uploaded_batch_count += first_current_counts[0]
+    uploaded_chunk_count += first_current_counts[1]
+    unparsed_record_count += first_current_counts[2]
+    unreadable_source_hashes.update(first_current_counts[3])
+
+    catch_up_deadline = _collect_deadline()
+    deadline_exceeded = False
+    try:
         current_counts = _upload_source_paths(
             current_transcript_paths,
             upload_url=upload_url,
@@ -229,14 +264,19 @@ def _run_collect(
             policy=policy,
             lifecycle_event=lifecycle_event,
             hook_context=hook_context,
-            ledger=ledger,
-            deadline=float("inf"),
+            ledger_path=ledger_path,
+            deadline=catch_up_deadline,
         )
         uploaded_batch_count += current_counts[0]
         uploaded_chunk_count += current_counts[1]
         unparsed_record_count += current_counts[2]
+        unreadable_source_hashes.update(current_counts[3])
+    except CollectDeadlineExceeded:
+        deadline_exceeded = True
 
-        catch_up_deadline = _collect_deadline()
+    idle_source_paths: tuple[Path, ...] = ()
+    idle_scan_complete = False
+    if not deadline_exceeded:
         discovered_idle_paths, idle_scan_complete = _idle_root_scan_paths(
             host,
             deadline=catch_up_deadline,
@@ -244,11 +284,12 @@ def _run_collect(
         )
         all_source_paths = _ordered_unique_source_paths(current_transcript_paths, discovered_idle_paths)
         idle_source_paths = all_source_paths[len(current_transcript_paths) :]
-        if not current_transcript_paths and not idle_source_paths and idle_scan_complete:
-            _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
-            return 0
-
         deadline_exceeded = not idle_scan_complete
+    if not current_transcript_paths and not idle_source_paths and idle_scan_complete:
+        _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
+        return 0
+
+    if not deadline_exceeded:
         try:
             idle_counts = _upload_source_paths(
                 idle_source_paths,
@@ -259,18 +300,16 @@ def _run_collect(
                 policy=policy,
                 lifecycle_event=lifecycle_event,
                 hook_context=hook_context,
-                ledger=ledger,
+                ledger_path=ledger_path,
                 deadline=catch_up_deadline,
             )
             uploaded_batch_count += idle_counts[0]
             uploaded_chunk_count += idle_counts[1]
             unparsed_record_count += idle_counts[2]
+            unreadable_source_hashes.update(idle_counts[3])
         except CollectDeadlineExceeded:
             deadline_exceeded = True
 
-    unreadable_source_count = sum(
-        1 for report in ledger.drift_reports if report.get("kind") == "native_trace_source_unreadable"
-    )
     payload: dict[str, JsonValue] = {
         "status": "trace_upload_partial" if deadline_exceeded else "trace_upload_complete",
         "host": host,
@@ -278,8 +317,8 @@ def _run_collect(
         "chunk_count": uploaded_chunk_count,
         "unparsed_record_count": unparsed_record_count,
     }
-    if unreadable_source_count:
-        payload["unreadable_source_count"] = unreadable_source_count
+    if unreadable_source_hashes:
+        payload["unreadable_source_count"] = len(unreadable_source_hashes)
     if deadline_exceeded:
         payload["reason"] = "collection_deadline_exceeded"
     _emit(payload, quiet=quiet)
@@ -876,24 +915,37 @@ def _iter_upload_batches(
     source_paths: tuple[Path, ...],
     deadline: float,
 ) -> Iterator[UploadBatch]:
-    """Yield uniformly bounded batches from the supplied paths until the deadline."""
+    """Yield exact-wire-bounded batches from the supplied paths until the deadline."""
 
     event_transcript_paths = _event_transcript_paths(hook_context, lifecycle_event)
-    target_transport_budget = TARGET_TRANSPORT_BATCH_BYTES - TRANSPORT_BATCH_OVERHEAD_BYTES
-    hard_transport_budget = MAX_TRANSPORT_BATCH_BYTES - TRANSPORT_BATCH_OVERHEAD_BYTES
     pending_events: list[SourceEvent] = []
     pending_payloads: list[dict[str, JsonValue]] = []
     pending_decoded_bytes = 0
-    pending_transport_bytes = 0
     pending_snapshot_count = 0
+    pending_batch: UploadBatch | None = None
     for source_path in source_paths:
         _ensure_collect_deadline(deadline)
         for event in _iter_source_events(ledger, (source_path,)):
             _ensure_collect_deadline(deadline)
             chunk_lifecycle = lifecycle_event if event.path in event_transcript_paths else None
+            event_snapshot_count = len(_analysis_context_snapshot_ranges(ledger, (event,)))
+            if event_snapshot_count > MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH:
+                raise BootstrapError(
+                    "one native trace JSONL range intersects more than "
+                    f"{MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH} instruction-hub release ranges"
+                )
             payload = _chunk_payload(event, chunk_lifecycle)
-            chunk_transport_bytes = _chunk_transport_bytes(payload)
-            if event.kind == "jsonl_range" and chunk_transport_bytes > hard_transport_budget:
+            event_batch = _upload_batch(
+                host=host,
+                metadata=metadata,
+                policy=policy,
+                lifecycle_event=lifecycle_event,
+                hook_context=hook_context,
+                ledger=ledger,
+                events=(event,),
+                chunks=(payload,),
+            )
+            if event.kind == "jsonl_range" and _serialized_upload_batch_bytes(event_batch) > MAX_TRANSPORT_BATCH_BYTES:
                 # Passing the raw-size cap does not guarantee the wire fits: high-entropy
                 # content grows under gzip+base64. Skip-report the record so the ledger
                 # advances past it instead of retrying an unsendable chunk forever.
@@ -906,56 +958,63 @@ def _iter_upload_batches(
                     reason="transport_size",
                 )
                 payload = _chunk_payload(event, chunk_lifecycle)
-                chunk_transport_bytes = _chunk_transport_bytes(payload)
-            event_snapshot_count = len(_analysis_context_snapshot_ranges(ledger, (event,)))
-            if event_snapshot_count > MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH:
-                raise BootstrapError(
-                    "one native trace JSONL range intersects more than "
-                    f"{MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH} instruction-hub release ranges"
-                )
-            next_decoded_bytes = pending_decoded_bytes + event.byte_count
-            next_transport_bytes = pending_transport_bytes + chunk_transport_bytes
-            if pending_payloads and (
-                len(pending_payloads) >= MAX_UPLOAD_CHUNKS_PER_BATCH
-                or pending_snapshot_count + event_snapshot_count > MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH
-                or next_decoded_bytes > MAX_TRACE_BATCH_BYTES
-                or next_transport_bytes > target_transport_budget
-                or next_transport_bytes > hard_transport_budget
-            ):
-                _ensure_collect_deadline(deadline)
-                yield _upload_batch(
+                event_batch = _upload_batch(
                     host=host,
                     metadata=metadata,
                     policy=policy,
                     lifecycle_event=lifecycle_event,
                     hook_context=hook_context,
                     ledger=ledger,
-                    events=tuple(pending_events),
-                    chunks=tuple(pending_payloads),
+                    events=(event,),
+                    chunks=(payload,),
                 )
+            if _serialized_upload_batch_bytes(event_batch) > MAX_TRANSPORT_BATCH_BYTES:
+                raise BootstrapError("one native trace event exceeds the request transport limit")
+            exceeds_structural_limit = (
+                len(pending_payloads) >= MAX_UPLOAD_CHUNKS_PER_BATCH
+                or pending_snapshot_count + event_snapshot_count > MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH
+                or pending_decoded_bytes + event.byte_count > MAX_TRACE_BATCH_BYTES
+            )
+            if pending_batch is not None and exceeds_structural_limit:
+                _ensure_collect_deadline(deadline)
+                yield pending_batch
                 pending_events = []
                 pending_payloads = []
                 pending_decoded_bytes = 0
-                pending_transport_bytes = 0
                 pending_snapshot_count = 0
+                pending_batch = None
                 _ensure_collect_deadline(deadline)
+
+            next_batch = event_batch
+            if pending_batch is not None:
+                combined_batch = _upload_batch(
+                    host=host,
+                    metadata=metadata,
+                    policy=policy,
+                    lifecycle_event=lifecycle_event,
+                    hook_context=hook_context,
+                    ledger=ledger,
+                    events=(*pending_events, event),
+                    chunks=(*pending_payloads, payload),
+                )
+                if _serialized_upload_batch_bytes(combined_batch) <= TARGET_TRANSPORT_BATCH_BYTES:
+                    next_batch = combined_batch
+                else:
+                    _ensure_collect_deadline(deadline)
+                    yield pending_batch
+                    pending_events = []
+                    pending_payloads = []
+                    pending_decoded_bytes = 0
+                    pending_snapshot_count = 0
+                    _ensure_collect_deadline(deadline)
             pending_events.append(event)
             pending_payloads.append(payload)
             pending_decoded_bytes += event.byte_count
-            pending_transport_bytes += chunk_transport_bytes
             pending_snapshot_count += event_snapshot_count
-    if pending_events:
+            pending_batch = next_batch
+    if pending_batch is not None:
         _ensure_collect_deadline(deadline)
-        yield _upload_batch(
-            host=host,
-            metadata=metadata,
-            policy=policy,
-            lifecycle_event=lifecycle_event,
-            hook_context=hook_context,
-            ledger=ledger,
-            events=tuple(pending_events),
-            chunks=tuple(pending_payloads),
-        )
+        yield pending_batch
 
 
 def _upload_source_paths(
@@ -968,31 +1027,53 @@ def _upload_source_paths(
     policy: HostPolicy,
     lifecycle_event: LifecycleEvent,
     hook_context: HookTraceContext,
-    ledger: SourceLedger,
+    ledger_path: Path,
     deadline: float,
-) -> tuple[int, int, int]:
-    """Upload pending bytes for the supplied paths and persist each acknowledgement."""
+    batch_limit: int | None = None,
+) -> tuple[int, int, int, frozenset[str]]:
+    """Upload paths with one ledger-locked request and acknowledgement at a time."""
 
     uploaded_batch_count = 0
     uploaded_chunk_count = 0
     unparsed_record_count = 0
-    for batch in _iter_upload_batches(
-        host=host,
-        metadata=metadata,
-        policy=policy,
-        lifecycle_event=lifecycle_event,
-        hook_context=hook_context,
-        ledger=ledger,
-        source_paths=source_paths,
-        deadline=deadline,
-    ):
-        response = _post_upload_batch(upload_url, credential, policy, batch)
-        _advance_ledger_from_response(ledger, source_paths, response)
-        _write_source_ledger(ledger)
+    unreadable_source_hashes: set[str] = set()
+    while source_paths and (batch_limit is None or uploaded_batch_count < batch_limit):
+        _ensure_collect_deadline(deadline)
+        lock_deadline = _collect_deadline() if deadline == float("inf") else deadline
+        with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=lock_deadline) as lock_acquired:
+            if not lock_acquired:
+                raise CollectDeadlineExceeded("native trace collection exceeded deadline waiting for ledger lock")
+            ledger = _load_source_ledger(ledger_path)
+            batch = next(
+                _iter_upload_batches(
+                    host=host,
+                    metadata=metadata,
+                    policy=policy,
+                    lifecycle_event=lifecycle_event,
+                    hook_context=hook_context,
+                    ledger=ledger,
+                    source_paths=source_paths,
+                    deadline=deadline,
+                ),
+                None,
+            )
+            unreadable_source_hashes.update(
+                source_path_hash
+                for report in ledger.drift_reports
+                if report.get("kind") == "native_trace_source_unreadable"
+                if (source_path_hash := _string_value(report.get("source_path_hash"))) is not None
+            )
+            if batch is None:
+                if ledger.drift_reports:
+                    _write_source_ledger(ledger)
+                break
+            response = _post_upload_batch(upload_url, credential, policy, batch)
+            _advance_ledger_from_response(ledger, source_paths, response)
+            _write_source_ledger(ledger)
         uploaded_batch_count += 1
         uploaded_chunk_count += len(batch.events)
         unparsed_record_count += _optional_int_value(response.get("unparsed_record_count")) or 0
-    return uploaded_batch_count, uploaded_chunk_count, unparsed_record_count
+    return uploaded_batch_count, uploaded_chunk_count, unparsed_record_count, frozenset(unreadable_source_hashes)
 
 
 def _iter_source_events(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> Iterator[SourceEvent]:
@@ -1144,17 +1225,6 @@ def _gzip_base64(content: bytes) -> str:
     return base64.b64encode(gzip.compress(content, mtime=0)).decode("ascii")
 
 
-def _chunk_transport_bytes(payload: dict[str, JsonValue]) -> int:
-    """Bound one chunk's JSON wire footprint from above.
-
-    base64 text needs no JSON escaping, so its serialized length equals its
-    string length; the flat overhead covers the chunk's envelope fields.
-    """
-
-    content = _string_value(payload.get("content_base64"))
-    return (len(content) if content is not None else 0) + TRANSPORT_CHUNK_OVERHEAD_BYTES
-
-
 def _upload_batch(
     *,
     host: Host,
@@ -1181,6 +1251,12 @@ def _upload_batch(
         request["snapshots"] = snapshots
     request.update(_native_request_context(hook_context, lifecycle_event))
     return UploadBatch(request=request, events=events)
+
+
+def _serialized_upload_batch_bytes(batch: UploadBatch) -> int:
+    """Return the exact JSON body size used by the worker client."""
+
+    return len(json.dumps(batch.request, sort_keys=True).encode())
 
 
 def _analysis_context_snapshots(

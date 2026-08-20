@@ -5,6 +5,7 @@ import json
 import os
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -12,11 +13,15 @@ import pytest
 from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.contracts import (
     BootstrapError,
+    CHUNK_TARGET_BYTES,
     CollectDeadlineExceeded,
     HookTraceContext,
+    Host,
+    HostCredential,
     HostPolicy,
     InstalledInstructionHubRelease,
     JsonValue,
+    MAX_TRANSPORT_BATCH_BYTES,
     RuntimeMetadata,
     SourceEvent,
     SourceLedger,
@@ -31,8 +36,12 @@ from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptles
     _iter_upload_batches,
     _ledger_has_host_source,
     _load_source_ledger,
+    _persist_session_release_marker,
     _record_ledger_offset,
     _record_session_release_marker,
+    _run_collect as _run_collect_runtime,
+    _source_ledger_lock,
+    _upload_source_paths,
     _write_source_ledger,
 )
 from promptless_instruction_hub.release.hashing import stable_hash
@@ -129,6 +138,20 @@ def _ledger_with_release_markers(
             }
         },
     )
+
+
+def _maximize_release_marker_metadata(ledger: SourceLedger) -> None:
+    source = next(iter(ledger.sources.values()))
+    markers = _json_list(source["instruction_hub_release_markers"], "instruction_hub_release_markers")
+    for index, marker_value in enumerate(markers):
+        marker = _json_mapping(marker_value, "instruction_hub_release_marker")
+        marker["session_id"] = f"{'s' * 210}-{index:03d}"
+        marker["release"] = {
+            "plugin_id": "p" * 120,
+            "plugin_name": "n" * 200,
+            "plugin_version": "v" * 80,
+            "release_id": f"{'v' * 80}+aaaaaaaaaaaa",
+        }
 
 
 def test_loads_content_validated_release_from_installed_plugin_root(tmp_path: Path) -> None:
@@ -475,66 +498,82 @@ def test_persisted_markers_split_snapshot_ranges_without_changing_upload_batch(
     assert _ledger_has_host_source(persisted, "codex")
 
 
-def test_current_transcript_upload_finishes_before_expired_idle_catch_up(tmp_path: Path) -> None:
-    transcript_path = (tmp_path / "current.jsonl").resolve()
-    idle_path = (tmp_path / "idle.jsonl").resolve()
-    transcript_record = b'{"kind":"current"}\n'
-    idle_record = b'{"kind":"idle"}\n'
-    transcript_path.write_bytes(transcript_record)
-    idle_path.write_bytes(idle_record)
-    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=False, sources={})
-    _record_ledger_offset(ledger, transcript_path, 0)
-    _record_ledger_offset(ledger, idle_path, 0)
-    hook_context = HookTraceContext(transcript_path, None, "session-1", None, None, None)
-
-    current_batches = list(
-        _iter_upload_batches(
-            host="codex",
-            metadata=_metadata("1.0.0"),
-            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
-            lifecycle_event="stop",
-            hook_context=hook_context,
-            ledger=ledger,
-            source_paths=(transcript_path,),
-            deadline=float("inf"),
+def test_current_transcript_ack_is_persisted_before_idle_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/pig"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = (tmp_path / "current.jsonl").resolve()
+        baseline_record = b'{"kind":"baseline"}\n'
+        current_record = b'{"kind":"current"}\n'
+        transcript_path.write_bytes(baseline_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "session-1", "transcript_path": str(transcript_path)},
         )
-    )
-    assert len(current_batches) == 1
-    assert [event.path for event in current_batches[0].events] == [transcript_path]
-    _record_ledger_offset(ledger, transcript_path, current_batches[0].events[-1].end_offset)
-    with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
-        list(
-            _iter_upload_batches(
-                host="codex",
-                metadata=_metadata("1.0.0"),
-                policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+        transcript_path.write_bytes(baseline_record + current_record)
+
+        runtime_env = {
+            **env,
+            "PROMPTLESS_DASHBOARD_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES": "1",
+            "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER": "0",
+        }
+        for key, value in runtime_env.items():
+            monkeypatch.setenv(key, value)
+
+        idle_discovery_observed = False
+
+        def observe_idle_discovery(
+            host: Host, *, deadline: float, include_active: bool = False
+        ) -> tuple[tuple[Path, ...], bool]:
+            del host, deadline, include_active
+            nonlocal idle_discovery_observed
+            idle_discovery_observed = True
+            assert len(server.trace_batches) == 1
+            persisted = _load_source_ledger(ledger_path)
+            source = next(iter(persisted.sources.values()))
+            assert source["end_offset"] == len(baseline_record + current_record)
+            return (), True
+
+        monkeypatch.setattr(
+            "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+            "promptless_host_runtime.traces._idle_root_scan_paths",
+            observe_idle_discovery,
+        )
+
+        assert (
+            _run_collect_runtime(
+                "codex",
                 lifecycle_event="stop",
-                hook_context=hook_context,
-                ledger=ledger,
-                source_paths=(idle_path,),
-                deadline=0,
+                hook_context=HookTraceContext(transcript_path, None, "session-1", None, None, None),
+                baseline=False,
+                include_active=False,
+                quiet=True,
+                release_marker_captured=True,
             )
+            == 0
         )
-
-    transcript_hash = hashlib.sha256(str(transcript_path).encode()).hexdigest()
-    idle_hash = hashlib.sha256(str(idle_path).encode()).hexdigest()
-    assert ledger.sources[transcript_hash]["end_offset"] == len(transcript_record)
-    assert ledger.sources[idle_hash]["end_offset"] == 0
-
-    resumed_batches = list(
-        _iter_upload_batches(
-            host="codex",
-            metadata=_metadata("1.0.0"),
-            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
-            lifecycle_event="stop",
-            hook_context=hook_context,
-            ledger=ledger,
-            source_paths=(idle_path,),
-            deadline=float("inf"),
-        )
-    )
-    assert len(resumed_batches) == 1
-    assert [event.path for event in resumed_batches[0].events] == [idle_path]
+        assert idle_discovery_observed
+    finally:
+        server.stop()
 
 
 def test_expired_deadline_stops_before_idle_source_iteration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -586,19 +625,18 @@ def test_idle_catch_up_checks_deadline_between_source_events(tmp_path: Path, mon
         lambda: next(monotonic_values),
     )
 
+    batches = _iter_upload_batches(
+        host="codex",
+        metadata=_metadata("1.0.0"),
+        policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+        lifecycle_event="stop",
+        hook_context=HookTraceContext(None, None, None, None, None, None),
+        ledger=ledger,
+        source_paths=(first_idle_path, second_idle_path),
+        deadline=2.0,
+    )
     with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
-        list(
-            _iter_upload_batches(
-                host="codex",
-                metadata=_metadata("1.0.0"),
-                policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
-                lifecycle_event="stop",
-                hook_context=HookTraceContext(None, None, None, None, None, None),
-                ledger=ledger,
-                source_paths=(first_idle_path, second_idle_path),
-                deadline=2.0,
-            )
-        )
+        next(batches)
 
 
 @pytest.mark.parametrize(
@@ -633,19 +671,213 @@ def test_idle_catch_up_rechecks_deadline_before_upload(
         lambda: next(pending_monotonic_values),
     )
 
+    batches = _iter_upload_batches(
+        host="codex",
+        metadata=_metadata("1.0.0"),
+        policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+        lifecycle_event="stop",
+        hook_context=HookTraceContext(None, None, None, None, None, None),
+        ledger=ledger,
+        source_paths=idle_paths,
+        deadline=2.0,
+    )
     with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
-        list(
-            _iter_upload_batches(
-                host="codex",
-                metadata=_metadata("1.0.0"),
-                policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
-                lifecycle_event="stop",
-                hook_context=HookTraceContext(None, None, None, None, None, None),
-                ledger=ledger,
-                source_paths=idle_paths,
-                deadline=2.0,
-            )
+        next(batches)
+
+
+def test_transport_target_counts_snapshot_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    transcript_path = (tmp_path / "session.jsonl").resolve()
+    first_record = os.urandom(140_000).replace(b"\n", b"x") + b"\n"
+    second_record = os.urandom(140_000).replace(b"\n", b"x") + b"\n"
+    transcript_path.write_bytes(first_record + second_record)
+    offsets = [index * len(first_record) // 100 for index in range(100)]
+    offsets.extend(len(first_record) + index * len(second_record) // 100 for index in range(100))
+    ledger = _ledger_with_release_markers(tmp_path / "ledger.json", transcript_path, offsets)
+    _maximize_release_marker_metadata(ledger)
+    target_bytes = 512 * 1024
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces.CHUNK_TARGET_BYTES",
+        len(first_record),
+    )
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces.TARGET_TRANSPORT_BATCH_BYTES",
+        target_bytes,
+    )
+
+    batches = list(
+        _iter_upload_batches(
+            host="codex",
+            metadata=_metadata("1.0.0"),
+            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+            lifecycle_event="stop",
+            hook_context=HookTraceContext(transcript_path, None, "session-199", None, None, None),
+            ledger=ledger,
+            source_paths=(transcript_path,),
+            deadline=float("inf"),
         )
+    )
+
+    assert len(batches) == 2
+    assert all(len(json.dumps(batch.request, sort_keys=True).encode()) <= target_bytes for batch in batches)
+    assert [len(_json_list(batch.request["snapshots"], "batch.snapshots")) for batch in batches] == [100, 100]
+
+
+def test_transport_limit_counts_snapshot_metadata_for_indivisible_record(tmp_path: Path) -> None:
+    transcript_path = (tmp_path / "session.jsonl").resolve()
+    record = os.urandom(7_750_000).replace(b"\n", b"x") + b"\n"
+    transcript_path.write_bytes(record)
+    offsets = [index * len(record) // 200 for index in range(200)]
+    ledger = _ledger_with_release_markers(tmp_path / "ledger.json", transcript_path, offsets)
+    _maximize_release_marker_metadata(ledger)
+
+    batches = list(
+        _iter_upload_batches(
+            host="codex",
+            metadata=_metadata("1.0.0"),
+            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+            lifecycle_event="stop",
+            hook_context=HookTraceContext(transcript_path, None, "session-199", None, None, None),
+            ledger=ledger,
+            source_paths=(transcript_path,),
+            deadline=float("inf"),
+        )
+    )
+
+    assert len(batches) == 1
+    assert len(json.dumps(batches[0].request, sort_keys=True).encode()) <= MAX_TRANSPORT_BATCH_BYTES
+    assert len(batches[0].events) == 1
+    assert batches[0].events[0].kind == "oversized_record"
+    assert batches[0].events[0].oversized_reason == "transport_size"
+
+
+def test_source_range_boundaries_are_stable_across_lost_ack_retry(tmp_path: Path) -> None:
+    transcript_path = (tmp_path / "session.jsonl").resolve()
+    record = b"x" * 69_999 + b"\n"
+    transcript_path.write_bytes(record * 65)
+    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=False, sources={})
+    _record_ledger_offset(ledger, transcript_path, 0)
+
+    first_attempt = list(_iter_source_events(ledger, (transcript_path,)))
+    retry_attempt = list(_iter_source_events(ledger, (transcript_path,)))
+
+    assert CHUNK_TARGET_BYTES == 4 * 1024 * 1024
+    assert len(first_attempt) == len(retry_attempt) == 2
+    assert first_attempt == retry_attempt
+    assert (first_attempt[0].start_offset, first_attempt[0].end_offset) == (0, 59 * len(record))
+    assert first_attempt[1].start_offset == first_attempt[0].end_offset
+
+
+def test_upload_reloads_ledger_between_acks_so_session_marker_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript_path = (tmp_path / "session.jsonl").resolve()
+    ledger_path = tmp_path / "ledger.json"
+    record = b'{"kind":"record"}\n'
+    first_two_records = record * 2
+    transcript_path.write_bytes(first_two_records)
+    ledger = SourceLedger(path=ledger_path, is_new=False, sources={})
+    _record_ledger_offset(ledger, transcript_path, 0)
+    _write_source_ledger(ledger)
+    posted_batches: list[UploadBatch] = []
+    marker_inserted = False
+    original_source_ledger_lock = _source_ledger_lock
+    release = _release("2.0.0", "bbbbbbbbbbbb")
+
+    def acknowledge_batch(
+        upload_url: str,
+        credential: HostCredential,
+        policy: HostPolicy,
+        batch: UploadBatch,
+    ) -> dict[str, JsonValue]:
+        del upload_url, credential
+        posted_batches.append(batch)
+        return {
+            "accepted": True,
+            "batch_id": batch.request["batch_id"],
+            "policy_version": policy.policy_version,
+            "raw_artifact_count": sum(event.kind == "jsonl_range" for event in batch.events),
+            "skipped_record_count": sum(event.kind == "oversized_record" for event in batch.events),
+            "acknowledged_ranges": [
+                {
+                    "kind": event.kind,
+                    "source_path_hash": event.path_hash,
+                    "start_offset": event.start_offset,
+                    "end_offset": event.end_offset,
+                    "content_sha256": event.content_sha256,
+                }
+                for event in batch.events
+            ],
+            "unparsed_record_count": 0,
+        }
+
+    @contextmanager
+    def insert_marker_between_requests(path: Path, *, wait_for_lock: bool, deadline: float) -> Iterator[bool]:
+        nonlocal marker_inserted
+        with original_source_ledger_lock(path, wait_for_lock=wait_for_lock, deadline=deadline) as acquired:
+            yield acquired
+        if len(posted_batches) != 1 or marker_inserted:
+            return
+        marker_inserted = True
+        _persist_session_release_marker(
+            ledger_path,
+            lifecycle_event="session_start",
+            hook_context=HookTraceContext(transcript_path, None, "session-2", None, None, None),
+            installed_release=release,
+            deadline=float("inf"),
+        )
+        transcript_path.write_bytes(first_two_records + record)
+
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces.CHUNK_TARGET_BYTES",
+        len(record),
+    )
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces.MAX_UPLOAD_CHUNKS_PER_BATCH",
+        1,
+    )
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces._post_upload_batch",
+        acknowledge_batch,
+    )
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces._source_ledger_lock",
+        insert_marker_between_requests,
+    )
+
+    counts = _upload_source_paths(
+        (transcript_path,),
+        upload_url="https://worker.invalid/v0/traces/batches",
+        credential=HostCredential("credential", None, None),
+        host="codex",
+        metadata=_metadata("2.0.0"),
+        policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+        lifecycle_event="stop",
+        hook_context=HookTraceContext(transcript_path, None, "session-1", None, None, None),
+        ledger_path=ledger_path,
+        deadline=float("inf"),
+    )
+
+    assert counts == (3, 3, 0, frozenset())
+    assert marker_inserted
+    assert len(posted_batches) == 3
+    third_snapshots = _json_list(posted_batches[2].request["snapshots"], "third_batch.snapshots")
+    assert len(third_snapshots) == 1
+    third_snapshot = _json_mapping(third_snapshots[0], "third_batch.snapshots[0]")
+    assert third_snapshot["session_id"] == "session-2"
+    assert third_snapshot["start_offset"] == len(first_two_records)
+    assert third_snapshot["end_offset"] == len(first_two_records + record)
+    persisted = _load_source_ledger(ledger_path)
+    source = next(iter(persisted.sources.values()))
+    assert source["end_offset"] == len(first_two_records + record)
+    assert [(marker.session_id, marker.release) for marker in _instruction_hub_release_markers(source)] == [
+        ("session-2", release)
+    ]
 
 
 def test_snapshot_limit_pages_whole_events_without_loss_and_retries_stably(
