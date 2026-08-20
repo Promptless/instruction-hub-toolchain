@@ -390,7 +390,7 @@ def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> No
         batch = server.trace_batches[0]
         assert batch["source"] == "claude-desktop"
         assert batch["host"] == "claude-desktop"
-        assert batch["collector_version"] == "0.2.8"
+        assert batch["collector_version"] == "0.2.9"
         chunks = _json_list(batch["chunks"], "batch.chunks")
         assert len(chunks) == 1
         chunk = _json_mapping(chunks[0], "batch.chunks[0]")
