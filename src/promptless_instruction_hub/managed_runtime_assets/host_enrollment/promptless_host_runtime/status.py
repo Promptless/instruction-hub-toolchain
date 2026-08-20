@@ -7,6 +7,7 @@ from .contracts import (
     Host,
     JsonValue,
     MANAGED_RUNTIME_ID,
+    PENDING_FIRST_ENROLLMENT_SUCCESS_KEY,
     RUNTIME_CHANNEL,
     RUNTIME_EXECUTABLE,
     RUNTIME_VERSION,
@@ -116,14 +117,13 @@ def _reset_host_state(host: Host) -> tuple[int, int]:
 
         # Re-arm the one-time first-success confirmation: a reset makes the next enrollment a
         # genuine first success for this host, so it should confirm again.
-        shown_targets = _json_mapping_or_empty(state.get(FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY))
-        reset_latch = False
-        for target in reset_targets:
-            if target in shown_targets:
-                del shown_targets[target]
-                reset_latch = True
-        if reset_latch:
-            state[FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY] = shown_targets
+        for notice_key in (FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY, PENDING_FIRST_ENROLLMENT_SUCCESS_KEY):
+            notice_targets = _json_mapping_or_empty(state.get(notice_key))
+            original_count = len(notice_targets)
+            for target in reset_targets:
+                notice_targets.pop(target, None)
+            if len(notice_targets) != original_count:
+                state[notice_key] = notice_targets
 
         _write_state(state_path, state)
     return credentials_removed, pending_removed

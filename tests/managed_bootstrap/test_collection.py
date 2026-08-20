@@ -29,7 +29,24 @@ from .helpers import (
 )
 
 
-def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -> None:
+def _seed_ledger_offsets(ledger_path: Path, *source_paths: Path) -> None:
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": {
+                    hashlib.sha256(str(path.resolve()).encode()).hexdigest(): {
+                        "path": str(path.resolve()),
+                        "end_offset": path.stat().st_size,
+                    }
+                    for path in source_paths
+                },
+            }
+        )
+    )
+
+
+def test_collect_uploads_full_transcript_then_only_new_ranges(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -54,16 +71,24 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
         _run_collect(
             plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"],
             env,
             {"sessionId": "codex_session_1", "transcriptPath": str(transcript_path)},
         )
-        assert server.trace_batches == []
+        assert len(server.trace_batches) == 1
+        first_chunk = _json_mapping(
+            _json_list(server.trace_batches[0]["chunks"], "first_batch.chunks")[0],
+            "first_batch.chunks[0]",
+        )
+        assert first_chunk["start_offset"] == 0
+        assert first_chunk["end_offset"] == len(first_record)
+        assert gzip.decompress(base64.b64decode(_json_string(first_chunk["content_base64"], "content"))) == first_record
+        server.trace_batches.clear()
 
-        baseline_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
-        baseline_sources = _json_mapping(baseline_ledger["sources"], "ledger.sources")
-        baseline_source = _json_mapping(next(iter(baseline_sources.values())), "ledger.sources[0]")
-        assert baseline_source["end_offset"] == len(first_record)
+        initial_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        initial_sources = _json_mapping(initial_ledger["sources"], "ledger.sources")
+        initial_source = _json_mapping(next(iter(initial_sources.values())), "ledger.sources[0]")
+        assert initial_source["end_offset"] == len(first_record)
 
         third_record = b'{"kind":"note","message":"coalesced"}\n'
         transcript_path.write_bytes(first_record + second_record + third_record)
@@ -111,7 +136,7 @@ def test_collect_baselines_then_uploads_transcript_path_ranges(tmp_path: Path) -
         server.stop()
 
 
-def test_collect_zero_source_first_baseline_persists_host_marker(tmp_path: Path) -> None:
+def test_collect_with_no_sources_does_not_create_ledger(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -132,20 +157,18 @@ def test_collect_zero_source_first_baseline_persists_host_marker(tmp_path: Path)
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
         _run_collect(
             plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"],
             env,
             {},
         )
 
         assert server.trace_batches == []
-        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
-        assert _json_mapping(ledger["sources"], "ledger.sources") == {}
-        assert _json_list(ledger["host_baselines"], "ledger.host_baselines") == ["codex"]
+        assert not ledger_path.exists()
     finally:
         server.stop()
 
 
-def test_collect_legacy_host_source_is_treated_as_existing_baseline(tmp_path: Path) -> None:
+def test_collect_resumes_from_existing_ledger_offset(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -186,7 +209,7 @@ def test_collect_legacy_host_source_is_treated_as_existing_baseline(tmp_path: Pa
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
         _run_collect(
             plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"],
             env,
             {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
         )
@@ -200,12 +223,12 @@ def test_collect_legacy_host_source_is_treated_as_existing_baseline(tmp_path: Pa
         assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == appended_record
 
         ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
-        assert _json_list(ledger["host_baselines"], "ledger.host_baselines") == ["codex"]
+        assert "host_baselines" not in ledger
     finally:
         server.stop()
 
 
-def test_collect_without_baseline_uploads_new_ledger_sources_from_start(tmp_path: Path) -> None:
+def test_collect_uploads_new_ledger_sources_from_start(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -230,8 +253,7 @@ def test_collect_without_baseline_uploads_new_ledger_sources_from_start(tmp_path
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        # A terminal hook is the first collection to see this ledger (missed SessionStart).
-        # The completed transcript must upload from offset 0, not get baselined away.
+        # The completed transcript uploads from offset 0 when no ACK exists yet.
         _run_collect(
             plugin_root,
             ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
@@ -269,17 +291,23 @@ def test_collect_without_baseline_uploads_new_ledger_sources_from_start(tmp_path
 
         historical_path = codex_home / "archived_sessions/historical.jsonl"
         historical_path.parent.mkdir(parents=True)
-        historical_path.write_bytes(b'{"kind":"response","message":"pre-baseline history"}\n')
+        historical_record = b'{"kind":"response","message":"existing history"}\n'
+        historical_path.write_bytes(historical_record)
         _run_collect(
             plugin_root,
             ["collect", "--host", "codex", "--lifecycle", "session_start", "--include-active", "--quiet"],
             env,
             {},
         )
-        guarded_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
-        assert _json_list(guarded_ledger["host_baselines"], "ledger.host_baselines") == []
-        assert len(_json_mapping(guarded_ledger["sources"], "ledger.sources")) == 1
-        assert len(server.trace_batches) == 1
+        updated_ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        assert len(_json_mapping(updated_ledger["sources"], "ledger.sources")) == 2
+        assert len(server.trace_batches) == 2
+        history_chunk = _json_mapping(_json_list(server.trace_batches[-1]["chunks"], "chunks")[0], "chunk")
+        assert history_chunk["start_offset"] == 0
+        assert (
+            gzip.decompress(base64.b64decode(_json_string(history_chunk["content_base64"], "content")))
+            == historical_record
+        )
     finally:
         server.stop()
 
@@ -297,9 +325,9 @@ def test_collect_include_active_uploads_recent_root_source_without_lifecycle(tmp
         ledger_path = tmp_path / "ledger.json"
         transcript_path = codex_home / "archived_sessions/recent.jsonl"
         transcript_path.parent.mkdir(parents=True)
-        baseline_record = b'{"kind":"session_start"}\n'
-        pending_record = b'{"kind":"response","message":"sync now"}\n'
-        transcript_path.write_bytes(baseline_record)
+        first_record = b'{"kind":"session_start"}\n'
+        second_record = b'{"kind":"response","message":"sync now"}\n'
+        transcript_path.write_bytes(first_record + second_record)
         env = {
             "HOME": str(home),
             "CODEX_HOME": str(codex_home),
@@ -311,28 +339,12 @@ def test_collect_include_active_uploads_recent_root_source_without_lifecycle(tmp
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
         _run_collect(
             plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--include-active", "--quiet"],
-            env,
-            {},
-        )
-        assert server.trace_batches == []
-        assert not ledger_path.exists()
-
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {},
-        )
-        transcript_path.write_bytes(baseline_record + pending_record)
-
-        _run_collect(
-            plugin_root,
             ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"],
             env,
             {},
         )
         assert server.trace_batches == []
+        assert not ledger_path.exists()
 
         _run_collect(
             plugin_root,
@@ -344,9 +356,12 @@ def test_collect_include_active_uploads_recent_root_source_without_lifecycle(tmp
         assert len(server.trace_batches) == 1
         chunk = _json_mapping(_json_list(server.trace_batches[0]["chunks"], "chunks")[0], "chunk")
         assert "lifecycle_event" not in chunk
-        assert chunk["start_offset"] == len(baseline_record)
-        assert chunk["end_offset"] == len(baseline_record) + len(pending_record)
-        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == pending_record
+        assert chunk["start_offset"] == 0
+        assert chunk["end_offset"] == len(first_record) + len(second_record)
+        assert (
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content")))
+            == first_record + second_record
+        )
     finally:
         server.stop()
 
@@ -374,12 +389,7 @@ def test_collect_uploads_subagent_transcript_with_parent_identity(tmp_path: Path
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {"session_id": "parent_session_1", "transcript_path": str(agent_transcript_path)},
-        )
+        _seed_ledger_offsets(ledger_path, agent_transcript_path)
         agent_transcript_path.write_bytes(first_record + second_record)
         _run_collect(
             plugin_root,
@@ -436,12 +446,7 @@ def test_collect_uploads_current_transcript_before_idle_history(tmp_path: Path) 
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
-        )
+        _seed_ledger_offsets(ledger_path, transcript_path, idle_path)
         transcript_extra = b'{"kind":"stop"}\n'
         idle_extra = b'{"kind":"idle_tail"}\n'
         transcript_path.write_bytes(transcript_record + transcript_extra)
@@ -503,12 +508,7 @@ def test_collect_reports_oversized_record_with_content_size_reason(tmp_path: Pat
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
-        )
+        _seed_ledger_offsets(ledger_path, transcript_path)
         transcript_path.write_bytes(baseline_record + oversized_record + trailing_record)
         _run_collect(
             plugin_root,
@@ -563,12 +563,7 @@ def test_collect_reports_oversized_record_with_transport_size_reason(tmp_path: P
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
-        )
+        _seed_ledger_offsets(ledger_path, transcript_path)
         transcript_path.write_bytes(baseline_record + incompressible_record + trailing_record)
         _run_collect(
             plugin_root,
@@ -630,12 +625,7 @@ def test_collect_splits_batches_by_transport_size(tmp_path: Path) -> None:
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
-        )
+        _seed_ledger_offsets(ledger_path, transcript_path)
         transcript_path.write_bytes(baseline_record + first_blob + second_blob)
         _run_collect(
             plugin_root,
@@ -690,12 +680,7 @@ def test_collect_keeps_ordinary_requests_under_transport_target(tmp_path: Path) 
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
-        )
+        _seed_ledger_offsets(ledger_path, transcript_path)
         transcript_path.write_bytes(baseline_record + b"".join(pending_records))
         _run_collect(
             plugin_root,
@@ -744,12 +729,7 @@ def test_collect_skips_unreadable_idle_source_and_uploads_the_rest(tmp_path: Pat
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
-        )
+        _seed_ledger_offsets(ledger_path, transcript_path)
 
         # Two idle files appear after the baseline; the alphabetically first one
         # stats fine but cannot be opened. It must not abort the run: the pending
@@ -823,12 +803,7 @@ def test_collect_tolerates_unparsed_record_counts_and_advances_ledger(tmp_path: 
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
-        )
+        _seed_ledger_offsets(ledger_path, transcript_path)
         transcript_path.write_bytes(first_record + second_record)
         _run_collect(
             plugin_root,
@@ -873,12 +848,7 @@ def test_collect_waits_for_ledger_lock_before_uploading_current_transcript(tmp_p
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
-        )
+        _seed_ledger_offsets(ledger_path, transcript_path)
         transcript_path.write_bytes(first_record + second_record)
         policy_request_count = len(server.policy_requests)
 
@@ -910,7 +880,7 @@ def test_collect_waits_for_ledger_lock_before_uploading_current_transcript(tmp_p
         server.stop()
 
 
-def test_zero_deadline_collect_baselines_fully_and_uploads_current_transcript(tmp_path: Path) -> None:
+def test_zero_catch_up_deadline_still_uploads_current_transcript(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -922,7 +892,7 @@ def test_zero_deadline_collect_baselines_fully_and_uploads_current_transcript(tm
         ledger_path = tmp_path / "ledger.json"
         codex_home = home / ".codex"
         transcript_path = tmp_path / "codex-session.jsonl"
-        first_record = b'{"kind":"session_start","message":"baseline"}\n'
+        first_record = b'{"kind":"session_start","message":"upload"}\n'
         transcript_path.write_bytes(first_record)
         idle_path = codex_home / "sessions/idle-history.jsonl"
         idle_path.parent.mkdir(parents=True)
@@ -941,36 +911,20 @@ def test_zero_deadline_collect_baselines_fully_and_uploads_current_transcript(tm
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
         _run_collect(
             plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"],
             env,
             {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
         )
 
-        # A zero deadline truncates the idle scan, but the first-run baseline must
-        # still inventory the full tree: a partial baseline would replay every
-        # missed file from offset zero later as a surprise backfill.
-        assert server.trace_batches == []
-        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
-        sources = _json_mapping(ledger["sources"], "ledger.sources")
-        assert len(sources) == 2
-        diagnostics = _diagnostic_log_entries(home)
-        assert diagnostics[-1]["status"] == "trace_upload_baselined"
-        assert diagnostics[-1]["source_count"] == 2
-
-        second_record = b'{"kind":"stop","message":"upload"}\n'
-        transcript_path.write_bytes(first_record + second_record)
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
-            env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
-        )
-
-        # Current-transcript upload is a separate phase, so a zero catch-up
-        # deadline cannot prevent it from reaching the worker.
+        # The explicit transcript gets its own deadline. The zero catch-up budget
+        # prevents the idle scan, but cannot prevent this first upload from byte 0.
         assert len(server.trace_batches) == 1
         chunk = _json_mapping(_json_list(server.trace_batches[0]["chunks"], "batch.chunks")[0], "batch.chunks[0]")
-        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == second_record
+        assert chunk["start_offset"] == 0
+        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == first_record
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        assert len(sources) == 1
         diagnostics = _diagnostic_log_entries(home)
         assert diagnostics[-1]["status"] == "trace_upload_partial"
         assert diagnostics[-1]["reason"] == "collection_deadline_exceeded"
@@ -1007,12 +961,7 @@ def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) ->
         zero_deadline_env = dict(env, PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS="0")
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
-        )
+        _seed_ledger_offsets(ledger_path, transcript_path, idle_path)
 
         pending_records = [
             b'{"kind":"note","payload":"' + base64.b64encode(os.urandom(600_000)) + b'"}\n' for _ in range(10)
@@ -1110,7 +1059,7 @@ def test_deadline_truncation_keeps_acked_progress_and_resumes(tmp_path: Path) ->
         server.stop()
 
 
-def test_truncated_empty_scan_still_reaches_first_run_baseline(tmp_path: Path) -> None:
+def test_zero_deadline_without_current_transcript_defers_idle_history(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -1136,26 +1085,37 @@ def test_truncated_empty_scan_still_reaches_first_run_baseline(tmp_path: Path) -
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        # No transcript path on hook stdin plus a zero budget: the truncated empty
-        # scan must not return no_sources before the ledger exists, or the first
-        # baseline never happens and later terminal hooks upload the pre-enrollment
-        # tree from offset 0.
+        # With no explicit transcript, the zero budget defers discovery without
+        # manufacturing an offset for history that has not been uploaded.
         _run_collect(
             plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"],
             env,
             {},
         )
 
         assert server.trace_batches == []
-        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
-        sources = _json_mapping(ledger["sources"], "ledger.sources")
-        assert len(sources) == 1
-        baselined_source = _json_mapping(next(iter(sources.values())), "ledger.sources[0]")
-        assert baselined_source["end_offset"] == idle_path.stat().st_size
+        assert not ledger_path.exists()
         diagnostics = _diagnostic_log_entries(home)
-        assert diagnostics[-1]["status"] == "trace_upload_baselined"
-        assert diagnostics[-1]["source_count"] == 1
+        assert diagnostics[-1]["status"] == "trace_upload_partial"
+        assert diagnostics[-1]["reason"] == "collection_deadline_exceeded"
+
+        normal_env = dict(env)
+        normal_env.pop("PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS")
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            normal_env,
+            {},
+        )
+
+        assert len(server.trace_batches) == 1
+        chunk = _json_mapping(_json_list(server.trace_batches[0]["chunks"], "chunks")[0], "chunk")
+        assert chunk["start_offset"] == 0
+        assert (
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content")))
+            == idle_path.read_bytes()
+        )
     finally:
         server.stop()
 

@@ -168,6 +168,27 @@ def _record_collector_failure(host: Host, *, exit_code: int | None, error_code: 
     _write_last_status(diagnostic)
 
 
+def _record_session_start_failure(
+    host: Host,
+    *,
+    stage: str,
+    exit_code: int | None,
+    error_code: str | None,
+) -> None:
+    diagnostic: dict[str, JsonValue] = {
+        "status": "error",
+        "reason": "session_start_process_failed",
+        "stage": stage,
+        "host": host,
+    }
+    if exit_code is not None:
+        diagnostic["exit_code"] = exit_code
+    if error_code is not None:
+        diagnostic["error_code"] = error_code
+    _write_diagnostic_log(diagnostic)
+    _write_last_status(diagnostic)
+
+
 @dataclass(frozen=True)
 class HostDisplay:
     """Human-facing host name and user config path used in SessionStart messages."""

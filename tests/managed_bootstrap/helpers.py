@@ -26,6 +26,7 @@ DIAGNOSTIC_LOG_REL_PATH = Path(".promptless/instruction-hub/host-runtime-diagnos
 INTERNAL_WELCOME_SHOWN_AT_KEY = "internal_promptless_welcome_shown_at"
 INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY = "internal_promptless_welcome_shown_at_by_version"
 FIRST_SUCCESS_SHOWN_KEY = "first_enrollment_success_shown_at_by_target"
+PENDING_FIRST_SUCCESS_KEY = "pending_first_enrollment_success_by_target"
 FIRST_SUCCESS_ACTIVE_FRAGMENT = "telemetry is now active for"
 FIRST_SUCCESS_NO_RESTART_FRAGMENT = "No restart or plugin reload is needed."
 BROWSER_ENROLLMENT_MESSAGE = (
@@ -83,10 +84,6 @@ def _assert_hook_output(result: subprocess.CompletedProcess[str], expected: obje
 
 def _assert_hook_system_message(result: subprocess.CompletedProcess[str], message: str) -> None:
     _assert_hook_output(result, {"systemMessage": message})
-
-
-def _assert_hook_argv(result: subprocess.CompletedProcess[str], target: str) -> None:
-    _assert_hook_output(result, {"argv": ["ensure", "--host", target, "--prepare-baseline"]})
 
 
 CODEX_SAFE_STDOUT_KEYS = frozenset({"systemMessage"})
@@ -151,11 +148,8 @@ def _run_bootstrap(
     env: dict[str, str],
     *,
     expected_status: str = "configured",
-    prepare_baseline: bool = False,
 ) -> tuple[dict[str, JsonValue], subprocess.CompletedProcess[str]]:
     args = [str(plugin_root / "runtime" / HOST_RUNTIME_BIN), "ensure", "--host", host]
-    if prepare_baseline:
-        args.append("--prepare-baseline")
     result = subprocess.run(
         args,
         env=_clean_env(**env),

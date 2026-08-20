@@ -10,14 +10,19 @@ from typing import BinaryIO
 import pytest
 
 from promptless_instruction_hub.compiler import build_hub, init_hub
+from promptless_instruction_hub.fs import validate_json_value
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime import (
     cli as host_runtime_cli,
 )
 
 from .helpers import (
     BUNDLE_LOAD_ERROR,
+    FIRST_SUCCESS_ACTIVE_FRAGMENT,
+    FIRST_SUCCESS_SHOWN_KEY,
     HOST_RUNTIME_BIN,
     HOST_RUNTIME_PACKAGE,
+    INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY,
+    PENDING_FIRST_SUCCESS_KEY,
     _FakeWorkerServer,
     _clean_env,
     _diagnostic_log_entries,
@@ -215,7 +220,6 @@ def test_collector_process_creation_failure_is_persisted(
             return_code = host_runtime_cli._launch_detached_collect(
                 "codex",
                 collector_args,
-                lifecycle="stop",
             )
         else:
             return_code = host_runtime_cli._supervise_collect("codex", collector_args)
@@ -235,7 +239,7 @@ def test_collector_process_creation_failure_is_persisted(
     assert _last_status_path(home).stat().st_mode & 0o777 == 0o600
 
 
-def test_detached_session_start_persists_boundary_before_spawn_and_preserves_stdin(
+def test_detached_session_start_only_spawns_supervisor_and_preserves_stdin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -265,24 +269,118 @@ def test_detached_session_start_persists_boundary_before_spawn_and_preserves_std
     monkeypatch.setenv("PLUGIN_ROOT", str(plugin_root))
     monkeypatch.setenv("PROMPTLESS_HOST_RUNTIME_LEDGER", str(ledger_path))
     monkeypatch.setattr(host_runtime_cli, "_spawn_detached", spawn_detached)
-    collector_args = ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"]
-
     with hook_input_path.open() as hook_input:
         monkeypatch.setattr(host_runtime_cli.sys, "stdin", hook_input)
-        return_code = host_runtime_cli._launch_detached_collect(
-            "codex",
-            collector_args,
-            lifecycle="session_start",
-        )
+        return_code = host_runtime_cli._launch_detached_session_start("codex", if_sources=False)
 
     assert return_code == 0
     assert spawned_stdin == raw_hook_input
-    assert spawned_args.count("--release-marker-captured") == 1
-    ledger = json.loads(ledger_path.read_text())
-    source = next(iter(ledger["sources"].values()))
-    marker = source["instruction_hub_release_markers"][0]
-    assert marker["start_offset"] == len(before_launch)
-    assert marker["session_id"] == "session-1"
+    assert spawned_args[-4:] == ["session-start", "--host", "codex", "--supervised"]
+    assert not ledger_path.exists()
+
+
+def test_session_start_launcher_emits_and_claims_local_notices_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root, plugin_version="0.2.0")
+    plugin_root = hub_root / "dist/codex/pig"
+    home = tmp_path / "home"
+    state_path = _host_state_path(home)
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "credentials": {
+                    "codex-credential": {
+                        "is_internal_promptless_user": True,
+                        "target": "codex",
+                        "value": "host-secret",
+                    }
+                },
+                "last_seen_plugin_versions": {"codex": "0.1.0"},
+                PENDING_FIRST_SUCCESS_KEY: {"codex": "configured"},
+            }
+        )
+    )
+    spawned_args: list[list[str]] = []
+
+    def spawn_detached(args: list[str], *, stdin: BinaryIO) -> None:
+        del stdin
+        spawned_args.append(args)
+
+    def unexpected_network_lookup() -> str:
+        pytest.fail("the synchronous SessionStart launcher attempted network setup")
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
+    monkeypatch.setenv("PLUGIN_ROOT", str(plugin_root))
+    monkeypatch.setenv("PROMPTLESS_HOST_RUNTIME_LEDGER", str(tmp_path / "ledger.json"))
+    monkeypatch.setattr(host_runtime_cli, "_spawn_detached", spawn_detached)
+    monkeypatch.setattr(host_runtime_cli, "_worker_base_url", unexpected_network_lookup)
+
+    for invocation in range(2):
+        hook_input_path = tmp_path / f"hook-input-{invocation}.json"
+        hook_input_path.write_text("{}")
+        with hook_input_path.open() as hook_input:
+            monkeypatch.setattr(host_runtime_cli.sys, "stdin", hook_input)
+            assert (
+                host_runtime_cli._run_session_start_command(
+                    "codex",
+                    if_sources=False,
+                    detach=True,
+                    supervised=False,
+                )
+                == 0
+            )
+        captured = capsys.readouterr()
+        if invocation == 0:
+            payload = _json_mapping(validate_json_value(json.loads(captured.out), "hook output"), "hook output")
+            message = _json_string(payload["systemMessage"], "systemMessage")
+            assert "Promptless Instruction Hub updated to v0.2.0 (was v0.1.0)." in message
+            assert FIRST_SUCCESS_ACTIVE_FRAGMENT in message
+            assert "welcome promptless pigfooder." in message
+            assert "version updated: v0.2.0" in message
+        else:
+            assert captured.out == ""
+
+    state = _json_mapping(validate_json_value(json.loads(state_path.read_text()), "host state"), "host state")
+    assert _json_mapping(state["last_seen_plugin_versions"], "last seen versions") == {"codex": "0.2.0"}
+    assert "codex" in _json_mapping(state[FIRST_SUCCESS_SHOWN_KEY], "first-success shown")
+    assert _json_mapping(state[PENDING_FIRST_SUCCESS_KEY], "pending first-success") == {}
+    assert _json_mapping(state[INTERNAL_WELCOME_SHOWN_BY_VERSION_KEY], "welcome shown") != {}
+    assert len(spawned_args) == 2
+
+
+def test_session_start_supervisor_records_ensure_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    hook_input_path = tmp_path / "hook-input.json"
+    hook_input_path.write_text("{}")
+    monkeypatch.setenv("HOME", str(home))
+
+    def fail_ensure(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        raise FileNotFoundError(2, "missing runtime dependency")
+
+    monkeypatch.setattr(host_runtime_cli, "_run_ensure", fail_ensure)
+
+    with hook_input_path.open() as hook_input:
+        monkeypatch.setattr(host_runtime_cli.sys, "stdin", hook_input)
+        return_code = host_runtime_cli._supervise_session_start("codex", if_sources=False)
+
+    assert return_code == 1
+    diagnostic = _diagnostic_log_entries(home)
+    assert len(diagnostic) == 1
+    assert diagnostic[0]["reason"] == "session_start_process_failed"
+    assert diagnostic[0]["stage"] == "ensure"
+    assert diagnostic[0]["host"] == "codex"
+    assert diagnostic[0]["error_code"] == "ENOENT"
 
 
 def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:

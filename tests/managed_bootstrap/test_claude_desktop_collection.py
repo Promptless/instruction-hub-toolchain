@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import json
 import os
 import subprocess
@@ -25,11 +26,27 @@ from .helpers import (
     _json_list,
     _json_mapping,
     _json_string,
-    _run_bootstrap,
     _run_collect,
     _run_runtime_json,
     _signed_policy,
 )
+
+
+def _seed_ledger_offsets(ledger_path: Path, *source_paths: Path) -> None:
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": {
+                    hashlib.sha256(str(path.resolve()).encode()).hexdigest(): {
+                        "path": str(path.resolve()),
+                        "end_offset": path.stat().st_size,
+                    }
+                    for path in source_paths
+                },
+            }
+        )
+    )
 
 
 def test_claude_desktop_discovers_both_audit_stores_under_platform_config_root(tmp_path: Path) -> None:
@@ -57,14 +74,13 @@ def test_claude_desktop_discovers_both_audit_stores_under_platform_config_root(t
             env["XDG_CONFIG_HOME"] = str(config_root)
             claude_base = config_root / "Claude"
 
-        appended_records: dict[Path, bytes] = {}
+        records: dict[Path, bytes] = {}
         for store_name in ("local-agent-mode-sessions", "claude-code-sessions"):
             audit_path = claude_base / store_name / f"{store_name}-session/audit.jsonl"
             audit_path.parent.mkdir(parents=True)
-            baseline_record = json.dumps({"store": store_name, "message": "baseline"}).encode() + b"\n"
-            appended_record = json.dumps({"store": store_name, "message": "upload"}).encode() + b"\n"
-            audit_path.write_bytes(baseline_record)
-            appended_records[audit_path.resolve()] = appended_record
+            record = json.dumps({"store": store_name, "message": "existing history"}).encode() + b"\n"
+            audit_path.write_bytes(record)
+            records[audit_path.resolve()] = record
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "claude-desktop"], env)
         _run_collect(
@@ -75,25 +91,12 @@ def test_claude_desktop_discovers_both_audit_stores_under_platform_config_root(t
                 "claude-desktop",
                 "--lifecycle",
                 "session_start",
-                "--baseline",
+                "--include-active",
                 "--quiet",
             ],
             env,
             {},
         )
-        assert server.trace_batches == []
-
-        stale_time = time.time() - (13 * 60 * 60)
-        for audit_path, appended_record in appended_records.items():
-            audit_path.write_bytes(audit_path.read_bytes() + appended_record)
-            os.utime(audit_path, (stale_time, stale_time))
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "claude-desktop", "--lifecycle", "stop", "--quiet"],
-            env,
-            {},
-        )
-
         chunks = [
             _json_mapping(chunk, "batch.chunks[]")
             for batch in server.trace_batches
@@ -102,12 +105,13 @@ def test_claude_desktop_discovers_both_audit_stores_under_platform_config_root(t
         assert len(chunks) == 2
         assert {
             gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) for chunk in chunks
-        } == set(appended_records.values())
+        } == set(records.values())
+        assert {chunk["start_offset"] for chunk in chunks} == {0}
     finally:
         server.stop()
 
 
-def test_claude_uploads_current_transcript_before_idle_history_with_release_snapshot(tmp_path: Path) -> None:
+def test_claude_uploads_current_transcript_before_idle_history(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -133,12 +137,7 @@ def test_claude_uploads_current_transcript_before_idle_history_with_release_snap
         }
 
         _run_runtime_json(plugin_root, ["enroll", "--host", "claude"], env)
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "claude", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {"session_id": "current", "transcript_path": str(transcript_path)},
-        )
+        _seed_ledger_offsets(ledger_path, transcript_path, idle_path)
 
         transcript_extra = b'{"sessionId":"current","message":"stop"}\n'
         idle_extra = b'{"sessionId":"idle","message":"catch-up"}\n'
@@ -165,28 +164,7 @@ def test_claude_uploads_current_transcript_before_idle_history_with_release_snap
             gzip.decompress(base64.b64decode(_json_string(transcript_chunk["content_base64"], "content_base64")))
             == transcript_extra
         )
-        snapshots = _json_list(transcript_batch["snapshots"], "transcript_batch.snapshots")
-        assert len(snapshots) == 1
-        snapshot = _json_mapping(snapshots[0], "snapshot")
-        assert snapshot["source_path_hash"] == transcript_chunk["source_path_hash"]
-        assert snapshot["session_id"] == "current"
-        release_manifest = _json_mapping(
-            validate_json_value(json.loads((plugin_root / "hub.release.json").read_text()), "hub.release.json"),
-            "hub.release.json",
-        )
-        claude_runtime = next(
-            _json_mapping(runtime, "hub.release.json.managed_runtimes[]")
-            for runtime in _json_list(release_manifest["managed_runtimes"], "hub.release.json.managed_runtimes")
-            if _json_mapping(runtime, "hub.release.json.managed_runtimes[]").get("target") == "claude"
-        )
-        assert _json_mapping(
-            snapshot["installed_instruction_hub_release"], "snapshot.installed_instruction_hub_release"
-        ) == {
-            "plugin_id": claude_runtime["plugin_id"],
-            "plugin_name": claude_runtime["plugin_name"],
-            "plugin_version": claude_runtime["plugin_version"],
-            "release_id": release_manifest["release_id"],
-        }
+        assert "snapshots" not in transcript_batch
         assert "lifecycle_event" not in idle_chunk
         assert (
             gzip.decompress(base64.b64decode(_json_string(idle_chunk["content_base64"], "content_base64")))
@@ -213,7 +191,6 @@ def test_claude_desktop_ensure_if_sources_skips_without_audit_files(tmp_path: Pa
                 "--host",
                 "claude-desktop",
                 "--if-sources",
-                "--prepare-baseline",
             ],
             env=_clean_env(
                 HOME=str(home),
@@ -234,7 +211,7 @@ def test_claude_desktop_ensure_if_sources_skips_without_audit_files(tmp_path: Pa
         assert server.session_requests == []
         assert server.policy_requests == []
         assert server.check_ins == []
-        assert ledger_path.with_name(f"{ledger_path.name}.claude-desktop.baseline-pending").exists()
+        assert not ledger_path.exists()
     finally:
         server.stop()
 
@@ -358,7 +335,7 @@ def test_claude_desktop_collect_skips_without_cached_credential(tmp_path: Path) 
 
         _run_collect(
             plugin_root,
-            ["collect", "--host", "claude-desktop", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            ["collect", "--host", "claude-desktop", "--lifecycle", "session_start", "--quiet"],
             {
                 "HOME": str(home),
                 "CLAUDE_PLUGIN_ROOT": str(plugin_root),
@@ -386,10 +363,11 @@ def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> No
         ledger_path = tmp_path / "ledger.json"
         audit_path = _claude_desktop_audit_path(home, "local-agent-mode-sessions", "session-1")
         audit_path.parent.mkdir(parents=True)
-        first_record = b'{"sessionId":"desktop_session_1","message":"baseline"}\n'
+        first_record = b'{"sessionId":"desktop_session_1","message":"existing"}\n'
         second_record = b'{"sessionId":"desktop_session_1","message":"upload"}\n'
-        audit_path.write_bytes(first_record)
+        audit_path.write_bytes(first_record + second_record)
         stale_time = time.time() - (13 * 60 * 60)
+        os.utime(audit_path, (stale_time, stale_time))
         env = {
             "HOME": str(home),
             "CLAUDE_PLUGIN_ROOT": str(plugin_root),
@@ -402,26 +380,13 @@ def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> No
 
         _run_collect(
             plugin_root,
-            ["collect", "--host", "claude-desktop", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {},
-        )
-        assert server.trace_batches == []
-
-        audit_path.write_bytes(first_record + second_record)
-        os.utime(audit_path, (stale_time, stale_time))
-        _run_collect(
-            plugin_root,
             ["collect", "--host", "claude-desktop", "--lifecycle", "stop", "--quiet"],
             env,
             {},
         )
 
         assert len(server.trace_batches) == 1
-        assert server.policy_requests == [
-            "/v0/host-enrollment/policy?target=claude",
-            "/v0/host-enrollment/policy?target=claude",
-        ]
+        assert server.policy_requests == ["/v0/host-enrollment/policy?target=claude"]
         batch = server.trace_batches[0]
         assert batch["source"] == "claude-desktop"
         assert batch["host"] == "claude-desktop"
@@ -430,18 +395,21 @@ def test_claude_desktop_collect_uploads_audit_jsonl_ranges(tmp_path: Path) -> No
         assert len(chunks) == 1
         chunk = _json_mapping(chunks[0], "batch.chunks[0]")
         assert chunk["kind"] == "jsonl_range"
-        assert chunk["start_offset"] == len(first_record)
+        assert chunk["start_offset"] == 0
         assert chunk["end_offset"] == len(first_record) + len(second_record)
         assert "lifecycle_event" not in chunk
-        assert gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content"))) == second_record
+        assert (
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content")))
+            == first_record + second_record
+        )
 
         ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
-        assert "claude-desktop" in _json_list(ledger["host_baselines"], "ledger.host_baselines")
+        assert "host_baselines" not in ledger
     finally:
         server.stop()
 
 
-def test_claude_desktop_baseline_is_per_host_with_shared_ledger(tmp_path: Path) -> None:
+def test_claude_and_desktop_collections_share_one_offset_ledger(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -455,11 +423,8 @@ def test_claude_desktop_baseline_is_per_host_with_shared_ledger(tmp_path: Path) 
         desktop_path = _claude_desktop_audit_path(home, "claude-code-sessions", "session-1")
         claude_path.parent.mkdir(parents=True)
         desktop_path.parent.mkdir(parents=True)
-        claude_path.write_bytes(b'{"sessionId":"claude_session_1","message":"baseline"}\n')
-        desktop_path.write_bytes(b'{"sessionId":"desktop_session_1","message":"baseline"}\n')
-        stale_time = time.time() - (13 * 60 * 60)
-        os.utime(claude_path, (stale_time, stale_time))
-        os.utime(desktop_path, (stale_time, stale_time))
+        claude_path.write_bytes(b'{"sessionId":"claude_session_1","message":"history"}\n')
+        desktop_path.write_bytes(b'{"sessionId":"desktop_session_1","message":"history"}\n')
         env = {
             "HOME": str(home),
             "CLAUDE_PLUGIN_ROOT": str(plugin_root),
@@ -472,20 +437,36 @@ def test_claude_desktop_baseline_is_per_host_with_shared_ledger(tmp_path: Path) 
 
         _run_collect(
             plugin_root,
-            ["collect", "--host", "claude", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            [
+                "collect",
+                "--host",
+                "claude",
+                "--lifecycle",
+                "session_start",
+                "--include-active",
+                "--quiet",
+            ],
             env,
             {},
         )
         _run_collect(
             plugin_root,
-            ["collect", "--host", "claude-desktop", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            [
+                "collect",
+                "--host",
+                "claude-desktop",
+                "--lifecycle",
+                "session_start",
+                "--include-active",
+                "--quiet",
+            ],
             env,
             {},
         )
 
-        assert server.trace_batches == []
+        assert {batch["host"] for batch in server.trace_batches} == {"claude", "claude-desktop"}
         ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
-        assert set(_json_list(ledger["host_baselines"], "ledger.host_baselines")) == {"claude", "claude-desktop"}
+        assert "host_baselines" not in ledger
         sources = _json_mapping(ledger["sources"], "ledger.sources")
         assert len(sources) == 2
         assert [request["target"] for request in server.session_requests] == ["claude"]
@@ -493,7 +474,7 @@ def test_claude_desktop_baseline_is_per_host_with_shared_ledger(tmp_path: Path) 
         server.stop()
 
 
-def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path) -> None:
+def test_concurrent_claude_collections_wait_for_shared_ledger_lock(tmp_path: Path) -> None:
     if os.name == "nt":
         pytest.skip("fcntl lock contention test is POSIX-only")
     import fcntl
@@ -512,8 +493,8 @@ def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path)
         desktop_path = _claude_desktop_audit_path(home, "claude-code-sessions", "session-1")
         claude_path.parent.mkdir(parents=True)
         desktop_path.parent.mkdir(parents=True)
-        claude_path.write_bytes(b'{"sessionId":"claude_session_1","message":"baseline"}\n')
-        desktop_path.write_bytes(b'{"sessionId":"desktop_session_1","message":"baseline"}\n')
+        claude_path.write_bytes(b'{"sessionId":"claude_session_1","message":"history"}\n')
+        desktop_path.write_bytes(b'{"sessionId":"desktop_session_1","message":"history"}\n')
         env = {
             "HOME": str(home),
             "CLAUDE_PLUGIN_ROOT": str(plugin_root),
@@ -538,7 +519,7 @@ def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path)
                             host,
                             "--lifecycle",
                             "session_start",
-                            "--baseline",
+                            "--include-active",
                             "--quiet",
                         ],
                         env=_clean_env(**env),
@@ -551,7 +532,7 @@ def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path)
 
             time.sleep(1)
             assert all(process.poll() is None for process in processes)
-            assert server.policy_requests == []
+            assert len(server.policy_requests) == 2
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
         for process in processes:
@@ -561,9 +542,10 @@ def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path)
             assert stderr == ""
 
         ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
-        assert set(_json_list(ledger["host_baselines"], "ledger.host_baselines")) == {"claude", "claude-desktop"}
+        assert "host_baselines" not in ledger
         assert len(_json_mapping(ledger["sources"], "ledger.sources")) == 2
         assert len(server.policy_requests) == 2
+        assert {batch["host"] for batch in server.trace_batches} == {"claude", "claude-desktop"}
     finally:
         for process in processes:
             if process.poll() is None:
@@ -572,46 +554,70 @@ def test_concurrent_claude_baselines_wait_for_shared_ledger_lock(tmp_path: Path)
         server.stop()
 
 
-def test_ensure_prepare_baseline_stops_before_enrollment_when_guard_write_fails(tmp_path: Path) -> None:
+def test_claude_session_start_supervisor_collects_code_and_desktop(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/pig"
-    server = _FakeWorkerServer()
+    plugin_root = hub_root / "dist/claude/pig"
+    server = _FakeWorkerServer(policy=_signed_policy(enabled_hosts=["codex", "claude"]))
     server.start()
     try:
         home = tmp_path / "home"
-        invalid_ledger_parent = tmp_path / "not-a-directory"
-        invalid_ledger_parent.write_text("file")
+        ledger_path = tmp_path / "ledger.json"
+        claude_path = home / ".claude/projects/project-1/session.jsonl"
+        desktop_path = _claude_desktop_audit_path(home, "claude-code-sessions", "session-1")
+        claude_path.parent.mkdir(parents=True)
+        desktop_path.parent.mkdir(parents=True)
+        claude_record = b'{"sessionId":"claude_session_1","message":"history"}\n'
+        desktop_record = b'{"sessionId":"desktop_session_1","message":"history"}\n'
+        claude_path.write_bytes(claude_record)
+        desktop_path.write_bytes(desktop_record)
+        env = {
+            "HOME": str(home),
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+        _run_runtime_json(plugin_root, ["enroll", "--host", "claude"], env)
+        server.policy_requests.clear()
+
         result = subprocess.run(
             [
                 str(plugin_root / "runtime" / HOST_RUNTIME_BIN),
-                "ensure",
+                "session-start",
                 "--host",
-                "codex",
-                "--prepare-baseline",
+                "claude",
+                "--supervised",
             ],
-            env=_clean_env(
-                HOME=str(home),
-                CODEX_HOME=str(home / ".codex"),
-                PLUGIN_ROOT=str(plugin_root),
-                PROMPTLESS_WORKER_BASE_URL=server.base_url,
-                PROMPTLESS_HOST_RUNTIME_LEDGER=str(invalid_ledger_parent / "ledger.json"),
-            ),
+            env=_clean_env(**env),
+            input=json.dumps({"session_id": "claude_session_1", "transcript_path": str(claude_path)}),
             text=True,
             capture_output=True,
             check=False,
         )
 
-        assert result.returncode == 1
-        assert server.session_requests == []
-        assert server.policy_requests == []
-        assert server.check_ins == []
+        assert result.returncode == 0
+        payload = _assert_session_start_streams(result.stdout, result.stderr, "configured")
+        assert payload["host"] == "claude"
+        assert [request["target"] for request in server.session_requests] == ["claude"]
+        assert len(server.check_ins) == 1
+        assert server.policy_requests == [
+            "/v0/host-enrollment/policy?target=claude",
+            "/v0/host-enrollment/policy?target=claude",
+            "/v0/host-enrollment/policy?target=claude",
+        ]
+        assert {batch["host"] for batch in server.trace_batches} == {"claude", "claude-desktop"}
+        uploaded_content = {
+            gzip.decompress(base64.b64decode(_json_string(chunk["content_base64"], "content")))
+            for batch in server.trace_batches
+            for chunk in _json_list(batch["chunks"], "chunks")
+        }
+        assert uploaded_content == {claude_record, desktop_record}
     finally:
         server.stop()
 
 
-def test_baseline_collect_stops_before_policy_when_guard_creation_fails(tmp_path: Path) -> None:
+def test_removed_baseline_flags_are_rejected(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -620,49 +626,34 @@ def test_baseline_collect_stops_before_policy_when_guard_creation_fails(tmp_path
     server.start()
     try:
         home = tmp_path / "home"
-        invalid_ledger_parent = tmp_path / "not-a-directory"
-        invalid_ledger_parent.write_text("file")
-        ledger_path = invalid_ledger_parent / "ledger.json"
         env = {
             "HOME": str(home),
             "CODEX_HOME": str(home / ".codex"),
             "PLUGIN_ROOT": str(plugin_root),
             "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
         }
-        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        server.session_requests.clear()
-
-        result = subprocess.run(
-            [
-                str(plugin_root / "runtime" / HOST_RUNTIME_BIN),
-                "collect",
-                "--host",
-                "codex",
-                "--lifecycle",
-                "session_start",
-                "--baseline",
-                "--quiet",
-            ],
-            env=_clean_env(**env),
-            input="{}",
-            text=True,
-            capture_output=True,
-            check=False,
+        commands = (
+            ["ensure", "--host", "codex", "--prepare-baseline"],
+            ["collect", "--host", "codex", "--baseline"],
         )
-
-        assert result.returncode == 1
-        assert result.stdout == ""
-        assert result.stderr == ""
+        for command in commands:
+            result = subprocess.run(
+                [str(plugin_root / "runtime" / HOST_RUNTIME_BIN), *command],
+                env=_clean_env(**env),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert result.returncode == 2
+            assert "unrecognized arguments" in result.stderr
         assert server.session_requests == []
         assert server.policy_requests == []
         assert server.trace_batches == []
-        assert not ledger_path.exists()
     finally:
         server.stop()
 
 
-def test_baseline_collect_stops_waiting_for_ledger_lock_at_deadline(tmp_path: Path) -> None:
+def test_idle_collect_stops_waiting_for_ledger_lock_at_deadline(tmp_path: Path) -> None:
     if os.name == "nt":
         pytest.skip("fcntl lock contention test is POSIX-only")
     import fcntl
@@ -679,6 +670,8 @@ def test_baseline_collect_stops_waiting_for_ledger_lock_at_deadline(tmp_path: Pa
         transcript_path = home / ".codex/sessions/pre-enrollment.jsonl"
         transcript_path.parent.mkdir(parents=True)
         transcript_path.write_text('{"kind":"response","message":"pre-enrollment history"}\n')
+        stale_time = time.time() - (13 * 60 * 60)
+        os.utime(transcript_path, (stale_time, stale_time))
         env = {
             "HOME": str(home),
             "CODEX_HOME": str(home / ".codex"),
@@ -687,12 +680,7 @@ def test_baseline_collect_stops_waiting_for_ledger_lock_at_deadline(tmp_path: Pa
             "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
             "PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS": "0.1",
         }
-        _run_bootstrap(plugin_root, "codex", env, prepare_baseline=True)
-
-        pending_path = ledger_path.with_name(f"{ledger_path.name}.codex.baseline-pending")
-        assert pending_path.exists()
-        pending_path.write_text("existing baseline guard\n")
-        pending_contents = pending_path.read_text()
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
         server.policy_requests.clear()
 
         lock_path = ledger_path.with_name(f"{ledger_path.name}.lock")
@@ -702,42 +690,32 @@ def test_baseline_collect_stops_waiting_for_ledger_lock_at_deadline(tmp_path: Pa
             started_at = time.monotonic()
             _run_collect(
                 plugin_root,
-                ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+                ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"],
                 env,
-                {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+                {},
                 timeout_seconds=2,
             )
             elapsed_seconds = time.monotonic() - started_at
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
         assert elapsed_seconds < 1
-        assert server.policy_requests == []
+        assert len(server.policy_requests) == 1
+        assert server.trace_batches == []
         assert not ledger_path.exists()
 
-        assert pending_path.exists()
-        assert pending_path.read_text() == pending_contents
-
-        # The deadline-expired baseline remains a durable guard. A terminal hook must not
-        # treat the absent ledger as a missed SessionStart and upload history from offset zero.
+        normal_env = dict(env)
+        normal_env.pop("PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS")
         _run_collect(
             plugin_root,
             ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
-            env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
+            normal_env,
+            {},
         )
-        assert server.policy_requests == []
-        assert server.trace_batches == []
-        assert not ledger_path.exists()
 
-        _run_collect(
-            plugin_root,
-            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
-            env,
-            {"session_id": "codex_session_1", "transcript_path": str(transcript_path)},
-        )
+        assert len(server.trace_batches) == 1
+        chunk = _json_mapping(_json_list(server.trace_batches[0]["chunks"], "chunks")[0], "chunk")
+        assert chunk["start_offset"] == 0
         ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
-        assert _json_list(ledger["host_baselines"], "ledger.host_baselines") == ["codex"]
-        assert server.trace_batches == []
-        assert not pending_path.exists()
+        assert len(_json_mapping(ledger["sources"], "ledger.sources")) == 1
     finally:
         server.stop()

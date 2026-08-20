@@ -133,9 +133,10 @@ stdlib-only Python runtime with POSIX shell checks. The stable executable in
 enrollment, trace collection, host configuration, persistence, and output.
 Generated Claude hooks use Claude Code's exec-form hook so Windows installs do
 not need a POSIX shell; Node must be available to start the inline launcher.
-Every launcher starts its primary host collection in a detached process that
-inherits the hook input and redirects collection output away from the agent
-transcript. The sibling Claude Desktop baseline starts without hook input.
+Every SessionStart launcher starts one detached supervisor that inherits the
+hook input and redirects background output away from the agent transcript. The
+Claude supervisor collects both Claude Code and any detected Claude Desktop
+sources.
 Startup launchers emit schema-safe diagnostics when the host cannot resolve the
 plugin root, a readable managed runtime bundle (the launcher plus its sibling
 package and CLI entry module), or Python 3.9+. Terminal lifecycle launchers stay
@@ -145,10 +146,10 @@ the same plugin id when the recorded root is stale or incomplete, and exit 0
 with no output when no usable bundle exists.
 
 ```sh
-sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime ensure --host codex --prepare-baseline; run promptless-host-runtime collect --host codex --lifecycle session_start --baseline --detach --quiet'
+sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime session-start --host codex --detach'
 sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle stop --detach --quiet'
 sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle session_end --detach --quiet'
-node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find Python 3.9+; run promptless-host-runtime ensure --host claude --prepare-baseline; run promptless-host-runtime collect --host claude --lifecycle session_start --baseline --detach --quiet; best-effort run promptless-host-runtime ensure --host claude-desktop --if-sources --prepare-baseline; then collect --host claude-desktop only if ensure succeeds' '${CLAUDE_PLUGIN_ROOT}'
+node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find Python 3.9+; run promptless-host-runtime session-start --host claude --detach' '${CLAUDE_PLUGIN_ROOT}'
 node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host claude --lifecycle session_end --detach --quiet' '${CLAUDE_PLUGIN_ROOT}'
 ```
 
@@ -160,6 +161,18 @@ runtime for a one-time per-host credential, caches that credential, and uses the
 host credential to fetch `/v0/host-enrollment/policy?target=...` and post
 `/v0/host-enrollment/check-ins`.
 
+SessionStart never waits for browser approval, worker requests, trace discovery,
+or the upload ledger. It launches one detached supervisor, emits and claims any
+already-pending plugin-update, first-enrollment, and internal-user notices using
+local state only, and returns. The supervisor runs enrollment and reconciliation
+before collecting Claude Code and Claude Desktop sequentially for Claude, or the
+single native source family for other hosts. On Linux, enrollment does not invoke a browser
+when `DISPLAY`, `WAYLAND_DISPLAY`, `MIR_SOCKET`, and `WSL_INTEROP` are all
+absent; set `PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER=1` to force a browser
+attempt or `0` to disable one explicitly. Detached enrollment outcomes remain
+available in `~/.promptless/instruction-hub/last-bootstrap-status.json` and the
+bounded `host-runtime-diagnostics.jsonl` log.
+
 #### Native trace collection
 
 The runtime uploads native host transcript JSONL ranges to
@@ -169,9 +182,11 @@ uploader and forward-only ledger. The ledger lives at
 `PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads use the host credential and
 are gated by the `enabled_hosts` policy.
 
-SessionStart hooks run `ensure` and then a quiet first baseline for each host.
-Terminal lifecycle hooks (`Stop`, `SessionEnd`, and `SubagentStop`) run
-collection only. Hook input accepts snake_case, camelCase, and nested
+SessionStart hooks launch one quiet `ensure`-then-collection supervisor. They
+include active files so pre-existing history is uploaded from byte zero when a
+source has no acknowledged offset. Terminal lifecycle hooks (`Stop`,
+`SessionEnd`, and `SubagentStop`) run collection only. Hook input accepts
+snake_case, camelCase, and nested
 `session`/`transcript`/`agent` transcript references from Codex- and
 Claude-style hooks. Claude Desktop has no hook-provided current transcript and
 starts with idle catch-up.
@@ -179,9 +194,7 @@ starts with idle catch-up.
 A collection follows this order:
 
 ```text
-persist the SessionStart release marker, when applicable
-    -> enforce the baseline gate; a first baseline records offsets and stops
-    -> upload at most one pending current-transcript request
+upload at most one pending current-transcript request
     -> start a fresh 25-second catch-up deadline
     -> upload remaining current-transcript ranges
     -> scan and upload idle transcripts
@@ -201,53 +214,26 @@ lock -> reload ledger -> select request -> post -> validate acknowledgement
      -> persist acknowledged offsets -> unlock
 ```
 
-Policy reads and transcript-root scans run without the ledger lock. Releasing
-the lock between requests lets SessionStart persist a release marker during
-catch-up; the next request reloads that marker instead of overwriting it from
-stale state. The ledger advances only after the worker acknowledges the exact
-source ranges and content hashes. When the catch-up deadline expires, collection
+Policy reads and transcript-root scans run without the ledger lock. The ledger
+advances only after the worker acknowledges the exact source ranges and content
+hashes. Releasing and reloading the ledger between requests preserves progress
+from other collectors. When the catch-up deadline expires, collection
 reports `trace_upload_partial` and resumes from the acknowledged offsets on a
 later hook.
 
 Source ranges target 4 MiB and end on complete-record boundaries. Serialized
-requests target 6 MiB and never exceed 10 MiB; sizing includes chunks, release
-snapshots, and request metadata.
-
-#### Release provenance
-
-When a SessionStart hook identifies an exact transcript path and session, the
-collector validates the installed plugin's `hub.release.json` and durably marks
-the source offset where that release begins to govern new bytes. Uploads retain
-their original raw chunks and add customer-local analysis-context snapshots for
-the marker intersections. Each snapshot carries the package-scoped `plugin_id`
-and display `plugin_name` of the plugin whose embedded runtime is executing,
-plus the hub-wide `plugin_version` and content-derived `release_id`. The runtime
-identity must match the content-validated release manifest. A release may list
-other package plugins, but the collector does not claim those siblings are
-installed. The marker is written before upload so retries preserve the same
-boundary and capture timestamp. Idle catch-up sources and ambiguous sessions
-receive no release assertion; missing provenance means unknown, not that no
-Instruction Hub release was installed.
-
-Snapshot-heavy uploads page at existing chunk boundaries to stay within the
-worker's 200-snapshot request limit. If one complete-record chunk alone crosses
-more than 200 release boundaries, collection fails before upload instead of
-acknowledging bytes whose provenance was omitted.
-
-Roll out the fully compatible worker first, with empty release fields omitted
-when it calls Hosted Runtime. Deploy Hosted Runtime next, then this collector
-version last; older native upload models reject unknown fields.
+requests target 6 MiB and never exceed 10 MiB; sizing includes chunks and request
+metadata. Each batch carries the currently installed `plugin_version`, which is
+treated as the version associated with every byte in that batch.
 
 #### Collection safety
 
-SessionStart creates a durable pending guard before it waits for enrollment and
-check-in. Its first baseline performs a complete, unmetered source inventory;
-truncating that scan could miss a file and cause its history to replay from
-offset zero later. Baseline collection waits for the shared ledger lock until
-the collection deadline. If the guard cannot be created, collection stops before
-policy lookup or upload. A timed-out baseline leaves the guard in place so
-terminal hooks cannot upload pre-enrollment history before a later SessionStart
-completes the baseline.
+An unseen source starts at byte zero. A known source resumes at its last
+worker-acknowledged offset, including offsets written by earlier runtime
+versions. Plugin updates immediately use the new collection code, but do not
+rewind those existing offsets; intentionally skipped prefixes therefore remain
+grandfathered unless the ledger is reset. Obsolete baseline and release-marker
+fields are discarded when an older ledger is next rewritten.
 
 Collection runs detached from the hook process group. Quiet collection writes
 no status JSON to hook stdout. A source that vanishes or loses read permission
@@ -275,14 +261,13 @@ Claude `settings.json` are deleted (with a timestamped backup), while unmanaged
 user config is never touched. The hosted policy's legacy `collector` section is
 ignored.
 
-The host runtime has one executable entrypoint with subcommands. `ensure` is the hook-safe
-path that enrolls when needed, removes legacy managed telemetry config, and
-posts a check-in. SessionStart adds `--prepare-baseline` so `ensure` persists the
-guard required before it can detach baseline collection. `collect` is the
+The host runtime has one executable entrypoint with subcommands. `session-start`
+detaches one `ensure`-then-collection supervisor. `ensure` enrolls when needed,
+removes legacy managed telemetry config, and posts a check-in. `collect` is the
 native JSONL upload path; hooks pass `--detach` so the runtime supervises
 collection outside the hook process group. Pass `--include-active` for a
-user-initiated sweep that includes files still inside the idle grace period
-after SessionStart has established the upload baseline. `enroll` acquires only
+user-initiated sweep that includes files still inside the idle grace period.
+`enroll` acquires only
 the host credential. `status` prints local JSON without network,
 browser, config writes, or check-ins. `reset --yes` clears cached host
 credentials and pending enrollments while preserving the stable host id,
