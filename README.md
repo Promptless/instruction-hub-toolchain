@@ -172,18 +172,60 @@ attempt or `0` to disable one explicitly. Detached enrollment outcomes remain
 available in `~/.promptless/instruction-hub/last-bootstrap-status.json` and the
 bounded `host-runtime-diagnostics.jsonl` log.
 
-The same runtime also uploads native host transcript JSONL ranges to
-`/v0/traces/batches?target=...`. SessionStart supervisors run `ensure` and then
-a quiet first baseline for each host; terminal lifecycle hooks (`Stop`,
-`SessionEnd`, and `SubagentStop`) run collection only. Collection uses hook stdin
-transcript references first, accepting snake_case, camelCase, and nested
-`session`/`transcript`/`agent` shapes from Codex- and Claude-style hooks, then
-scans idle host-native transcript roots as a catch-up path. SessionStart creates
-a durable pending guard before it detaches enrollment and collection; terminal hooks detach
-collection after resolving the runtime and Python interpreter. The forward-only
-ledger lives at `~/.promptless/instruction-hub/host-runtime-ledger.json` or
-`PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads are authenticated with the
-same host credential and are gated by the `enabled_hosts` policy.
+#### Native trace collection
+
+The runtime uploads native host transcript JSONL ranges to
+`/v0/traces/batches?target=...`. Claude Code, Codex, and Claude Desktop share one
+uploader and forward-only ledger. The ledger lives at
+`~/.promptless/instruction-hub/host-runtime-ledger.json` or
+`PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads use the host credential and
+are gated by the `enabled_hosts` policy.
+
+SessionStart hooks run `ensure` and then a quiet first baseline for each host.
+Terminal lifecycle hooks (`Stop`, `SessionEnd`, and `SubagentStop`) run
+collection only. Hook input accepts snake_case, camelCase, and nested
+`session`/`transcript`/`agent` transcript references from Codex- and
+Claude-style hooks. Claude Desktop has no hook-provided current transcript and
+starts with idle catch-up.
+
+A collection follows this order:
+
+```text
+persist the SessionStart release marker, when applicable
+    -> enforce the baseline gate; a first baseline records offsets and stops
+    -> upload at most one pending current-transcript request
+    -> start a fresh 25-second catch-up deadline
+    -> upload remaining current-transcript ranges
+    -> scan and upload idle transcripts
+```
+
+The first pending current-transcript request receives its own fixed 25-second
+deadline before the catch-up clock starts. Contention or exhausting that budget
+reports `trace_upload_partial` for a later hook to resume. Remaining current-
+transcript work, idle discovery, and idle uploads share the fresh catch-up
+deadline, configurable with
+`PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS`.
+
+Each request is one ledger transaction:
+
+```text
+lock -> reload ledger -> select request -> post -> validate acknowledgement
+     -> persist acknowledged offsets -> unlock
+```
+
+Policy reads and transcript-root scans run without the ledger lock. Releasing
+the lock between requests lets SessionStart persist a release marker during
+catch-up; the next request reloads that marker instead of overwriting it from
+stale state. The ledger advances only after the worker acknowledges the exact
+source ranges and content hashes. When the catch-up deadline expires, collection
+reports `trace_upload_partial` and resumes from the acknowledged offsets on a
+later hook.
+
+Source ranges target 4 MiB and end on complete-record boundaries. Serialized
+requests target 6 MiB and never exceed 10 MiB; sizing includes chunks, release
+snapshots, and request metadata.
+
+#### Release provenance
 
 When a SessionStart hook identifies an exact transcript path and session, the
 collector validates the installed plugin's `hub.release.json` and durably marks
@@ -208,36 +250,25 @@ Roll out the fully compatible worker first, with empty release fields omitted
 when it calls Hosted Runtime. Deploy Hosted Runtime next, then this collector
 version last; older native upload models reject unknown fields.
 
-Quiet collection stays hook-safe: it never writes status JSON to stdout, and it
-fails open if the ledger lock is busy. The collection deadline (default 25
-seconds, overridable with `PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS`) is
-a budget for optional catch-up work, never a reason to skip the hook's own
-transcript: hook-subject paths are collected without deadline checks, the first
-pending upload batch is always sent so every hook makes forward progress, and
-only the idle scan and follow-on batches stop when the budget runs out
-(reported as `trace_upload_partial`; the forward-only ledger resumes on the
-next collect). A host's first baseline never uses a deadline-truncated
-inventory — files missed by a partial scan would replay from offset zero later
-as a surprise backfill — so the inventory scan reruns
-unmetered. A source that vanishes or loses read permission mid-collect is
-skipped with a drift entry (surfaced as `unreadable_source_count`) instead of
-failing the run, so one bad idle file cannot block the hook subject's upload.
-Support diagnostics are written as bounded, redacted JSONL at
-`~/.promptless/instruction-hub/host-runtime-diagnostics.jsonl` with `0600`
-permissions and without transcript content, tool inputs, or credentials.
-Detached collector launch and nonzero-exit failures are recorded there and in
-the structured `last-bootstrap-status.json` support status.
+#### Collection safety
 
-Hook-triggered collectors still scan idle transcript roots and hold the ledger
-lock across catch-up uploads. The collector process is detached from the hook,
-so that work cannot delay the host or remain in the hook's process group.
-Baseline collections reuse the durable pending guard created by SessionStart
-and wait for the shared ledger lock until the collection deadline. If a missing
-guard cannot be created, collection stops before policy lookup or upload. A
-timed-out baseline leaves the guard in place, so terminal collections cannot
-upload pre-enrollment history before a later SessionStart completes the
-baseline. Other collections stay non-blocking and can skip when another
-collector holds the lock.
+SessionStart creates a durable pending guard before it waits for enrollment and
+check-in. Its first baseline performs a complete, unmetered source inventory;
+truncating that scan could miss a file and cause its history to replay from
+offset zero later. Baseline collection waits for the shared ledger lock until
+the collection deadline. If the guard cannot be created, collection stops before
+policy lookup or upload. A timed-out baseline leaves the guard in place so
+terminal hooks cannot upload pre-enrollment history before a later SessionStart
+completes the baseline.
+
+Collection runs detached from the hook process group. Quiet collection writes
+no status JSON to hook stdout. A source that vanishes or loses read permission
+mid-collect is recorded as drift and surfaced through `unreadable_source_count`;
+it does not block later sources. Support diagnostics are bounded, redacted JSONL
+at `~/.promptless/instruction-hub/host-runtime-diagnostics.jsonl` with `0600`
+permissions and no transcript content, tool inputs, or credentials. Detached
+launch and nonzero-exit failures are also recorded in the structured
+`last-bootstrap-status.json` support status.
 
 Host enrollment is per host, not per installed `pig` version. The credential
 and pending approval are cached at a single host-global path
