@@ -26,6 +26,8 @@ from promptless_instruction_hub.managed_runtime import (
     UNSUPPORTED_PYTHON_MESSAGE,
 )
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.contracts import (
+    FIRST_CURRENT_BATCH_DEADLINE_SECONDS,
+    HTTP_TIMEOUT_SECONDS,
     MAX_DIAGNOSTIC_LOG_BYTES,
 )
 
@@ -49,6 +51,10 @@ from .helpers import (
     _write_python_forwarder,
     _write_shell_script,
 )
+
+
+def test_first_current_batch_deadline_fits_one_hook_pass() -> None:
+    assert FIRST_CURRENT_BATCH_DEADLINE_SECONDS + HTTP_TIMEOUT_SECONDS < HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
 
 
 def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:

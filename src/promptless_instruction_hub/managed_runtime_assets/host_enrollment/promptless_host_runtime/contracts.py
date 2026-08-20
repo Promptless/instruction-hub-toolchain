@@ -67,6 +67,12 @@ ENROLLMENT_POLL_DEADLINE_SECONDS = 35
 COLLECT_DEADLINE_SECONDS = 25.0
 
 
+# The generated hook allows one collection pass 390 seconds. Start no new
+# first-batch request after 350 seconds so its 10-second HTTP timeout and hook
+# shutdown remain inside that host budget.
+FIRST_CURRENT_BATCH_DEADLINE_SECONDS = 350.0
+
+
 MAX_STDIN_BYTES = 1024 * 1024
 
 
@@ -349,6 +355,29 @@ class SourceEvent:
 
 
 @dataclass(frozen=True)
+class InFlightSourceEvent:
+    """Durable source range selected for an upload whose acknowledgement is pending."""
+
+    kind: SourceEventKind
+    path: Path
+    path_hash: str
+    start_offset: int
+    end_offset: int
+    byte_count: int
+    content_sha256: str
+    oversized_reason: OversizedReason | None = None
+
+
+@dataclass(frozen=True)
+class InFlightUploadBatch:
+    """Durable batch boundaries and context retained until the worker acknowledges them."""
+
+    lifecycle_event: LifecycleEvent
+    hook_context: HookTraceContext
+    events: tuple[InFlightSourceEvent, ...]
+
+
+@dataclass(frozen=True)
 class UploadBatch:
     """A native trace upload request plus the source events it acknowledges."""
 
@@ -364,5 +393,6 @@ class SourceLedger:
     is_new: bool
     sources: dict[str, dict[str, JsonValue]]
     host_baselines: set[str] = field(default_factory=set)
+    in_flight_batches: dict[Host, list[InFlightUploadBatch]] = field(default_factory=dict)
     reset_sources: set[str] = field(default_factory=set)
     drift_reports: list[dict[str, JsonValue]] = field(default_factory=list)

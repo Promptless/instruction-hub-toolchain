@@ -199,9 +199,12 @@ version last; older native upload models reject unknown fields.
 
 Quiet collection stays hook-safe: it never writes status JSON to stdout, and it
 selects the hook's transcript before scanning idle roots. The first pending
-current-transcript batch is always sent so every hook makes forward progress.
-Remaining current-transcript batches, the idle scan, and idle uploads share the
-collection deadline (default 25 seconds, overridable with
+current-transcript batch gets a dedicated 350-second deadline measured from
+collector start, leaving time inside the 390-second hook pass for its final
+request and shutdown. Lock contention that exhausts that budget reports a
+partial upload for the next hook to resume. Remaining current-transcript
+batches, the idle scan, and idle uploads share the collection deadline (default
+25 seconds, overridable with
 `PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS`). When the budget runs out,
 collection reports `trace_upload_partial` and the forward-only ledger resumes
 at the acknowledged offset on the next hook. Source ranges retain stable 4 MiB
@@ -220,10 +223,13 @@ Detached collector launch and nonzero-exit failures are recorded there and in
 the structured `last-bootstrap-status.json` support status.
 
 Policy reads and transcript-root scans run without the ledger lock. Each upload
-transaction reloads the ledger, selects one request, posts it, persists its
-acknowledgement, and releases the lock before the next request. SessionStart can
-therefore persist a release marker between catch-up requests, and the next
-request includes that marker instead of overwriting it from stale state. The
+transaction reloads the ledger and durably records its exact ranges and hook
+context before posting. A lost response therefore replays the same request
+boundaries even if a live transcript grows. An exact acknowledgement advances
+the source offsets, clears the pending request, and releases the lock before the
+next request. SessionStart can therefore persist a release marker between
+catch-up requests, and the next request includes that marker instead of
+overwriting it from stale state. The
 collector process is detached from the hook, so catch-up work cannot delay the
 host or remain in the hook's process group. Baseline collections reuse the
 durable pending guard created by SessionStart and wait for the shared ledger lock

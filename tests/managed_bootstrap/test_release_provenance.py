@@ -15,6 +15,7 @@ from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptles
     BootstrapError,
     CHUNK_TARGET_BYTES,
     CollectDeadlineExceeded,
+    FIRST_CURRENT_BATCH_DEADLINE_SECONDS,
     HookTraceContext,
     Host,
     HostCredential,
@@ -46,7 +47,14 @@ from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptles
 )
 from promptless_instruction_hub.release.hashing import stable_hash
 
-from .helpers import _FakeWorkerServer, _json_list, _json_mapping, _run_collect, _run_runtime_json
+from .helpers import (
+    _FakeWorkerServer,
+    _diagnostic_log_entries,
+    _json_list,
+    _json_mapping,
+    _run_collect,
+    _run_runtime_json,
+)
 
 
 def _metadata(plugin_version: str) -> RuntimeMetadata:
@@ -576,6 +584,85 @@ def test_current_transcript_ack_is_persisted_before_idle_discovery(
         server.stop()
 
 
+def test_first_current_transcript_lock_timeout_reports_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/pig"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = (tmp_path / "current.jsonl").resolve()
+        baseline_record = b'{"kind":"baseline"}\n'
+        transcript_path.write_bytes(baseline_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--baseline", "--quiet"],
+            env,
+            {"session_id": "session-1", "transcript_path": str(transcript_path)},
+        )
+        transcript_path.write_bytes(baseline_record + b'{"kind":"current"}\n')
+        for key, value in {
+            **env,
+            "PROMPTLESS_DASHBOARD_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES": "1",
+            "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER": "0",
+        }.items():
+            monkeypatch.setenv(key, value)
+
+        original_source_ledger_lock = _source_ledger_lock
+        lock_deadlines: list[float] = []
+
+        @contextmanager
+        def time_out_first_upload_lock(path: Path, *, wait_for_lock: bool, deadline: float) -> Iterator[bool]:
+            lock_deadlines.append(deadline)
+            if len(lock_deadlines) == 2:
+                yield False
+                return
+            with original_source_ledger_lock(path, wait_for_lock=wait_for_lock, deadline=deadline) as acquired:
+                yield acquired
+
+        monkeypatch.setattr(
+            "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+            "promptless_host_runtime.traces._source_ledger_lock",
+            time_out_first_upload_lock,
+        )
+        started_at = time.monotonic()
+
+        assert (
+            _run_collect_runtime(
+                "codex",
+                lifecycle_event="stop",
+                hook_context=HookTraceContext(transcript_path, None, "session-1", None, None, None),
+                baseline=False,
+                include_active=False,
+                quiet=True,
+                release_marker_captured=True,
+            )
+            == 0
+        )
+
+        assert server.trace_batches == []
+        assert len(lock_deadlines) == 2
+        first_batch_budget = lock_deadlines[1] - started_at
+        assert FIRST_CURRENT_BATCH_DEADLINE_SECONDS <= first_batch_budget < FIRST_CURRENT_BATCH_DEADLINE_SECONDS + 1
+        diagnostics = _diagnostic_log_entries(home)
+        assert diagnostics[-1]["status"] == "trace_upload_partial"
+        assert diagnostics[-1]["reason"] == "collection_deadline_exceeded"
+    finally:
+        server.stop()
+
+
 def test_expired_deadline_stops_before_idle_source_iteration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     idle_path = (tmp_path / "idle.jsonl").resolve()
     idle_path.write_bytes(b'{"kind":"incomplete"}')
@@ -633,6 +720,45 @@ def test_idle_catch_up_checks_deadline_between_source_events(tmp_path: Path, mon
         hook_context=HookTraceContext(None, None, None, None, None, None),
         ledger=ledger,
         source_paths=(first_idle_path, second_idle_path),
+        deadline=2.0,
+    )
+    with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
+        next(batches)
+
+
+def test_transport_target_overflow_checks_deadline_before_yield(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript_path = (tmp_path / "idle.jsonl").resolve()
+    record = b'{"kind":"idle"}\n'
+    transcript_path.write_bytes(record * 2)
+    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=False, sources={})
+    _record_ledger_offset(ledger, transcript_path, 0)
+    monotonic_values = iter((1.0, 1.0, 1.0, 3.0))
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces.CHUNK_TARGET_BYTES",
+        len(record),
+    )
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces.TARGET_TRANSPORT_BATCH_BYTES",
+        1,
+    )
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    batches = _iter_upload_batches(
+        host="codex",
+        metadata=_metadata("1.0.0"),
+        policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+        lifecycle_event="stop",
+        hook_context=HookTraceContext(None, None, None, None, None, None),
+        ledger=ledger,
+        source_paths=(transcript_path,),
         deadline=2.0,
     )
     with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
@@ -767,6 +893,92 @@ def test_source_range_boundaries_are_stable_across_lost_ack_retry(tmp_path: Path
     assert first_attempt == retry_attempt
     assert (first_attempt[0].start_offset, first_attempt[0].end_offset) == (0, 59 * len(record))
     assert first_attempt[1].start_offset == first_attempt[0].end_offset
+
+
+def test_lost_ack_replays_exact_live_tail_after_transcript_grows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript_path = (tmp_path / "session.jsonl").resolve()
+    ledger_path = tmp_path / "ledger.json"
+    record = b"x" * (1024 * 1024 - 1) + b"\n"
+    initial_content = record * 3
+    grown_content = record * 5
+    transcript_path.write_bytes(initial_content)
+    ledger = SourceLedger(path=ledger_path, is_new=False, sources={})
+    _record_ledger_offset(ledger, transcript_path, 0)
+    _write_source_ledger(ledger)
+    posted_batches: list[UploadBatch] = []
+
+    def lose_first_acknowledgement(
+        upload_url: str,
+        credential: HostCredential,
+        policy: HostPolicy,
+        batch: UploadBatch,
+    ) -> dict[str, JsonValue]:
+        del upload_url, credential
+        posted_batches.append(batch)
+        if len(posted_batches) == 1:
+            raise BootstrapError("trace batch response was lost")
+        return {
+            "accepted": True,
+            "batch_id": batch.request["batch_id"],
+            "policy_version": policy.policy_version,
+            "raw_artifact_count": sum(event.kind == "jsonl_range" for event in batch.events),
+            "skipped_record_count": sum(event.kind == "oversized_record" for event in batch.events),
+            "acknowledged_ranges": [
+                {
+                    "kind": event.kind,
+                    "source_path_hash": event.path_hash,
+                    "start_offset": event.start_offset,
+                    "end_offset": event.end_offset,
+                    "content_sha256": event.content_sha256,
+                }
+                for event in batch.events
+            ],
+            "unparsed_record_count": 0,
+        }
+
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces._post_upload_batch",
+        lose_first_acknowledgement,
+    )
+
+    def upload() -> tuple[int, int, int, frozenset[str]]:
+        return _upload_source_paths(
+            (transcript_path,),
+            upload_url="https://worker.invalid/v0/traces/batches",
+            credential=HostCredential("credential", None, None),
+            host="codex",
+            metadata=_metadata("2.0.0"),
+            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+            lifecycle_event="stop",
+            hook_context=HookTraceContext(transcript_path, None, "session-1", None, None, None),
+            ledger_path=ledger_path,
+            deadline=float("inf"),
+        )
+
+    with pytest.raises(BootstrapError, match="response was lost"):
+        upload()
+
+    persisted_after_loss = _load_source_ledger(ledger_path)
+    pending_batch = persisted_after_loss.in_flight_batches["codex"][0]
+    assert [(event.start_offset, event.end_offset) for event in pending_batch.events] == [(0, len(initial_content))]
+
+    transcript_path.write_bytes(grown_content)
+    counts = upload()
+
+    assert counts == (2, 2, 0, frozenset())
+    assert [[(event.start_offset, event.end_offset) for event in batch.events] for batch in posted_batches] == [
+        [(0, len(initial_content))],
+        [(0, len(initial_content))],
+        [(len(initial_content), len(grown_content))],
+    ]
+    assert posted_batches[0].request["batch_id"] == posted_batches[1].request["batch_id"]
+    persisted_after_ack = _load_source_ledger(ledger_path)
+    assert persisted_after_ack.in_flight_batches == {}
+    source = next(iter(persisted_after_ack.sources.values()))
+    assert source["end_offset"] == len(grown_content)
 
 
 def test_upload_reloads_ledger_between_acks_so_session_marker_survives(

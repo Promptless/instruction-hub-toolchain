@@ -24,12 +24,15 @@ from .contracts import (
     COLLECT_DEADLINE_ENV,
     COLLECT_DEADLINE_SECONDS,
     CollectDeadlineExceeded,
+    FIRST_CURRENT_BATCH_DEADLINE_SECONDS,
     HookTraceContext,
     Host,
     HostCredential,
     HostPolicy,
     HOST_VALUES,
     IDLE_SESSION_GRACE_SECONDS,
+    InFlightSourceEvent,
+    InFlightUploadBatch,
     InstalledInstructionHubRelease,
     JsonValue,
     LifecycleEvent,
@@ -118,6 +121,7 @@ def _run_collect(
     quiet: bool,
     release_marker_captured: bool = False,
 ) -> int:
+    first_current_batch_deadline = time.monotonic() + FIRST_CURRENT_BATCH_DEADLINE_SECONDS
     marker_deadline = _collect_deadline()
     plugin_root = _plugin_root()
     metadata = _load_runtime_metadata(plugin_root, host)
@@ -234,19 +238,26 @@ def _run_collect(
     unparsed_record_count = 0
     unreadable_source_hashes: set[str] = set()
 
-    first_current_counts = _upload_source_paths(
-        current_transcript_paths,
-        upload_url=upload_url,
-        credential=credential,
-        host=host,
-        metadata=metadata,
-        policy=policy,
-        lifecycle_event=lifecycle_event,
-        hook_context=hook_context,
-        ledger_path=ledger_path,
-        deadline=float("inf"),
-        batch_limit=1,
-    )
+    try:
+        first_current_counts = _upload_source_paths(
+            current_transcript_paths,
+            upload_url=upload_url,
+            credential=credential,
+            host=host,
+            metadata=metadata,
+            policy=policy,
+            lifecycle_event=lifecycle_event,
+            hook_context=hook_context,
+            ledger_path=ledger_path,
+            deadline=first_current_batch_deadline,
+            batch_limit=1,
+        )
+    except CollectDeadlineExceeded:
+        _emit(
+            {"status": "trace_upload_partial", "reason": "collection_deadline_exceeded", "host": host},
+            quiet=quiet,
+        )
+        return 0
     uploaded_batch_count += first_current_counts[0]
     uploaded_chunk_count += first_current_counts[1]
     unparsed_record_count += first_current_counts[2]
@@ -632,7 +643,132 @@ def _load_source_ledger(path: Path) -> SourceLedger:
             host = _string_value(raw_host)
             if host in HOST_VALUES:
                 host_baselines.add(host)
-    return SourceLedger(path=path, is_new=False, sources=valid_sources, host_baselines=host_baselines)
+    return SourceLedger(
+        path=path,
+        is_new=False,
+        sources=valid_sources,
+        host_baselines=host_baselines,
+        in_flight_batches=_load_in_flight_batches(value.get("in_flight_batches")),
+    )
+
+
+def _load_in_flight_batches(value: JsonValue | None) -> dict[Host, list[InFlightUploadBatch]]:
+    batches_by_host: dict[Host, list[InFlightUploadBatch]] = {}
+    for raw_host, raw_batches in _json_mapping_or_empty(value).items():
+        host = _host_value(raw_host)
+        if host is None or not isinstance(raw_batches, list):
+            continue
+        batches = [batch for raw_batch in raw_batches if (batch := _in_flight_batch_value(raw_batch)) is not None]
+        if batches:
+            batches_by_host[host] = batches
+    return batches_by_host
+
+
+def _in_flight_batch_value(value: JsonValue) -> InFlightUploadBatch | None:
+    batch = _json_mapping_or_empty(value)
+    lifecycle_event = _lifecycle_event_value(batch.get("lifecycle_event"))
+    context = _json_mapping_or_empty(batch.get("hook_context"))
+    raw_events = batch.get("events")
+    if lifecycle_event is None or not isinstance(raw_events, list) or not raw_events:
+        return None
+    events = tuple(event for raw_event in raw_events if (event := _in_flight_event_value(raw_event)) is not None)
+    if len(events) != len(raw_events) or len(events) > MAX_UPLOAD_CHUNKS_PER_BATCH:
+        return None
+    return InFlightUploadBatch(
+        lifecycle_event=lifecycle_event,
+        hook_context=HookTraceContext(
+            transcript_path=_optional_path_value(context.get("transcript_path")),
+            agent_transcript_path=_optional_path_value(context.get("agent_transcript_path")),
+            session_id=_string_value(context.get("session_id")),
+            parent_session_id=_string_value(context.get("parent_session_id")),
+            agent_id=_string_value(context.get("agent_id")),
+            agent_type=_string_value(context.get("agent_type")),
+        ),
+        events=events,
+    )
+
+
+def _in_flight_event_value(value: JsonValue) -> InFlightSourceEvent | None:
+    event = _json_mapping_or_empty(value)
+    kind_value = _string_value(event.get("kind"))
+    if kind_value == "jsonl_range":
+        kind = "jsonl_range"
+    elif kind_value == "oversized_record":
+        kind = "oversized_record"
+    else:
+        return None
+    path_value = _non_empty(_string_value(event.get("path")))
+    path_hash = _string_value(event.get("source_path_hash"))
+    start_offset = _optional_int_value(event.get("start_offset"))
+    end_offset = _optional_int_value(event.get("end_offset"))
+    byte_count = _optional_int_value(event.get("byte_count"))
+    content_sha256 = _string_value(event.get("content_sha256"))
+    oversized_reason_value = _string_value(event.get("oversized_reason"))
+    oversized_reason: OversizedReason | None = None
+    if oversized_reason_value == "content_size":
+        oversized_reason = "content_size"
+    elif oversized_reason_value == "transport_size":
+        oversized_reason = "transport_size"
+    if (
+        path_value is None
+        or path_hash is None
+        or len(path_hash) != 64
+        or any(character not in "0123456789abcdef" for character in path_hash)
+        or start_offset is None
+        or start_offset < 0
+        or end_offset is None
+        or end_offset <= start_offset
+        or byte_count is None
+        or byte_count != end_offset - start_offset
+        or content_sha256 is None
+        or len(content_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in content_sha256)
+        or (kind == "jsonl_range" and oversized_reason is not None)
+        or (kind == "oversized_record" and oversized_reason is None)
+    ):
+        return None
+    path = Path(path_value)
+    if _path_hash(path) != path_hash:
+        return None
+    return InFlightSourceEvent(
+        kind=kind,
+        path=path,
+        path_hash=path_hash,
+        start_offset=start_offset,
+        end_offset=end_offset,
+        byte_count=byte_count,
+        content_sha256=content_sha256,
+        oversized_reason=oversized_reason,
+    )
+
+
+def _host_value(value: JsonValue | None) -> Host | None:
+    text = _string_value(value)
+    if text == "codex":
+        return "codex"
+    if text == "claude":
+        return "claude"
+    if text == "claude-desktop":
+        return "claude-desktop"
+    return None
+
+
+def _lifecycle_event_value(value: JsonValue | None) -> LifecycleEvent | None:
+    text = _string_value(value)
+    if text == "session_start":
+        return "session_start"
+    if text == "stop":
+        return "stop"
+    if text == "session_end":
+        return "session_end"
+    if text == "subagent_stop":
+        return "subagent_stop"
+    return None
+
+
+def _optional_path_value(value: JsonValue | None) -> Path | None:
+    text = _string_value(value)
+    return Path(text) if text is not None else None
 
 
 def _quarantine_corrupt_ledger(path: Path) -> None:
@@ -652,11 +788,54 @@ def _write_source_ledger(ledger: SourceLedger) -> None:
         "host_baselines": sorted(ledger.host_baselines),
         "sources": ledger.sources,
     }
+    if ledger.in_flight_batches:
+        payload["in_flight_batches"] = {
+            host: [_in_flight_batch_payload(batch) for batch in batches]
+            for host, batches in ledger.in_flight_batches.items()
+            if batches
+        }
     _atomic_write_text(ledger.path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     try:
         ledger.path.chmod(0o600)
     except OSError:
         pass
+
+
+def _in_flight_batch_payload(batch: InFlightUploadBatch) -> dict[str, JsonValue]:
+    context = batch.hook_context
+    hook_context: dict[str, JsonValue] = {}
+    if context.transcript_path is not None:
+        hook_context["transcript_path"] = str(context.transcript_path)
+    if context.agent_transcript_path is not None:
+        hook_context["agent_transcript_path"] = str(context.agent_transcript_path)
+    if context.session_id is not None:
+        hook_context["session_id"] = context.session_id
+    if context.parent_session_id is not None:
+        hook_context["parent_session_id"] = context.parent_session_id
+    if context.agent_id is not None:
+        hook_context["agent_id"] = context.agent_id
+    if context.agent_type is not None:
+        hook_context["agent_type"] = context.agent_type
+    return {
+        "lifecycle_event": batch.lifecycle_event,
+        "hook_context": hook_context,
+        "events": [_in_flight_event_payload(event) for event in batch.events],
+    }
+
+
+def _in_flight_event_payload(event: InFlightSourceEvent) -> dict[str, JsonValue]:
+    payload: dict[str, JsonValue] = {
+        "kind": event.kind,
+        "path": str(event.path),
+        "source_path_hash": event.path_hash,
+        "start_offset": event.start_offset,
+        "end_offset": event.end_offset,
+        "byte_count": event.byte_count,
+        "content_sha256": event.content_sha256,
+    }
+    if event.oversized_reason is not None:
+        payload["oversized_reason"] = event.oversized_reason
+    return payload
 
 
 def _baseline_source_offsets(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> None:
@@ -1039,24 +1218,33 @@ def _upload_source_paths(
     unreadable_source_hashes: set[str] = set()
     while source_paths and (batch_limit is None or uploaded_batch_count < batch_limit):
         _ensure_collect_deadline(deadline)
-        lock_deadline = _collect_deadline() if deadline == float("inf") else deadline
-        with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=lock_deadline) as lock_acquired:
+        with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=deadline) as lock_acquired:
             if not lock_acquired:
                 raise CollectDeadlineExceeded("native trace collection exceeded deadline waiting for ledger lock")
             ledger = _load_source_ledger(ledger_path)
-            batch = next(
-                _iter_upload_batches(
+            in_flight_batch = _next_in_flight_batch(ledger, host, source_paths)
+            if in_flight_batch is None:
+                batch = next(
+                    _iter_upload_batches(
+                        host=host,
+                        metadata=metadata,
+                        policy=policy,
+                        lifecycle_event=lifecycle_event,
+                        hook_context=hook_context,
+                        ledger=ledger,
+                        source_paths=source_paths,
+                        deadline=deadline,
+                    ),
+                    None,
+                )
+            else:
+                batch = _restore_in_flight_upload_batch(
+                    in_flight_batch,
                     host=host,
                     metadata=metadata,
                     policy=policy,
-                    lifecycle_event=lifecycle_event,
-                    hook_context=hook_context,
                     ledger=ledger,
-                    source_paths=source_paths,
-                    deadline=deadline,
-                ),
-                None,
-            )
+                )
             unreadable_source_hashes.update(
                 source_path_hash
                 for report in ledger.drift_reports
@@ -1067,13 +1255,150 @@ def _upload_source_paths(
                 if ledger.drift_reports:
                     _write_source_ledger(ledger)
                 break
+            if in_flight_batch is None:
+                in_flight_batch = _record_in_flight_batch(
+                    ledger,
+                    host=host,
+                    lifecycle_event=lifecycle_event,
+                    hook_context=hook_context,
+                    batch=batch,
+                )
+                # The exact range boundaries must survive a worker commit whose
+                # response is lost. Persist them before starting the request.
+                _write_source_ledger(ledger)
+            _ensure_collect_deadline(deadline)
             response = _post_upload_batch(upload_url, credential, policy, batch)
             _advance_ledger_from_response(ledger, source_paths, response)
+            _clear_in_flight_batch(ledger, host, in_flight_batch)
             _write_source_ledger(ledger)
         uploaded_batch_count += 1
         uploaded_chunk_count += len(batch.events)
         unparsed_record_count += _optional_int_value(response.get("unparsed_record_count")) or 0
     return uploaded_batch_count, uploaded_chunk_count, unparsed_record_count, frozenset(unreadable_source_hashes)
+
+
+def _next_in_flight_batch(
+    ledger: SourceLedger,
+    host: Host,
+    source_paths: tuple[Path, ...],
+) -> InFlightUploadBatch | None:
+    paths_by_hash = {_path_hash(path): path for path in source_paths}
+    for batch in ledger.in_flight_batches.get(host, []):
+        if all(paths_by_hash.get(event.path_hash) == event.path for event in batch.events):
+            return batch
+    return None
+
+
+def _record_in_flight_batch(
+    ledger: SourceLedger,
+    *,
+    host: Host,
+    lifecycle_event: LifecycleEvent,
+    hook_context: HookTraceContext,
+    batch: UploadBatch,
+) -> InFlightUploadBatch:
+    events: list[InFlightSourceEvent] = []
+    for event in batch.events:
+        if event.content_sha256 is None:
+            raise BootstrapError("native trace event missing content hash")
+        events.append(
+            InFlightSourceEvent(
+                kind=event.kind,
+                path=event.path,
+                path_hash=event.path_hash,
+                start_offset=event.start_offset,
+                end_offset=event.end_offset,
+                byte_count=event.byte_count,
+                content_sha256=event.content_sha256,
+                oversized_reason=event.oversized_reason,
+            )
+        )
+    in_flight_batch = InFlightUploadBatch(
+        lifecycle_event=lifecycle_event,
+        hook_context=hook_context,
+        events=tuple(events),
+    )
+    ledger.in_flight_batches.setdefault(host, []).append(in_flight_batch)
+    return in_flight_batch
+
+
+def _restore_in_flight_upload_batch(
+    in_flight_batch: InFlightUploadBatch,
+    *,
+    host: Host,
+    metadata: RuntimeMetadata,
+    policy: HostPolicy,
+    ledger: SourceLedger,
+) -> UploadBatch:
+    events = tuple(_restore_in_flight_source_event(event) for event in in_flight_batch.events)
+    event_transcript_paths = _event_transcript_paths(
+        in_flight_batch.hook_context,
+        in_flight_batch.lifecycle_event,
+    )
+    chunks = tuple(
+        _chunk_payload(
+            event,
+            in_flight_batch.lifecycle_event if event.path in event_transcript_paths else None,
+        )
+        for event in events
+    )
+    batch = _upload_batch(
+        host=host,
+        metadata=metadata,
+        policy=policy,
+        lifecycle_event=in_flight_batch.lifecycle_event,
+        hook_context=in_flight_batch.hook_context,
+        ledger=ledger,
+        events=events,
+        chunks=chunks,
+    )
+    if _serialized_upload_batch_bytes(batch) > MAX_TRANSPORT_BATCH_BYTES:
+        raise BootstrapError("persisted native trace batch exceeds the request transport limit")
+    return batch
+
+
+def _restore_in_flight_source_event(event: InFlightSourceEvent) -> SourceEvent:
+    if event.kind == "oversized_record":
+        return SourceEvent(
+            kind=event.kind,
+            path=event.path,
+            path_hash=event.path_hash,
+            start_offset=event.start_offset,
+            end_offset=event.end_offset,
+            byte_count=event.byte_count,
+            content_sha256=event.content_sha256,
+            oversized_reason=event.oversized_reason,
+        )
+    try:
+        with event.path.open("rb") as handle:
+            handle.seek(event.start_offset)
+            content = handle.read(event.byte_count)
+    except OSError as exc:
+        raise BootstrapError("persisted native trace range is no longer readable") from exc
+    if len(content) != event.byte_count or hashlib.sha256(content).hexdigest() != event.content_sha256:
+        raise BootstrapError("persisted native trace range content changed before acknowledgement")
+    return SourceEvent(
+        kind=event.kind,
+        path=event.path,
+        path_hash=event.path_hash,
+        start_offset=event.start_offset,
+        end_offset=event.end_offset,
+        byte_count=event.byte_count,
+        content_sha256=event.content_sha256,
+        content=content,
+    )
+
+
+def _clear_in_flight_batch(ledger: SourceLedger, host: Host, batch: InFlightUploadBatch) -> None:
+    batches = ledger.in_flight_batches.get(host)
+    if batches is None:
+        raise BootstrapError("native trace acknowledgement has no persisted in-flight batch")
+    try:
+        batches.remove(batch)
+    except ValueError as exc:
+        raise BootstrapError("native trace acknowledgement does not match a persisted in-flight batch") from exc
+    if not batches:
+        ledger.in_flight_batches.pop(host)
 
 
 def _iter_source_events(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> Iterator[SourceEvent]:
