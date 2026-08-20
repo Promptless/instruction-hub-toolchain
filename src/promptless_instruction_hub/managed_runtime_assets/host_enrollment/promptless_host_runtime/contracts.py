@@ -67,12 +67,6 @@ ENROLLMENT_POLL_DEADLINE_SECONDS = 35
 COLLECT_DEADLINE_SECONDS = 25.0
 
 
-# The generated hook allows one collection pass 390 seconds. Start no new
-# first-batch request after 350 seconds so its 10-second HTTP timeout and hook
-# shutdown remain inside that host budget.
-FIRST_CURRENT_BATCH_DEADLINE_SECONDS = 350.0
-
-
 MAX_STDIN_BYTES = 1024 * 1024
 
 
@@ -89,12 +83,6 @@ MAX_UPLOAD_CHUNKS_PER_BATCH = 200
 
 
 MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH = 200
-
-
-MAX_SESSION_ID_LENGTH = 220
-
-
-MAX_AGENT_CONTEXT_LENGTH = 160
 
 
 # This soft request target fits one established 4 MiB source range after
@@ -219,10 +207,6 @@ class BootstrapAuthError(BootstrapError):
     """Host credential was rejected by the worker."""
 
 
-class InvalidUploadJournalError(BootstrapError):
-    """A pending native trace upload cannot be reconstructed safely."""
-
-
 class CollectDeadlineExceeded(BootstrapError):
     """Optional collection work exceeded the hook-safe runtime budget.
 
@@ -253,18 +237,6 @@ class InstalledInstructionHubRelease:
     plugin_name: str
     plugin_version: str
     release_id: str
-
-
-@dataclass(frozen=True)
-class InstructionHubReleaseSnapshot:
-    """One proven source interval governed by an installed Instruction Hub release."""
-
-    source_path_hash: str
-    session_id: str
-    start_offset: int
-    end_offset: int
-    captured_at: str
-    release: InstalledInstructionHubRelease
 
 
 @dataclass(frozen=True)
@@ -377,37 +349,11 @@ class SourceEvent:
 
 
 @dataclass(frozen=True)
-class InFlightSourceEvent:
-    """Durable source range selected for an upload whose acknowledgement is pending."""
-
-    kind: SourceEventKind
-    path: Path
-    path_hash: str
-    start_offset: int
-    end_offset: int
-    byte_count: int
-    content_sha256: str
-    content: bytes | None = None
-    oversized_reason: OversizedReason | None = None
-
-
-@dataclass(frozen=True)
-class InFlightUploadBatch:
-    """Durable batch boundaries and context retained until the worker acknowledges them."""
-
-    lifecycle_event: LifecycleEvent
-    hook_context: HookTraceContext
-    events: tuple[InFlightSourceEvent, ...]
-    snapshots: tuple[InstructionHubReleaseSnapshot, ...]
-
-
-@dataclass(frozen=True)
 class UploadBatch:
     """A native trace upload request plus the source events it acknowledges."""
 
     request: dict[str, JsonValue]
     events: tuple[SourceEvent, ...]
-    snapshots: tuple[InstructionHubReleaseSnapshot, ...]
 
 
 @dataclass
@@ -418,6 +364,5 @@ class SourceLedger:
     is_new: bool
     sources: dict[str, dict[str, JsonValue]]
     host_baselines: set[str] = field(default_factory=set)
-    in_flight_batches: dict[Host, list[InFlightUploadBatch]] = field(default_factory=dict)
     reset_sources: set[str] = field(default_factory=set)
     drift_reports: list[dict[str, JsonValue]] = field(default_factory=list)

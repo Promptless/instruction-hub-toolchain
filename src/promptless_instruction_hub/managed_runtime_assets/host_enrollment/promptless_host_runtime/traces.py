@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import binascii
 import datetime as dt
 import glob
 import gzip
@@ -12,7 +11,6 @@ import json
 import os
 import sys
 import time
-import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -26,24 +24,17 @@ from .contracts import (
     COLLECT_DEADLINE_ENV,
     COLLECT_DEADLINE_SECONDS,
     CollectDeadlineExceeded,
-    FIRST_CURRENT_BATCH_DEADLINE_SECONDS,
     HookTraceContext,
     Host,
     HostCredential,
     HostPolicy,
     HOST_VALUES,
     IDLE_SESSION_GRACE_SECONDS,
-    InFlightSourceEvent,
-    InFlightUploadBatch,
-    InvalidUploadJournalError,
     InstalledInstructionHubRelease,
-    InstructionHubReleaseSnapshot,
     JsonValue,
     LifecycleEvent,
     MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH,
-    MAX_AGENT_CONTEXT_LENGTH,
     MAX_RECORD_BYTES,
-    MAX_SESSION_ID_LENGTH,
     MAX_STDIN_BYTES,
     MAX_TRACE_BATCH_BYTES,
     MAX_TRANSPORT_BATCH_BYTES,
@@ -87,17 +78,24 @@ from .worker import _get_json, _post_json_response, _validate_signed_policy, _wo
 _INSTRUCTION_HUB_RELEASE_MARKERS_KEY = "instruction_hub_release_markers"
 
 
-_INVALID_UPLOAD_JOURNAL_MESSAGE = (
-    "native trace ledger has an invalid in-flight upload journal; preserve it and contact Promptless support"
-)
-
-
 @dataclass(frozen=True)
 class _InstructionHubReleaseMarker:
     """Installed release known to govern bytes starting at one source offset."""
 
     start_offset: int
     session_id: str
+    captured_at: str
+    release: InstalledInstructionHubRelease
+
+
+@dataclass(frozen=True)
+class _InstructionHubReleaseSnapshotRange:
+    """One proven source interval governed by an installed release marker."""
+
+    source_path_hash: str
+    session_id: str
+    start_offset: int
+    end_offset: int
     captured_at: str
     release: InstalledInstructionHubRelease
 
@@ -120,8 +118,6 @@ def _run_collect(
     quiet: bool,
     release_marker_captured: bool = False,
 ) -> int:
-    first_current_batch_deadline = time.monotonic() + FIRST_CURRENT_BATCH_DEADLINE_SECONDS
-    current_transcript_paths = _current_transcript_paths(hook_context, lifecycle_event)
     marker_deadline = _collect_deadline()
     plugin_root = _plugin_root()
     metadata = _load_runtime_metadata(plugin_root, host)
@@ -158,8 +154,7 @@ def _run_collect(
             )
             return 1
 
-    prerequisite_deadline = first_current_batch_deadline if current_transcript_paths else _collect_deadline()
-    with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=prerequisite_deadline) as lock_acquired:
+    with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=_collect_deadline()) as lock_acquired:
         if not lock_acquired:
             _emit(
                 {"status": "trace_upload_partial", "reason": "collection_deadline_exceeded", "host": host},
@@ -192,54 +187,15 @@ def _run_collect(
         _emit({"status": "blocked", "reason": "bootstrap_upgrade_required", "host": host}, quiet=quiet)
         return 0
 
-    upload_url = _worker_url(worker_base_url, f"/v0/traces/batches?{urlencode({'target': host})}")
+    current_transcript_paths = _current_transcript_paths(hook_context, lifecycle_event)
     if baseline:
         source_paths: tuple[Path, ...] = ()
-        baseline_needs_offsets = not host_baselined
-        if baseline_needs_offsets:
+        if not host_baselined:
             # Baseline discovery records offsets for every known source, including
             # files still inside the idle grace period. The unmetered scan runs
             # without the ledger lock so release-marker capture remains available.
             idle_source_paths, _ = _idle_root_scan_paths(host, deadline=float("inf"), include_active=True)
             source_paths = _ordered_unique_source_paths(current_transcript_paths, idle_source_paths)
-
-            with _source_ledger_lock(
-                ledger_path,
-                wait_for_lock=True,
-                deadline=_collect_deadline(),
-            ) as lock_acquired:
-                if not lock_acquired:
-                    _emit(
-                        {"status": "trace_upload_partial", "reason": "collection_deadline_exceeded", "host": host},
-                        quiet=quiet,
-                    )
-                    return 0
-                ledger = _load_source_ledger(ledger_path)
-                pending_source_paths = _in_flight_source_paths(ledger, host)
-
-            if pending_source_paths:
-                try:
-                    _upload_source_paths(
-                        pending_source_paths,
-                        upload_url=upload_url,
-                        credential=credential,
-                        host=host,
-                        metadata=metadata,
-                        policy=policy,
-                        lifecycle_event=lifecycle_event,
-                        hook_context=hook_context,
-                        ledger_path=ledger_path,
-                        deadline=first_current_batch_deadline,
-                        drain_in_flight=True,
-                    )
-                except CollectDeadlineExceeded:
-                    _emit(
-                        {"status": "trace_upload_partial", "reason": "collection_deadline_exceeded", "host": host},
-                        quiet=quiet,
-                    )
-                    return 0
-
-        baseline_blocked_by_in_flight = False
         with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=_collect_deadline()) as lock_acquired:
             if not lock_acquired:
                 _emit(
@@ -249,13 +205,8 @@ def _run_collect(
                 return 0
             ledger = _load_source_ledger(ledger_path)
             host_baselined = host in ledger.host_baselines or _ledger_has_host_source(ledger, host)
-            if host in ledger.host_baselines:
-                baseline_needs_offsets = False
-            if baseline_needs_offsets and ledger.in_flight_batches.get(host):
-                baseline_blocked_by_in_flight = True
-            elif baseline_needs_offsets:
-                never_started_paths = tuple(path for path in source_paths if not _source_has_upload_state(ledger, path))
-                _baseline_source_offsets(ledger, never_started_paths)
+            if not host_baselined:
+                _baseline_source_offsets(ledger, source_paths)
                 ledger.host_baselines.add(host)
                 _write_source_ledger(ledger)
                 _clear_baseline_pending(baseline_pending_path)
@@ -263,7 +214,7 @@ def _run_collect(
                     {
                         "status": "trace_upload_baselined",
                         "host": host,
-                        "source_count": len(never_started_paths),
+                        "source_count": len(source_paths),
                         "drift_report_count": len(ledger.drift_reports),
                     },
                     quiet=quiet,
@@ -272,17 +223,12 @@ def _run_collect(
             if host not in ledger.host_baselines:
                 ledger.host_baselines.add(host)
                 _write_source_ledger(ledger)
-        if baseline_blocked_by_in_flight:
-            _emit(
-                {"status": "trace_upload_partial", "reason": "pending_acknowledgement", "host": host},
-                quiet=quiet,
-            )
-            return 0
         _clear_baseline_pending(baseline_pending_path)
 
     # A new/quarantined ledger seen without --baseline (e.g. a terminal hook after a missed
     # SessionStart or a corrupt-ledger reset) must not baseline: that would skip the completed
     # transcript entirely. Fall through so unknown sources upload from offset 0.
+    upload_url = _worker_url(worker_base_url, f"/v0/traces/batches?{urlencode({'target': host})}")
     uploaded_batch_count = 0
     uploaded_chunk_count = 0
     unparsed_record_count = 0
@@ -299,7 +245,7 @@ def _run_collect(
             lifecycle_event=lifecycle_event,
             hook_context=hook_context,
             ledger_path=ledger_path,
-            deadline=first_current_batch_deadline,
+            deadline=float("inf"),
             batch_limit=1,
         )
     except CollectDeadlineExceeded:
@@ -346,6 +292,10 @@ def _run_collect(
         all_source_paths = _ordered_unique_source_paths(current_transcript_paths, discovered_idle_paths)
         idle_source_paths = all_source_paths[len(current_transcript_paths) :]
         deadline_exceeded = not idle_scan_complete
+    if not current_transcript_paths and not idle_source_paths and idle_scan_complete:
+        _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
+        return 0
+
     if not deadline_exceeded:
         try:
             idle_counts = _upload_source_paths(
@@ -359,7 +309,6 @@ def _run_collect(
                 hook_context=hook_context,
                 ledger_path=ledger_path,
                 deadline=catch_up_deadline,
-                drain_in_flight=True,
             )
             uploaded_batch_count += idle_counts[0]
             uploaded_chunk_count += idle_counts[1]
@@ -367,16 +316,6 @@ def _run_collect(
             unreadable_source_hashes.update(idle_counts[3])
         except CollectDeadlineExceeded:
             deadline_exceeded = True
-
-    if (
-        uploaded_batch_count == 0
-        and not current_transcript_paths
-        and not idle_source_paths
-        and idle_scan_complete
-        and not deadline_exceeded
-    ):
-        _emit({"status": "trace_upload_skipped", "reason": "no_sources", "host": host}, quiet=quiet)
-        return 0
 
     payload: dict[str, JsonValue] = {
         "status": "trace_upload_partial" if deadline_exceeded else "trace_upload_complete",
@@ -434,36 +373,30 @@ def _hook_trace_context(context: dict[str, JsonValue]) -> HookTraceContext:
     return HookTraceContext(
         transcript_path=transcript_path,
         agent_transcript_path=agent_transcript_path,
-        session_id=_bounded_hook_identifier(
-            context,
-            ("session_id", "sessionId", "conversation_id", "conversationId", "session.id"),
-            label="session_id",
-            max_length=MAX_SESSION_ID_LENGTH,
+        session_id=_non_empty(
+            _first_string(context, ("session_id", "sessionId", "conversation_id", "conversationId", "session.id"))
         ),
-        parent_session_id=_bounded_hook_identifier(
-            context,
-            (
-                "parent_session_id",
-                "parentSessionId",
-                "parent_conversation_id",
-                "parentConversationId",
-                "parent_session.id",
-                "parentSession.id",
-            ),
-            label="parent_session_id",
-            max_length=MAX_SESSION_ID_LENGTH,
+        parent_session_id=_non_empty(
+            _first_string(
+                context,
+                (
+                    "parent_session_id",
+                    "parentSessionId",
+                    "parent_conversation_id",
+                    "parentConversationId",
+                    "parent_session.id",
+                    "parentSession.id",
+                ),
+            )
         ),
-        agent_id=_bounded_hook_identifier(
-            context,
-            ("agent_id", "agentId", "subagent_id", "subagentId", "agent_name", "agentName", "agent.id"),
-            label="agent_id",
-            max_length=MAX_AGENT_CONTEXT_LENGTH,
+        agent_id=_non_empty(
+            _first_string(
+                context,
+                ("agent_id", "agentId", "subagent_id", "subagentId", "agent_name", "agentName", "agent.id"),
+            )
         ),
-        agent_type=_bounded_hook_identifier(
-            context,
-            ("agent_type", "agentType", "subagent_type", "subagentType", "agent.type"),
-            label="agent_type",
-            max_length=MAX_AGENT_CONTEXT_LENGTH,
+        agent_type=_non_empty(
+            _first_string(context, ("agent_type", "agentType", "subagent_type", "subagentType", "agent.type"))
         ),
     )
 
@@ -481,21 +414,6 @@ def _first_string(context: dict[str, JsonValue], keys: tuple[str, ...]) -> str |
         if value is not None:
             return value
     return None
-
-
-def _bounded_hook_identifier(
-    context: dict[str, JsonValue],
-    keys: tuple[str, ...],
-    *,
-    label: str,
-    max_length: int,
-) -> str | None:
-    """Read one optional hook identifier that fits the worker request contract."""
-
-    value = _first_string(context, keys)
-    if value is not None and len(value) > max_length:
-        raise BootstrapError(f"hook {label} exceeds maximum supported length {max_length}")
-    return value
 
 
 def _first_context_value(context: dict[str, JsonValue], keys: tuple[str, ...]) -> JsonValue | None:
@@ -721,272 +639,7 @@ def _load_source_ledger(path: Path) -> SourceLedger:
             host = _string_value(raw_host)
             if host in HOST_VALUES:
                 host_baselines.add(host)
-    in_flight_batches: dict[Host, list[InFlightUploadBatch]] = {}
-    if "in_flight_batches" in value:
-        in_flight_batches = _load_in_flight_batches(value.get("in_flight_batches"))
-    return SourceLedger(
-        path=path,
-        is_new=False,
-        sources=valid_sources,
-        host_baselines=host_baselines,
-        in_flight_batches=in_flight_batches,
-    )
-
-
-def _load_in_flight_batches(value: JsonValue | None) -> dict[Host, list[InFlightUploadBatch]]:
-    if not isinstance(value, dict) or not value:
-        raise InvalidUploadJournalError(_INVALID_UPLOAD_JOURNAL_MESSAGE)
-    batches_by_host: dict[Host, list[InFlightUploadBatch]] = {}
-    for raw_host, raw_batches in value.items():
-        host = _host_value(raw_host)
-        if host is None or not isinstance(raw_batches, list) or not raw_batches:
-            raise InvalidUploadJournalError(_INVALID_UPLOAD_JOURNAL_MESSAGE)
-        batches: list[InFlightUploadBatch] = []
-        for raw_batch in raw_batches:
-            batch = _in_flight_batch_value(raw_batch)
-            if batch is None:
-                raise InvalidUploadJournalError(_INVALID_UPLOAD_JOURNAL_MESSAGE)
-            batches.append(batch)
-        batches_by_host[host] = batches
-    return batches_by_host
-
-
-def _in_flight_batch_value(value: JsonValue) -> InFlightUploadBatch | None:
-    batch = _json_mapping_or_empty(value)
-    lifecycle_event = _lifecycle_event_value(batch.get("lifecycle_event"))
-    context_value = batch.get("hook_context")
-    if not isinstance(context_value, dict):
-        return None
-    context = _json_mapping_or_empty(context_value)
-    raw_events = batch.get("events")
-    raw_snapshots = batch.get("snapshots")
-    if (
-        lifecycle_event is None
-        or not isinstance(raw_events, list)
-        or not raw_events
-        or not isinstance(raw_snapshots, list)
-    ):
-        return None
-    events = tuple(event for raw_event in raw_events if (event := _in_flight_event_value(raw_event)) is not None)
-    if len(events) != len(raw_events) or len(events) > MAX_UPLOAD_CHUNKS_PER_BATCH:
-        return None
-    snapshots = tuple(
-        snapshot for raw_snapshot in raw_snapshots if (snapshot := _in_flight_snapshot_value(raw_snapshot)) is not None
-    )
-    if (
-        len(snapshots) != len(raw_snapshots)
-        or len(snapshots) > MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH
-        or any(not _snapshot_is_covered_by_events(snapshot, events) for snapshot in snapshots)
-    ):
-        return None
-    session_id = _optional_bounded_identifier(context.get("session_id"), MAX_SESSION_ID_LENGTH)
-    parent_session_id = _optional_bounded_identifier(context.get("parent_session_id"), MAX_SESSION_ID_LENGTH)
-    agent_id = _optional_bounded_identifier(context.get("agent_id"), MAX_AGENT_CONTEXT_LENGTH)
-    agent_type = _optional_bounded_identifier(context.get("agent_type"), MAX_AGENT_CONTEXT_LENGTH)
-    if any(
-        key in context and parsed_value is None
-        for key, parsed_value in (
-            ("session_id", session_id),
-            ("parent_session_id", parent_session_id),
-            ("agent_id", agent_id),
-            ("agent_type", agent_type),
-        )
-    ):
-        return None
-    return InFlightUploadBatch(
-        lifecycle_event=lifecycle_event,
-        hook_context=HookTraceContext(
-            transcript_path=_optional_path_value(context.get("transcript_path")),
-            agent_transcript_path=_optional_path_value(context.get("agent_transcript_path")),
-            session_id=session_id,
-            parent_session_id=parent_session_id,
-            agent_id=agent_id,
-            agent_type=agent_type,
-        ),
-        events=events,
-        snapshots=snapshots,
-    )
-
-
-def _optional_bounded_identifier(value: JsonValue | None, max_length: int) -> str | None:
-    """Return a non-empty identifier within one persisted field's limit."""
-
-    text = _non_empty(_string_value(value))
-    if text is None or len(text) > max_length:
-        return None
-    return text
-
-
-def _in_flight_event_value(value: JsonValue) -> InFlightSourceEvent | None:
-    event = _json_mapping_or_empty(value)
-    kind_value = _string_value(event.get("kind"))
-    if kind_value == "jsonl_range":
-        kind = "jsonl_range"
-    elif kind_value == "oversized_record":
-        kind = "oversized_record"
-    else:
-        return None
-    path_value = _non_empty(_string_value(event.get("path")))
-    path_hash = _string_value(event.get("source_path_hash"))
-    start_offset = _optional_int_value(event.get("start_offset"))
-    end_offset = _optional_int_value(event.get("end_offset"))
-    byte_count = _optional_int_value(event.get("byte_count"))
-    content_sha256 = _string_value(event.get("content_sha256"))
-    content_gzip_base64 = _string_value(event.get("content_gzip_base64"))
-    oversized_reason_value = _string_value(event.get("oversized_reason"))
-    oversized_reason: OversizedReason | None = None
-    if oversized_reason_value == "content_size":
-        oversized_reason = "content_size"
-    elif oversized_reason_value == "transport_size":
-        oversized_reason = "transport_size"
-    if (
-        path_value is None
-        or path_hash is None
-        or len(path_hash) != 64
-        or any(character not in "0123456789abcdef" for character in path_hash)
-        or start_offset is None
-        or start_offset < 0
-        or end_offset is None
-        or end_offset <= start_offset
-        or byte_count is None
-        or byte_count != end_offset - start_offset
-        or content_sha256 is None
-        or len(content_sha256) != 64
-        or any(character not in "0123456789abcdef" for character in content_sha256)
-        or (kind == "jsonl_range" and oversized_reason is not None)
-        or (kind == "oversized_record" and oversized_reason is None)
-        or (kind == "jsonl_range" and content_gzip_base64 is None)
-        or (kind == "oversized_record" and content_gzip_base64 is not None)
-    ):
-        return None
-    content = _gunzip_base64(content_gzip_base64) if content_gzip_base64 is not None else None
-    if kind == "jsonl_range" and (
-        content is None
-        or len(content) != byte_count
-        or hashlib.sha256(content).hexdigest() != content_sha256
-        or not content.endswith(b"\n")
-    ):
-        return None
-    path = Path(path_value)
-    if _path_hash(path) != path_hash:
-        return None
-    return InFlightSourceEvent(
-        kind=kind,
-        path=path,
-        path_hash=path_hash,
-        start_offset=start_offset,
-        end_offset=end_offset,
-        byte_count=byte_count,
-        content_sha256=content_sha256,
-        content=content,
-        oversized_reason=oversized_reason,
-    )
-
-
-def _in_flight_snapshot_value(value: JsonValue) -> InstructionHubReleaseSnapshot | None:
-    snapshot = _json_mapping_or_empty(value)
-    source_path_hash = _string_value(snapshot.get("source_path_hash"))
-    session_id = _non_empty(_string_value(snapshot.get("session_id")))
-    start_offset = _optional_int_value(snapshot.get("start_offset"))
-    end_offset = _optional_int_value(snapshot.get("end_offset"))
-    captured_at = _non_empty(_string_value(snapshot.get("captured_at")))
-    release_value = _json_mapping_or_empty(snapshot.get("installed_instruction_hub_release"))
-    plugin_id = _non_empty(_string_value(release_value.get("plugin_id")))
-    plugin_name = _non_empty(_string_value(release_value.get("plugin_name")))
-    plugin_version = _non_empty(_string_value(release_value.get("plugin_version")))
-    release_id = _non_empty(_string_value(release_value.get("release_id")))
-    if (
-        snapshot.get("schema_version") != 1
-        or source_path_hash is None
-        or len(source_path_hash) != 64
-        or any(character not in "0123456789abcdef" for character in source_path_hash)
-        or session_id is None
-        or len(session_id) > MAX_SESSION_ID_LENGTH
-        or start_offset is None
-        or start_offset < 0
-        or end_offset is None
-        or end_offset <= start_offset
-        or captured_at is None
-        or not _timezone_aware_iso_datetime(captured_at)
-        or plugin_id is None
-        or len(plugin_id) > 120
-        or not _is_kebab_case_identifier(plugin_id)
-        or plugin_name is None
-        or len(plugin_name) > 200
-        or plugin_version is None
-        or len(plugin_version) > 80
-        or release_id is None
-        or len(release_id) > 120
-        or not _release_id_matches_plugin_version(release_id, plugin_version)
-    ):
-        return None
-    return InstructionHubReleaseSnapshot(
-        source_path_hash=source_path_hash,
-        session_id=session_id,
-        start_offset=start_offset,
-        end_offset=end_offset,
-        captured_at=captured_at,
-        release=InstalledInstructionHubRelease(
-            plugin_id=plugin_id,
-            plugin_name=plugin_name,
-            plugin_version=plugin_version,
-            release_id=release_id,
-        ),
-    )
-
-
-def _snapshot_is_covered_by_events(
-    snapshot: InstructionHubReleaseSnapshot,
-    events: tuple[InFlightSourceEvent, ...],
-) -> bool:
-    covered_until = snapshot.start_offset
-    matching_events = sorted(
-        (
-            event
-            for event in events
-            if event.kind == "jsonl_range"
-            and event.path_hash == snapshot.source_path_hash
-            and event.end_offset > snapshot.start_offset
-            and event.start_offset < snapshot.end_offset
-        ),
-        key=lambda event: event.start_offset,
-    )
-    for event in matching_events:
-        if event.start_offset > covered_until:
-            return False
-        covered_until = max(covered_until, event.end_offset)
-        if covered_until >= snapshot.end_offset:
-            return True
-    return False
-
-
-def _host_value(value: JsonValue | None) -> Host | None:
-    text = _string_value(value)
-    if text == "codex":
-        return "codex"
-    if text == "claude":
-        return "claude"
-    if text == "claude-desktop":
-        return "claude-desktop"
-    return None
-
-
-def _lifecycle_event_value(value: JsonValue | None) -> LifecycleEvent | None:
-    text = _string_value(value)
-    if text == "session_start":
-        return "session_start"
-    if text == "stop":
-        return "stop"
-    if text == "session_end":
-        return "session_end"
-    if text == "subagent_stop":
-        return "subagent_stop"
-    return None
-
-
-def _optional_path_value(value: JsonValue | None) -> Path | None:
-    text = _string_value(value)
-    return Path(text) if text is not None else None
+    return SourceLedger(path=path, is_new=False, sources=valid_sources, host_baselines=host_baselines)
 
 
 def _quarantine_corrupt_ledger(path: Path) -> None:
@@ -1006,57 +659,11 @@ def _write_source_ledger(ledger: SourceLedger) -> None:
         "host_baselines": sorted(ledger.host_baselines),
         "sources": ledger.sources,
     }
-    if ledger.in_flight_batches:
-        payload["in_flight_batches"] = {
-            host: [_in_flight_batch_payload(batch) for batch in batches]
-            for host, batches in ledger.in_flight_batches.items()
-            if batches
-        }
     _atomic_write_text(ledger.path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     try:
         ledger.path.chmod(0o600)
     except OSError:
         pass
-
-
-def _in_flight_batch_payload(batch: InFlightUploadBatch) -> dict[str, JsonValue]:
-    context = batch.hook_context
-    hook_context: dict[str, JsonValue] = {}
-    if context.transcript_path is not None:
-        hook_context["transcript_path"] = str(context.transcript_path)
-    if context.agent_transcript_path is not None:
-        hook_context["agent_transcript_path"] = str(context.agent_transcript_path)
-    if context.session_id is not None:
-        hook_context["session_id"] = context.session_id
-    if context.parent_session_id is not None:
-        hook_context["parent_session_id"] = context.parent_session_id
-    if context.agent_id is not None:
-        hook_context["agent_id"] = context.agent_id
-    if context.agent_type is not None:
-        hook_context["agent_type"] = context.agent_type
-    return {
-        "lifecycle_event": batch.lifecycle_event,
-        "hook_context": hook_context,
-        "events": [_in_flight_event_payload(event) for event in batch.events],
-        "snapshots": [_snapshot_range_payload(snapshot) for snapshot in batch.snapshots],
-    }
-
-
-def _in_flight_event_payload(event: InFlightSourceEvent) -> dict[str, JsonValue]:
-    payload: dict[str, JsonValue] = {
-        "kind": event.kind,
-        "path": str(event.path),
-        "source_path_hash": event.path_hash,
-        "start_offset": event.start_offset,
-        "end_offset": event.end_offset,
-        "byte_count": event.byte_count,
-        "content_sha256": event.content_sha256,
-    }
-    if event.content is not None:
-        payload["content_gzip_base64"] = _gzip_base64(event.content)
-    if event.oversized_reason is not None:
-        payload["oversized_reason"] = event.oversized_reason
-    return payload
 
 
 def _baseline_source_offsets(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> None:
@@ -1066,15 +673,6 @@ def _baseline_source_offsets(ledger: SourceLedger, source_paths: tuple[Path, ...
         except OSError:
             continue
         _record_ledger_offset(ledger, path, end_offset)
-
-
-def _source_has_upload_state(ledger: SourceLedger, path: Path) -> bool:
-    source = ledger.sources.get(_path_hash(path))
-    return (
-        source is not None
-        and source.get("provenance_only") is not True
-        and _string_value(source.get("path")) == str(path)
-    )
 
 
 def _persist_session_release_marker(
@@ -1439,7 +1037,6 @@ def _upload_source_paths(
     ledger_path: Path,
     deadline: float,
     batch_limit: int | None = None,
-    drain_in_flight: bool = False,
 ) -> tuple[int, int, int, frozenset[str]]:
     """Upload paths with one ledger-locked request and acknowledgement at a time."""
 
@@ -1447,44 +1044,26 @@ def _upload_source_paths(
     uploaded_chunk_count = 0
     unparsed_record_count = 0
     unreadable_source_hashes: set[str] = set()
-    while batch_limit is None or uploaded_batch_count < batch_limit:
+    while source_paths and (batch_limit is None or uploaded_batch_count < batch_limit):
         _ensure_collect_deadline(deadline)
-        with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=deadline) as lock_acquired:
+        lock_deadline = _collect_deadline() if deadline == float("inf") else deadline
+        with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=lock_deadline) as lock_acquired:
             if not lock_acquired:
                 raise CollectDeadlineExceeded("native trace collection exceeded deadline waiting for ledger lock")
             ledger = _load_source_ledger(ledger_path)
-            in_flight_batch = _next_in_flight_batch(
-                ledger,
-                host,
-                source_paths,
-                include_unmatched=drain_in_flight,
-            )
-            if in_flight_batch is None:
-                batch = (
-                    next(
-                        _iter_upload_batches(
-                            host=host,
-                            metadata=metadata,
-                            policy=policy,
-                            lifecycle_event=lifecycle_event,
-                            hook_context=hook_context,
-                            ledger=ledger,
-                            source_paths=source_paths,
-                            deadline=deadline,
-                        ),
-                        None,
-                    )
-                    if source_paths
-                    else None
-                )
-            else:
-                batch = _restore_in_flight_upload_batch(
-                    in_flight_batch,
+            batch = next(
+                _iter_upload_batches(
                     host=host,
                     metadata=metadata,
                     policy=policy,
+                    lifecycle_event=lifecycle_event,
+                    hook_context=hook_context,
                     ledger=ledger,
-                )
+                    source_paths=source_paths,
+                    deadline=deadline,
+                ),
+                None,
+            )
             unreadable_source_hashes.update(
                 source_path_hash
                 for report in ledger.drift_reports
@@ -1495,147 +1074,13 @@ def _upload_source_paths(
                 if ledger.drift_reports:
                     _write_source_ledger(ledger)
                 break
-            if in_flight_batch is None:
-                in_flight_batch = _record_in_flight_batch(
-                    ledger,
-                    host=host,
-                    lifecycle_event=lifecycle_event,
-                    hook_context=hook_context,
-                    batch=batch,
-                )
-                # The exact range boundaries must survive a worker commit whose
-                # response is lost. Persist them before starting the request.
-                _write_source_ledger(ledger)
-            _ensure_collect_deadline(deadline)
             response = _post_upload_batch(upload_url, credential, policy, batch)
-            _advance_ledger_from_response(ledger, batch, response)
-            _clear_in_flight_batch(ledger, host, in_flight_batch)
+            _advance_ledger_from_response(ledger, source_paths, response)
             _write_source_ledger(ledger)
         uploaded_batch_count += 1
         uploaded_chunk_count += len(batch.events)
         unparsed_record_count += _optional_int_value(response.get("unparsed_record_count")) or 0
     return uploaded_batch_count, uploaded_chunk_count, unparsed_record_count, frozenset(unreadable_source_hashes)
-
-
-def _next_in_flight_batch(
-    ledger: SourceLedger,
-    host: Host,
-    source_paths: tuple[Path, ...],
-    *,
-    include_unmatched: bool,
-) -> InFlightUploadBatch | None:
-    paths_by_hash = {_path_hash(path): path for path in source_paths}
-    for batch in ledger.in_flight_batches.get(host, []):
-        if include_unmatched or any(paths_by_hash.get(event.path_hash) == event.path for event in batch.events):
-            return batch
-    return None
-
-
-def _in_flight_source_paths(ledger: SourceLedger, host: Host) -> tuple[Path, ...]:
-    return _ordered_unique_source_paths(
-        tuple(event.path for batch in ledger.in_flight_batches.get(host, []) for event in batch.events)
-    )
-
-
-def _record_in_flight_batch(
-    ledger: SourceLedger,
-    *,
-    host: Host,
-    lifecycle_event: LifecycleEvent,
-    hook_context: HookTraceContext,
-    batch: UploadBatch,
-) -> InFlightUploadBatch:
-    events: list[InFlightSourceEvent] = []
-    for event in batch.events:
-        if event.content_sha256 is None:
-            raise BootstrapError("native trace event missing content hash")
-        if event.kind == "jsonl_range" and event.content is None:
-            raise BootstrapError("native trace range missing content for durable retry")
-        events.append(
-            InFlightSourceEvent(
-                kind=event.kind,
-                path=event.path,
-                path_hash=event.path_hash,
-                start_offset=event.start_offset,
-                end_offset=event.end_offset,
-                byte_count=event.byte_count,
-                content_sha256=event.content_sha256,
-                content=event.content,
-                oversized_reason=event.oversized_reason,
-            )
-        )
-    in_flight_batch = InFlightUploadBatch(
-        lifecycle_event=lifecycle_event,
-        hook_context=hook_context,
-        events=tuple(events),
-        snapshots=batch.snapshots,
-    )
-    ledger.in_flight_batches.setdefault(host, []).append(in_flight_batch)
-    return in_flight_batch
-
-
-def _restore_in_flight_upload_batch(
-    in_flight_batch: InFlightUploadBatch,
-    *,
-    host: Host,
-    metadata: RuntimeMetadata,
-    policy: HostPolicy,
-    ledger: SourceLedger,
-) -> UploadBatch:
-    events = tuple(_restore_in_flight_source_event(event) for event in in_flight_batch.events)
-    event_transcript_paths = _event_transcript_paths(
-        in_flight_batch.hook_context,
-        in_flight_batch.lifecycle_event,
-    )
-    chunks = tuple(
-        _chunk_payload(
-            event,
-            in_flight_batch.lifecycle_event if event.path in event_transcript_paths else None,
-        )
-        for event in events
-    )
-    batch = _upload_batch(
-        host=host,
-        metadata=metadata,
-        policy=policy,
-        lifecycle_event=in_flight_batch.lifecycle_event,
-        hook_context=in_flight_batch.hook_context,
-        ledger=ledger,
-        events=events,
-        chunks=chunks,
-        snapshots=in_flight_batch.snapshots,
-    )
-    if _serialized_upload_batch_bytes(batch) > MAX_TRANSPORT_BATCH_BYTES:
-        raise BootstrapError("persisted native trace batch exceeds the request transport limit")
-    return batch
-
-
-def _restore_in_flight_source_event(event: InFlightSourceEvent) -> SourceEvent:
-    if event.kind == "jsonl_range" and event.content is None:
-        raise BootstrapError("persisted native trace range is missing retry content")
-    return SourceEvent(
-        kind=event.kind,
-        path=event.path,
-        path_hash=event.path_hash,
-        start_offset=event.start_offset,
-        end_offset=event.end_offset,
-        byte_count=event.byte_count,
-        content_sha256=event.content_sha256,
-        content=event.content,
-        oversized_reason=event.oversized_reason,
-    )
-
-
-def _clear_in_flight_batch(ledger: SourceLedger, host: Host, batch: InFlightUploadBatch) -> None:
-    batches = ledger.in_flight_batches.get(host)
-    if batches is None:
-        raise BootstrapError("native trace acknowledgement has no persisted in-flight batch")
-    try:
-        batches.remove(batch)
-    except ValueError as exc:
-        raise BootstrapError("native trace acknowledgement does not match a persisted in-flight batch") from exc
-    if not batches:
-        ledger.in_flight_batches.pop(host)
 
 
 def _iter_source_events(ledger: SourceLedger, source_paths: tuple[Path, ...]) -> Iterator[SourceEvent]:
@@ -1787,14 +1232,6 @@ def _gzip_base64(content: bytes) -> str:
     return base64.b64encode(gzip.compress(content, mtime=0)).decode("ascii")
 
 
-def _gunzip_base64(content_gzip_base64: str) -> bytes | None:
-    try:
-        compressed = base64.b64decode(content_gzip_base64, validate=True)
-        return gzip.decompress(compressed)
-    except (binascii.Error, EOFError, OSError, zlib.error):
-        return None
-
-
 def _upload_batch(
     *,
     host: Host,
@@ -1805,14 +1242,7 @@ def _upload_batch(
     ledger: SourceLedger,
     events: tuple[SourceEvent, ...],
     chunks: tuple[dict[str, JsonValue], ...],
-    snapshots: tuple[InstructionHubReleaseSnapshot, ...] | None = None,
 ) -> UploadBatch:
-    snapshot_ranges = _analysis_context_snapshot_ranges(ledger, events) if snapshots is None else snapshots
-    if len(snapshot_ranges) > MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH:
-        raise BootstrapError(
-            "native trace batch intersects more than "
-            f"{MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH} instruction-hub release ranges"
-        )
     request: dict[str, JsonValue] = {
         "batch_id": _stable_upload_batch_id(host, policy, events),
         "source": host,
@@ -1823,10 +1253,11 @@ def _upload_batch(
         "uploaded_at": _utc_now_iso(),
         "chunks": list(chunks),
     }
-    if snapshot_ranges:
-        request["snapshots"] = [_snapshot_range_payload(snapshot) for snapshot in snapshot_ranges]
+    snapshots = _analysis_context_snapshots(ledger, events)
+    if snapshots:
+        request["snapshots"] = snapshots
     request.update(_native_request_context(hook_context, lifecycle_event))
-    return UploadBatch(request=request, events=events, snapshots=snapshot_ranges)
+    return UploadBatch(request=request, events=events)
 
 
 def _serialized_upload_batch_bytes(batch: UploadBatch) -> int:
@@ -1835,13 +1266,26 @@ def _serialized_upload_batch_bytes(batch: UploadBatch) -> int:
     return len(json.dumps(batch.request, sort_keys=True).encode())
 
 
+def _analysis_context_snapshots(
+    ledger: SourceLedger,
+    events: tuple[SourceEvent, ...],
+) -> list[dict[str, JsonValue]]:
+    """Intersect JSONL chunks with durable markers without changing upload ranges."""
+
+    ranges = _analysis_context_snapshot_ranges(ledger, events)
+    if len(ranges) > MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH:
+        raise BootstrapError(
+            "native trace batch intersects more than "
+            f"{MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH} instruction-hub release ranges"
+        )
+    return [_snapshot_range_payload(value) for value in ranges]
+
+
 def _analysis_context_snapshot_ranges(
     ledger: SourceLedger,
     events: tuple[SourceEvent, ...],
-) -> tuple[InstructionHubReleaseSnapshot, ...]:
-    """Intersect JSONL chunks with durable markers without changing upload ranges."""
-
-    ranges: list[InstructionHubReleaseSnapshot] = []
+) -> list[_InstructionHubReleaseSnapshotRange]:
+    ranges: list[_InstructionHubReleaseSnapshotRange] = []
     for event in events:
         if event.kind != "jsonl_range":
             continue
@@ -1855,7 +1299,7 @@ def _analysis_context_snapshot_ranges(
             end_offset = min(event.end_offset, marker_end)
             if end_offset <= start_offset:
                 continue
-            candidate = InstructionHubReleaseSnapshot(
+            candidate = _InstructionHubReleaseSnapshotRange(
                 source_path_hash=event.path_hash,
                 session_id=marker.session_id,
                 start_offset=start_offset,
@@ -1865,7 +1309,7 @@ def _analysis_context_snapshot_ranges(
             )
             if ranges and _snapshot_ranges_are_coalescible(ranges[-1], candidate):
                 previous = ranges[-1]
-                ranges[-1] = InstructionHubReleaseSnapshot(
+                ranges[-1] = _InstructionHubReleaseSnapshotRange(
                     source_path_hash=previous.source_path_hash,
                     session_id=previous.session_id,
                     start_offset=previous.start_offset,
@@ -1875,12 +1319,12 @@ def _analysis_context_snapshot_ranges(
                 )
             else:
                 ranges.append(candidate)
-    return tuple(ranges)
+    return ranges
 
 
 def _snapshot_ranges_are_coalescible(
-    first: InstructionHubReleaseSnapshot,
-    second: InstructionHubReleaseSnapshot,
+    first: _InstructionHubReleaseSnapshotRange,
+    second: _InstructionHubReleaseSnapshotRange,
 ) -> bool:
     return (
         first.source_path_hash == second.source_path_hash
@@ -1891,7 +1335,7 @@ def _snapshot_ranges_are_coalescible(
     )
 
 
-def _snapshot_range_payload(value: InstructionHubReleaseSnapshot) -> dict[str, JsonValue]:
+def _snapshot_range_payload(value: _InstructionHubReleaseSnapshotRange) -> dict[str, JsonValue]:
     return {
         "schema_version": 1,
         "source_path_hash": value.source_path_hash,
@@ -1984,24 +1428,23 @@ def _validate_upload_response(response: dict[str, JsonValue], policy: HostPolicy
 
 def _advance_ledger_from_response(
     ledger: SourceLedger,
-    batch: UploadBatch,
+    source_paths: tuple[Path, ...],
     response: dict[str, JsonValue],
 ) -> None:
-    events_by_range = {(event.path_hash, event.start_offset, event.end_offset): event for event in batch.events}
+    paths_by_hash = {_path_hash(path): path for path in source_paths}
     acknowledged_ranges = response.get("acknowledged_ranges")
     if not isinstance(acknowledged_ranges, list):
         raise BootstrapError("trace batch response acknowledged_ranges must be a list")
     for value in acknowledged_ranges:
         acknowledged = _json_mapping_or_empty(value)
         source_path_hash = _string_value(acknowledged.get("source_path_hash"))
-        start_offset = _optional_int_value(acknowledged.get("start_offset"))
         end_offset = _optional_int_value(acknowledged.get("end_offset"))
-        if source_path_hash is None or start_offset is None or end_offset is None:
+        if source_path_hash is None or end_offset is None:
             raise BootstrapError("trace batch response acknowledged range is malformed")
-        event = events_by_range.get((source_path_hash, start_offset, end_offset))
-        if event is None:
-            raise BootstrapError("trace batch response acknowledged unknown source range")
-        _record_ledger_offset(ledger, event.path, end_offset)
+        path = paths_by_hash.get(source_path_hash)
+        if path is None:
+            raise BootstrapError("trace batch response acknowledged unknown source")
+        _record_ledger_offset(ledger, path, end_offset)
 
 
 def _expected_acknowledged_ranges(events: tuple[SourceEvent, ...]) -> list[dict[str, JsonValue]]:

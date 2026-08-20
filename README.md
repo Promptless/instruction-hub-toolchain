@@ -198,19 +198,17 @@ when it calls Hosted Runtime. Deploy Hosted Runtime next, then this collector
 version last; older native upload models reject unknown fields.
 
 Quiet collection stays hook-safe: it never writes status JSON to stdout, and it
-selects the hook's transcript before scanning idle roots. The first pending
-current-transcript batch gets a dedicated 350-second deadline measured from
-collector start, leaving time inside the 390-second hook pass for its final
-request and shutdown. Lock contention that exhausts that budget reports a
-partial upload for the next hook to resume. Remaining current-transcript
-batches, the idle scan, and idle uploads share the collection deadline (default
-25 seconds, overridable with
+selects the hook's transcript before scanning idle roots. It attempts one
+pending current-transcript batch before starting the catch-up deadline; lock
+contention reports a partial upload for the next hook to resume. Remaining
+current-transcript batches, the idle scan, and idle uploads share the collection
+deadline (default 25 seconds, overridable with
 `PROMPTLESS_HOST_RUNTIME_COLLECT_DEADLINE_SECONDS`). When the budget runs out,
 collection reports `trace_upload_partial` and the forward-only ledger resumes
-at the acknowledged offset on the next hook. Source ranges retain stable 4 MiB
-complete-record boundaries. Requests target 6 MiB and never exceed the 10 MiB
-encoded-body limit; sizing includes chunks, release snapshots, and request
-metadata. A host's first baseline never uses a deadline-truncated inventory —
+at the acknowledged offset on the next hook. Source ranges use a 4 MiB target
+and end on complete-record boundaries. Requests target 6 MiB and never exceed
+the 10 MiB encoded-body limit; sizing includes chunks, release snapshots, and
+request metadata. A host's first baseline never uses a deadline-truncated inventory —
 files missed by a partial scan would replay from offset zero later as a surprise
 backfill — so the inventory scan reruns unmetered. A source that vanishes or
 loses read permission mid-collect is skipped with a drift entry (surfaced as
@@ -223,25 +221,17 @@ Detached collector launch and nonzero-exit failures are recorded there and in
 the structured `last-bootstrap-status.json` support status.
 
 Policy reads and transcript-root scans run without the ledger lock. Each upload
-transaction reloads the ledger and durably records its exact ranges, compressed
-range content, hook context, and release snapshots before posting. A lost
-response therefore replays the same trace payload even if a source grows,
-changes, disappears, or falls out of discovery. An exact acknowledgement
-advances the source offsets, clears the pending request, and releases the lock
-before the next request. A baseline settles pending requests before it records
-offsets and never baselines a source whose upload already started. SessionStart
-can therefore persist a release marker between catch-up requests, and the next
-request includes that marker without changing an already-attempted payload. If
-a durable pending upload cannot be reconstructed exactly, collection fails
-closed, preserves the ledger for recovery, and records a failed collector
-status for operator intervention. The collector process is detached from the
-hook, so catch-up work cannot delay the host or remain in the hook's process
-group. Baseline collections reuse the durable pending guard created by
-SessionStart and wait for the shared ledger lock until the collection deadline.
-If a missing guard cannot be created, collection stops before policy lookup or
-upload. A timed-out baseline leaves the guard in place, so terminal collections
-cannot upload pre-enrollment history before a later SessionStart completes the
-baseline.
+transaction reloads the ledger, selects one request, posts it, persists its
+acknowledgement, and releases the lock before the next request. SessionStart can
+therefore persist a release marker between catch-up requests, and the next
+request includes that marker instead of overwriting it from stale state. The
+collector process is detached from the hook, so catch-up work cannot delay the
+host or remain in the hook's process group. Baseline collections reuse the
+durable pending guard created by SessionStart and wait for the shared ledger lock
+until the collection deadline. If a missing guard cannot be created, collection
+stops before policy lookup or upload. A timed-out baseline leaves the guard in
+place, so terminal collections cannot upload pre-enrollment history before a
+later SessionStart completes the baseline.
 
 Host enrollment is per host, not per installed `pig` version. The credential
 and pending approval are cached at a single host-global path

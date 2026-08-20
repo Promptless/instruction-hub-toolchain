@@ -15,16 +15,12 @@ from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptles
     BootstrapError,
     CHUNK_TARGET_BYTES,
     CollectDeadlineExceeded,
-    FIRST_CURRENT_BATCH_DEADLINE_SECONDS,
     HookTraceContext,
     Host,
     HostCredential,
     HostPolicy,
-    InvalidUploadJournalError,
     InstalledInstructionHubRelease,
     JsonValue,
-    MAX_AGENT_CONTEXT_LENGTH,
-    MAX_SESSION_ID_LENGTH,
     MAX_TRANSPORT_BATCH_BYTES,
     RuntimeMetadata,
     SourceEvent,
@@ -35,7 +31,6 @@ from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptles
     _load_installed_instruction_hub_release,
 )
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.traces import (
-    _hook_trace_context,
     _instruction_hub_release_markers,
     _iter_source_events,
     _iter_upload_batches,
@@ -73,31 +68,6 @@ def _metadata(plugin_version: str) -> RuntimeMetadata:
     )
 
 
-def _accepted_upload_response(policy: HostPolicy, batch: UploadBatch) -> dict[str, JsonValue]:
-    return {
-        "accepted": True,
-        "batch_id": batch.request["batch_id"],
-        "policy_version": policy.policy_version,
-        "raw_artifact_count": sum(event.kind == "jsonl_range" for event in batch.events),
-        "skipped_record_count": sum(event.kind == "oversized_record" for event in batch.events),
-        "acknowledged_ranges": [
-            {
-                "kind": event.kind,
-                "source_path_hash": event.path_hash,
-                "start_offset": event.start_offset,
-                "end_offset": event.end_offset,
-                "content_sha256": event.content_sha256,
-            }
-            for event in batch.events
-        ],
-        "unparsed_record_count": 0,
-    }
-
-
-def _request_without_upload_time(batch: UploadBatch) -> dict[str, JsonValue]:
-    return {key: value for key, value in batch.request.items() if key != "uploaded_at"}
-
-
 def _release_manifest(plugin_version: str) -> dict[str, JsonValue]:
     manifest: dict[str, JsonValue] = {
         "schema_version": 1,
@@ -132,20 +102,6 @@ def _seal_release_manifest(manifest: dict[str, JsonValue]) -> dict[str, JsonValu
     manifest["release_id"] = f"{plugin_version}+{stable_hash(manifest)[:12]}"
     manifest["release_hash"] = stable_hash(manifest)
     return manifest
-
-
-@pytest.mark.parametrize(
-    ("field", "max_length"),
-    (
-        ("session_id", MAX_SESSION_ID_LENGTH),
-        ("parent_session_id", MAX_SESSION_ID_LENGTH),
-        ("agent_id", MAX_AGENT_CONTEXT_LENGTH),
-        ("agent_type", MAX_AGENT_CONTEXT_LENGTH),
-    ),
-)
-def test_hook_context_rejects_identifiers_that_worker_cannot_accept(field: str, max_length: int) -> None:
-    with pytest.raises(BootstrapError, match=f"hook {field} exceeds maximum supported length"):
-        _hook_trace_context({field: "x" * (max_length + 1)})
 
 
 def _release(plugin_version: str, release_hash_prefix: str) -> InstalledInstructionHubRelease:
@@ -627,12 +583,7 @@ def test_current_transcript_ack_is_persisted_before_idle_discovery(
         server.stop()
 
 
-@pytest.mark.parametrize("timed_out_lock_number", (1, 2))
-def test_first_current_transcript_lock_timeout_reports_partial(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    timed_out_lock_number: int,
-) -> None:
+def test_first_current_transcript_lock_timeout_reports_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     build_hub(hub_root)
@@ -669,12 +620,13 @@ def test_first_current_transcript_lock_timeout_reports_partial(
             monkeypatch.setenv(key, value)
 
         original_source_ledger_lock = _source_ledger_lock
-        lock_deadlines: list[float] = []
+        lock_call_count = 0
 
         @contextmanager
         def time_out_first_upload_lock(path: Path, *, wait_for_lock: bool, deadline: float) -> Iterator[bool]:
-            lock_deadlines.append(deadline)
-            if len(lock_deadlines) == timed_out_lock_number:
+            nonlocal lock_call_count
+            lock_call_count += 1
+            if lock_call_count == 2:
                 yield False
                 return
             with original_source_ledger_lock(path, wait_for_lock=wait_for_lock, deadline=deadline) as acquired:
@@ -685,19 +637,6 @@ def test_first_current_transcript_lock_timeout_reports_partial(
             "promptless_host_runtime.traces._source_ledger_lock",
             time_out_first_upload_lock,
         )
-
-        def fail_idle_discovery(
-            host: Host, *, deadline: float, include_active: bool = False
-        ) -> tuple[tuple[Path, ...], bool]:
-            del host, deadline, include_active
-            raise AssertionError("idle discovery ran after the guaranteed current upload timed out")
-
-        monkeypatch.setattr(
-            "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
-            "promptless_host_runtime.traces._idle_root_scan_paths",
-            fail_idle_discovery,
-        )
-        started_at = time.monotonic()
 
         assert (
             _run_collect_runtime(
@@ -713,9 +652,7 @@ def test_first_current_transcript_lock_timeout_reports_partial(
         )
 
         assert server.trace_batches == []
-        assert len(lock_deadlines) == timed_out_lock_number
-        first_batch_budget = lock_deadlines[-1] - started_at
-        assert FIRST_CURRENT_BATCH_DEADLINE_SECONDS <= first_batch_budget < FIRST_CURRENT_BATCH_DEADLINE_SECONDS + 1
+        assert lock_call_count == 2
         diagnostics = _diagnostic_log_entries(home)
         assert diagnostics[-1]["status"] == "trace_upload_partial"
         assert diagnostics[-1]["reason"] == "collection_deadline_exceeded"
@@ -780,45 +717,6 @@ def test_idle_catch_up_checks_deadline_between_source_events(tmp_path: Path, mon
         hook_context=HookTraceContext(None, None, None, None, None, None),
         ledger=ledger,
         source_paths=(first_idle_path, second_idle_path),
-        deadline=2.0,
-    )
-    with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
-        next(batches)
-
-
-def test_transport_target_overflow_checks_deadline_before_yield(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    transcript_path = (tmp_path / "idle.jsonl").resolve()
-    record = b'{"kind":"idle"}\n'
-    transcript_path.write_bytes(record * 2)
-    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=False, sources={})
-    _record_ledger_offset(ledger, transcript_path, 0)
-    monotonic_values = iter((1.0, 1.0, 1.0, 3.0))
-    monkeypatch.setattr(
-        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
-        "promptless_host_runtime.traces.CHUNK_TARGET_BYTES",
-        len(record),
-    )
-    monkeypatch.setattr(
-        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
-        "promptless_host_runtime.traces.TARGET_TRANSPORT_BATCH_BYTES",
-        1,
-    )
-    monkeypatch.setattr(
-        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
-        "promptless_host_runtime.traces.time.monotonic",
-        lambda: next(monotonic_values),
-    )
-
-    batches = _iter_upload_batches(
-        host="codex",
-        metadata=_metadata("1.0.0"),
-        policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
-        lifecycle_event="stop",
-        hook_context=HookTraceContext(None, None, None, None, None, None),
-        ledger=ledger,
-        source_paths=(transcript_path,),
         deadline=2.0,
     )
     with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
@@ -938,7 +836,7 @@ def test_transport_limit_counts_snapshot_metadata_for_indivisible_record(tmp_pat
     assert batches[0].events[0].oversized_reason == "transport_size"
 
 
-def test_source_range_boundaries_are_stable_across_lost_ack_retry(tmp_path: Path) -> None:
+def test_source_range_boundaries_are_stable_for_unchanged_source(tmp_path: Path) -> None:
     transcript_path = (tmp_path / "session.jsonl").resolve()
     record = b"x" * 69_999 + b"\n"
     transcript_path.write_bytes(record * 65)
@@ -953,450 +851,6 @@ def test_source_range_boundaries_are_stable_across_lost_ack_retry(tmp_path: Path
     assert first_attempt == retry_attempt
     assert (first_attempt[0].start_offset, first_attempt[0].end_offset) == (0, 59 * len(record))
     assert first_attempt[1].start_offset == first_attempt[0].end_offset
-
-
-def test_lost_ack_replays_exact_live_tail_after_transcript_changes_and_grows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    transcript_path = (tmp_path / "session.jsonl").resolve()
-    ledger_path = tmp_path / "ledger.json"
-    record = b"x" * (1024 * 1024 - 1) + b"\n"
-    changed_record = b"y" * (1024 * 1024 - 1) + b"\n"
-    initial_content = record * 3
-    grown_content = changed_record * 3 + record * 2
-    transcript_path.write_bytes(initial_content)
-    ledger = SourceLedger(path=ledger_path, is_new=False, sources={})
-    _record_ledger_offset(ledger, transcript_path, 0)
-    _write_source_ledger(ledger)
-    posted_batches: list[UploadBatch] = []
-
-    def lose_first_acknowledgement(
-        upload_url: str,
-        credential: HostCredential,
-        policy: HostPolicy,
-        batch: UploadBatch,
-    ) -> dict[str, JsonValue]:
-        del upload_url, credential
-        posted_batches.append(batch)
-        if len(posted_batches) == 1:
-            raise BootstrapError("trace batch response was lost")
-        return _accepted_upload_response(policy, batch)
-
-    monkeypatch.setattr(
-        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
-        "promptless_host_runtime.traces._post_upload_batch",
-        lose_first_acknowledgement,
-    )
-
-    def upload() -> tuple[int, int, int, frozenset[str]]:
-        return _upload_source_paths(
-            (transcript_path,),
-            upload_url="https://worker.invalid/v0/traces/batches",
-            credential=HostCredential("credential", None, None),
-            host="codex",
-            metadata=_metadata("2.0.0"),
-            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
-            lifecycle_event="stop",
-            hook_context=HookTraceContext(transcript_path, None, "session-1", None, None, None),
-            ledger_path=ledger_path,
-            deadline=float("inf"),
-        )
-
-    with pytest.raises(BootstrapError, match="response was lost"):
-        upload()
-
-    persisted_after_loss = _load_source_ledger(ledger_path)
-    pending_batch = persisted_after_loss.in_flight_batches["codex"][0]
-    assert [(event.start_offset, event.end_offset) for event in pending_batch.events] == [(0, len(initial_content))]
-    assert pending_batch.events[0].content == initial_content
-
-    transcript_path.write_bytes(grown_content)
-    counts = upload()
-
-    assert counts == (2, 2, 0, frozenset())
-    assert [[(event.start_offset, event.end_offset) for event in batch.events] for batch in posted_batches] == [
-        [(0, len(initial_content))],
-        [(0, len(initial_content))],
-        [(len(initial_content), len(grown_content))],
-    ]
-    assert posted_batches[0].request["batch_id"] == posted_batches[1].request["batch_id"]
-    assert _request_without_upload_time(posted_batches[0]) == _request_without_upload_time(posted_batches[1])
-    persisted_after_ack = _load_source_ledger(ledger_path)
-    assert persisted_after_ack.in_flight_batches == {}
-    source = next(iter(persisted_after_ack.sources.values()))
-    assert source["end_offset"] == len(grown_content)
-
-
-def test_lost_ack_reuses_persisted_release_snapshot_before_uploading_new_release(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    transcript_path = (tmp_path / "session.jsonl").resolve()
-    ledger_path = tmp_path / "ledger.json"
-    first_record = b'{"kind":"first"}\n'
-    second_record = b'{"kind":"second"}\n'
-    first_release = _release("1.0.0", "aaaaaaaaaaaa")
-    second_release = _release("2.0.0", "bbbbbbbbbbbb")
-    transcript_path.write_bytes(b"")
-    ledger = SourceLedger(path=ledger_path, is_new=True, sources={})
-    assert _record_session_release_marker(
-        ledger,
-        lifecycle_event="session_start",
-        hook_context=HookTraceContext(transcript_path, None, "session-1", None, None, None),
-        installed_release=first_release,
-    )
-    _write_source_ledger(ledger)
-    transcript_path.write_bytes(first_record)
-    posted_batches: list[UploadBatch] = []
-
-    def lose_first_acknowledgement(
-        upload_url: str,
-        credential: HostCredential,
-        policy: HostPolicy,
-        batch: UploadBatch,
-    ) -> dict[str, JsonValue]:
-        del upload_url, credential
-        posted_batches.append(batch)
-        if len(posted_batches) == 1:
-            raise BootstrapError("trace batch response was lost")
-        return _accepted_upload_response(policy, batch)
-
-    monkeypatch.setattr(
-        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
-        "promptless_host_runtime.traces._post_upload_batch",
-        lose_first_acknowledgement,
-    )
-
-    def upload() -> tuple[int, int, int, frozenset[str]]:
-        return _upload_source_paths(
-            (transcript_path,),
-            upload_url="https://worker.invalid/v0/traces/batches",
-            credential=HostCredential("credential", None, None),
-            host="codex",
-            metadata=_metadata("2.0.0"),
-            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
-            lifecycle_event="stop",
-            hook_context=HookTraceContext(transcript_path, None, "session-1", None, None, None),
-            ledger_path=ledger_path,
-            deadline=float("inf"),
-        )
-
-    with pytest.raises(BootstrapError, match="response was lost"):
-        upload()
-
-    transcript_path.write_bytes(b"")
-    persisted = _load_source_ledger(ledger_path)
-    assert _record_session_release_marker(
-        persisted,
-        lifecycle_event="session_start",
-        hook_context=HookTraceContext(transcript_path, None, "session-2", None, None, None),
-        installed_release=second_release,
-    )
-    _write_source_ledger(persisted)
-    transcript_path.write_bytes(first_record + second_record)
-
-    assert upload() == (2, 2, 0, frozenset())
-    assert len(posted_batches) == 3
-    assert _request_without_upload_time(posted_batches[0]) == _request_without_upload_time(posted_batches[1])
-    first_snapshots = _json_list(posted_batches[0].request["snapshots"], "first_batch.snapshots")
-    retry_snapshots = _json_list(posted_batches[1].request["snapshots"], "retry_batch.snapshots")
-    suffix_snapshots = _json_list(posted_batches[2].request["snapshots"], "suffix_batch.snapshots")
-    assert first_snapshots == retry_snapshots
-    assert _json_mapping(first_snapshots[0], "first_batch.snapshot")["session_id"] == "session-1"
-    suffix_snapshot = _json_mapping(suffix_snapshots[0], "suffix_batch.snapshot")
-    assert suffix_snapshot["session_id"] == "session-2"
-    assert (suffix_snapshot["start_offset"], suffix_snapshot["end_offset"]) == (
-        len(first_record),
-        len(first_record + second_record),
-    )
-
-
-def test_pending_multi_source_batch_replays_when_one_source_disappears(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    current_path = (tmp_path / "current.jsonl").resolve()
-    idle_path = (tmp_path / "idle.jsonl").resolve()
-    current_content = b'{"kind":"current"}\n'
-    current_tail = b'{"kind":"current_tail"}\n'
-    idle_content = b'{"kind":"idle"}\n'
-    current_path.write_bytes(current_content)
-    idle_path.write_bytes(idle_content)
-    ledger_path = tmp_path / "ledger.json"
-    ledger = SourceLedger(path=ledger_path, is_new=False, sources={})
-    _record_ledger_offset(ledger, current_path, 0)
-    _record_ledger_offset(ledger, idle_path, 0)
-    _write_source_ledger(ledger)
-    posted_batches: list[UploadBatch] = []
-
-    def lose_first_acknowledgement(
-        upload_url: str,
-        credential: HostCredential,
-        policy: HostPolicy,
-        batch: UploadBatch,
-    ) -> dict[str, JsonValue]:
-        del upload_url, credential
-        posted_batches.append(batch)
-        if len(posted_batches) == 1:
-            raise BootstrapError("trace batch response was lost")
-        return _accepted_upload_response(policy, batch)
-
-    monkeypatch.setattr(
-        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
-        "promptless_host_runtime.traces._post_upload_batch",
-        lose_first_acknowledgement,
-    )
-
-    def upload(source_paths: tuple[Path, ...]) -> tuple[int, int, int, frozenset[str]]:
-        return _upload_source_paths(
-            source_paths,
-            upload_url="https://worker.invalid/v0/traces/batches",
-            credential=HostCredential("credential", None, None),
-            host="codex",
-            metadata=_metadata("2.0.0"),
-            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
-            lifecycle_event="stop",
-            hook_context=HookTraceContext(current_path, None, "session-1", None, None, None),
-            ledger_path=ledger_path,
-            deadline=float("inf"),
-        )
-
-    with pytest.raises(BootstrapError, match="response was lost"):
-        upload((current_path, idle_path))
-
-    idle_path.unlink()
-    current_path.write_bytes(current_content + current_tail)
-    counts = upload((current_path,))
-
-    assert counts == (2, 3, 0, frozenset())
-    assert _request_without_upload_time(posted_batches[0]) == _request_without_upload_time(posted_batches[1])
-    assert [(event.path, event.content) for event in posted_batches[1].events] == [
-        (current_path, current_content),
-        (idle_path, idle_content),
-    ]
-    assert [(event.path, event.content) for event in posted_batches[2].events] == [(current_path, current_tail)]
-    persisted = _load_source_ledger(ledger_path)
-    current_source = persisted.sources[hashlib.sha256(str(current_path).encode()).hexdigest()]
-    idle_source = persisted.sources[hashlib.sha256(str(idle_path).encode()).hexdigest()]
-    assert current_source["end_offset"] == len(current_content + current_tail)
-    assert idle_source["end_offset"] == len(idle_content)
-    assert persisted.in_flight_batches == {}
-
-
-def test_empty_inventory_drains_persisted_batch_after_source_disappears(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    transcript_path = (tmp_path / "session.jsonl").resolve()
-    content = b'{"kind":"terminal"}\n'
-    transcript_path.write_bytes(content)
-    ledger_path = tmp_path / "ledger.json"
-    ledger = SourceLedger(path=ledger_path, is_new=False, sources={})
-    _record_ledger_offset(ledger, transcript_path, 0)
-    _write_source_ledger(ledger)
-    posted_batches: list[UploadBatch] = []
-
-    def lose_first_acknowledgement(
-        upload_url: str,
-        credential: HostCredential,
-        policy: HostPolicy,
-        batch: UploadBatch,
-    ) -> dict[str, JsonValue]:
-        del upload_url, credential
-        posted_batches.append(batch)
-        if len(posted_batches) == 1:
-            raise BootstrapError("trace batch response was lost")
-        return _accepted_upload_response(policy, batch)
-
-    monkeypatch.setattr(
-        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
-        "promptless_host_runtime.traces._post_upload_batch",
-        lose_first_acknowledgement,
-    )
-
-    def upload(
-        source_paths: tuple[Path, ...], *, drain_in_flight: bool = False
-    ) -> tuple[int, int, int, frozenset[str]]:
-        return _upload_source_paths(
-            source_paths,
-            upload_url="https://worker.invalid/v0/traces/batches",
-            credential=HostCredential("credential", None, None),
-            host="codex",
-            metadata=_metadata("2.0.0"),
-            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
-            lifecycle_event="stop",
-            hook_context=HookTraceContext(transcript_path, None, "session-1", None, None, None),
-            ledger_path=ledger_path,
-            deadline=float("inf"),
-            drain_in_flight=drain_in_flight,
-        )
-
-    with pytest.raises(BootstrapError, match="response was lost"):
-        upload((transcript_path,))
-
-    transcript_path.unlink()
-    counts = upload((), drain_in_flight=True)
-
-    assert counts == (1, 1, 0, frozenset())
-    assert _request_without_upload_time(posted_batches[0]) == _request_without_upload_time(posted_batches[1])
-    persisted = _load_source_ledger(ledger_path)
-    source = next(iter(persisted.sources.values()))
-    assert source["end_offset"] == len(content)
-    assert persisted.in_flight_batches == {}
-
-
-def test_corrupt_persisted_batch_content_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    transcript_path = (tmp_path / "session.jsonl").resolve()
-    transcript_path.write_bytes(b'{"kind":"terminal"}\n')
-    ledger_path = tmp_path / "ledger.json"
-    ledger = SourceLedger(path=ledger_path, is_new=False, sources={})
-    _record_ledger_offset(ledger, transcript_path, 0)
-    _write_source_ledger(ledger)
-
-    def lose_acknowledgement(
-        upload_url: str,
-        credential: HostCredential,
-        policy: HostPolicy,
-        batch: UploadBatch,
-    ) -> dict[str, JsonValue]:
-        del upload_url, credential, policy, batch
-        raise BootstrapError("trace batch response was lost")
-
-    monkeypatch.setattr(
-        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
-        "promptless_host_runtime.traces._post_upload_batch",
-        lose_acknowledgement,
-    )
-    with pytest.raises(BootstrapError, match="response was lost"):
-        _upload_source_paths(
-            (transcript_path,),
-            upload_url="https://worker.invalid/v0/traces/batches",
-            credential=HostCredential("credential", None, None),
-            host="codex",
-            metadata=_metadata("2.0.0"),
-            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
-            lifecycle_event="stop",
-            hook_context=HookTraceContext(transcript_path, None, "session-1", None, None, None),
-            ledger_path=ledger_path,
-            deadline=float("inf"),
-        )
-
-    serialized_ledger = _json_mapping(json.loads(ledger_path.read_text()), "ledger")
-    batches_by_host = _json_mapping(serialized_ledger["in_flight_batches"], "ledger.in_flight_batches")
-    batches = _json_list(batches_by_host["codex"], "ledger.in_flight_batches.codex")
-    batch = _json_mapping(batches[0], "ledger.in_flight_batches.codex[0]")
-    events = _json_list(batch["events"], "ledger.in_flight_batches.codex[0].events")
-    event = _json_mapping(events[0], "ledger.in_flight_batches.codex[0].events[0]")
-    event["content_gzip_base64"] = "not-base64"
-    ledger_path.write_text(json.dumps(serialized_ledger))
-
-    with pytest.raises(InvalidUploadJournalError, match="invalid in-flight upload journal"):
-        _load_source_ledger(ledger_path)
-
-
-def test_initial_baseline_settles_pending_batch_before_recording_offsets(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    build_hub(hub_root)
-    plugin_root = hub_root / "dist/codex/pig"
-    server = _FakeWorkerServer()
-    server.start()
-    try:
-        home = tmp_path / "home"
-        ledger_path = tmp_path / "ledger.json"
-        transcript_path = (tmp_path / "current.jsonl").resolve()
-        record = b'{"kind":"terminal"}\n'
-        transcript_content = record * 4
-        transcript_path.write_bytes(transcript_content)
-        env = {
-            "HOME": str(home),
-            "CODEX_HOME": str(home / ".codex"),
-            "PLUGIN_ROOT": str(plugin_root),
-            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
-            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
-        }
-        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
-        for key, value in {
-            **env,
-            "PROMPTLESS_DASHBOARD_BASE_URL": server.base_url,
-            "PROMPTLESS_HOST_ENROLLMENT_ALLOW_TEST_URL_OVERRIDES": "1",
-            "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER": "0",
-        }.items():
-            monkeypatch.setenv(key, value)
-
-        posted_batches: list[UploadBatch] = []
-
-        def lose_first_acknowledgement(
-            upload_url: str,
-            credential: HostCredential,
-            policy: HostPolicy,
-            batch: UploadBatch,
-        ) -> dict[str, JsonValue]:
-            del upload_url, credential
-            posted_batches.append(batch)
-            if len(posted_batches) == 1:
-                raise BootstrapError("trace batch response was lost")
-            return _accepted_upload_response(policy, batch)
-
-        monkeypatch.setattr(
-            "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
-            "promptless_host_runtime.traces.CHUNK_TARGET_BYTES",
-            len(record) * 2,
-        )
-        monkeypatch.setattr(
-            "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
-            "promptless_host_runtime.traces.MAX_UPLOAD_CHUNKS_PER_BATCH",
-            1,
-        )
-        monkeypatch.setattr(
-            "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
-            "promptless_host_runtime.traces._post_upload_batch",
-            lose_first_acknowledgement,
-        )
-        hook_context = HookTraceContext(transcript_path, None, "session-1", None, None, None)
-
-        with pytest.raises(BootstrapError, match="response was lost"):
-            _run_collect_runtime(
-                "codex",
-                lifecycle_event="stop",
-                hook_context=hook_context,
-                baseline=False,
-                include_active=False,
-                quiet=True,
-                release_marker_captured=True,
-            )
-
-        persisted_after_loss = _load_source_ledger(ledger_path)
-        assert persisted_after_loss.sources == {}
-        pending_event = persisted_after_loss.in_flight_batches["codex"][0].events[0]
-        assert (pending_event.start_offset, pending_event.end_offset) == (0, len(record) * 2)
-
-        assert (
-            _run_collect_runtime(
-                "codex",
-                lifecycle_event="session_start",
-                hook_context=hook_context,
-                baseline=True,
-                include_active=False,
-                quiet=True,
-                release_marker_captured=True,
-            )
-            == 0
-        )
-
-        assert len(posted_batches) == 3
-        assert _request_without_upload_time(posted_batches[0]) == _request_without_upload_time(posted_batches[1])
-        assert [[(event.start_offset, event.end_offset) for event in batch.events] for batch in posted_batches] == [
-            [(0, len(record) * 2)],
-            [(0, len(record) * 2)],
-            [(len(record) * 2, len(transcript_content))],
-        ]
-        persisted_after_baseline = _load_source_ledger(ledger_path)
-        source = next(iter(persisted_after_baseline.sources.values()))
-        assert source["end_offset"] == len(transcript_content)
-        assert persisted_after_baseline.host_baselines == {"codex"}
-        assert persisted_after_baseline.in_flight_batches == {}
-    finally:
-        server.stop()
 
 
 def test_upload_reloads_ledger_between_acks_so_session_marker_survives(
