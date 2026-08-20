@@ -871,10 +871,11 @@ def _iter_upload_batches(
 ) -> Iterator[UploadBatch]:
     """Yield contract-shaped upload batches, metering everything after the first.
 
-    The first batch is always yielded regardless of the deadline so every hook
-    makes forward progress on its own transcript (source paths are ordered
-    hook-subject-first); later batches stop at the deadline and the forward-only
-    ledger resumes them on the next collect.
+    When the hook subject has pending bytes, its chunks are isolated from idle
+    catch-up work in the first batch. That batch is always yielded regardless of
+    the deadline so every hook makes forward progress on its own transcript;
+    later batches stop at the deadline and the forward-only ledger resumes them
+    on the next collect.
     """
 
     lifecycle_paths = _lifecycle_subject_paths(hook_context, lifecycle_event)
@@ -913,8 +914,12 @@ def _iter_upload_batches(
             )
         next_decoded_bytes = pending_decoded_bytes + event.byte_count
         next_transport_bytes = pending_transport_bytes + chunk_transport_bytes
+        leaving_lifecycle_subject = (
+            bool(pending_events) and pending_events[-1].path in lifecycle_paths and event.path not in lifecycle_paths
+        )
         if pending_payloads and (
-            len(pending_payloads) >= MAX_UPLOAD_CHUNKS_PER_BATCH
+            leaving_lifecycle_subject
+            or len(pending_payloads) >= MAX_UPLOAD_CHUNKS_PER_BATCH
             or pending_snapshot_count + event_snapshot_count > MAX_ANALYSIS_CONTEXT_SNAPSHOTS_PER_BATCH
             or next_decoded_bytes > MAX_TRACE_BATCH_BYTES
             or next_transport_bytes > transport_budget
@@ -935,6 +940,7 @@ def _iter_upload_batches(
             pending_decoded_bytes = 0
             pending_transport_bytes = 0
             pending_snapshot_count = 0
+            _ensure_collect_deadline(deadline)
         pending_events.append(event)
         pending_payloads.append(payload)
         pending_decoded_bytes += event.byte_count

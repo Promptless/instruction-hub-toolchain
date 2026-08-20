@@ -11,6 +11,7 @@ import pytest
 from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.contracts import (
     BootstrapError,
+    CollectDeadlineExceeded,
     HookTraceContext,
     HostPolicy,
     InstalledInstructionHubRelease,
@@ -38,7 +39,7 @@ from .helpers import _FakeWorkerServer, _json_list, _json_mapping, _run_collect,
 
 def _metadata(plugin_version: str) -> RuntimeMetadata:
     return RuntimeMetadata(
-        bootstrap_version="0.2.6",
+        bootstrap_version="0.2.8",
         toolchain_version="test",
         plugin_id="promptless-instruction-hub-pig",
         plugin_name="PIG",
@@ -368,14 +369,14 @@ def test_terminal_and_subagent_hooks_do_not_smear_release_onto_unmarked_sources(
             {"session_id": "subject-session", "transcript_path": str(subject_path)},
         )
 
-        mixed_batch = server.trace_batches[0]
-        mixed_snapshots = [
-            _json_mapping(value, "snapshot") for value in _json_list(mixed_batch["snapshots"], "snapshots")
+        subject_batch = server.trace_batches[0]
+        subject_snapshots = [
+            _json_mapping(value, "snapshot") for value in _json_list(subject_batch["snapshots"], "snapshots")
         ]
         subject_hash = hashlib.sha256(str(subject_path.resolve()).encode()).hexdigest()
         idle_hash = hashlib.sha256(str(idle_path.resolve()).encode()).hexdigest()
-        assert {snapshot["source_path_hash"] for snapshot in mixed_snapshots} == {subject_hash}
-        assert idle_hash not in {snapshot["source_path_hash"] for snapshot in mixed_snapshots}
+        assert {snapshot["source_path_hash"] for snapshot in subject_snapshots} == {subject_hash}
+        assert idle_hash not in {snapshot["source_path_hash"] for snapshot in subject_snapshots}
 
         agent_path = tmp_path / "subagent.jsonl"
         agent_path.write_bytes(b'{"kind":"agent_stop"}\n')
@@ -469,6 +470,56 @@ def test_persisted_markers_split_snapshot_ranges_without_changing_upload_batch(
     assert source.get("provenance_only") is None
     assert len(_instruction_hub_release_markers(source)) == 2
     assert _ledger_has_host_source(persisted, "codex")
+
+
+def test_expired_deadline_uploads_subject_then_resumes_idle_catch_up(tmp_path: Path) -> None:
+    subject_path = (tmp_path / "subject.jsonl").resolve()
+    idle_path = (tmp_path / "idle.jsonl").resolve()
+    subject_record = b'{"kind":"subject"}\n'
+    idle_record = b'{"kind":"idle"}\n'
+    subject_path.write_bytes(subject_record)
+    idle_path.write_bytes(idle_record)
+    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=False, sources={})
+    _record_ledger_offset(ledger, subject_path, 0)
+    _record_ledger_offset(ledger, idle_path, 0)
+    hook_context = HookTraceContext(subject_path, None, "session-1", None, None, None)
+
+    batches = _iter_upload_batches(
+        host="codex",
+        metadata=_metadata("1.0.0"),
+        policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+        lifecycle_event="stop",
+        hook_context=hook_context,
+        ledger=ledger,
+        source_paths=(subject_path, idle_path),
+        deadline=0,
+    )
+
+    subject_batch = next(batches)
+    assert [event.path for event in subject_batch.events] == [subject_path]
+    _record_ledger_offset(ledger, subject_path, subject_batch.events[-1].end_offset)
+    with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
+        next(batches)
+
+    subject_hash = hashlib.sha256(str(subject_path).encode()).hexdigest()
+    idle_hash = hashlib.sha256(str(idle_path).encode()).hexdigest()
+    assert ledger.sources[subject_hash]["end_offset"] == len(subject_record)
+    assert ledger.sources[idle_hash]["end_offset"] == 0
+
+    resumed_batches = list(
+        _iter_upload_batches(
+            host="codex",
+            metadata=_metadata("1.0.0"),
+            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+            lifecycle_event="stop",
+            hook_context=hook_context,
+            ledger=ledger,
+            source_paths=(subject_path, idle_path),
+            deadline=float("inf"),
+        )
+    )
+    assert len(resumed_batches) == 1
+    assert [event.path for event in resumed_batches[0].events] == [idle_path]
 
 
 def test_snapshot_limit_pages_whole_events_without_loss_and_retries_stably(
