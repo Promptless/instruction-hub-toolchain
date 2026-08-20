@@ -49,7 +49,13 @@ from .notices import (
     _pending_plugin_update,
     _record_plugin_version_seen,
 )
-from .output import _emit, _emit_command_json, _flush_control_output, _record_collector_failure
+from .output import (
+    _emit,
+    _emit_command_json,
+    _flush_control_output,
+    _record_collector_failure,
+    _record_session_start_failure,
+)
 from .redaction import _redact_text
 from .status import _reset_host_state, _status_payload
 from .storage import _ledger_path
@@ -77,12 +83,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "version":
         return _run_version_command(json_output=args.json)
     host = _resolve_host(args.host)
+    if args.command == "session-start":
+        return _run_session_start_command(
+            host,
+            if_sources=args.if_sources,
+            detach=args.detach,
+            supervised=args.supervised,
+        )
     if args.command == "ensure":
         return _run_ensure_command(
             host,
             quiet=args.quiet,
             if_sources=args.if_sources,
             prepare_baseline=args.prepare_baseline,
+            background=args.background,
         )
     if args.command == "collect":
         collector_args = _collector_command_args(
@@ -141,6 +155,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Persist the baseline guard before detached collection",
     )
+    ensure_parser.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
+
+    session_start_parser = subcommands.add_parser(
+        "session-start",
+        help="Capture startup state and reconcile the host in a detached process",
+    )
+    _add_host_argument(session_start_parser)
+    session_start_parser.add_argument(
+        "--if-sources",
+        action="store_true",
+        help="Skip startup reconciliation when the host has no native trace source files",
+    )
+    session_start_execution = session_start_parser.add_mutually_exclusive_group(required=True)
+    session_start_execution.add_argument("--detach", action="store_true", help="Detach startup reconciliation")
+    session_start_execution.add_argument("--supervised", action="store_true", help=argparse.SUPPRESS)
 
     collect_parser = subcommands.add_parser(
         "collect",
@@ -194,14 +223,41 @@ def _add_host_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", choices=("auto", "codex", "claude", "claude-desktop"), default="auto")
 
 
-def _run_ensure_command(host: Host, *, quiet: bool, if_sources: bool, prepare_baseline: bool) -> int:
+def _run_session_start_command(host: Host, *, if_sources: bool, detach: bool, supervised: bool) -> int:
     try:
-        return _run_ensure(host, quiet=quiet, if_sources=if_sources, prepare_baseline=prepare_baseline)
+        if detach:
+            return _launch_detached_session_start(host, if_sources=if_sources)
+        if supervised:
+            return _supervise_session_start(host, if_sources=if_sources)
+        raise ValueError("session-start requires --detach or --supervised")
+    except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
+        _emit({"status": "error", "host": host, "message": _redact_text(str(exc))})
+        return 1
+    finally:
+        _flush_control_output()
+
+
+def _run_ensure_command(
+    host: Host,
+    *,
+    quiet: bool,
+    if_sources: bool,
+    prepare_baseline: bool,
+    background: bool,
+) -> int:
+    try:
+        return _run_ensure(
+            host,
+            quiet=quiet,
+            if_sources=if_sources,
+            prepare_baseline=prepare_baseline,
+            claim_notices=not background,
+        )
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
         _emit(
             {"status": "error", "host": host, "message": _redact_text(str(exc))},
             quiet=quiet,
-            internal_welcome_notice=_claim_internal_promptless_welcome(quiet=quiet),
+            internal_welcome_notice=_claim_internal_promptless_welcome(quiet=quiet or background),
         )
         return 0
     finally:
@@ -264,6 +320,101 @@ def _collector_command_args(
     if release_marker_captured:
         command_args.append("--release-marker-captured")
     return command_args
+
+
+def _launch_detached_session_start(host: Host, *, if_sources: bool) -> int:
+    hook_input = _read_hook_input()
+    if if_sources and not _has_native_trace_sources(host):
+        return 0
+
+    hook_context = _hook_trace_context(_read_hook_context(hook_input))
+    plugin_root = _plugin_root()
+    metadata = _load_runtime_metadata(plugin_root, host)
+    installed_release = _load_installed_instruction_hub_release(plugin_root, metadata)
+    _persist_session_release_marker(
+        _ledger_path(),
+        lifecycle_event="session_start",
+        hook_context=hook_context,
+        installed_release=installed_release,
+        deadline=_collect_deadline(),
+    )
+    _prepare_baseline(host)
+
+    supervisor_args = [
+        sys.executable,
+        str(Path(sys.argv[0]).resolve()),
+        "session-start",
+        "--host",
+        host,
+    ]
+    if if_sources:
+        supervisor_args.append("--if-sources")
+    supervisor_args.append("--supervised")
+    with tempfile.TemporaryFile(mode="w+b") as preserved_stdin:
+        binary_stdin = cast(BinaryIO, preserved_stdin)
+        binary_stdin.write(hook_input)
+        binary_stdin.seek(0)
+        _spawn_detached(supervisor_args, stdin=binary_stdin)
+    return 0
+
+
+def _supervise_session_start(host: Host, *, if_sources: bool) -> int:
+    runtime_path = str(Path(sys.argv[0]).resolve())
+    ensure_args = [sys.executable, runtime_path, "ensure", "--host", host, "--background"]
+    if if_sources:
+        ensure_args.append("--if-sources")
+    try:
+        ensure_result = subprocess.run(
+            ensure_args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError as exc:
+        _record_session_start_failure(
+            host,
+            stage="ensure",
+            exit_code=None,
+            error_code=_os_error_code(exc),
+        )
+        return 1
+    if ensure_result.returncode != 0:
+        _record_session_start_failure(
+            host,
+            stage="ensure",
+            exit_code=ensure_result.returncode,
+            error_code=None,
+        )
+        return ensure_result.returncode
+
+    collector_args = [
+        sys.executable,
+        runtime_path,
+        "collect",
+        "--host",
+        host,
+        "--lifecycle",
+        "session_start",
+        "--baseline",
+    ]
+    if if_sources:
+        collector_args.append("--if-sources")
+    collector_args.extend(("--quiet", "--release-marker-captured"))
+    try:
+        collect_result = subprocess.run(
+            collector_args,
+            stdin=sys.stdin.buffer,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError as exc:
+        _record_collector_failure(host, exit_code=None, error_code=_os_error_code(exc))
+        return 1
+    if collect_result.returncode != 0:
+        _record_collector_failure(host, exit_code=collect_result.returncode, error_code=None)
+    return collect_result.returncode
 
 
 def _launch_detached_collect(
@@ -449,7 +600,14 @@ def _run_version_command(*, json_output: bool) -> int:
     return 0
 
 
-def _run_ensure(host: Host, *, quiet: bool, if_sources: bool, prepare_baseline: bool) -> int:
+def _run_ensure(
+    host: Host,
+    *,
+    quiet: bool,
+    if_sources: bool,
+    prepare_baseline: bool,
+    claim_notices: bool,
+) -> int:
     if prepare_baseline:
         try:
             _prepare_baseline(host)
@@ -457,7 +615,7 @@ def _run_ensure(host: Host, *, quiet: bool, if_sources: bool, prepare_baseline: 
             _emit(
                 {"status": "error", "host": host, "message": _redact_text(str(exc))},
                 quiet=quiet,
-                internal_welcome_notice=_claim_internal_promptless_welcome(quiet=quiet),
+                internal_welcome_notice=_claim_internal_promptless_welcome(quiet=quiet or not claim_notices),
             )
             return 1
     if if_sources and not _has_native_trace_sources(host):
@@ -471,18 +629,18 @@ def _run_ensure(host: Host, *, quiet: bool, if_sources: bool, prepare_baseline: 
     enrollment_target = _enrollment_host(host)
     metadata = _load_runtime_metadata(plugin_root, enrollment_target)
     pending_update = _pending_plugin_update(metadata)
-    update_notice = pending_update.notice if pending_update is not None else None
+    update_notice = pending_update.notice if pending_update is not None and claim_notices else None
     exit_code = _run_host_enrollment(
         enrollment_target,
         metadata,
         quiet=quiet,
         update_notice=update_notice,
         plugin_version_updated=update_notice is not None,
+        claim_notices=claim_notices,
     )
-    # Reached only when the host enrollment step returned without raising, i.e. the SessionStart
-    # output (including any update notice) was emitted. A quiet run suppresses that output, so it
-    # does not consume the one-time notice.
-    if pending_update is not None and not quiet:
+    # Reached only when the host enrollment step returned without raising. Quiet and detached
+    # background runs do not consume notices that no user could have seen.
+    if pending_update is not None and not quiet and (claim_notices or pending_update.notice is None):
         _record_plugin_version_seen(pending_update)
     return exit_code
 
@@ -494,6 +652,7 @@ def _run_host_enrollment(
     quiet: bool,
     update_notice: str | None,
     plugin_version_updated: bool,
+    claim_notices: bool,
 ) -> int:
     worker_base_url = _worker_base_url()
     dashboard_base_url = _dashboard_base_url()
@@ -509,7 +668,7 @@ def _run_host_enrollment(
             quiet=quiet,
             update_notice=update_notice,
             internal_welcome_notice=_claim_internal_promptless_welcome(
-                quiet=quiet,
+                quiet=quiet or not claim_notices,
                 plugin_version=metadata.plugin_version,
                 version_updated=plugin_version_updated,
             ),
@@ -534,7 +693,7 @@ def _run_host_enrollment(
                 quiet=quiet,
                 update_notice=update_notice,
                 internal_welcome_notice=_claim_internal_promptless_welcome(
-                    quiet=quiet,
+                    quiet=quiet or not claim_notices,
                     plugin_version=metadata.plugin_version,
                     version_updated=plugin_version_updated,
                 ),
@@ -564,7 +723,7 @@ def _run_host_enrollment(
             update_notice=update_notice,
             internal_welcome_notice=_claim_internal_promptless_welcome(
                 credential=credential,
-                quiet=quiet,
+                quiet=quiet or not claim_notices,
                 plugin_version=metadata.plugin_version,
                 version_updated=plugin_version_updated,
             ),
@@ -577,10 +736,14 @@ def _run_host_enrollment(
         {"status": result.status, "host": host, "needs_restart": result.needs_restart},
         quiet=quiet,
         update_notice=update_notice,
-        first_success_notice=_claim_first_enrollment_success_notice(host, status=result.status, quiet=quiet),
+        first_success_notice=_claim_first_enrollment_success_notice(
+            host,
+            status=result.status,
+            quiet=quiet or not claim_notices,
+        ),
         internal_welcome_notice=_claim_internal_promptless_welcome(
             credential=credential,
-            quiet=quiet,
+            quiet=quiet or not claim_notices,
             plugin_version=metadata.plugin_version,
             version_updated=plugin_version_updated,
         ),

@@ -85,10 +85,6 @@ def _assert_hook_system_message(result: subprocess.CompletedProcess[str], messag
     _assert_hook_output(result, {"systemMessage": message})
 
 
-def _assert_hook_argv(result: subprocess.CompletedProcess[str], target: str) -> None:
-    _assert_hook_output(result, {"argv": ["ensure", "--host", target, "--prepare-baseline"]})
-
-
 CODEX_SAFE_STDOUT_KEYS = frozenset({"systemMessage"})
 CLAUDE_SAFE_STDOUT_KEYS = frozenset({"systemMessage", "terminalSequence"})
 

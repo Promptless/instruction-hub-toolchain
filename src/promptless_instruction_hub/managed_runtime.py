@@ -25,15 +25,14 @@ HOST_RUNTIME_PACKAGE = "promptless_host_runtime"
 # Directory (relative to a plugin root) that the runtime bundle is copied into.
 # Intentionally not "bin": claude.ai-hosted plugins must not ship a top-level bin/.
 HOST_RUNTIME_OUTPUT_DIR = "runtime"
-# Keep one startup pass above the browser callback deadline plus the follow-up poll,
-# policy fetch, local config write, check-in network calls, and trace collection.
-# Claude SessionStart can run two startup passes serially: Claude Code first, then a
-# best-effort Claude Desktop pass when Desktop audit sources exist.
-HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS = 390
-HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS = HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS * 2
-HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS = HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
+# SessionStart only captures local release/baseline state and launches a detached
+# enrollment + collection supervisor. The 30-second ceiling leaves room for the
+# existing 25-second ledger-lock deadline without putting browser or network waits
+# on the hook's critical path.
+HOST_RUNTIME_SESSION_START_HOOK_TIMEOUT_SECONDS = 30
+HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS = 390
 HOST_RUNTIME_CHANNEL = "stable"
-HOST_RUNTIME_VERSION = "0.2.7"
+HOST_RUNTIME_VERSION = "0.2.8"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
 SUPPORTED_HOST_RUNTIME_TARGETS: tuple[Harness, ...] = ("claude", "codex")
 MISSING_RUNTIME_ROOT_MESSAGE = (
@@ -241,14 +240,14 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
     # https://docs.anthropic.com/en/docs/claude-code/hooks
     # The Python entrypoint is dogfood-only. Customer-grade releases should invoke a
     # Promptless-built static native binary so customer machines do not need Python or uv.
-    # SessionStart performs user-visible enrollment, writes config/check-in status, and then
-    # launches a detached forward-only JSONL baseline. Terminal lifecycle hooks only launch
-    # detached native JSONL uploads; failures stay out of the agent transcript.
+    # SessionStart durably captures its release/baseline boundary and then launches detached
+    # enrollment, config/check-in reconciliation, and forward-only JSONL collection. Terminal
+    # lifecycle hooks only launch detached native JSONL uploads.
     hook_entry: dict[str, JsonValue] = {
         "hooks": [
             {
                 "type": "command",
-                "timeout": _host_runtime_hook_timeout(target, event_name),
+                "timeout": _host_runtime_hook_timeout(event_name),
                 "statusMessage": (
                     "Checking Promptless host runtime"
                     if event_name == "SessionStart"
@@ -263,11 +262,9 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
     return hook_entry
 
 
-def _host_runtime_hook_timeout(target: Harness, event_name: str) -> int:
-    if target == "claude" and event_name == "SessionStart":
-        return HOST_RUNTIME_CLAUDE_SESSION_START_TIMEOUT_SECONDS
+def _host_runtime_hook_timeout(event_name: str) -> int:
     if event_name == "SessionStart":
-        return HOST_RUNTIME_STARTUP_PASS_TIMEOUT_SECONDS
+        return HOST_RUNTIME_SESSION_START_HOOK_TIMEOUT_SECONDS
     return HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS
 
 
@@ -387,34 +384,19 @@ def _node_host_runtime_hook_script(
     missing_python = _system_message_json(MISSING_PYTHON_MESSAGE)
     unsupported_python = _system_message_json(UNSUPPORTED_PYTHON_MESSAGE)
     broken_python = _system_message_json(BROKEN_PYTHON_MESSAGE)
-    collect_args = [
-        "runtime",
-        "'collect'",
-        "'--host'",
-        repr(host),
-        "'--lifecycle'",
-        repr(lifecycle),
-    ]
-    if baseline:
-        collect_args.append("'--baseline'")
-    collect_args.append("'--detach'")
-    collect_args.append("'--quiet'")
-    ensure_run_script = ""
+    runtime_args = ["runtime"]
     if run_ensure:
-        ensure_run_script = (
-            f"const ensureArgs = [runtime, 'ensure', '--host', {host!r}, '--prepare-baseline'];\n"
-            "  const ensure = spawnSync(candidate.command, [...candidate.runPrefix, ...ensureArgs], { stdio: 'inherit', env: process.env });\n"
-            "  if (ensure.error) {\n"
-            "    sawBrokenPython = true;\n"
-            "    continue;\n"
-            "  }\n"
-            "  if (ensure.status !== 0) process.exit(ensure.status === null ? 1 : ensure.status);\n"
-        )
-    claude_desktop_collect_script = ""
+        runtime_args.extend(("'session-start'", "'--host'", repr(host), "'--detach'"))
+    else:
+        runtime_args.extend(("'collect'", "'--host'", repr(host), "'--lifecycle'", repr(lifecycle)))
+        if baseline:
+            runtime_args.append("'--baseline'")
+        runtime_args.extend(("'--detach'", "'--quiet'"))
+    claude_desktop_start_script = ""
     if collect_claude_desktop:
-        claude_desktop_collect_script = (
-            "  const desktopCollectArgs = [runtime, 'collect', '--host', 'claude-desktop', '--lifecycle', 'session_start', '--baseline', '--if-sources', '--detach', '--quiet'];\n"
-            "  launchDetachedCollector(candidate.command, [...candidate.runPrefix, ...desktopCollectArgs], ['ignore', 'ignore', 'ignore'], 'claude-desktop');\n"
+        claude_desktop_start_script = (
+            "  const desktopStartArgs = [runtime, 'session-start', '--host', 'claude-desktop', '--if-sources', '--detach'];\n"
+            "  launchRuntime(candidate.command, [...candidate.runPrefix, ...desktopStartArgs], ['ignore', 'ignore', 'ignore'], 'claude-desktop');\n"
         )
     return (
         "const fs = require('fs');\n"
@@ -430,11 +412,12 @@ def _node_host_runtime_hook_script(
         "}\n"
         "function emitLaunchFailure(host, error) {\n"
         "  const errorCode = typeof error.code === 'string' ? error.code : 'unknown';\n"
-        "  console.error(JSON.stringify({ status: 'error', reason: 'collector_launch_failed', host, error_code: errorCode }));\n"
+        "  console.error(JSON.stringify({ status: 'error', reason: 'runtime_launch_failed', host, error_code: errorCode }));\n"
         "}\n"
-        "function launchDetachedCollector(command, args, stdio, host) {\n"
+        "function launchRuntime(command, args, stdio, host) {\n"
         "  const launcher = spawnSync(command, args, { stdio, env: process.env });\n"
-        "  if (launcher.error) emitLaunchFailure(host, launcher.error);\n"
+        "  if (launcher.error) { emitLaunchFailure(host, launcher.error); return false; }\n"
+        "  return launcher.status === 0;\n"
         "}\n"
         "function runtimeState(candidate) {\n"
         "  const bundleRoot = path.dirname(candidate);\n"
@@ -477,7 +460,7 @@ def _node_host_runtime_hook_script(
         f"if (runtimeStatus === 'missing') finishWithDiagnostic({missing_file!r});\n"
         f"if (runtimeStatus === 'unreadable') finishWithDiagnostic({unreadable_file!r});\n"
         f"const pythonProbe = {PYTHON_VERSION_PROBE!r};\n"
-        f"const collectArgs = [{', '.join(collect_args)}];\n"
+        f"const runtimeArgs = [{', '.join(runtime_args)}];\n"
         "const candidates = [\n"
         "  { command: 'python3', probeArgs: ['-c', pythonProbe], runPrefix: [] },\n"
         "  { command: 'python', probeArgs: ['-c', pythonProbe], runPrefix: [] },\n"
@@ -485,7 +468,7 @@ def _node_host_runtime_hook_script(
         "];\n"
         "let sawUnsupportedPython = false;\n"
         "let sawBrokenPython = false;\n"
-        "let collectorStarted = false;\n"
+        "let runtimeStarted = false;\n"
         "for (const candidate of candidates) {\n"
         "  const probe = spawnSync(candidate.command, candidate.probeArgs, { stdio: 'ignore' });\n"
         "  if (probe.error) {\n"
@@ -497,15 +480,14 @@ def _node_host_runtime_hook_script(
         "    else sawBrokenPython = true;\n"
         "    continue;\n"
         "  }\n"
-        f"{ensure_run_script}"
-        f"  launchDetachedCollector(candidate.command, [...candidate.runPrefix, ...collectArgs], ['inherit', 'ignore', 'ignore'], {host!r});\n"
-        f"{claude_desktop_collect_script}"
-        "  collectorStarted = true;\n"
+        f"  runtimeStarted = launchRuntime(candidate.command, [...candidate.runPrefix, ...runtimeArgs], ['inherit', 'inherit', 'inherit'], {host!r});\n"
+        "  if (!runtimeStarted && emitDiagnostics) process.exit(1);\n"
+        f"{claude_desktop_start_script}"
         "  break;\n"
         "}\n"
-        f"if (!collectorStarted && sawUnsupportedPython) finishWithDiagnostic({unsupported_python!r});\n"
-        f"else if (!collectorStarted && sawBrokenPython) finishWithDiagnostic({broken_python!r});\n"
-        f"else if (!collectorStarted) finishWithDiagnostic({missing_python!r});\n"
+        f"if (!runtimeStarted && sawUnsupportedPython) finishWithDiagnostic({unsupported_python!r});\n"
+        f"else if (!runtimeStarted && sawBrokenPython) finishWithDiagnostic({broken_python!r});\n"
+        f"else if (!runtimeStarted) finishWithDiagnostic({missing_python!r});\n"
     )
 
 
@@ -567,18 +549,19 @@ def _posix_host_runtime_hook_command(
             f"else {_posix_emit_system_message(MISSING_PYTHON_MESSAGE)}; fi; "
             "exit 0"
         )
-    ensure_command = ""
+    runtime_command: str
     if run_ensure:
-        ensure_command = (
-            f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" ensure --host {host} --prepare-baseline; '
-            f'else "$python_cmd" "$runtime" ensure --host {host} --prepare-baseline; fi; '
-            'status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; '
+        runtime_command = (
+            f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" session-start --host {host} --detach <&3; '
+            f'else "$python_cmd" "$runtime" session-start --host {host} --detach <&3; fi; '
+            "exit $?"
         )
-    collect_command = (
-        f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --detach --quiet <&3 >/dev/null 2>&1; '
-        f'else "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --detach --quiet <&3 >/dev/null 2>&1; fi; '
-        "exit 0"
-    )
+    else:
+        runtime_command = (
+            f'if [ -n "$python_arg" ]; then "$python_cmd" "$python_arg" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --detach --quiet <&3 >/dev/null 2>&1; '
+            f'else "$python_cmd" "$runtime" collect --host {host} --lifecycle {lifecycle}{collect_baseline_arg} --detach --quiet <&3 >/dev/null 2>&1; fi; '
+            "exit 0"
+        )
     script = (
         f"exec 3<&0; root={root_expr}; "
         f'if [ -z "$root" ]; then {missing_root_action}; fi; '
@@ -600,8 +583,7 @@ def _posix_host_runtime_hook_command(
         'if [ -z "$python_cmd" ]; then '
         f"{missing_python_action}; "
         "fi; "
-        f"{ensure_command}"
-        f"{collect_command}"
+        f"{runtime_command}"
     )
     return f"sh -c {shlex.quote(script)}"
 

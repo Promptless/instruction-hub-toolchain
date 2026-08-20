@@ -145,10 +145,10 @@ the same plugin id when the recorded root is stale or incomplete, and exit 0
 with no output when no usable bundle exists.
 
 ```sh
-sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime ensure --host codex --prepare-baseline; run promptless-host-runtime collect --host codex --lifecycle session_start --baseline --detach --quiet'
+sh -c 'root=${PLUGIN_ROOT:-}; ...; find python3/python/py; run promptless-host-runtime session-start --host codex --detach'
 sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle stop --detach --quiet'
 sh -c 'root=${PLUGIN_ROOT:-}; ...; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host codex --lifecycle session_end --detach --quiet'
-node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find Python 3.9+; run promptless-host-runtime ensure --host claude --prepare-baseline; run promptless-host-runtime collect --host claude --lifecycle session_start --baseline --detach --quiet; best-effort run promptless-host-runtime ensure --host claude-desktop --if-sources --prepare-baseline; then collect --host claude-desktop only if ensure succeeds' '${CLAUDE_PLUGIN_ROOT}'
+node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find Python 3.9+; run promptless-host-runtime session-start --host claude --detach; best-effort run promptless-host-runtime session-start --host claude-desktop --if-sources --detach' '${CLAUDE_PLUGIN_ROOT}'
 node -e '... resolve ${CLAUDE_PLUGIN_ROOT}; find same-plugin sibling runtime if needed; run promptless-host-runtime collect --host claude --lifecycle session_end --detach --quiet' '${CLAUDE_PLUGIN_ROOT}'
 ```
 
@@ -160,15 +160,24 @@ runtime for a one-time per-host credential, caches that credential, and uses the
 host credential to fetch `/v0/host-enrollment/policy?target=...` and post
 `/v0/host-enrollment/check-ins`.
 
+SessionStart never waits for browser approval or worker requests. It records
+the local release boundary and baseline-pending guard, launches a detached
+supervisor, and returns. The supervisor runs enrollment and reconciliation
+before its baseline collection. On Linux, enrollment does not invoke a browser
+when `DISPLAY`, `WAYLAND_DISPLAY`, `MIR_SOCKET`, and `WSL_INTEROP` are all
+absent; set `PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER=1` to force a browser
+attempt or `0` to disable one explicitly. Detached enrollment outcomes remain
+available in `~/.promptless/instruction-hub/last-bootstrap-status.json` and the
+bounded `host-runtime-diagnostics.jsonl` log.
+
 The same runtime also uploads native host transcript JSONL ranges to
-`/v0/traces/batches?target=...`. SessionStart hooks run `ensure` and then a
-quiet first baseline for each host; terminal lifecycle hooks (`Stop`,
+`/v0/traces/batches?target=...`. SessionStart supervisors run `ensure` and then
+a quiet first baseline for each host; terminal lifecycle hooks (`Stop`,
 `SessionEnd`, and `SubagentStop`) run collection only. Collection uses hook stdin
 transcript references first, accepting snake_case, camelCase, and nested
 `session`/`transcript`/`agent` shapes from Codex- and Claude-style hooks, then
 scans idle host-native transcript roots as a catch-up path. SessionStart creates
-a durable pending guard before it waits for enrollment and check-in, then
-detaches collection; terminal hooks detach
+a durable pending guard before it detaches enrollment and collection; terminal hooks detach
 collection after resolving the runtime and Python interpreter. The forward-only
 ledger lives at `~/.promptless/instruction-hub/host-runtime-ledger.json` or
 `PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads are authenticated with the
@@ -245,12 +254,12 @@ Claude `settings.json` are deleted (with a timestamped backup), while unmanaged
 user config is never touched. The hosted policy's legacy `collector` section is
 ignored.
 
-The host runtime has one executable entrypoint with subcommands. `ensure` is the hook-safe
-path that enrolls when needed, removes legacy managed telemetry config, and
-posts a check-in. SessionStart adds `--prepare-baseline` so `ensure` persists the
-guard required before it can detach baseline collection. `collect` is the
-native JSONL upload path; hooks pass `--detach` so the runtime supervises
-collection outside the hook process group. Pass `--include-active` for a
+The host runtime has one executable entrypoint with subcommands. `session-start`
+captures the hook's release boundary and baseline guard before detaching an
+`ensure`-then-`collect` supervisor. `ensure` enrolls when needed, removes legacy
+managed telemetry config, and posts a check-in. `collect` is the native JSONL
+upload path; hooks pass `--detach` so the runtime supervises collection outside
+the hook process group. Pass `--include-active` for a
 user-initiated sweep that includes files still inside the idle grace period
 after SessionStart has established the upload baseline. `enroll` acquires only
 the host credential. `status` prints local JSON without network,

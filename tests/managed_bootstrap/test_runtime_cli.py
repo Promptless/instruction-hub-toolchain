@@ -68,7 +68,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     )
     assert payload["id"] == "host-runtime"
     assert payload["name"] == HOST_RUNTIME_BIN
-    assert payload["version"] == "0.2.7"
+    assert payload["version"] == "0.2.8"
     assert payload["channel"] == "stable"
     manifest = json.loads((plugin_root / "hub.managed-runtimes.json").read_text())
     bundle_sha256 = _runtime_bundle_sha256(plugin_root / "runtime")
@@ -100,7 +100,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert text_version.returncode == 0
-    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.7\n"
+    assert text_version.stdout == f"{HOST_RUNTIME_BIN} 0.2.8\n"
     assert text_version.stderr == ""
 
     poison_root = tmp_path / "poison-pythonpath"
@@ -128,7 +128,7 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
         check=False,
     )
     assert poisoned_pythonpath.returncode == 0
-    assert json.loads(poisoned_pythonpath.stdout)["version"] == "0.2.7"
+    assert json.loads(poisoned_pythonpath.stdout)["version"] == "0.2.8"
     assert poisoned_pythonpath.stderr == ""
     assert not poison_marker.exists()
 
@@ -235,7 +235,7 @@ def test_collector_process_creation_failure_is_persisted(
     assert _last_status_path(home).stat().st_mode & 0o777 == 0o600
 
 
-def test_detached_session_start_persists_boundary_before_spawn_and_preserves_stdin(
+def test_detached_session_start_persists_guard_and_boundary_before_spawn_and_preserves_stdin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -265,24 +265,42 @@ def test_detached_session_start_persists_boundary_before_spawn_and_preserves_std
     monkeypatch.setenv("PLUGIN_ROOT", str(plugin_root))
     monkeypatch.setenv("PROMPTLESS_HOST_RUNTIME_LEDGER", str(ledger_path))
     monkeypatch.setattr(host_runtime_cli, "_spawn_detached", spawn_detached)
-    collector_args = ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"]
-
     with hook_input_path.open() as hook_input:
         monkeypatch.setattr(host_runtime_cli.sys, "stdin", hook_input)
-        return_code = host_runtime_cli._launch_detached_collect(
-            "codex",
-            collector_args,
-            lifecycle="session_start",
-        )
+        return_code = host_runtime_cli._launch_detached_session_start("codex", if_sources=False)
 
     assert return_code == 0
     assert spawned_stdin == raw_hook_input
-    assert spawned_args.count("--release-marker-captured") == 1
+    assert spawned_args[-4:] == ["session-start", "--host", "codex", "--supervised"]
+    assert ledger_path.with_name("ledger.json.codex.baseline-pending").is_file()
     ledger = json.loads(ledger_path.read_text())
     source = next(iter(ledger["sources"].values()))
     marker = source["instruction_hub_release_markers"][0]
     assert marker["start_offset"] == len(before_launch)
     assert marker["session_id"] == "session-1"
+
+
+def test_session_start_supervisor_records_ensure_process_creation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    hook_input_path = tmp_path / "hook-input.json"
+    hook_input_path.write_text("{}")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(host_runtime_cli.sys, "executable", str(tmp_path / "missing-python"))
+
+    with hook_input_path.open() as hook_input:
+        monkeypatch.setattr(host_runtime_cli.sys, "stdin", hook_input)
+        return_code = host_runtime_cli._supervise_session_start("codex", if_sources=False)
+
+    assert return_code == 1
+    diagnostic = _diagnostic_log_entries(home)
+    assert len(diagnostic) == 1
+    assert diagnostic[0]["reason"] == "session_start_process_failed"
+    assert diagnostic[0]["stage"] == "ensure"
+    assert diagnostic[0]["host"] == "codex"
+    assert diagnostic[0]["error_code"] == "ENOENT"
 
 
 def test_host_runtime_enroll_status_and_reset_commands(tmp_path: Path) -> None:

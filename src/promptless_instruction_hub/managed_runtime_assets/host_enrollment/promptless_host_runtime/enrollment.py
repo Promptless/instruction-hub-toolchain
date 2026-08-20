@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 import uuid
 import webbrowser
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -567,7 +567,7 @@ def _credential_cache_key(context: EnrollmentContext) -> str:
 
 
 def _open_hosted_enrollment_url(enrollment_url: str) -> bool:
-    if os.environ.get(OPEN_BROWSER_ENV) == "0":
+    if not _browser_session_available(os.environ, platform.system()):
         if _test_url_overrides_enabled() and _is_loopback_parsed_url(urlsplit(enrollment_url)):
             _open_loopback_url_for_test(enrollment_url)
             return True
@@ -576,6 +576,17 @@ def _open_hosted_enrollment_url(enrollment_url: str) -> bool:
         return webbrowser.open(enrollment_url, new=2, autoraise=True)
     except webbrowser.Error:
         return False
+
+
+def _browser_session_available(environment: Mapping[str, str], system_name: str) -> bool:
+    browser_override = environment.get(OPEN_BROWSER_ENV)
+    if browser_override == "0":
+        return False
+    if browser_override == "1":
+        return True
+    if system_name != "Linux":
+        return True
+    return any(environment.get(name) for name in ("DISPLAY", "WAYLAND_DISPLAY", "MIR_SOCKET", "WSL_INTEROP"))
 
 
 def _open_loopback_url_for_test(enrollment_url: str) -> None:

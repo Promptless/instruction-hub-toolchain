@@ -9,6 +9,9 @@ import pytest
 
 from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.fs import validate_json_value
+from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime import (
+    enrollment as host_enrollment,
+)
 
 from .helpers import (
     BROWSER_ENROLLMENT_MESSAGE,
@@ -439,6 +442,56 @@ def test_bootstrap_confirms_first_successful_enrollment_once_per_host(tmp_path: 
         server.stop()
 
 
+def test_background_ensure_records_status_without_consuming_user_notices(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        plugin_root = hub_root / "dist/codex/pig"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+        }
+
+        background = subprocess.run(
+            [str(plugin_root / "runtime" / HOST_RUNTIME_BIN), "ensure", "--host", "codex", "--background"],
+            env=_clean_env(**env),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert background.returncode == 0
+        background_status = _json_mapping(
+            validate_json_value(json.loads(_last_status_path(home).read_text()), "background status"),
+            "background status",
+        )
+        assert background_status["status"] == "configured"
+        state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        assert FIRST_SUCCESS_SHOWN_KEY not in state
+        assert _json_mapping(state["last_seen_plugin_versions"], "last seen versions")["codex"] == "0.1.0"
+
+        foreground_payload, _ = _run_bootstrap(plugin_root, "codex", env)
+        foreground_message = _json_string(foreground_payload["systemMessage"], "systemMessage")
+        assert FIRST_SUCCESS_ACTIVE_FRAGMENT in foreground_message
+        foreground_state = _json_mapping(
+            validate_json_value(json.loads(_host_state_path(home).read_text()), "host state"),
+            "host state",
+        )
+        assert "codex" in _json_mapping(foreground_state[FIRST_SUCCESS_SHOWN_KEY], "first-success shown")
+        assert _json_mapping(foreground_state["last_seen_plugin_versions"], "last seen versions")["codex"] == "0.1.0"
+    finally:
+        server.stop()
+
+
 def test_reset_clears_first_successful_enrollment_latch(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -512,6 +565,36 @@ def test_bootstrap_surfaces_browser_open_failure(tmp_path: Path) -> None:
         assert server.check_ins == []
     finally:
         server.stop()
+
+
+def test_headless_linux_does_not_attempt_browser_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "MIR_SOCKET",
+        "WSL_INTEROP",
+        "BROWSER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(host_enrollment.platform, "system", lambda: "Linux")
+
+    def unexpected_browser_open(*args: object, **kwargs: object) -> bool:
+        pytest.fail(f"headless enrollment attempted browser launch: args={args!r} kwargs={kwargs!r}")
+
+    monkeypatch.setattr(host_enrollment.webbrowser, "open", unexpected_browser_open)
+
+    assert not host_enrollment._open_hosted_enrollment_url("https://app.gopromptless.ai/instruction-hub/enroll")
+    assert not host_enrollment._browser_session_available({"BROWSER": "xdg-open"}, "Linux")
+
+
+@pytest.mark.parametrize("display_variable", ("DISPLAY", "WAYLAND_DISPLAY", "MIR_SOCKET", "WSL_INTEROP"))
+def test_linux_browser_session_detection_accepts_graphical_or_wsl_session(display_variable: str) -> None:
+    assert host_enrollment._browser_session_available({display_variable: "available"}, "Linux")
+    assert host_enrollment._browser_session_available(
+        {"PROMPTLESS_HOST_ENROLLMENT_OPEN_BROWSER": "1"},
+        "Linux",
+    )
 
 
 def test_bootstrap_persists_host_global_state_file(tmp_path: Path) -> None:
@@ -790,7 +873,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
         assert server.session_requests[0]["plugin_id"] == "promptless-instruction-hub-pig"
         assert server.session_requests[0]["plugin_version"] == "0.1.0"
         assert server.session_requests[0]["package_id"] == "pig"
-        assert server.session_requests[0]["bootstrap_version"] == "0.2.7"
+        assert server.session_requests[0]["bootstrap_version"] == "0.2.8"
         assert server.session_requests[0]["toolchain_version"] != "unknown"
         assert server.session_requests[0]["pending_callback"] == "1"
         assert server.session_requests[1]["target"] == "claude"
@@ -812,7 +895,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
                 "policy_version",
                 "status",
             }
-            assert check_in["bootstrap_version"] == "0.2.7"
+            assert check_in["bootstrap_version"] == "0.2.8"
             assert check_in["plugin_version"] == "0.1.0"
             assert check_in["status"] == "configured"
             assert check_in["needs_restart"] is False
