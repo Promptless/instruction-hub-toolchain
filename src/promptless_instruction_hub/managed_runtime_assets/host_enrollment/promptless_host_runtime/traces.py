@@ -234,6 +234,9 @@ def _run_collect(
     unparsed_record_count = 0
     unreadable_source_hashes: set[str] = set()
 
+    # Keep the hook subject independent from the configurable catch-up budget
+    # while bounding its local read, encoding, and ledger-lock work.
+    first_current_deadline = time.monotonic() + COLLECT_DEADLINE_SECONDS
     try:
         first_current_counts = _upload_source_paths(
             current_transcript_paths,
@@ -245,7 +248,7 @@ def _run_collect(
             lifecycle_event=lifecycle_event,
             hook_context=hook_context,
             ledger_path=ledger_path,
-            deadline=float("inf"),
+            deadline=first_current_deadline,
             batch_limit=1,
         )
     except CollectDeadlineExceeded:
@@ -1046,8 +1049,7 @@ def _upload_source_paths(
     unreadable_source_hashes: set[str] = set()
     while source_paths and (batch_limit is None or uploaded_batch_count < batch_limit):
         _ensure_collect_deadline(deadline)
-        lock_deadline = _collect_deadline() if deadline == float("inf") else deadline
-        with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=lock_deadline) as lock_acquired:
+        with _source_ledger_lock(ledger_path, wait_for_lock=True, deadline=deadline) as lock_acquired:
             if not lock_acquired:
                 raise CollectDeadlineExceeded("native trace collection exceeded deadline waiting for ledger lock")
             ledger = _load_source_ledger(ledger_path)

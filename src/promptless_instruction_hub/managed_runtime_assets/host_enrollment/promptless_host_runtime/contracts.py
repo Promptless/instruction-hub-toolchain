@@ -210,9 +210,10 @@ class BootstrapAuthError(BootstrapError):
 class CollectDeadlineExceeded(BootstrapError):
     """Optional collection work exceeded the hook-safe runtime budget.
 
-    The first pending current-transcript batch and the first-run baseline
-    inventory run separately. Remaining current-transcript and idle catch-up
-    work share the deadline so later hooks can resume it safely.
+    The first pending current-transcript batch receives its own deadline, and
+    the first-run baseline inventory runs separately. Remaining current-
+    transcript and idle catch-up work share a fresh deadline so later hooks can
+    resume it safely.
     """
 
 
