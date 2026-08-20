@@ -522,6 +522,133 @@ def test_expired_deadline_uploads_subject_then_resumes_idle_catch_up(tmp_path: P
     assert [event.path for event in resumed_batches[0].events] == [idle_path]
 
 
+def test_expired_deadline_defers_idle_catch_up_when_subject_is_up_to_date(tmp_path: Path) -> None:
+    subject_path = (tmp_path / "subject.jsonl").resolve()
+    idle_path = (tmp_path / "idle.jsonl").resolve()
+    subject_record = b'{"kind":"subject"}\n'
+    idle_record = b'{"kind":"idle"}\n'
+    subject_path.write_bytes(subject_record)
+    idle_path.write_bytes(idle_record)
+    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=False, sources={})
+    _record_ledger_offset(ledger, subject_path, len(subject_record))
+    _record_ledger_offset(ledger, idle_path, 0)
+    hook_context = HookTraceContext(subject_path, None, "session-1", None, None, None)
+
+    with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
+        list(
+            _iter_upload_batches(
+                host="codex",
+                metadata=_metadata("1.0.0"),
+                policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+                lifecycle_event="stop",
+                hook_context=hook_context,
+                ledger=ledger,
+                source_paths=(subject_path, idle_path),
+                deadline=0,
+            )
+        )
+
+    resumed_batches = list(
+        _iter_upload_batches(
+            host="codex",
+            metadata=_metadata("1.0.0"),
+            policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+            lifecycle_event="stop",
+            hook_context=hook_context,
+            ledger=ledger,
+            source_paths=(subject_path, idle_path),
+            deadline=float("inf"),
+        )
+    )
+    assert len(resumed_batches) == 1
+    assert [event.path for event in resumed_batches[0].events] == [idle_path]
+
+
+def test_idle_catch_up_checks_deadline_between_source_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    subject_path = (tmp_path / "subject.jsonl").resolve()
+    first_idle_path = (tmp_path / "first-idle.jsonl").resolve()
+    second_idle_path = (tmp_path / "second-idle.jsonl").resolve()
+    subject_record = b'{"kind":"subject"}\n'
+    subject_path.write_bytes(subject_record)
+    first_idle_path.write_bytes(b'{"kind":"first_idle"}\n')
+    second_idle_path.write_bytes(b'{"kind":"second_idle"}\n')
+    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=False, sources={})
+    _record_ledger_offset(ledger, subject_path, len(subject_record))
+    _record_ledger_offset(ledger, first_idle_path, 0)
+    _record_ledger_offset(ledger, second_idle_path, 0)
+    monotonic_values = iter((1.0, 3.0))
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
+        list(
+            _iter_upload_batches(
+                host="codex",
+                metadata=_metadata("1.0.0"),
+                policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+                lifecycle_event="stop",
+                hook_context=HookTraceContext(subject_path, None, "session-1", None, None, None),
+                ledger=ledger,
+                source_paths=(subject_path, first_idle_path, second_idle_path),
+                deadline=2.0,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("idle_path_count", "max_chunks", "monotonic_values"),
+    (
+        pytest.param(1, None, (1.0, 3.0), id="final-batch"),
+        pytest.param(2, 1, (1.0, 1.0, 3.0), id="batch-cap"),
+    ),
+)
+def test_idle_catch_up_rechecks_deadline_before_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    idle_path_count: int,
+    max_chunks: int | None,
+    monotonic_values: tuple[float, ...],
+) -> None:
+    subject_path = (tmp_path / "subject.jsonl").resolve()
+    subject_record = b'{"kind":"subject"}\n'
+    subject_path.write_bytes(subject_record)
+    idle_paths = tuple((tmp_path / f"idle-{index}.jsonl").resolve() for index in range(idle_path_count))
+    ledger = SourceLedger(path=tmp_path / "ledger.json", is_new=False, sources={})
+    _record_ledger_offset(ledger, subject_path, len(subject_record))
+    for idle_path in idle_paths:
+        idle_path.write_bytes(b'{"kind":"idle"}\n')
+        _record_ledger_offset(ledger, idle_path, 0)
+    if max_chunks is not None:
+        monkeypatch.setattr(
+            "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+            "promptless_host_runtime.traces.MAX_UPLOAD_CHUNKS_PER_BATCH",
+            max_chunks,
+        )
+    pending_monotonic_values = iter(monotonic_values)
+    monkeypatch.setattr(
+        "promptless_instruction_hub.managed_runtime_assets.host_enrollment."
+        "promptless_host_runtime.traces.time.monotonic",
+        lambda: next(pending_monotonic_values),
+    )
+
+    with pytest.raises(CollectDeadlineExceeded, match="native trace collection exceeded deadline"):
+        list(
+            _iter_upload_batches(
+                host="codex",
+                metadata=_metadata("1.0.0"),
+                policy=HostPolicy(policy_version=1, required_bootstrap_version=None),
+                lifecycle_event="stop",
+                hook_context=HookTraceContext(subject_path, None, "session-1", None, None, None),
+                ledger=ledger,
+                source_paths=(subject_path, *idle_paths),
+                deadline=2.0,
+            )
+        )
+
+
 def test_snapshot_limit_pages_whole_events_without_loss_and_retries_stably(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -875,7 +875,8 @@ def _iter_upload_batches(
     catch-up work in the first batch. That batch is always yielded regardless of
     the deadline so every hook makes forward progress on its own transcript;
     later batches stop at the deadline and the forward-only ledger resumes them
-    on the next collect.
+    on the next collect. When the hook subject has no uploadable bytes, idle
+    catch-up is metered before its first event.
     """
 
     lifecycle_paths = _lifecycle_subject_paths(hook_context, lifecycle_event)
@@ -887,9 +888,11 @@ def _iter_upload_batches(
     pending_snapshot_count = 0
     yielded_batch = False
     for event in _iter_source_events(ledger, source_paths):
-        if yielded_batch:
+        event_is_lifecycle_subject = event.path in lifecycle_paths
+        pending_batch_is_lifecycle_subject = bool(pending_events) and pending_events[0].path in lifecycle_paths
+        if yielded_batch or (not event_is_lifecycle_subject and not pending_batch_is_lifecycle_subject):
             _ensure_collect_deadline(deadline)
-        chunk_lifecycle = lifecycle_event if event.path in lifecycle_paths else None
+        chunk_lifecycle = lifecycle_event if event_is_lifecycle_subject else None
         payload = _chunk_payload(event, chunk_lifecycle)
         chunk_transport_bytes = _chunk_transport_bytes(payload)
         if event.kind == "jsonl_range" and chunk_transport_bytes > transport_budget:
@@ -914,9 +917,7 @@ def _iter_upload_batches(
             )
         next_decoded_bytes = pending_decoded_bytes + event.byte_count
         next_transport_bytes = pending_transport_bytes + chunk_transport_bytes
-        leaving_lifecycle_subject = (
-            bool(pending_events) and pending_events[-1].path in lifecycle_paths and event.path not in lifecycle_paths
-        )
+        leaving_lifecycle_subject = pending_batch_is_lifecycle_subject and not event_is_lifecycle_subject
         if pending_payloads and (
             leaving_lifecycle_subject
             or len(pending_payloads) >= MAX_UPLOAD_CHUNKS_PER_BATCH
@@ -924,6 +925,8 @@ def _iter_upload_batches(
             or next_decoded_bytes > MAX_TRACE_BATCH_BYTES
             or next_transport_bytes > transport_budget
         ):
+            if yielded_batch or not pending_batch_is_lifecycle_subject:
+                _ensure_collect_deadline(deadline)
             yield _upload_batch(
                 host=host,
                 metadata=metadata,
@@ -947,6 +950,9 @@ def _iter_upload_batches(
         pending_transport_bytes += chunk_transport_bytes
         pending_snapshot_count += event_snapshot_count
     if pending_events:
+        pending_batch_is_lifecycle_subject = pending_events[0].path in lifecycle_paths
+        if yielded_batch or not pending_batch_is_lifecycle_subject:
+            _ensure_collect_deadline(deadline)
         yield _upload_batch(
             host=host,
             metadata=metadata,
