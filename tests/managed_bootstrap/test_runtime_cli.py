@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import subprocess
@@ -12,6 +13,10 @@ import pytest
 from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime import (
     cli as host_runtime_cli,
+)
+from promptless_instruction_hub.managed_runtime_assets.host_enrollment.promptless_host_runtime.contracts import (
+    HostCredential,
+    RuntimeMetadata,
 )
 
 from .helpers import (
@@ -194,6 +199,62 @@ def test_host_runtime_requires_subcommand_and_reports_version(tmp_path: Path) ->
     assert internal_import.stdout == ""
     assert "ImportError: sentinel internal import" in internal_import.stderr
     assert BUNDLE_LOAD_ERROR.strip() not in internal_import.stderr
+
+
+def test_instruction_request_uploads_active_trace_before_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Send the current trace first, then submit one authenticated request."""
+
+    calls: list[str] = []
+    posted_payload: dict[str, object] = {}
+    metadata = RuntimeMetadata(
+        bootstrap_version="0.2.7",
+        toolchain_version="0.1.0",
+        plugin_id="pig",
+        plugin_name="PIG",
+        plugin_version="0.1.0",
+        package_id="pig",
+        target="claude",
+    )
+
+    def collect(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        calls.append("collect")
+        return 0
+
+    def post(url: str, token: str, payload: dict[str, object], *, label: str) -> dict[str, object]:
+        assert url == "https://worker.example.test/v0/instruction-requests?target=claude"
+        assert token == "credential"
+        assert label == "instruction request response"
+        calls.append("post")
+        posted_payload.update(payload)
+        return {"accepted": True, "request_id": payload["request_id"]}
+
+    monkeypatch.setattr(host_runtime_cli, "_run_collect", collect)
+    monkeypatch.setattr(host_runtime_cli, "_plugin_root", lambda: Path("/plugin"))
+    monkeypatch.setattr(host_runtime_cli, "_load_runtime_metadata", lambda _root, _host: metadata)
+    monkeypatch.setattr(host_runtime_cli, "_worker_base_url", lambda: "https://worker.example.test")
+    monkeypatch.setattr(host_runtime_cli, "_dashboard_base_url", lambda: "https://dashboard.example.test")
+    monkeypatch.setattr(host_runtime_cli, "_enrollment_context", lambda *args: object())
+    monkeypatch.setattr(
+        host_runtime_cli,
+        "_cached_host_credential",
+        lambda _context: HostCredential(value="credential", credential_id=None, deployment_instance_id=None),
+    )
+    monkeypatch.setattr(host_runtime_cli, "_post_json_response", post)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("Please simplify the active instructions.\n"))
+
+    result = host_runtime_cli._run_instruction_request_command("claude", session_id="session-1")
+
+    assert result == 0
+    assert calls == ["collect", "post"]
+    assert posted_payload["session_id"] == "session-1"
+    assert posted_payload["request"] == "Please simplify the active instructions."
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "submitted"
+    assert output["request_id"] == posted_payload["request_id"]
 
 
 @pytest.mark.parametrize("execution_mode", ("detached", "supervised"))

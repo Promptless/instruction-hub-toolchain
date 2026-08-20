@@ -13,11 +13,13 @@ import urllib.request
 from pathlib import Path
 from typing import BinaryIO, cast
 from urllib.parse import urlencode
+from uuid import uuid4
 
 from .contracts import (
     BootstrapAuthError,
     BootstrapError,
     Host,
+    HookTraceContext,
     MANAGED_RUNTIME_ID,
     RUNTIME_CHANNEL,
     RUNTIME_EXECUTABLE,
@@ -26,6 +28,7 @@ from .contracts import (
     _enrollment_host,
 )
 from .enrollment import (
+    _cached_host_credential,
     _credential_with_policy_identity,
     _enroll_host_credential,
     _enrollment_context,
@@ -64,10 +67,12 @@ from .traces import (
     _run_collect,
 )
 from .validation import _requires_newer_bootstrap
-from .worker import _get_json, _post_check_in, _validate_signed_policy, _worker_url
+from .worker import _get_json, _post_check_in, _post_json_response, _validate_signed_policy, _worker_url
 
 _WINDOWS_CREATE_NEW_PROCESS_GROUP = 0x00000200
 _WINDOWS_DETACHED_PROCESS = 0x00000008
+_MAX_INSTRUCTION_REQUEST_CHARS = 4_000
+_MAX_SESSION_ID_CHARS = 500
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -116,6 +121,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "status":
         return _run_status_command(host)
+    if args.command == "request":
+        return _run_instruction_request_command(host, session_id=args.session_id)
     if args.command == "enroll":
         return _run_enroll_command(host)
     if args.command == "reset":
@@ -178,6 +185,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     status_parser = subcommands.add_parser("status", help="Print local host-runtime status as JSON")
     _add_host_argument(status_parser)
 
+    request_parser = subcommands.add_parser(
+        "request",
+        help="Upload the active trace and ask Promptless to analyze a request from stdin",
+    )
+    _add_host_argument(request_parser)
+    request_parser.add_argument("--session-id", required=True, help="Native parent session ID")
+
     enroll_parser = subcommands.add_parser("enroll", help="Enroll the host credential without editing host config")
     _add_host_argument(enroll_parser)
 
@@ -236,6 +250,80 @@ def _run_collect_command(
     except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
         _emit({"status": "error", "host": host, "message": _redact_text(str(exc))}, quiet=quiet)
         return 0
+    finally:
+        _flush_control_output()
+
+
+def _run_instruction_request_command(host: Host, *, session_id: str) -> int:
+    """Upload the active session and queue one explicit trace analysis."""
+
+    try:
+        if not session_id.strip() or len(session_id) > _MAX_SESSION_ID_CHARS:
+            raise BootstrapError("session ID must contain 1 to 500 characters")
+        request_text = sys.stdin.read(_MAX_INSTRUCTION_REQUEST_CHARS + 1).strip()
+        if not request_text:
+            raise BootstrapError("instruction request must not be empty")
+        if len(request_text) > _MAX_INSTRUCTION_REQUEST_CHARS:
+            raise BootstrapError("instruction request exceeds 4000 characters")
+
+        hook_context = HookTraceContext(
+            transcript_path=None,
+            agent_transcript_path=None,
+            session_id=session_id,
+            parent_session_id=None,
+            agent_id=None,
+            agent_type=None,
+        )
+        collect_result = _run_collect(
+            host,
+            lifecycle_event="session_start",
+            hook_context=hook_context,
+            baseline=False,
+            include_active=True,
+            quiet=True,
+        )
+        if collect_result != 0:
+            raise BootstrapError("active trace upload failed")
+
+        plugin_root = _plugin_root()
+        metadata = _load_runtime_metadata(plugin_root, host)
+        enrollment_target = _enrollment_host(host)
+        enrollment_metadata = (
+            metadata if enrollment_target == host else _load_runtime_metadata(plugin_root, enrollment_target)
+        )
+        context = _enrollment_context(_worker_base_url(), _dashboard_base_url(), enrollment_metadata)
+        credential = _cached_host_credential(context)
+        if credential is None:
+            raise BootstrapError("Promptless host enrollment is required")
+
+        request_id = str(uuid4())
+        url = _worker_url(
+            _worker_base_url(),
+            f"/v0/instruction-requests?{urlencode({'target': host})}",
+        )
+        response = _post_json_response(
+            url,
+            credential.value,
+            {
+                "request_id": request_id,
+                "session_id": session_id,
+                "request": request_text,
+            },
+            label="instruction request response",
+        )
+        if response.get("accepted") is not True or response.get("request_id") != request_id:
+            raise BootstrapError("instruction request response did not confirm the request")
+        _emit_command_json(
+            {
+                "status": "submitted",
+                "request_id": request_id,
+                "session_id": session_id,
+            }
+        )
+        return 0
+    except (BootstrapError, OSError, ValueError, urllib.error.URLError) as exc:
+        _emit_command_json({"status": "error", "message": _redact_text(str(exc))})
+        return 1
     finally:
         _flush_control_output()
 
