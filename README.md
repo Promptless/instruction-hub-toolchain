@@ -180,7 +180,10 @@ The runtime uploads native host transcript JSONL ranges to
 uploader and forward-only ledger. The ledger lives at
 `~/.promptless/instruction-hub/host-runtime-ledger.json` or
 `PROMPTLESS_HOST_RUNTIME_LEDGER` when set. Uploads use the host credential and
-are gated by the `enabled_hosts` policy.
+are gated by the `enabled_hosts` policy. Codex idle discovery scans only
+`CODEX_HOME/sessions/**/*.jsonl` and
+`CODEX_HOME/archived_sessions/**/*.jsonl`. Hook-provided current transcript
+paths remain eligible outside those roots.
 
 SessionStart hooks launch one quiet `ensure`-then-collection supervisor. They
 include active files so pre-existing history is uploaded from byte zero when a

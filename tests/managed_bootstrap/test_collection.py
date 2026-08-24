@@ -168,6 +168,42 @@ def test_collect_with_no_sources_does_not_create_ledger(tmp_path: Path) -> None:
         server.stop()
 
 
+def test_collect_ignores_codex_jsonl_outside_native_trace_roots(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/pig"
+    server = _FakeWorkerServer()
+    server.start()
+    try:
+        home = tmp_path / "home"
+        codex_home = home / ".codex"
+        artifact_path = codex_home / "artifacts/trace-reprocessing/copied-session.jsonl"
+        artifact_path.parent.mkdir(parents=True)
+        artifact_path.write_bytes(b'{"kind":"session_start","message":"copied artifact"}\n')
+        ledger_path = tmp_path / "ledger.json"
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(codex_home),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--include-active", "--quiet"],
+            env,
+            {},
+        )
+
+        assert server.trace_batches == []
+        assert not ledger_path.exists()
+    finally:
+        server.stop()
+
+
 def test_collect_resumes_from_existing_ledger_offset(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")

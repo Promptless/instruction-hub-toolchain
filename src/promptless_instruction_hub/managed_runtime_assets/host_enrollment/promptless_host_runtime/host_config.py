@@ -34,7 +34,10 @@ def _native_trace_globs(host: Host) -> tuple[str, ...]:
     if host == "claude-desktop":
         return tuple(str(root / "**/audit.jsonl") for root in _claude_desktop_trace_roots())
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
-    return (str(codex_home / "**/*.jsonl"),)
+    return (
+        str(codex_home / "sessions/**/*.jsonl"),
+        str(codex_home / "archived_sessions/**/*.jsonl"),
+    )
 
 
 def _claude_desktop_trace_roots() -> tuple[Path, ...]:

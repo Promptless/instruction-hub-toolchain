@@ -892,6 +892,7 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
             "/v0/host-enrollment/policy?target=claude",
         ]
         assert len(server.check_ins) == 2
+        expected_native_root_counts = {"codex": 2, "claude": 1}
         for check_in in server.check_ins:
             assert set(check_in) == {
                 "bootstrap_version",
@@ -922,7 +923,8 @@ def test_bootstrap_configures_codex_and_claude_and_reports_metadata(tmp_path: Pa
             assert effective_config["configured"] is True
             assert effective_config["managed_config_detected"] is False
             assert effective_config["trace_upload_endpoint"] == f"{server.base_url}/v0/traces/batches"
-            assert effective_config["native_root_count"] == 1
+            host = _json_string(check_in["host"], "host")
+            assert effective_config["native_root_count"] == expected_native_root_counts[host]
             assert _json_string(effective_config["source_ledger_path"], "source_ledger_path").endswith(
                 "host-runtime-ledger.json"
             )
