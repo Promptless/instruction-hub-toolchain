@@ -11,9 +11,11 @@ import json
 import os
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
+from typing import Protocol, cast
 from urllib.parse import urlencode
 
 from .contracts import (
@@ -27,6 +29,7 @@ from .contracts import (
     Host,
     HostCredential,
     HostPolicy,
+    HOST_VALUES,
     IDLE_SESSION_GRACE_SECONDS,
     JsonValue,
     LifecycleEvent,
@@ -41,7 +44,10 @@ from .contracts import (
     SourceEvent,
     SourceLedger,
     TARGET_TRANSPORT_BATCH_BYTES,
+    TraceSourceRangeProof,
+    TraceSourceSequenceConflict,
     UploadBatch,
+    WorkerResponseError,
     _enrollment_host,
 )
 from .enrollment import (
@@ -67,6 +73,16 @@ from .validation import (
     _string_value,
 )
 from .worker import _get_json, _post_json_response, _validate_signed_policy, _worker_url
+
+
+class _HashState(Protocol):
+    """Copyable digest state used to bind an upload to one source snapshot."""
+
+    def copy(self) -> _HashState: ...
+
+    def update(self, data: bytes) -> None: ...
+
+    def hexdigest(self) -> str: ...
 
 
 def _run_collect(
@@ -517,13 +533,11 @@ def _iter_upload_batches(
                 # Passing the raw-size cap does not guarantee the wire fits: high-entropy
                 # content grows under gzip+base64. Skip-report the record so the ledger
                 # advances past it instead of retrying an unsendable chunk forever.
-                event = _oversized_event(
-                    event.path,
-                    event.path_hash,
-                    event.start_offset,
-                    event.end_offset,
-                    event.content or b"",
-                    reason="transport_size",
+                event = replace(
+                    event,
+                    kind="oversized_record",
+                    content=None,
+                    oversized_reason="transport_size",
                 )
                 payload = _chunk_payload(event, chunk_lifecycle)
                 event_batch = _upload_batch(
@@ -628,8 +642,13 @@ def _upload_source_paths(
                 if ledger.drift_reports:
                     _write_source_ledger(ledger)
                 break
-            response = _post_upload_batch(upload_url, credential, policy, batch)
-            _advance_ledger_from_response(ledger, source_paths, response)
+            try:
+                response = _post_upload_batch(upload_url, credential, policy, batch)
+            except TraceSourceSequenceConflict as conflict:
+                _reconcile_source_sequence_conflict(ledger, batch, conflict)
+                _write_source_ledger(ledger)
+                continue
+            _advance_ledger_from_response(ledger, batch, response)
             _write_source_ledger(ledger)
         uploaded_batch_count += 1
         uploaded_chunk_count += len(batch.events)
@@ -645,32 +664,60 @@ def _iter_source_events(ledger: SourceLedger, source_paths: tuple[Path, ...]) ->
         if start_offset is None or start_offset < 0:
             start_offset = 0
         try:
-            file_size = path.stat().st_size
-        except OSError:
-            continue
-        if start_offset > file_size:
-            ledger.drift_reports.append(
-                {
-                    "kind": "native_trace_source_rewound",
-                    "source_path_hash": path_hash,
-                    "previous_end_offset": start_offset,
-                    "current_size": file_size,
-                }
-            )
-            ledger.reset_sources.add(path_hash)
-            if source is not None:
-                reset_source = dict(source)
-                reset_source.pop("instruction_hub_release_markers", None)
-                reset_source.pop("provenance_only", None)
-                ledger.sources[path_hash] = reset_source
-            start_offset = 0
-        if start_offset == file_size:
-            continue
-        try:
             with path.open("rb") as handle:
-                handle.seek(start_offset)
+                file_size = os.fstat(handle.fileno()).st_size
+                if start_offset > file_size:
+                    ledger.drift_reports.append(
+                        {
+                            "kind": "native_trace_source_rewound",
+                            "source_path_hash": path_hash,
+                            "previous_end_offset": start_offset,
+                            "current_size": file_size,
+                        }
+                    )
+                    ledger.reset_sources.add(path_hash)
+                    if source is not None:
+                        reset_source = dict(source)
+                        reset_source.pop("instruction_hub_release_markers", None)
+                        reset_source.pop("provenance_only", None)
+                        ledger.sources[path_hash] = reset_source
+                    start_offset = 0
+
+                source_prefix_digest = cast(_HashState, hashlib.sha256())
+                remaining_prefix_bytes = start_offset
+                while remaining_prefix_bytes > 0:
+                    block = handle.read(min(remaining_prefix_bytes, 1024 * 1024))
+                    if block == b"":
+                        raise OSError("trace source was truncated while capturing its upload snapshot")
+                    source_prefix_digest.update(block)
+                    remaining_prefix_bytes -= len(block)
+
+                prefix_sha256 = _string_value(source.get("prefix_sha256")) if source is not None else None
+                if start_offset > 0 and prefix_sha256 is not None:
+                    if source_prefix_digest.hexdigest() != prefix_sha256:
+                        ledger.drift_reports.append(
+                            {
+                                "kind": "native_trace_source_identity_changed",
+                                "source_path_hash": path_hash,
+                                "previous_end_offset": start_offset,
+                                "current_size": file_size,
+                            }
+                        )
+                        ledger.reset_sources.add(path_hash)
+                        if source is not None:
+                            reset_source = dict(source)
+                            reset_source.pop("instruction_hub_release_markers", None)
+                            reset_source.pop("provenance_only", None)
+                            ledger.sources[path_hash] = reset_source
+                        start_offset = 0
+                        handle.seek(0)
+                        source_prefix_digest = cast(_HashState, hashlib.sha256())
+                if start_offset == file_size:
+                    continue
+
                 buffered_lines = bytearray()
                 buffered_start = start_offset
+                buffered_prefix_digest = source_prefix_digest.copy()
                 while handle.tell() < file_size:
                     record_start = handle.tell()
                     line = handle.readline()
@@ -678,31 +725,68 @@ def _iter_source_events(ledger: SourceLedger, source_paths: tuple[Path, ...]) ->
                         break
                     if len(line) > MAX_RECORD_BYTES:
                         if buffered_lines:
-                            yield _range_event(path, path_hash, buffered_start, record_start, bytes(buffered_lines))
+                            yield _range_event(
+                                path,
+                                path_hash,
+                                buffered_start,
+                                record_start,
+                                bytes(buffered_lines),
+                                buffered_prefix_digest,
+                            )
                             buffered_lines = bytearray()
                         yield _oversized_event(
-                            path, path_hash, record_start, handle.tell(), line, reason="content_size"
+                            path,
+                            path_hash,
+                            record_start,
+                            handle.tell(),
+                            line,
+                            source_prefix_digest,
+                            reason="content_size",
                         )
+                        source_prefix_digest.update(line)
                         buffered_start = handle.tell()
+                        buffered_prefix_digest = source_prefix_digest.copy()
                         continue
                     if buffered_lines and len(buffered_lines) + len(line) > CHUNK_TARGET_BYTES:
-                        yield _range_event(path, path_hash, buffered_start, record_start, bytes(buffered_lines))
+                        yield _range_event(
+                            path,
+                            path_hash,
+                            buffered_start,
+                            record_start,
+                            bytes(buffered_lines),
+                            buffered_prefix_digest,
+                        )
                         buffered_lines = bytearray()
                         buffered_start = record_start
+                        buffered_prefix_digest = source_prefix_digest.copy()
                     buffered_lines += line
+                    source_prefix_digest.update(line)
                 if buffered_lines:
                     yield _range_event(
-                        path, path_hash, buffered_start, buffered_start + len(buffered_lines), bytes(buffered_lines)
+                        path,
+                        path_hash,
+                        buffered_start,
+                        buffered_start + len(buffered_lines),
+                        bytes(buffered_lines),
+                        buffered_prefix_digest,
                     )
         except OSError:
-            # A source that vanished or lost read permission after the stat() above
-            # must not abort the run: a persistently unreadable idle file would block
-            # all later uploads forever. Ranges already yielded stay contiguous from
-            # the watermark, which retries the remainder on the next collect.
+            # A source that vanished, was truncated, or lost read permission mid-read
+            # must not abort the run: that would drop every pending chunk, including
+            # the hook subject's, and a persistently unreadable idle file would block
+            # all uploads forever. Ranges already yielded stay contiguous from the
+            # watermark, which retries the remainder on the next collect.
             ledger.drift_reports.append({"kind": "native_trace_source_unreadable", "source_path_hash": path_hash})
 
 
-def _range_event(path: Path, path_hash: str, start_offset: int, end_offset: int, content: bytes) -> SourceEvent:
+def _range_event(
+    path: Path,
+    path_hash: str,
+    start_offset: int,
+    end_offset: int,
+    content: bytes,
+    source_prefix_digest: _HashState,
+) -> SourceEvent:
     return SourceEvent(
         kind="jsonl_range",
         path=path,
@@ -712,6 +796,7 @@ def _range_event(path: Path, path_hash: str, start_offset: int, end_offset: int,
         byte_count=len(content),
         content_sha256=hashlib.sha256(content).hexdigest(),
         content=content,
+        source_prefix_sha256_at=_source_prefix_sha256_at(source_prefix_digest, start_offset, content),
     )
 
 
@@ -721,6 +806,7 @@ def _oversized_event(
     start_offset: int,
     end_offset: int,
     content: bytes,
+    source_prefix_digest: _HashState,
     *,
     reason: OversizedReason,
 ) -> SourceEvent:
@@ -733,11 +819,32 @@ def _oversized_event(
         byte_count=len(content),
         content_sha256=hashlib.sha256(content).hexdigest(),
         oversized_reason=reason,
+        source_prefix_sha256_at=_source_prefix_sha256_at(source_prefix_digest, start_offset, content),
     )
 
 
+def _source_prefix_sha256_at(
+    source_prefix_digest: _HashState,
+    start_offset: int,
+    content: bytes,
+) -> Callable[[int], str]:
+    """Return full-prefix digests derived from the bytes captured for one event."""
+
+    captured_prefix_digest = source_prefix_digest.copy()
+
+    def digest_at(end_offset: int) -> str:
+        relative_end = end_offset - start_offset
+        if relative_end < 0 or relative_end > len(content):
+            raise BootstrapError("trace source offset fell outside its captured upload snapshot")
+        digest = captured_prefix_digest.copy()
+        digest.update(content[:relative_end])
+        return digest.hexdigest()
+
+    return digest_at
+
+
 def _event_transcript_paths(hook_context: HookTraceContext, lifecycle_event: LifecycleEvent) -> frozenset[Path]:
-    """Return the transcript files described by the current lifecycle event.
+    """Return the files the hook's lifecycle event actually describes.
 
     Idle-file sweeps piggyback on whatever hook fired; stamping the hook's
     lifecycle event onto chunks from other sessions' files would finalize those
@@ -866,9 +973,135 @@ def _post_upload_batch(
     policy: HostPolicy,
     batch: UploadBatch,
 ) -> dict[str, JsonValue]:
-    response = _post_json_response(upload_url, credential.value, batch.request, label="trace batch response")
+    try:
+        response = _post_json_response(upload_url, credential.value, batch.request, label="trace batch response")
+    except WorkerResponseError as exc:
+        conflict = _trace_source_sequence_conflict(exc, batch)
+        if conflict is None:
+            raise
+        raise conflict from exc
     _validate_upload_response(response, policy, batch)
     return response
+
+
+def _trace_source_sequence_conflict(
+    error: WorkerResponseError,
+    batch: UploadBatch,
+) -> TraceSourceSequenceConflict | None:
+    if error.status_code != 409 or error.response_body == b"":
+        return None
+    try:
+        payload = _decode_json_object(error.response_body, "trace batch error response")
+    except BootstrapError:
+        return None
+    detail = _json_mapping_or_empty(payload.get("detail"))
+    if _string_value(detail.get("code")) != "trace_source_sequence_conflict":
+        return None
+    source = _string_value(detail.get("source"))
+    source_path_hash = _string_value(detail.get("source_path_hash"))
+    requested_start_offset = _optional_int_value(detail.get("requested_start_offset"))
+    requested_end_offset = _optional_int_value(detail.get("requested_end_offset"))
+    acknowledged_offset = _optional_int_value(detail.get("acknowledged_offset"))
+    acknowledged_range = _json_mapping_or_empty(detail.get("acknowledged_range"))
+    acknowledged_range_start = _optional_int_value(acknowledged_range.get("start_offset"))
+    acknowledged_range_end = _optional_int_value(acknowledged_range.get("end_offset"))
+    acknowledged_range_sha256 = _string_value(acknowledged_range.get("content_sha256"))
+    request_source = _string_value(batch.request.get("source"))
+    if (
+        source not in HOST_VALUES
+        or source != request_source
+        or source_path_hash is None
+        or requested_start_offset is None
+        or requested_end_offset is None
+        or acknowledged_offset is None
+        or acknowledged_range_start is None
+        or acknowledged_range_end is None
+        or acknowledged_range_sha256 is None
+        or acknowledged_range_start != requested_start_offset
+        or acknowledged_range_end != acknowledged_offset
+        or len(acknowledged_range_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in acknowledged_range_sha256)
+    ):
+        return None
+    matching_event = next(
+        (
+            event
+            for event in batch.events
+            if event.path_hash == source_path_hash
+            and event.start_offset == requested_start_offset
+            and event.end_offset == requested_end_offset
+        ),
+        None,
+    )
+    if matching_event is None:
+        return None
+    return TraceSourceSequenceConflict(
+        source=source,
+        source_path_hash=source_path_hash,
+        requested_start_offset=requested_start_offset,
+        requested_end_offset=requested_end_offset,
+        acknowledged_offset=acknowledged_offset,
+        acknowledged_range=TraceSourceRangeProof(
+            start_offset=acknowledged_range_start,
+            end_offset=acknowledged_range_end,
+            content_sha256=acknowledged_range_sha256,
+        ),
+    )
+
+
+def _reconcile_source_sequence_conflict(
+    ledger: SourceLedger,
+    batch: UploadBatch,
+    conflict: TraceSourceSequenceConflict,
+) -> None:
+    event = next(
+        (
+            candidate
+            for candidate in batch.events
+            if candidate.path_hash == conflict.source_path_hash
+            and candidate.start_offset == conflict.requested_start_offset
+            and candidate.end_offset == conflict.requested_end_offset
+        ),
+        None,
+    )
+    if event is None:
+        raise BootstrapError("trace source sequence conflict did not match the rejected upload batch")
+    existing = _json_mapping_or_empty(ledger.sources.get(event.path_hash))
+    local_offset = _optional_int_value(existing.get("end_offset")) or 0
+    if local_offset != conflict.requested_start_offset:
+        raise BootstrapError("trace source sequence conflict did not match the local source ledger")
+    if not conflict.requested_start_offset < conflict.acknowledged_offset < conflict.requested_end_offset:
+        raise BootstrapError("trace source sequence conflict did not identify an interior worker watermark")
+    proof = conflict.acknowledged_range
+    if proof.start_offset != local_offset or proof.end_offset != conflict.acknowledged_offset:
+        raise BootstrapError("trace source sequence conflict proof did not match the local source range")
+    prefix_sha256_at = event.source_prefix_sha256_at
+    if prefix_sha256_at is None:
+        raise BootstrapError("trace source sequence conflict was missing its captured upload snapshot")
+    local_prefix_sha256 = _string_value(existing.get("prefix_sha256"))
+    if local_prefix_sha256 is not None and prefix_sha256_at(local_offset) != local_prefix_sha256:
+        raise BootstrapError("trace source identity changed before watermark reconciliation")
+    if event.content is None:
+        raise BootstrapError("trace source sequence conflict referenced an upload without captured bytes")
+    acknowledged_content = event.content[: proof.end_offset - proof.start_offset]
+    if hashlib.sha256(acknowledged_content).hexdigest() != proof.content_sha256:
+        raise BootstrapError("trace source sequence conflict proof did not match the uploaded source bytes")
+    if not acknowledged_content.endswith(b"\n"):
+        raise BootstrapError("trace source sequence conflict proof did not end at a record boundary")
+    _record_ledger_offset(
+        ledger,
+        event.path,
+        conflict.acknowledged_offset,
+        prefix_sha256=prefix_sha256_at(conflict.acknowledged_offset),
+    )
+    ledger.drift_reports.append(
+        {
+            "kind": "native_trace_source_watermark_reconciled",
+            "source_path_hash": conflict.source_path_hash,
+            "previous_end_offset": local_offset,
+            "worker_end_offset": conflict.acknowledged_offset,
+        }
+    )
 
 
 def _validate_upload_response(response: dict[str, JsonValue], policy: HostPolicy, batch: UploadBatch) -> None:
@@ -893,10 +1126,10 @@ def _validate_upload_response(response: dict[str, JsonValue], policy: HostPolicy
 
 def _advance_ledger_from_response(
     ledger: SourceLedger,
-    source_paths: tuple[Path, ...],
+    batch: UploadBatch,
     response: dict[str, JsonValue],
 ) -> None:
-    paths_by_hash = {_path_hash(path): path for path in source_paths}
+    events_by_range = {(event.path_hash, event.start_offset, event.end_offset): event for event in batch.events}
     acknowledged_ranges = response.get("acknowledged_ranges")
     if not isinstance(acknowledged_ranges, list):
         raise BootstrapError("trace batch response acknowledged_ranges must be a list")
@@ -906,10 +1139,21 @@ def _advance_ledger_from_response(
         end_offset = _optional_int_value(acknowledged.get("end_offset"))
         if source_path_hash is None or end_offset is None:
             raise BootstrapError("trace batch response acknowledged range is malformed")
-        path = paths_by_hash.get(source_path_hash)
-        if path is None:
-            raise BootstrapError("trace batch response acknowledged unknown source")
-        _record_ledger_offset(ledger, path, end_offset)
+        start_offset = _optional_int_value(acknowledged.get("start_offset"))
+        if start_offset is None:
+            raise BootstrapError("trace batch response acknowledged range is malformed")
+        event = events_by_range.get((source_path_hash, start_offset, end_offset))
+        if event is None:
+            raise BootstrapError("trace batch response acknowledged unknown source range")
+        prefix_sha256_at = event.source_prefix_sha256_at
+        if prefix_sha256_at is None:
+            raise BootstrapError("trace batch response was missing its captured upload snapshot")
+        _record_ledger_offset(
+            ledger,
+            event.path,
+            end_offset,
+            prefix_sha256=prefix_sha256_at(end_offset),
+        )
 
 
 def _expected_acknowledged_ranges(events: tuple[SourceEvent, ...]) -> list[dict[str, JsonValue]]:
@@ -926,21 +1170,53 @@ def _expected_acknowledged_ranges(events: tuple[SourceEvent, ...]) -> list[dict[
     ]
 
 
-def _record_ledger_offset(ledger: SourceLedger, path: Path, end_offset: int) -> None:
+def _record_ledger_offset(
+    ledger: SourceLedger,
+    path: Path,
+    end_offset: int,
+    *,
+    prefix_sha256: str | None = None,
+) -> None:
     path_hash = _path_hash(path)
     existing = _json_mapping_or_empty(ledger.sources.get(path_hash))
     previous_offset = 0 if path_hash in ledger.reset_sources else (_optional_int_value(existing.get("end_offset")) or 0)
+    recorded_offset = max(previous_offset, end_offset)
+    if prefix_sha256 is not None and recorded_offset != end_offset:
+        raise BootstrapError("trace source snapshot did not match the ledger offset being recorded")
+    if prefix_sha256 is None:
+        prefix_sha256 = _source_prefix_sha256(path, recorded_offset)
+    if prefix_sha256 is None:
+        raise BootstrapError("trace source changed before its acknowledged offset could be recorded")
     updated_source = dict(existing)
     updated_source.update(
         {
             "path": str(path),
-            "end_offset": max(previous_offset, end_offset),
+            "end_offset": recorded_offset,
+            "prefix_sha256": prefix_sha256,
             "updated_at": _utc_now_iso(),
         }
     )
     updated_source.pop("provenance_only", None)
     updated_source.pop("instruction_hub_release_markers", None)
     ledger.sources[path_hash] = updated_source
+
+
+def _source_prefix_sha256(path: Path, end_offset: int) -> str | None:
+    """Hash exactly the source prefix represented by one local ledger offset."""
+
+    digest = hashlib.sha256()
+    remaining = end_offset
+    try:
+        with path.open("rb") as source_file:
+            while remaining > 0:
+                block = source_file.read(min(remaining, 1024 * 1024))
+                if block == b"":
+                    return None
+                digest.update(block)
+                remaining -= len(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
 
 
 def _path_hash(path: Path) -> str:

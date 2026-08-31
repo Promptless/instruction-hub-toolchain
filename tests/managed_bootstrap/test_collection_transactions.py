@@ -34,7 +34,7 @@ from .helpers import _FakeWorkerServer, _diagnostic_log_entries, _run_runtime_js
 
 def _metadata(plugin_version: str = "1.0.0") -> RuntimeMetadata:
     return RuntimeMetadata(
-        bootstrap_version="0.2.8",
+        bootstrap_version="0.2.9",
         toolchain_version="test",
         plugin_id="promptless-instruction-hub-pig",
         plugin_name="PIG",

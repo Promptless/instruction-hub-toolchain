@@ -130,7 +130,9 @@ def _optional_int_value(value: JsonValue | None) -> int | None:
 def _decode_json_object(body: bytes, label: str) -> dict[str, JsonValue]:
     try:
         value = json.loads(body.decode())
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if isinstance(exc, UnicodeDecodeError):
+            raise BootstrapError(f"{label} is not valid UTF-8") from exc
         raise BootstrapError(f"{label} is invalid JSON: {exc.msg}") from exc
     if not isinstance(value, dict):
         raise BootstrapError(f"{label} must be a JSON object")

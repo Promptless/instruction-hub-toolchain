@@ -110,7 +110,7 @@ def test_collect_uploads_full_transcript_then_only_new_ranges(tmp_path: Path) ->
         assert batch["host"] == "codex"
         assert batch["session_id"] == "codex_session_1"
         assert batch["policy_version"] == 1
-        assert batch["collector_version"] == "0.2.8"
+        assert batch["collector_version"] == "0.2.9"
         chunks = _json_list(batch["chunks"], "batch.chunks")
         # contiguous complete lines coalesce into one contract-shaped range chunk
         assert len(chunks) == 1
@@ -315,6 +315,7 @@ def test_collect_uploads_new_ledger_sources_from_start(tmp_path: Path) -> None:
         sources = _json_mapping(ledger["sources"], "ledger.sources")
         source = _json_mapping(sources[_json_string(chunk["source_path_hash"], "source_path_hash")], "source")
         assert source["end_offset"] == transcript_path.stat().st_size
+        assert source["prefix_sha256"] == hashlib.sha256(first_record + second_record).hexdigest()
 
         # The ledger advanced through the normal ACK path, so a repeat collect uploads nothing.
         _run_collect(
@@ -344,6 +345,68 @@ def test_collect_uploads_new_ledger_sources_from_start(tmp_path: Path) -> None:
             gzip.decompress(base64.b64decode(_json_string(history_chunk["content_base64"], "content")))
             == historical_record
         )
+    finally:
+        server.stop()
+
+
+def test_collect_recovers_when_worker_committed_an_upload_without_acknowledging_it(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    build_hub(hub_root)
+    plugin_root = hub_root / "dist/codex/pig"
+    server = _FakeWorkerServer(enforce_trace_watermarks=True, drop_next_trace_response_after_commit=True)
+    server.start()
+    try:
+        home = tmp_path / "home"
+        ledger_path = tmp_path / "ledger.json"
+        transcript_path = tmp_path / "codex-session.jsonl"
+        first_record = b'{"kind":"session_start","message":"committed without response"}\n'
+        appended_record = b'{"kind":"stop","message":"appended before retry"}\n'
+        transcript_path.write_bytes(first_record)
+        env = {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "PLUGIN_ROOT": str(plugin_root),
+            "PROMPTLESS_WORKER_BASE_URL": server.base_url,
+            "PROMPTLESS_HOST_RUNTIME_LEDGER": str(ledger_path),
+        }
+        hook_context = {"session_id": "codex_session_1", "transcript_path": str(transcript_path)}
+
+        _run_runtime_json(plugin_root, ["enroll", "--host", "codex"], env)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "session_start", "--quiet"],
+            env,
+            hook_context,
+        )
+
+        transcript_path.write_bytes(first_record + appended_record)
+        _run_collect(
+            plugin_root,
+            ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+            env,
+            hook_context,
+        )
+
+        requested_ranges = []
+        for batch in server.trace_batches:
+            chunks = _json_list(batch["chunks"], "batch.chunks")
+            assert len(chunks) == 1
+            chunk = _json_mapping(chunks[0], "batch.chunks[0]")
+            requested_ranges.append((chunk["start_offset"], chunk["end_offset"]))
+        assert requested_ranges == [
+            (0, len(first_record)),
+            (0, len(first_record) + len(appended_record)),
+            (len(first_record), len(first_record) + len(appended_record)),
+        ]
+
+        ledger = _json_mapping(validate_json_value(json.loads(ledger_path.read_text()), "ledger"), "ledger")
+        sources = _json_mapping(ledger["sources"], "ledger.sources")
+        source = _json_mapping(next(iter(sources.values())), "ledger.sources[0]")
+        assert source["end_offset"] == len(first_record) + len(appended_record)
+        assert source["prefix_sha256"] == hashlib.sha256(first_record + appended_record).hexdigest()
+        assert "provenance_only" not in source
+        assert "instruction_hub_release_markers" not in source
     finally:
         server.stop()
 

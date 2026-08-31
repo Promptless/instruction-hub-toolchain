@@ -490,6 +490,8 @@ class _FakeWorkerServer:
         pending_approval_url_override: str | None = None,
         pending_approval_path: str = "/instruction-hub/enroll",
         unparsed_record_count: int = 0,
+        enforce_trace_watermarks: bool = False,
+        drop_next_trace_response_after_commit: bool = False,
     ) -> None:
         self.check_ins: list[dict[str, JsonValue]] = []
         self.policy_requests: list[str] = []
@@ -512,6 +514,9 @@ class _FakeWorkerServer:
         _FakeWorkerHandler.pending_approval_url_override = pending_approval_url_override
         _FakeWorkerHandler.pending_approval_path = pending_approval_path
         _FakeWorkerHandler.unparsed_record_count = unparsed_record_count
+        _FakeWorkerHandler.enforce_trace_watermarks = enforce_trace_watermarks
+        _FakeWorkerHandler.drop_next_trace_response_after_commit = drop_next_trace_response_after_commit
+        _FakeWorkerHandler.trace_watermarks = {}
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWorkerHandler)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
@@ -542,6 +547,9 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
     pending_approval_url_override: ClassVar[str | None] = None
     pending_approval_path: ClassVar[str] = "/instruction-hub/enroll"
     unparsed_record_count: ClassVar[int] = 0
+    enforce_trace_watermarks: ClassVar[bool] = False
+    drop_next_trace_response_after_commit: ClassVar[bool] = False
+    trace_watermarks: ClassVar[dict[tuple[str, str], tuple[int, int, str]]] = {}
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
@@ -628,6 +636,40 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
             skipped_record_count = 0
             for chunk_value in chunks:
                 chunk = _json_mapping(chunk_value, "trace batch chunk")
+                source = _json_string(payload["source"], "trace batch source")
+                source_path_hash = _json_string(chunk["source_path_hash"], "trace batch source path hash")
+                start_offset = _json_int(chunk["start_offset"], "trace batch start offset")
+                end_offset = _json_int(chunk["end_offset"], "trace batch end offset")
+                watermark_key = (source, source_path_hash)
+                acknowledged_range = self.trace_watermarks.get(watermark_key)
+                acknowledged_offset = acknowledged_range[1] if acknowledged_range is not None else 0
+                if self.enforce_trace_watermarks and end_offset > acknowledged_offset:
+                    if acknowledged_offset > 0 and start_offset != acknowledged_offset:
+                        assert acknowledged_range is not None
+                        self._write_json(
+                            {
+                                "detail": {
+                                    "code": "trace_source_sequence_conflict",
+                                    "source": source,
+                                    "source_path_hash": source_path_hash,
+                                    "requested_start_offset": start_offset,
+                                    "requested_end_offset": end_offset,
+                                    "acknowledged_offset": acknowledged_offset,
+                                    "acknowledged_range": {
+                                        "start_offset": acknowledged_range[0],
+                                        "end_offset": acknowledged_range[1],
+                                        "content_sha256": acknowledged_range[2],
+                                    },
+                                }
+                            },
+                            status=409,
+                        )
+                        return
+                    self.trace_watermarks[watermark_key] = (
+                        start_offset,
+                        end_offset,
+                        _json_string(chunk["content_sha256"], "trace batch content sha256"),
+                    )
                 if chunk["kind"] == "jsonl_range":
                     raw_artifact_count += 1
                 elif chunk["kind"] == "oversized_record":
@@ -641,6 +683,10 @@ class _FakeWorkerHandler(BaseHTTPRequestHandler):
                         "content_sha256": chunk["content_sha256"],
                     }
                 )
+            if self.drop_next_trace_response_after_commit:
+                type(self).drop_next_trace_response_after_commit = False
+                self.close_connection = True
+                return
             self._write_json(
                 {
                     "accepted": True,

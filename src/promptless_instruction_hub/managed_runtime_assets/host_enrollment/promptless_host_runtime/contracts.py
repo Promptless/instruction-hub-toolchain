@@ -5,9 +5,9 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Union
+from typing import Callable, Literal, Union
 
-RUNTIME_VERSION = "0.2.8"
+RUNTIME_VERSION = "0.2.9"
 
 
 RUNTIME_CHANNEL = "stable"
@@ -76,7 +76,9 @@ MAX_RECORD_BYTES = 10 * 1024 * 1024
 CHUNK_TARGET_BYTES = 4 * 1024 * 1024
 
 
-MAX_UPLOAD_CHUNKS_PER_BATCH = 200
+# The worker commits one source chunk per transaction. Keep the request at that
+# same boundary so a rejection cannot hide committed siblings from the ledger.
+MAX_UPLOAD_CHUNKS_PER_BATCH = 1
 
 
 # This soft request target fits one established 4 MiB source range after
@@ -163,6 +165,7 @@ FIRST_ENROLLMENT_SUCCESS_SHOWN_KEY = "first_enrollment_success_shown_at_by_targe
 
 
 Host = Literal["codex", "claude", "claude-desktop"]
+HOST_VALUES = ("codex", "claude", "claude-desktop")
 
 
 def _enrollment_host(host: Host) -> Host:
@@ -201,6 +204,53 @@ class BootstrapError(RuntimeError):
 
 class BootstrapAuthError(BootstrapError):
     """Host credential was rejected by the worker."""
+
+
+class WorkerResponseError(BootstrapError):
+    """Worker returned a non-authentication HTTP error response."""
+
+    def __init__(self, message: str, *, status_code: int, response_body: bytes) -> None:
+        """Preserve the status and response body for contract-specific handling."""
+
+        self.status_code = status_code
+        self.response_body = response_body
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class TraceSourceRangeProof:
+    """Worker digest for the committed source bytes ending at its watermark."""
+
+    start_offset: int
+    end_offset: int
+    content_sha256: str
+
+
+class TraceSourceSequenceConflict(BootstrapError):
+    """Worker reported its watermark for an exact rejected trace range."""
+
+    def __init__(
+        self,
+        *,
+        source: Host,
+        source_path_hash: str,
+        requested_start_offset: int,
+        requested_end_offset: int,
+        acknowledged_offset: int,
+        acknowledged_range: TraceSourceRangeProof,
+    ) -> None:
+        """Record the rejected range and proof of the worker's committed prefix."""
+
+        self.source = source
+        self.source_path_hash = source_path_hash
+        self.requested_start_offset = requested_start_offset
+        self.requested_end_offset = requested_end_offset
+        self.acknowledged_offset = acknowledged_offset
+        self.acknowledged_range = acknowledged_range
+        super().__init__(
+            f"trace source {source_path_hash} range {requested_start_offset}-{requested_end_offset} "
+            f"conflicts with worker watermark {acknowledged_offset}"
+        )
 
 
 class CollectDeadlineExceeded(BootstrapError):
@@ -332,6 +382,7 @@ class SourceEvent:
     content_sha256: str | None = None
     content: bytes | None = None
     oversized_reason: OversizedReason | None = None
+    source_prefix_sha256_at: Callable[[int], str] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
