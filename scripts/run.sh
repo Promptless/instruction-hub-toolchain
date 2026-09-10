@@ -501,11 +501,13 @@ prepare_marketplace_pointer() {
 
   repository_url="$(github_repository_url)"
   mkdir -p "$(dirname "$prepared_path")"
-  python - "$platform" "$marketplace_path" "$prepared_path" "$repository_url" "$release_branch" "$hub_rel" "$GITHUB_REPOSITORY" <<'PY'
+  uv run --project "$GITHUB_ACTION_PATH" python - "$platform" "$marketplace_path" "$prepared_path" "$repository_url" "$release_branch" "$hub_rel" "$GITHUB_REPOSITORY" <<'PY'
 from pathlib import Path
 from urllib.parse import urlsplit
 import json
 import sys
+
+from promptless_instruction_hub.render.external import validate_external_marketplace_source
 
 platform = sys.argv[1]
 source_path = Path(sys.argv[2])
@@ -562,6 +564,10 @@ if not isinstance(plugins, list):
 for plugin in plugins:
     if not isinstance(plugin, dict):
         fail("Expected marketplace plugins to be objects.")
+    source = plugin.get("source")
+    if platform in {"claude", "codex"} and isinstance(source, dict) and source.get("source") != "local":
+        validate_external_marketplace_source(source)
+        continue
     path = plugin_local_path(plugin)
     if platform == "cursor" and urlsplit(repository_url).hostname == "github.com":
         plugin["source"] = github_cursor_source(path)
@@ -617,12 +623,14 @@ case "$mode" in
   build)
     hub_rel="$(hub_relative_path)"
     pig validate --hub "$hub_root"
+    pig verify-external --hub "$hub_root"
     pig build --hub "$hub_root"
     restore_generated_paths_on_default_branch "$hub_rel"
     ;;
   check)
     hub_relative_path >/dev/null
     pig validate --hub "$hub_root"
+    pig verify-external --hub "$hub_root"
     pig build --hub "$hub_root" --check
     ;;
   publish)
@@ -637,8 +645,10 @@ case "$mode" in
     pig validate --hub "$hub_root"
     if copy_previous_release_branch "$previous_release_root"; then
       previous_release_exists=true
+      pig verify-external --hub "$hub_root" --previous-release-root "$previous_release_root" --hub-relative-path "$hub_rel"
     else
       previous_release_exists=false
+      pig verify-external --hub "$hub_root"
     fi
     publish_version="$(resolve_publish_version "$previous_release_root" "$hub_rel" "$previous_release_exists")"
     pig build --hub "$hub_root" --version "$publish_version"

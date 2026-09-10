@@ -19,6 +19,8 @@ from promptless_instruction_hub.models import (
     UPDATE_INSTRUCTION_HUB_SKILL_ID,
     Harness,
     HubConfig,
+    HubPluginDefinition,
+    ExternalPluginDefinition,
     LoadedAsset,
     PluginDefinition,
     StablePlugin,
@@ -39,7 +41,7 @@ class ValidationResult:
     """Loaded and validated Instruction Hub source state."""
 
     config: HubConfig
-    plugins: dict[str, PluginDefinition]
+    plugins: dict[str, HubPluginDefinition]
     assets: dict[str, LoadedAsset]
     stable_plugins: tuple[StablePlugin, ...]
     warnings: tuple[AgentSkillWarning, ...] = ()
@@ -200,17 +202,17 @@ def _validate_mcp_assets(assets: dict[str, LoadedAsset]) -> None:
             read_mcp_servers(asset.path, default_server_name=asset.id)
 
 
-def _validate_managed_skill_reservations(plugins: dict[str, PluginDefinition]) -> None:
+def _validate_managed_skill_reservations(plugins: dict[str, HubPluginDefinition]) -> None:
     pig_plugin = plugins.get(PIG_PLUGIN_ID)
     reserved_ref = f"skill:{UPDATE_INSTRUCTION_HUB_SKILL_ID}"
-    if pig_plugin is not None and reserved_ref in pig_plugin.includes:
+    if isinstance(pig_plugin, PluginDefinition) and reserved_ref in pig_plugin.includes:
         msg = f"plugin {PIG_PLUGIN_ID!r} cannot include reserved managed asset {reserved_ref!r}"
         raise InstructionHubError(msg)
 
 
 def _resolve_stable_plugins(
     config: HubConfig,
-    plugins: dict[str, PluginDefinition],
+    plugins: dict[str, HubPluginDefinition],
     assets: dict[str, LoadedAsset],
 ) -> tuple[StablePlugin, ...]:
     stable_plugins: list[StablePlugin] = []
@@ -220,6 +222,11 @@ def _resolve_stable_plugins(
         if plugin is None:
             msg = f"stable plugin not found: {plugin_id}"
             raise InstructionHubError(msg)
+        if isinstance(plugin, ExternalPluginDefinition):
+            if not set(plugin.targets).intersection(config.targets):
+                raise InstructionHubError(f"external plugin {plugin.id!r} has no enabled Hub target")
+            stable_plugins.append(StablePlugin(definition=plugin, assets=()))
+            continue
         missing_refs.update(ref for ref in plugin.includes if ref not in assets)
         plugin_assets = tuple(assets[ref] for ref in sorted(plugin.includes) if ref in assets)
         stable_plugins.append(StablePlugin(definition=plugin, assets=plugin_assets))

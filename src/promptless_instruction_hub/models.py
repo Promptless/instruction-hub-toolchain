@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -146,6 +147,7 @@ class PluginDefinition(BaseModel):
     name: str = Field(min_length=1)
     owners: list[str] = Field(default_factory=list)
     includes: list[str] = Field(default_factory=list)
+    kind: Literal["authored"] = "authored"
 
     @field_validator("id")
     @classmethod
@@ -194,6 +196,89 @@ class HookDefinition(BaseModel):
         if any(not entries for entries in value.values()):
             raise ValueError("hook binding lists must not be empty")
         return value
+
+
+class ExternalGitSource(BaseModel):
+    """A repository revision fetched directly by the plugin host."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["git"]
+    url: str
+    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        """Keep repository locators portable and credentials out of catalogs."""
+
+        parts = urlsplit(value)
+        if (
+            parts.scheme != "https"
+            or not parts.hostname
+            or not parts.path.strip("/")
+            or parts.username is not None
+            or parts.password is not None
+            or parts.query
+            or parts.fragment
+            or any(character.isspace() or ord(character) < 32 for character in value)
+            or "\\" in value
+        ):
+            raise ValueError(
+                "external source url must be an HTTPS repository URL without credentials, query or fragment"
+            )
+        return value
+
+
+class ExternalPluginTarget(BaseModel):
+    """The installable upstream plugin directory for one host."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        """Accept a repository root or a canonical relative POSIX directory."""
+
+        if value == ".":
+            return value
+        if (
+            not value
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+            or any(character.isspace() or ord(character) < 32 for character in value)
+            or "\\" in value
+            or ":" in value
+        ):
+            raise ValueError("external target path must be '.' or a relative POSIX directory without traversal")
+        return value
+
+
+class ExternalPluginDefinition(BaseModel):
+    """An upstream plugin included in this Hub's marketplace without compilation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["external"]
+    id: str
+    name: str = Field(min_length=1)
+    owners: list[str] = Field(default_factory=list)
+    source: ExternalGitSource
+    targets: dict[Literal["claude", "codex"], ExternalPluginTarget] = Field(min_length=1)
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        """Reserve PIG for the Hub's locally generated lifecycle integration."""
+
+        validate_identifier(value, "plugin id")
+        if value == PIG_PLUGIN_ID:
+            raise ValueError("the required pig plugin must be authored locally")
+        return value
+
+
+HubPluginDefinition = PluginDefinition | ExternalPluginDefinition
 
 
 class AssetMetadata(BaseModel):
@@ -251,7 +336,7 @@ class LoadedAsset(BaseModel):
 class StablePlugin:
     """Resolved stable plugin and the assets to render into its plugin payload."""
 
-    definition: PluginDefinition
+    definition: HubPluginDefinition
     assets: tuple[LoadedAsset, ...]
 
 

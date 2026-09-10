@@ -238,7 +238,7 @@ required `plugins/pig.yaml` created by `pig init` in `stable_plugins`.
 The compiler uses `marketplace.id` as the marketplace name and each plugin's
 `id` as its native name. It adds no prefix or suffix. IDs use lowercase letters,
 digits, and hyphens, with a letter or digit at each end. Plugin display names
-come from `name` where the target supports them. Output goes to
+come from `name` where the target supports them. Authored plugin output goes to
 `dist/{target}/{plugin.id}/`. Gemini receives extensions with the same plugin
 IDs; it has no generated marketplace manifest.
 
@@ -261,6 +261,83 @@ branches. Publish requires committed source files and a clean index.
 An unchanged rerun creates no commits. If only one branch needs a content change,
 the other receives an empty recording commit so Git checks both leases. Merely
 writing the resolved version back does not cause another version bump.
+
+### External plugins
+
+A Hub can list a third-party plugin alongside its authored plugins. Declare the
+upstream repository and a reviewed, full 40-character commit SHA, then add the
+plugin ID to `stable_plugins`:
+
+```yaml
+# plugins/doc-detective.yaml
+kind: external
+id: doc-detective
+name: Doc Detective
+source:
+  type: git
+  url: https://github.com/doc-detective/agent-tools.git
+  sha: "<reviewed-40-character-commit-sha>"
+targets:
+  claude:
+    path: plugins/doc-detective
+  codex:
+    path: plugins/doc-detective
+```
+
+Replace the SHA placeholder before validation. Each target path is relative to
+the upstream repository; use `.` for a plugin at its root. External plugins
+currently support Claude and Codex. Cursor and Gemini declarations are rejected;
+authored plugins still support all four targets. Only declared, enabled targets
+receive an entry, and each stable external plugin needs at least one enabled
+target. External definitions cannot include local assets or replace `pig`.
+
+The compiler emits native `git-subdir` sources (or `url` for repository-root
+plugins), preserving the upstream URL, path, and SHA on both source and release
+branches. It creates no `dist` payload or managed runtime for external plugins.
+The upstream manifest must use the same plugin name as the Hub's `id`. Upstream
+authors, versions, skills, MCP configuration, and hooks remain upstream-owned;
+the Hub's `name` is catalog metadata, not a manifest override. Consumers install
+the plugin from the Hub marketplace without adding the upstream marketplace.
+
+`pig validate`, `pig build`, and `pig verify` remain offline. Run the separate
+network check before publication:
+
+```bash
+pig verify-external --hub .
+```
+
+The shared CI runner invokes this check in `build`, `check`, and `publish` modes.
+It fetches the exact commit, checks each enabled target's manifest name and
+optional SemVer version, and checks declared component paths exist inside the
+plugin. Symlinks and submodules inside the plugin are rejected. Verification
+reads Git objects without checking out files or running upstream hooks or code.
+It reports the upstream version with each verified source. This is structural
+verification; it does not validate every host-specific setting or prove that a
+desktop client can install and run the plugin.
+
+Publication also compares with the previous release. Claude pin/path changes
+that retain the same explicit upstream version are rejected because Claude may
+retain its cached plugin. This also covers replacing an authored plugin with an
+external plugin of the same name and version. Choose an upstream release with a
+different version; changing the Hub version cannot override the upstream manifest. Manifests without
+a version use the host's commit-based behavior. See the
+[Claude marketplace source and version rules](https://code.claude.com/docs/en/plugin-marketplaces)
+and [Codex marketplace metadata](https://developers.openai.com/plugins/build/plugins#marketplace-metadata).
+
+Source and target declarations participate in release versioning, so updating a
+pin advances the Hub release even when authored payloads are unchanged. Mixed
+releases use manifest schema version 3 and record external provenance in
+`version_basis.plugins`; authored-only releases keep version 2. The publisher
+accepts both versions, allowing external plugins to be added or removed without
+resetting release history. Older toolchains cannot consume version 3 releases.
+Fetch or verification failures stop before either publish branch is updated.
+
+Only credential-free HTTPS Git URLs are accepted. CI and each consuming host
+need their own access to private upstream repositories; Hub checkout credentials
+do not grant that access. A commit pins repository content, including declared
+MCP configuration, but does not freeze a remote MCP service or dependencies that
+upstream code downloads. Updating the marketplace does not itself prove that an
+already-installed plugin was refreshed by the host.
 
 ### Migrating existing hubs
 
@@ -292,8 +369,9 @@ skill namespaces, choose explicit IDs such as `acme-dev` for customer plugins.
 The compiler never adds that prefix automatically. The managed PIG plugin
 continues to require the ID `pig`.
 
-`hub.release.json` and `hub.stable.json` both use `schema_version: 2` and the
-same top-level `version`. Runtime enrollment metadata still uses `plugin_version`
+`hub.release.json` and `hub.stable.json` share a schema version (2 for authored-only
+releases, 3 when external plugins are selected) and the same top-level `version`.
+Runtime enrollment metadata still uses `plugin_version`
 for the installed plugin's version and `package_id` for the source plugin ID.
 Runtime `plugin_id` matches the literal ID in the native plugin manifest.
 

@@ -6,7 +6,14 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from promptless_instruction_hub.fs import write_json
-from promptless_instruction_hub.models import PIG_PLUGIN_ID, HubConfig, PluginDefinition, StablePlugin
+from promptless_instruction_hub.models import (
+    PIG_PLUGIN_ID,
+    ExternalPluginDefinition,
+    HubConfig,
+    PluginDefinition,
+    StablePlugin,
+)
+from promptless_instruction_hub.render.external import external_marketplace_entry
 from promptless_instruction_hub.render.common import (
     RenderedAssets,
     base_plugin_manifest,
@@ -59,13 +66,17 @@ def write_marketplace(output_root: Path, config: HubConfig, plugins: Sequence[St
         "name": config.marketplace.id,
         "interface": {"displayName": config.marketplace.name},
         "plugins": [
-            {
+            external_marketplace_entry(stable_plugin.definition, "codex")
+            if isinstance(stable_plugin.definition, ExternalPluginDefinition)
+            else {
                 "name": stable_plugin.definition.id,
                 "source": {"source": "local", "path": f"./dist/codex/{stable_plugin.definition.id}"},
                 "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
                 "category": "Productivity",
             }
             for stable_plugin in plugins
+            if not isinstance(stable_plugin.definition, ExternalPluginDefinition)
+            or "codex" in stable_plugin.definition.targets
         ],
     }
     write_json(output_root / ".agents/plugins/marketplace.json", marketplace)

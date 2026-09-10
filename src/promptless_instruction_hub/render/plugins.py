@@ -31,6 +31,8 @@ def render_target_plugins(
 
     for target in config.targets:
         for stable_plugin in plugins:
+            if not isinstance(stable_plugin.definition, PluginDefinition):
+                continue
             target_root = output_root / "dist" / target / stable_plugin.definition.id
             target_root.mkdir(parents=True, exist_ok=True)
             assets = list(stable_plugin.assets)
@@ -62,6 +64,8 @@ def embed_release_manifest(
 
     for target in config.targets:
         for stable_plugin in plugins:
+            if not isinstance(stable_plugin.definition, PluginDefinition):
+                continue
             write_json(
                 output_root / "dist" / target / stable_plugin.definition.id / RELEASE_MANIFEST_PATH,
                 release_manifest,

@@ -51,6 +51,7 @@ def write_marketplace(output_root: Path, config: HubConfig, plugins: Sequence[St
                 "description": plugin_description(config, stable_plugin.definition),
             }
             for stable_plugin in plugins
+            if isinstance(stable_plugin.definition, PluginDefinition)
         ],
     }
     write_json(output_root / ".cursor-plugin/marketplace.json", marketplace)
