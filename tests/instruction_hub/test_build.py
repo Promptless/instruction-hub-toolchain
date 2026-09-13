@@ -413,3 +413,67 @@ def test_build_renders_projected_rules_native_cursor_rules_and_mcp_assets(tmp_pa
     assert codex_mcp_config["mcpServers"]["trace-reporter"]["env"]["PROMPTLESS_API_KEY"] == "${PROMPTLESS_API_KEY}"
     cursor_mcp_config = json.loads((hub_root / "dist/cursor/pig/mcp.json").read_text())
     assert "trace-reporter" in cursor_mcp_config["mcpServers"]
+
+
+def _write_claude_only_agent(hub_root: Path, asset_id: str, file_stem: str | None = None) -> None:
+    stem = file_stem if file_stem is not None else asset_id
+    agents_dir = hub_root / "assets/agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    (agents_dir / f"{stem}.md").write_text(
+        f"---\nname: {asset_id}\ndescription: Plans things.\n---\n\n# {asset_id}\n",
+    )
+    (agents_dir / f"{stem}.asset.yaml").write_text(
+        "\n".join(
+            [
+                f"id: {asset_id}",
+                "support:",
+                "  claude:",
+                "    mode: native",
+                "  codex:",
+                "    mode: unsupported",
+                "    reason: No plugin subagent equivalent.",
+                "  gemini:",
+                "    mode: unsupported",
+                "    reason: No agents entry in the extension manifest.",
+                "  cursor:",
+                "    mode: unsupported",
+                "    reason: Does not consume Claude subagent frontmatter.",
+                "",
+            ]
+        )
+    )
+    (hub_root / "plugins/pig.yaml").write_text(
+        f"id: pig\nname: PIG\nowners: []\nincludes:\n- agent:{asset_id}\n",
+    )
+
+
+def test_claude_manifest_lists_agent_files_rather_than_the_directory(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    _write_claude_only_agent(hub_root, "experiment-planner")
+
+    build_hub(hub_root)
+
+    plugin_root = hub_root / "dist/claude/pig"
+    manifest = json.loads((plugin_root / ".claude-plugin/plugin.json").read_text())
+    # Claude Code rejects a directory for `agents` (unlike `skills`), so the manifest
+    # must enumerate each rendered agent file.
+    assert manifest["agents"] == ["./agents/experiment-planner.md"]
+    assert (plugin_root / "agents/experiment-planner.md").exists()
+    for target in ("codex", "gemini", "cursor"):
+        assert not (hub_root / f"dist/{target}/pig/agents").exists()
+
+
+def test_claude_agent_manifest_uses_rendered_filename_not_asset_id(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, org="Promptless")
+    # A sidecar may set an `id` that differs from the source filename; the file is
+    # rendered under its filename, so the manifest must point at that, not the id.
+    _write_claude_only_agent(hub_root, "experiment-planner", file_stem="planner-source")
+
+    build_hub(hub_root)
+
+    plugin_root = hub_root / "dist/claude/pig"
+    manifest = json.loads((plugin_root / ".claude-plugin/plugin.json").read_text())
+    assert manifest["agents"] == ["./agents/planner-source.md"]
+    assert (plugin_root / "agents/planner-source.md").exists()

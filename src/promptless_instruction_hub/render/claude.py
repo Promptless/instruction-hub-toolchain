@@ -31,7 +31,9 @@ def write_manifest(
     if rendered.get("commands"):
         manifest["commands"] = "./commands/"
     if rendered.get("agents"):
-        manifest["agents"] = "./agents/"
+        agent_files = sorted(path.name for path in (target_root / "agents").glob("*.md"))
+        if agent_files:
+            manifest["agents"] = [f"./agents/{name}" for name in agent_files]
     if mcp_server_names:
         manifest["mcpServers"] = "./.mcp.json"
     write_json(target_root / ".claude-plugin/plugin.json", manifest)
