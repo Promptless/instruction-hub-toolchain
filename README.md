@@ -530,6 +530,10 @@ snake_case, camelCase, and nested
 Claude-style hooks. Claude Desktop has no hook-provided current transcript and
 starts with idle catch-up.
 
+Hook timeouts cover the launcher, while collection runs in a detached process.
+The generated Codex `SessionEnd` hook uses its host's 3-second maximum; startup
+hooks use 30 seconds and the other terminal hooks use 390 seconds.
+
 A collection follows this order:
 
 ```text
