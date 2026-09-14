@@ -18,6 +18,12 @@ Hub repositories. It bundles the Python compiler and exposes reusable GitHub
 workflows, a GitLab CI template, and a composite GitHub Action for validating,
 building, and publishing generated hub artifacts.
 
+## Design discussions
+
+- [Portable assets and explicit harness adaptations](docs/rfcs/portable-assets.md)
+  — draft source-contract proposal, decision record, and rollout plan, with an
+  [evidence appendix](docs/rfcs/portable-assets-evidence.md) covering eight harnesses.
+
 ## Usage
 
 Use the [GitHub workflows](#github-actions) or [GitLab template](#gitlab-ci) to
