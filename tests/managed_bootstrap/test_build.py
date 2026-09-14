@@ -314,6 +314,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                     input=input_text,
                     capture_output=True,
                     check=False,
+                    timeout=hook["timeout"],
                 )
             if root is not None:
                 env_vars["PLUGIN_ROOT"] = str(root)
@@ -325,6 +326,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 input=input_text,
                 capture_output=True,
                 check=False,
+                timeout=hook["timeout"],
             )
 
         def make_stale_root_with_sibling_runtime(lifecycle: str) -> Path:
@@ -586,24 +588,30 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert_quiet_success(rooted)
         assert_startup_calls()
 
-        if target == "codex" and os.name == "posix":
+        if os.name == "posix":
             reset_stub_calls()
-            stop_hook_command = hook_events["Stop"][0]["hooks"][0]["command"]
-            collect_release_file = tmp_path / "codex-collect-release"
+            session_end_hook = hook_events["SessionEnd"][0]["hooks"][0]
+            session_end_command = (
+                [session_end_hook["command"], *session_end_hook["args"]]
+                if target == "claude"
+                else session_end_hook["command"]
+            )
+            root_env = {"CLAUDE_PLUGIN_ROOT" if target == "claude" else "PLUGIN_ROOT": str(stub_root)}
+            collect_release_file = tmp_path / f"{target}-collect-release"
             stdin_payload = json.dumps(
                 {
-                    "session_id": "codex_session_1",
-                    "transcript_path": str(tmp_path / "codex-session.jsonl"),
+                    "session_id": f"{target}_session_1",
+                    "transcript_path": str(tmp_path / f"{target}-session.jsonl"),
                 }
             )
             hook_process: subprocess.Popen[str] | None = None
             try:
                 hook_process = subprocess.Popen(
-                    stop_hook_command,
-                    shell=True,
+                    session_end_command,
+                    shell=target == "codex",
                     env=_clean_env(
-                        HOME=str(tmp_path / "codex-process-group-home"),
-                        PLUGIN_ROOT=str(stub_root),
+                        HOME=str(tmp_path / f"{target}-process-group-home"),
+                        **root_env,
                         PROMPTLESS_STUB_CALL_LOG=str(stub_call_log),
                         PROMPTLESS_STUB_ATTEMPT_LOG=str(stub_attempt_log),
                         PROMPTLESS_STUB_STARTED_LOG=str(stub_started_log),
@@ -616,7 +624,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                     text=True,
                     start_new_session=True,
                 )
-                stdout, stderr = hook_process.communicate(input=stdin_payload, timeout=5)
+                stdout, stderr = hook_process.communicate(input=stdin_payload, timeout=session_end_hook["timeout"])
                 assert hook_process.returncode == 0
                 assert stdout == ""
                 assert stderr == ""
@@ -639,11 +647,11 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 if hook_process is not None and hook_process.poll() is None:
                     hook_process.kill()
                     hook_process.communicate(timeout=5)
-            assert_terminal_calls("stop")
+            assert_terminal_calls("session_end")
             assert_stdin_entries_eventually(
                 [
                     {
-                        "argv": ["collect", "--host", "codex", "--lifecycle", "stop", "--quiet"],
+                        "argv": ["collect", "--host", target, "--lifecycle", "session_end", "--quiet"],
                         "stdin": stdin_payload,
                     }
                 ]

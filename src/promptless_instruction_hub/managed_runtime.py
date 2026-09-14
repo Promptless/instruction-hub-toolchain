@@ -29,7 +29,10 @@ HOST_RUNTIME_OUTPUT_DIR = "runtime"
 # collection supervisor, and emits already-pending notices. Browser, network, trace
 # discovery, and ledger work stay off the hook's critical path.
 HOST_RUNTIME_SESSION_START_HOOK_TIMEOUT_SECONDS = 30
-HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS = 390
+# Terminal hooks only launch detached collectors. Use a short launcher budget
+# for every host/event, within Codex's 3s SessionEnd maximum.
+# https://learn.chatgpt.com/docs/hooks#config-shape
+HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS = 3
 HOST_RUNTIME_CHANNEL = "stable"
 HOST_RUNTIME_VERSION = "0.2.9"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
