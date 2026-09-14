@@ -7,12 +7,14 @@ import sys
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from promptless_instruction_hub.cli import main
 from promptless_instruction_hub.compiler import build_hub, init_hub
 from promptless_instruction_hub.mcp_status import STATUS_TOOL_NAME, run_status_mcp
 from promptless_instruction_hub.scan.hub import scan_hub
 
+from .external_helpers import external_definition, write_external
 from .helpers import (
     FIXTURES,
     SCHEMAS,
@@ -188,3 +190,38 @@ def test_optional_hub_tests_keep_command_and_platform_in_caller_configuration() 
     # Run the actual workflow shell step; a failing hub suite must fail the CI job.
     result = subprocess.run(["bash", "-c", step["run"]], env={**os.environ, "HUB_TEST_COMMAND": "exit 23"})
     assert result.returncode == 23
+
+
+@pytest.mark.parametrize("plugin_path", [None, ".", "plugins/doc-detective", "plugins/Doc Detective"])
+def test_generated_release_validates_against_shipped_schema(tmp_path: Path, plugin_path: str | None) -> None:
+    init_hub(tmp_path)
+    if plugin_path is not None:
+        write_external(tmp_path, external_definition(path=plugin_path))
+    build_hub(tmp_path)
+    schema = json.loads((SCHEMAS / "release-manifest.schema.json").read_text())
+    Draft202012Validator.check_schema(schema)
+    release = json.loads((tmp_path / "hub.release.json").read_text())
+    Draft202012Validator(schema).validate(release)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "../plugin",
+        "/plugin",
+        "x/../plugin",
+        "x//plugin",
+        "./plugin",
+        "C:/plugin",
+        "x\\y",
+        "plugins/review\tdocs",
+        "plugins/review\ndocs",
+        "plugins/review\x00docs",
+        "plugins/review\u00a0docs",
+        "plugins/review docs\n",
+    ],
+)
+def test_external_target_schema_rejects_unsafe_paths(path: str) -> None:
+    schema = json.loads((SCHEMAS / "release-manifest.schema.json").read_text())
+    assert not Draft202012Validator(schema["$defs"]["external_target"]).is_valid({"path": path})
