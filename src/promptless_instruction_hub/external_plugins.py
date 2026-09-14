@@ -79,9 +79,10 @@ def verify_external_plugins(
     previous_version: str | None = None
     previous_targets: list[str] = []
     if previous_release_root is not None:
-        if hub_relative_path not in {"", "."}:
-            ExternalPluginTarget(path=hub_relative_path)
-        manifest_path = previous_release_root / hub_relative_path / RELEASE_MANIFEST_PATH
+        relative_path = Path(hub_relative_path)
+        manifest_path = (previous_release_root / relative_path / RELEASE_MANIFEST_PATH).resolve()
+        if relative_path.is_absolute() or not manifest_path.is_relative_to(previous_release_root.resolve()):
+            raise InstructionHubError("Hub path must be relative and stay inside the previous release root")
         previous_version, basis = read_release_manifest(manifest_path)
         # The authoritative reader validates these nested fields before returning.
         previous_targets = cast(list[str], basis["targets"])

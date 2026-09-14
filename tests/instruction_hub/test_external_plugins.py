@@ -199,6 +199,32 @@ def test_verifier_reads_pinned_upstream_manifests(
     assert _snapshot_tree(hub) == before
 
 
+@pytest.mark.parametrize("path_kind", ["absolute", "parent", "symlink", "manifest-symlink"])
+def test_verifier_rejects_previous_hub_paths_outside_release(tmp_path: Path, path_kind: str) -> None:
+    if os.name == "nt" and "symlink" in path_kind:
+        pytest.skip("Windows symlink creation requires privileges")
+    hub, previous = tmp_path / "hub", tmp_path / "previous"
+    init_hub(hub)
+    write_external(hub, external_definition())
+    build_hub(hub)
+    previous.mkdir()
+    if path_kind == "absolute":
+        hub_relative_path = str(previous)
+    elif path_kind == "parent":
+        hub_relative_path = "../hub"
+    elif path_kind == "symlink":
+        (previous / "linked-hub").symlink_to(hub, target_is_directory=True)
+        hub_relative_path = "linked-hub"
+    else:
+        (previous / "hub.release.json").symlink_to(hub / "hub.release.json")
+        hub_relative_path = "."
+
+    with pytest.raises(
+        InstructionHubError, match="Hub path must be relative and stay inside the previous release root"
+    ):
+        verify_external_plugins(hub, previous_release_root=previous, hub_relative_path=hub_relative_path)
+
+
 @pytest.mark.parametrize(
     "failure",
     [
