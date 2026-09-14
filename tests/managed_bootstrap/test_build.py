@@ -20,6 +20,8 @@ from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, validate_json_value
 from promptless_instruction_hub.managed_runtime import (
     HOST_RUNTIME_BUNDLE_RELATIVE_PATHS,
+    HOST_RUNTIME_SESSION_START_HOOK_TIMEOUT_SECONDS,
+    HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS,
     MISSING_PYTHON_MESSAGE,
     MISSING_RUNTIME_FILE_MESSAGE,
     MISSING_RUNTIME_ROOT_MESSAGE,
@@ -49,21 +51,6 @@ from .helpers import (
 )
 
 
-def test_build_emits_short_terminal_hook_timeouts_for_all_hosts(tmp_path: Path) -> None:
-    hub_root = tmp_path / "hub"
-    init_hub(hub_root, org="Promptless")
-    enable_trace_ingestion(hub_root)
-
-    build_hub(hub_root)
-
-    for target in ("codex", "claude"):
-        hook_path = hub_root / "dist" / target / "pig" / "hooks/hooks.json"
-        hooks = json.loads(hook_path.read_text())["hooks"]
-        assert {
-            event: [hook["timeout"] for group in groups for hook in group["hooks"]] for event, groups in hooks.items()
-        } == {"SessionStart": [30], "Stop": [3], "SessionEnd": [3], "SubagentStop": [3]}
-
-
 def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
@@ -89,6 +76,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             re.MULTILINE,
         )
         assert callback_deadline_match is not None
+        assert session_start_hook["timeout"] == HOST_RUNTIME_SESSION_START_HOOK_TIMEOUT_SECONDS
         assert session_start_hook["timeout"] < int(callback_deadline_match.group("value"))
         assert hook_events["SessionStart"][0]["matcher"] == "startup|resume"
         terminal_events = tuple(
@@ -102,6 +90,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         )
         for event_name, _lifecycle in terminal_events:
             hook = hook_events[event_name][0]["hooks"][0]
+            assert hook["timeout"] == HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS
             assert hook["statusMessage"] == "Uploading Promptless traces"
 
         for event_name, lifecycle in terminal_events:
