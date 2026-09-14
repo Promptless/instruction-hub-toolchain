@@ -374,6 +374,12 @@ resolved Hub release version to differ from the upstream version. If the automat
 version bump collides, use `pig set-version --hub . --version <new-version>` to
 select a higher Hub version before publishing.
 
+The publisher stores verified upstream versions in `hub.external.json` on the
+release branch, bound to the release hash and exact source declarations. Replacing
+an external source or switching to an authored plugin uses this record, so the old
+upstream repository no longer needs to be available. Releases without this record
+fall back to fetching the old pin for the version comparison.
+
 Source and target declarations participate in release versioning, so updating a
 pin advances the Hub release even when authored payloads are unchanged. Mixed
 releases use manifest schema version 3 and record external provenance in

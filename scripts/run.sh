@@ -420,6 +420,8 @@ prepare_release_commit() {
 
   cleanup_legacy_generated_paths "$worktree" "$hub_rel"
   copy_payload_generated_paths "$payload_root" "$worktree" "$hub_rel"
+  local verification_path="${hub_rel:+$hub_rel/}hub.external.json"
+  cp "$payload_root/$verification_path" "$worktree/$verification_path"
   if [[ -n "$hub_rel" ]]; then
     git -C "$worktree" add -A "$hub_rel"
   else
@@ -656,19 +658,22 @@ case "$mode" in
     previous_release_root="$(mktemp -d)"
     payload_root="$(mktemp -d)"
     pointer_root="$(mktemp -d)"
-    temp_paths+=("$previous_release_root" "$payload_root" "$pointer_root")
+    verification_output="$(mktemp)"
+    temp_paths+=("$previous_release_root" "$payload_root" "$pointer_root" "$verification_output")
     pig validate --hub "$hub_root"
     if copy_previous_release_branch "$previous_release_root"; then
       previous_release_exists=true
-      pig resolve-external --hub "$hub_root" --previous-release-root "$previous_release_root" --hub-relative-path "$hub_rel"
+      pig resolve-external --hub "$hub_root" --previous-release-root "$previous_release_root" --hub-relative-path "$hub_rel" >"$verification_output"
     else
       previous_release_exists=false
-      pig resolve-external --hub "$hub_root"
+      pig resolve-external --hub "$hub_root" >"$verification_output"
     fi
+    cat "$verification_output"
     publish_version="$(resolve_publish_version "$previous_release_root" "$hub_rel" "$previous_release_exists")"
     pig build --hub "$hub_root" --version "$publish_version"
     copy_generated_paths "$payload_root" "$hub_rel"
     restore_generated_paths_on_default_branch "$hub_rel"
+    pig record-external-verification --manifest "$payload_root/${hub_rel:+$hub_rel/}hub.release.json" --verification "$verification_output"
     marketplace_pointer_paths=()
     if [[ "$update_claude_pointer" == "true" ]]; then
       prepare_marketplace_pointer "claude" "$payload_root" "$pointer_root" "$hub_rel"

@@ -29,6 +29,7 @@ from promptless_instruction_hub.models import (
     PluginDefinition,
     SEMVER_RE,
 )
+from promptless_instruction_hub.release.external import read_external_versions
 from promptless_instruction_hub.release.versions import read_release_manifest, resolve_release_version
 from promptless_instruction_hub.validate.hub import ValidationResult, validate_hub
 
@@ -151,12 +152,14 @@ def _verify_external_plugins(
     previous_authored_ids: set[str] = set()
     previous_version: str | None = None
     previous_targets: list[str] = []
+    previous_external_versions: dict[tuple[str, str], str | None] | None = None
     if previous_release_root is not None:
         relative_path = Path(hub_relative_path)
         manifest_path = (previous_release_root / relative_path / RELEASE_MANIFEST_PATH).resolve()
         if relative_path.is_absolute() or not manifest_path.is_relative_to(previous_release_root.resolve()):
             raise InstructionHubError("Hub path must be relative and stay inside the previous release root")
         previous_version, basis = read_release_manifest(manifest_path)
+        previous_external_versions = read_external_versions(manifest_path, basis)
         # The authoritative reader validates these nested fields before returning.
         previous_targets = cast(list[str], basis["targets"])
         for item in cast(list[dict[str, JsonValue]], basis["plugins"]):
@@ -180,13 +183,18 @@ def _verify_external_plugins(
     if not plugins and not authored_replacements:
         return []
 
+    def previous_claude_version(plugin: ExternalPluginDefinition) -> JsonValue:
+        if previous_external_versions is not None:
+            return previous_external_versions[(plugin.id, "claude")]
+        return revision(plugin.source).manifest(plugin, "claude").get("version")
+
     records: list[dict[str, JsonValue]] = []
     if authored_replacements:
         publish_version = resolve_release_version(
             validation, previous_release_root=previous_release_root, hub_relative_path=hub_relative_path
         )
         for old in authored_replacements:
-            old_version = revision(old.source).manifest(old, "claude").get("version")
+            old_version = previous_claude_version(old)
             if old_version == publish_version:
                 raise InstructionHubError(
                     f"{old.id} (claude): authored replacement retains upstream version {old_version}; "
@@ -207,7 +215,7 @@ def _verify_external_plugins(
                 and target in previous_targets
                 and (old.source != plugin.source or old.targets[target] != plugin.targets[target])
             ):
-                old_version = revision(old.source).manifest(old, target).get("version")
+                old_version = previous_claude_version(old)
             elif target == "claude" and target in previous_targets and plugin.id in previous_authored_ids:
                 old_version = previous_version
             if old_version is not None and manifest.get("version") == old_version:

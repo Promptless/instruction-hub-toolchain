@@ -248,6 +248,7 @@ def test_external_to_authored_publish_rejects_version_collision_until_hub_versio
     _git(repo, "push")
     initial = _run_action(repo, tmp_path / "output", hub_root=hub_path)
     assert initial.returncode == 0, initial.stdout + initial.stderr
+    shutil.rmtree(tmp_path / "upstream")
 
     write_external(hub, {"id": "doc-detective", "name": "Authored Doc Detective", "includes": []})
     _git(repo, "add", "-A")
@@ -280,6 +281,68 @@ def test_external_to_authored_publish_rejects_version_collision_until_hub_versio
     rerun = _run_action(repo, tmp_path / "output", hub_root=hub_path)
     assert rerun.returncode == 0, rerun.stdout + rerun.stderr
     assert _git_output(repo, "ls-remote", "origin", "refs/heads/main", "refs/heads/release/stable") == before_rerun
+
+
+@pytest.mark.parametrize("latest", [False, True])
+def test_external_source_can_be_replaced_after_old_repository_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, latest: bool
+) -> None:
+    upstream = tmp_path / "upstream"
+    sha = make_upstream(upstream, monkeypatch)
+    repo = _init_action_repo(tmp_path / "publisher", targets=("claude", "codex", "cursor"))
+    definition = external_definition(sha)
+    if latest:
+        definition["source"] = {"type": "git", "url": UPSTREAM_URL, "ref": "latest"}
+    write_external(repo, definition)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "include external plugin")
+    _git(repo, "push")
+    initial = _run_action(repo, tmp_path / "output")
+    assert initial.returncode == 0, initial.stdout + initial.stderr
+    shutil.rmtree(upstream)
+
+    replacement = tmp_path / "replacement"
+    replacement_sha = make_upstream(replacement, monkeypatch)
+    if not latest:
+        definition["source"]["sha"] = replacement_sha
+    definition["source"]["url"] = "https://replacement.example.test/plugins.git"
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{upstream.as_posix()}.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_KEY_1", f"url.{replacement.as_posix()}.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_1", definition["source"]["url"])
+    write_external(repo, definition)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "replace unavailable upstream repository")
+    _git(repo, "push")
+    before = _git_output(repo, "ls-remote", "origin", "refs/heads/main", "refs/heads/release/stable")
+    collision = _run_action(repo, tmp_path / "output")
+    assert collision.returncode != 0
+    assert "retains upstream version 1.2.3" in collision.stderr
+    assert _git_output(repo, "ls-remote", "origin", "refs/heads/main", "refs/heads/release/stable") == before
+
+    for target in ("claude", "codex", "cursor"):
+        manifest_path = replacement / PLUGIN_PATH / f".{target}-plugin/plugin.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["version"] = "1.2.4"
+        manifest_path.write_text(json.dumps(manifest))
+    replacement_sha = commit_upstream(replacement)
+    if not latest:
+        definition["source"]["sha"] = replacement_sha
+        write_external(repo, definition)
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "avoid the previously installed version")
+        _git(repo, "push")
+    publish = _run_action(repo, tmp_path / "output")
+    assert publish.returncode == 0, publish.stdout + publish.stderr
+    _git(repo, "fetch", "origin")
+    release = json.loads(_git_output(repo, "show", "origin/release/stable:hub.release.json"))
+    metadata = json.loads(_git_output(repo, "show", "origin/release/stable:hub.external.json"))
+    assert metadata["release_hash"] == release["release_hash"]
+    assert {record["upstream_version"] for record in metadata["verified_external_plugins"]} == {"1.2.4"}
+    assert {record["url"] for record in metadata["verified_external_plugins"]} == {definition["source"]["url"]}
+    assert {record["sha"] for record in metadata["verified_external_plugins"]} == {replacement_sha}
+    assert not (repo / "hub.external.json").exists()
+    assert _git_output(repo, "status", "--short") == ""
 
 
 @pytest.mark.parametrize(

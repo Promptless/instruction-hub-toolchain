@@ -13,6 +13,7 @@ from promptless_instruction_hub.compiler import build_hub, init_hub, validate_hu
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.external_plugins import resolve_external_plugins, verify_external_plugins
 from promptless_instruction_hub.mcp_status import run_status_mcp
+from promptless_instruction_hub.release.external import write_external_verification
 from promptless_instruction_hub.release.versions import resolve_publish_version
 from promptless_instruction_hub.scan.hub import scan_hub
 from promptless_instruction_hub.status import summarize_release_manifest
@@ -62,6 +63,10 @@ def _build_parser() -> argparse.ArgumentParser:
         _add_hub_arg(external_parser)
         external_parser.add_argument("--previous-release-root", type=Path)
         external_parser.add_argument("--hub-relative-path", default="")
+
+    external_record_parser = subcommands.add_parser("record-external-verification", help=argparse.SUPPRESS)
+    external_record_parser.add_argument("--manifest", type=Path, required=True)
+    external_record_parser.add_argument("--verification", type=Path, required=True)
 
     build_parser = subcommands.add_parser("build", help="generate target distribution artifacts")
     _add_hub_arg(build_parser)
@@ -132,6 +137,9 @@ def _dispatch(args: argparse.Namespace) -> int:
         _print_conversion_warnings(result.warnings)
         verb = "checked" if result.checked else "built"
         print(f"{verb} release {result.release_id} ({result.release_hash[:12]})")
+        return 0
+    if args.command == "record-external-verification":
+        write_external_verification(args.manifest, args.verification)
         return 0
     if args.command == "publish-version":
         print(
