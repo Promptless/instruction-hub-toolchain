@@ -214,13 +214,14 @@ def _validate_component_paths(
     plugin_id: str, target: str, manifest: dict[str, JsonValue], files: dict[str, str]
 ) -> None:
     fields = ("skills", "commands", "agents", "hooks", "mcpServers", "lspServers")
+    file_fields = {"hooks", "mcpServers", "lspServers"}
     if target == "cursor":
         fields += ("rules",)
     for field in fields:
         if field not in manifest:
             continue
         value = manifest[field]
-        if isinstance(value, dict) and field in {"hooks", "mcpServers", "lspServers"}:
+        if isinstance(value, dict) and field in file_fields:
             continue
         paths = value if isinstance(value, list) else [value]
         for path in paths:
@@ -231,5 +232,12 @@ def _validate_component_paths(
                 ExternalPluginTarget(path=relative)
             except ValueError as exc:
                 raise InstructionHubError(f"{plugin_id} ({target}): {field} path must stay inside the plugin") from exc
-            if relative != "." and relative not in files and not any(name.startswith(relative + "/") for name in files):
+            if field in file_fields:
+                if path.endswith("/") or files.get(relative) not in {"100644", "100755"}:
+                    raise InstructionHubError(
+                        f"{plugin_id} ({target}): {field} path must reference an upstream file: {path}"
+                    )
+            elif (
+                relative != "." and relative not in files and not any(name.startswith(relative + "/") for name in files)
+            ):
                 raise InstructionHubError(f"{plugin_id} ({target}): missing upstream {field} path {path}")

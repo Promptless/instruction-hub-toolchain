@@ -291,6 +291,47 @@ def test_upstream_verification_failures(
         verify_external_plugins(hub)
 
 
+@pytest.mark.parametrize("target", ["claude", "codex", "cursor"])
+@pytest.mark.parametrize("field", ["hooks", "mcpServers", "lspServers"])
+@pytest.mark.parametrize("path", ["./hooks", "./", "./config.json", "./hooks/hooks.json/"])
+def test_configuration_paths_must_reference_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str, field: str, path: str
+) -> None:
+    upstream, hub = tmp_path / "upstream", tmp_path / "hub"
+    make_upstream(upstream, monkeypatch)
+    plugin = upstream / PLUGIN_PATH
+    (plugin / "config.json").mkdir()
+    (plugin / "config.json/nested.json").write_text("{}")
+    manifest_path = plugin / f".{target}-plugin/plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest[field] = path
+    manifest_path.write_text(json.dumps(manifest))
+    sha = commit_upstream(upstream)
+    init_hub(hub)
+    write_external(hub, external_definition(sha))
+
+    with pytest.raises(InstructionHubError, match=rf"\({target}\): {field} path must reference an upstream file"):
+        verify_external_plugins(hub)
+
+
+@pytest.mark.parametrize("target", ["claude", "codex", "cursor"])
+def test_configuration_paths_accept_files_and_inline_objects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    upstream, hub = tmp_path / "upstream", tmp_path / "hub"
+    make_upstream(upstream, monkeypatch)
+    manifest_path = upstream / PLUGIN_PATH / f".{target}-plugin/plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["mcpServers"] = ["./.mcp.json"]
+    manifest["lspServers"] = {}
+    manifest_path.write_text(json.dumps(manifest))
+    sha = commit_upstream(upstream)
+    init_hub(hub)
+    write_external(hub, external_definition(sha))
+
+    assert len(verify_external_plugins(hub)) == 3
+
+
 def test_cursor_only_hub_verifies_only_enabled_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     upstream, hub = tmp_path / "upstream", tmp_path / "hub"
     make_upstream(upstream, monkeypatch)
