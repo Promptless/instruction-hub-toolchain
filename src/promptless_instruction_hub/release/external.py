@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import cast
 
 from promptless_instruction_hub.fs import JsonValue, read_json_mapping, write_json
-from promptless_instruction_hub.models import ExternalGitSource, ExternalPluginDefinition, SEMVER_RE
+from promptless_instruction_hub.models import ResolvedExternalPluginDefinition, SEMVER_RE
 from promptless_instruction_hub.release.versions import read_release_manifest
 
 EXTERNAL_VERIFICATION_PATH = "hub.external.json"
@@ -53,11 +53,11 @@ def _validate_records(value: JsonValue, basis: dict[str, JsonValue]) -> dict[tup
     expected = set()
     for item in cast(list[dict[str, JsonValue]], basis["plugins"]):
         if item.get("kind") == "external":
-            plugin = ExternalPluginDefinition.model_validate(item)
-            source = cast(ExternalGitSource, plugin.source)
+            plugin = ResolvedExternalPluginDefinition.model_validate(item)
+            source = plugin.source
             for target, location in plugin.targets.items():
                 if target in cast(list[str], basis["targets"]):
-                    expected.add((plugin.id, target, source.url, source.ref, location.path))
+                    expected.add((plugin.id, target, source.url, source.sha, location.path))
 
     if not isinstance(value, list):
         raise ValueError("verified_external_plugins must be a list")

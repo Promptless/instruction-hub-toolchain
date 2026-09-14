@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Generic
 
 import yaml
 
@@ -24,6 +25,7 @@ from promptless_instruction_hub.models import (
     ExternalPluginDefinition,
     LoadedAsset,
     PluginDefinition,
+    PluginDefinitionT,
     StablePlugin,
 )
 
@@ -38,13 +40,13 @@ SUPPORT_MODES_BY_ASSET_TYPE = {
 
 
 @dataclass(frozen=True)
-class ValidationResult:
-    """Loaded and validated Instruction Hub source state."""
+class ValidationResult(Generic[PluginDefinitionT]):
+    """Original catalog and stable plugins at the requested or resolved source stage."""
 
     config: HubConfig
     plugins: dict[str, HubPluginDefinition]
     assets: dict[str, LoadedAsset]
-    stable_plugins: tuple[StablePlugin, ...]
+    stable_plugins: tuple[StablePlugin[PluginDefinitionT], ...]
     warnings: tuple[AgentSkillWarning, ...] = ()
 
     @property
@@ -54,7 +56,7 @@ class ValidationResult:
         return _resolve_stable_assets(self.stable_plugins)
 
 
-def validate_hub(hub_root: Path) -> ValidationResult:
+def validate_hub(hub_root: Path) -> ValidationResult[HubPluginDefinition]:
     """Validate config, plugins, target support, secrets, and asset references."""
 
     root = hub_root.resolve()
@@ -105,7 +107,7 @@ def _validate_support_modes(asset: LoadedAsset) -> None:
 
 
 def _validate_agent_skills(
-    config: HubConfig, assets: dict[str, LoadedAsset], stable_plugins: tuple[StablePlugin, ...]
+    config: HubConfig, assets: dict[str, LoadedAsset], stable_plugins: tuple[StablePlugin[HubPluginDefinition], ...]
 ) -> tuple[AgentSkillWarning, ...]:
     if "codex" not in config.targets:
         return ()
@@ -132,7 +134,7 @@ def _validate_commands(config: HubConfig, assets: dict[str, LoadedAsset]) -> Non
                 validate_verbatim_command(asset, target)
 
 
-def _validate_invocation_destinations(plugin: StablePlugin, target: Harness) -> None:
+def _validate_invocation_destinations(plugin: StablePlugin[HubPluginDefinition], target: Harness) -> None:
     """Commands and skills share invocation names even in different directories."""
 
     owners: dict[str, str] = {}
@@ -219,8 +221,8 @@ def _resolve_stable_plugins(
     config: HubConfig,
     plugins: dict[str, HubPluginDefinition],
     assets: dict[str, LoadedAsset],
-) -> tuple[StablePlugin, ...]:
-    stable_plugins: list[StablePlugin] = []
+) -> tuple[StablePlugin[HubPluginDefinition], ...]:
+    stable_plugins: list[StablePlugin[HubPluginDefinition]] = []
     missing_refs: set[str] = set()
     for plugin_id in config.stable_plugins:
         plugin = plugins.get(plugin_id)
@@ -241,6 +243,6 @@ def _resolve_stable_plugins(
     return tuple(stable_plugins)
 
 
-def _resolve_stable_assets(stable_plugins: tuple[StablePlugin, ...]) -> tuple[LoadedAsset, ...]:
+def _resolve_stable_assets(stable_plugins: tuple[StablePlugin[PluginDefinitionT], ...]) -> tuple[LoadedAsset, ...]:
     assets_by_ref = {asset.ref: asset for stable_plugin in stable_plugins for asset in stable_plugin.assets}
     return tuple(assets_by_ref[ref] for ref in sorted(assets_by_ref))

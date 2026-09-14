@@ -6,7 +6,13 @@ from pathlib import Path
 from collections.abc import Sequence
 
 from promptless_instruction_hub.fs import write_json
-from promptless_instruction_hub.models import ExternalPluginDefinition, HubConfig, PluginDefinition, StablePlugin
+from promptless_instruction_hub.models import (
+    ResolvedHubPluginDefinition,
+    ResolvedExternalPluginDefinition,
+    HubConfig,
+    PluginDefinition,
+    StablePlugin,
+)
 from promptless_instruction_hub.render.external import external_marketplace_entry
 from promptless_instruction_hub.render.common import (
     RenderedAssets,
@@ -40,7 +46,9 @@ def write_manifest(
     write_json(target_root / ".claude-plugin/plugin.json", manifest)
 
 
-def write_marketplace(output_root: Path, config: HubConfig, plugins: Sequence[StablePlugin]) -> None:
+def write_marketplace(
+    output_root: Path, config: HubConfig, plugins: Sequence[StablePlugin[ResolvedHubPluginDefinition]]
+) -> None:
     """Write the Claude Code repository marketplace manifest."""
 
     marketplace = {
@@ -49,7 +57,7 @@ def write_marketplace(output_root: Path, config: HubConfig, plugins: Sequence[St
         "description": f"{config.marketplace.name} marketplace.",
         "plugins": [
             external_marketplace_entry(stable_plugin.definition, "claude")
-            if isinstance(stable_plugin.definition, ExternalPluginDefinition)
+            if isinstance(stable_plugin.definition, ResolvedExternalPluginDefinition)
             else {
                 "name": stable_plugin.definition.id,
                 "source": f"./dist/claude/{stable_plugin.definition.id}",
@@ -60,7 +68,7 @@ def write_marketplace(output_root: Path, config: HubConfig, plugins: Sequence[St
                 "category": "Productivity",
             }
             for stable_plugin in plugins
-            if not isinstance(stable_plugin.definition, ExternalPluginDefinition)
+            if not isinstance(stable_plugin.definition, ResolvedExternalPluginDefinition)
             or "claude" in stable_plugin.definition.targets
         ],
     }

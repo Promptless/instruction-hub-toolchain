@@ -310,9 +310,11 @@ source:
 release. Other branch and tag names are not supported; resolve them to a full
 commit SHA for a fixed pin. Run `pig resolve-external --hub .` to fetch and verify
 the selected commit, then commit the generated `hub.external-plugins.lock.json`
-alongside the definition. The lock records immutable SHAs for selected `latest`
-plugins. Offline builds require a matching lock and never resolve upstream
-themselves.
+alongside the definition. The catalog uses `source.ref` for the requested revision.
+The lock and release provenance use `source.sha` for the resolved commit;
+generated marketplaces also use `source.sha`. Locks contain only selected
+`latest` plugins. Offline builds require a matching lock for these plugins and
+never resolve upstream themselves.
 
 The shared CI runner refreshes these resolutions in `build` and `publish` modes.
 Publication resolves each upstream repository once, verifies that commit, and

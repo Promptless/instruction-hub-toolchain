@@ -6,7 +6,13 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from promptless_instruction_hub.fs import write_json
-from promptless_instruction_hub.models import ExternalPluginDefinition, HubConfig, PluginDefinition, StablePlugin
+from promptless_instruction_hub.models import (
+    ResolvedHubPluginDefinition,
+    ResolvedExternalPluginDefinition,
+    HubConfig,
+    PluginDefinition,
+    StablePlugin,
+)
 from promptless_instruction_hub.render.external import external_marketplace_entry
 from promptless_instruction_hub.render.common import (
     RenderedAssets,
@@ -38,7 +44,9 @@ def write_manifest(
     write_json(target_root / ".cursor-plugin/plugin.json", manifest)
 
 
-def write_marketplace(output_root: Path, config: HubConfig, plugins: Sequence[StablePlugin]) -> None:
+def write_marketplace(
+    output_root: Path, config: HubConfig, plugins: Sequence[StablePlugin[ResolvedHubPluginDefinition]]
+) -> None:
     """Write the Cursor repository marketplace manifest."""
 
     marketplace = {
@@ -47,14 +55,14 @@ def write_marketplace(output_root: Path, config: HubConfig, plugins: Sequence[St
         "metadata": {"description": f"{config.marketplace.name} marketplace."},
         "plugins": [
             external_marketplace_entry(stable_plugin.definition, "cursor")
-            if isinstance(stable_plugin.definition, ExternalPluginDefinition)
+            if isinstance(stable_plugin.definition, ResolvedExternalPluginDefinition)
             else {
                 "name": stable_plugin.definition.id,
                 "source": f"dist/cursor/{stable_plugin.definition.id}",
                 "description": plugin_description(config, stable_plugin.definition),
             }
             for stable_plugin in plugins
-            if not isinstance(stable_plugin.definition, ExternalPluginDefinition)
+            if not isinstance(stable_plugin.definition, ResolvedExternalPluginDefinition)
             or "cursor" in stable_plugin.definition.targets
         ],
     }

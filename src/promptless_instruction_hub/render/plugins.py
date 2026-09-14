@@ -8,7 +8,13 @@ from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH
 from promptless_instruction_hub.fs import JsonValue, write_json
 from promptless_instruction_hub.managed_runtime import ManagedRuntimeRecord, render_managed_runtimes
 from promptless_instruction_hub.managed_skills import render_managed_skills
-from promptless_instruction_hub.models import Harness, HubConfig, PluginDefinition, StablePlugin
+from promptless_instruction_hub.models import (
+    ResolvedHubPluginDefinition,
+    Harness,
+    HubConfig,
+    PluginDefinition,
+    StablePlugin,
+)
 import promptless_instruction_hub.render.claude as claude
 import promptless_instruction_hub.render.codex as codex
 import promptless_instruction_hub.render.cursor as cursor
@@ -21,7 +27,7 @@ from promptless_instruction_hub.render.mcp import collect_mcp_servers, write_mcp
 def render_target_plugins(
     output_root: Path,
     config: HubConfig,
-    plugins: tuple[StablePlugin, ...],
+    plugins: tuple[StablePlugin[ResolvedHubPluginDefinition], ...],
 ) -> tuple[ManagedRuntimeRecord, ...]:
     """Render plugin directories and marketplace manifests for each target."""
 
@@ -57,7 +63,7 @@ def render_target_plugins(
 def embed_release_manifest(
     output_root: Path,
     config: HubConfig,
-    plugins: tuple[StablePlugin, ...],
+    plugins: tuple[StablePlugin[ResolvedHubPluginDefinition], ...],
     release_manifest: dict[str, JsonValue],
 ) -> None:
     """Copy the release manifest into each generated target plugin for local status tools."""

@@ -5,23 +5,25 @@ from __future__ import annotations
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue
 from promptless_instruction_hub.models import (
-    ExternalGitSource,
-    ExternalPluginDefinition,
+    ResolvedGitSource,
+    ResolvedExternalPluginDefinition,
     ExternalPluginHarness,
     ExternalPluginTarget,
 )
 
 
-def external_marketplace_entry(plugin: ExternalPluginDefinition, target: ExternalPluginHarness) -> dict[str, JsonValue]:
+def external_marketplace_entry(
+    plugin: ResolvedExternalPluginDefinition, target: ExternalPluginHarness
+) -> dict[str, JsonValue]:
     """Point the host at upstream files without overriding their publisher or version."""
 
-    if not isinstance(plugin.source, ExternalGitSource):
+    if not isinstance(plugin.source, ResolvedGitSource):
         raise InstructionHubError(f"{plugin.id}: external source must be resolved before rendering")
     path = plugin.targets[target].path
     source: dict[str, JsonValue] = {
         "source": "url" if path == "." else "git-subdir",
         "url": plugin.source.url,
-        "sha": plugin.source.ref,
+        "sha": plugin.source.sha,
     }
     if path != ".":
         source["path"] = path
@@ -39,7 +41,7 @@ def validate_external_marketplace_source(source: dict[str, JsonValue]) -> None:
     expected = {"source", "url", "sha", "path"} if kind == "git-subdir" else {"source", "url", "sha"}
     if kind not in {"url", "git-subdir"} or set(source) != expected:
         raise ValueError("Expected a pinned external Git marketplace source")
-    ExternalGitSource.model_validate({"type": "git", "url": source["url"], "ref": source["sha"]})
+    ResolvedGitSource.model_validate({"type": "git", "url": source["url"], "sha": source["sha"]})
     if kind == "git-subdir":
         target = ExternalPluginTarget.model_validate({"path": source["path"]})
         if target.path == ".":

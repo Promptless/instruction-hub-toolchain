@@ -7,8 +7,9 @@ from pathlib import Path
 
 from promptless_instruction_hub.fs import write_json
 from promptless_instruction_hub.models import (
+    ResolvedHubPluginDefinition,
     PIG_PLUGIN_ID,
-    ExternalPluginDefinition,
+    ResolvedExternalPluginDefinition,
     HubConfig,
     PluginDefinition,
     StablePlugin,
@@ -59,7 +60,9 @@ def write_manifest(
     write_json(target_root / ".codex-plugin/plugin.json", manifest)
 
 
-def write_marketplace(output_root: Path, config: HubConfig, plugins: Sequence[StablePlugin]) -> None:
+def write_marketplace(
+    output_root: Path, config: HubConfig, plugins: Sequence[StablePlugin[ResolvedHubPluginDefinition]]
+) -> None:
     """Write the Codex repository marketplace manifest."""
 
     marketplace = {
@@ -67,7 +70,7 @@ def write_marketplace(output_root: Path, config: HubConfig, plugins: Sequence[St
         "interface": {"displayName": config.marketplace.name},
         "plugins": [
             external_marketplace_entry(stable_plugin.definition, "codex")
-            if isinstance(stable_plugin.definition, ExternalPluginDefinition)
+            if isinstance(stable_plugin.definition, ResolvedExternalPluginDefinition)
             else {
                 "name": stable_plugin.definition.id,
                 "source": {"source": "local", "path": f"./dist/codex/{stable_plugin.definition.id}"},
@@ -75,7 +78,7 @@ def write_marketplace(output_root: Path, config: HubConfig, plugins: Sequence[St
                 "category": "Productivity",
             }
             for stable_plugin in plugins
-            if not isinstance(stable_plugin.definition, ExternalPluginDefinition)
+            if not isinstance(stable_plugin.definition, ResolvedExternalPluginDefinition)
             or "codex" in stable_plugin.definition.targets
         ],
     }

@@ -16,8 +16,8 @@ from promptless_instruction_hub.models import (
     IDENTIFIER_RE,
     SEMVER_RE,
     SUPPORTED_HARNESSES,
-    ExternalPluginDefinition,
-    ExternalGitSource,
+    ResolvedExternalPluginDefinition,
+    ResolvedHubPluginDefinition,
     HubConfig,
 )
 from promptless_instruction_hub.release.hashing import stable_hash
@@ -95,7 +95,10 @@ def resolve_publish_version(
 
 
 def resolve_release_version(
-    validation: ValidationResult, *, previous_release_root: Path | None = None, hub_relative_path: str = ""
+    validation: ValidationResult[ResolvedHubPluginDefinition],
+    *,
+    previous_release_root: Path | None = None,
+    hub_relative_path: str = "",
 ) -> str:
     """Compare resolved source state with the previous immutable release."""
 
@@ -254,7 +257,9 @@ def _validate_release_identity(
         raise ValueError(msg)
 
 
-def _build_current_version_basis(validation: ValidationResult, *, version: str) -> dict[str, JsonValue]:
+def _build_current_version_basis(
+    validation: ValidationResult[ResolvedHubPluginDefinition], *, version: str
+) -> dict[str, JsonValue]:
     versioned_validation = _with_version(validation, version)
     with tempfile.TemporaryDirectory(prefix="promptless-instruction-hub-version-") as temp_dir:
         output_root = Path(temp_dir)
@@ -266,7 +271,9 @@ def _build_current_version_basis(validation: ValidationResult, *, version: str) 
         return build_release_version_basis(output_root, versioned_validation, managed_runtimes)
 
 
-def _with_version(validation: ValidationResult, version: str) -> ValidationResult:
+def _with_version(
+    validation: ValidationResult[ResolvedHubPluginDefinition], version: str
+) -> ValidationResult[ResolvedHubPluginDefinition]:
     config = HubConfig.model_validate({**validation.config.model_dump(), "version": version})
     return ValidationResult(
         config=config,
@@ -367,11 +374,9 @@ def _validate_plugin_basis(manifest_path: Path, package: dict[str, JsonValue], k
     if package.get("kind") == "external":
         _require_exact_keys(manifest_path, package, key_path, frozenset({"kind", "id", "name", "source", "targets"}))
         try:
-            plugin = ExternalPluginDefinition.model_validate(package)
+            plugin = ResolvedExternalPluginDefinition.model_validate(package)
         except ValidationError as exc:
             raise ValueError(f"{manifest_path}: invalid {key_path}: {exc}") from exc
-        if not isinstance(plugin.source, ExternalGitSource):
-            raise ValueError(f"{manifest_path}: released external sources must be pinned to a commit SHA")
         return plugin.id
     _require_exact_keys(manifest_path, package, key_path, PLUGIN_BASIS_KEYS)
     plugin_id = _require_string(manifest_path, package, "id", display_path=f"{key_path}.id")

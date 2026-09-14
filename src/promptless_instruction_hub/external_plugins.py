@@ -21,11 +21,13 @@ from promptless_instruction_hub.external_lock import (
 )
 from promptless_instruction_hub.fs import JsonValue, validate_json_value, write_json
 from promptless_instruction_hub.models import (
-    ExternalGitSource,
+    RequestedGitSource,
+    ResolvedGitSource,
+    ResolvedExternalPluginDefinition,
+    ResolvedHubPluginDefinition,
     ExternalPluginDefinition,
     ExternalPluginHarness,
     ExternalPluginTarget,
-    LatestExternalGitSource,
     PluginDefinition,
     SEMVER_RE,
 )
@@ -48,7 +50,7 @@ class GitRevision:
     sha: str
     files: dict[str, str]
 
-    def manifest(self, plugin: ExternalPluginDefinition, target: ExternalPluginHarness) -> dict[str, JsonValue]:
+    def manifest(self, plugin: ResolvedExternalPluginDefinition, target: ExternalPluginHarness) -> dict[str, JsonValue]:
         prefix = plugin.targets[target].path
         prefix = "" if prefix == "." else prefix + "/"
         files = {name.removeprefix(prefix): mode for name, mode in self.files.items() if name.startswith(prefix)}
@@ -96,11 +98,9 @@ def resolve_external_plugins(
     with _git_revisions() as revision:
         for plugin in validation.stable_plugins:
             definition = plugin.definition
-            if isinstance(definition, ExternalPluginDefinition) and isinstance(
-                definition.source, LatestExternalGitSource
-            ):
-                lock.plugins[definition.id] = ExternalGitSource(
-                    type="git", url=definition.source.url, ref=revision(definition.source).sha
+            if isinstance(definition, ExternalPluginDefinition) and definition.source.ref == "latest":
+                lock.plugins[definition.id] = ResolvedGitSource(
+                    type="git", url=definition.source.url, sha=revision(definition.source).sha
                 )
         resolved = apply_external_resolutions(validation, lock)
         records = _verify_external_plugins(resolved, revision, previous_release_root, hub_relative_path)
@@ -116,7 +116,7 @@ def resolve_external_plugins(
     return records
 
 
-RevisionReader = Callable[[ExternalGitSource | LatestExternalGitSource], GitRevision]
+RevisionReader = Callable[[RequestedGitSource | ResolvedGitSource], GitRevision]
 
 
 @contextmanager
@@ -124,10 +124,13 @@ def _git_revisions() -> Iterator[RevisionReader]:
     with tempfile.TemporaryDirectory(prefix="pig-external-") as temp_dir:
         cache: dict[tuple[str, str], GitRevision] = {}
 
-        def revision(source: ExternalGitSource | LatestExternalGitSource) -> GitRevision:
-            key = (source.url, source.ref if isinstance(source, ExternalGitSource) else "HEAD")
+        def revision(source: RequestedGitSource | ResolvedGitSource) -> GitRevision:
+            requested = source.sha if isinstance(source, ResolvedGitSource) else source.ref
+            if requested == "latest":
+                requested = "HEAD"
+            key = (source.url, requested)
             if key not in cache:
-                fetched = _fetch_revision(Path(temp_dir) / str(len(cache)), source)
+                fetched = _fetch_revision(Path(temp_dir) / str(len(cache)), source.url, requested)
                 cache[key] = fetched
                 cache[(source.url, fetched.sha)] = fetched
             return cache[key]
@@ -136,7 +139,7 @@ def _git_revisions() -> Iterator[RevisionReader]:
 
 
 def _verify_external_plugins(
-    validation: ValidationResult,
+    validation: ValidationResult[ResolvedHubPluginDefinition],
     revision: RevisionReader,
     previous_release_root: Path | None,
     hub_relative_path: str,
@@ -144,11 +147,11 @@ def _verify_external_plugins(
     plugins = [
         plugin.definition
         for plugin in validation.stable_plugins
-        if isinstance(plugin.definition, ExternalPluginDefinition)
+        if isinstance(plugin.definition, ResolvedExternalPluginDefinition)
     ]
     if not plugins and previous_release_root is None:
         return []
-    previous: dict[str, ExternalPluginDefinition] = {}
+    previous: dict[str, ResolvedExternalPluginDefinition] = {}
     previous_authored_ids: set[str] = set()
     previous_version: str | None = None
     previous_targets: list[str] = []
@@ -164,7 +167,7 @@ def _verify_external_plugins(
         previous_targets = cast(list[str], basis["targets"])
         for item in cast(list[dict[str, JsonValue]], basis["plugins"]):
             if item.get("kind") == "external":
-                definition = ExternalPluginDefinition.model_validate(item)
+                definition = ResolvedExternalPluginDefinition.model_validate(item)
                 previous[definition.id] = definition
             else:
                 previous_authored_ids.add(cast(str, item["id"]))
@@ -183,7 +186,7 @@ def _verify_external_plugins(
     if not plugins and not authored_replacements:
         return []
 
-    def previous_claude_version(plugin: ExternalPluginDefinition) -> JsonValue:
+    def previous_claude_version(plugin: ResolvedExternalPluginDefinition) -> JsonValue:
         if previous_external_versions is not None:
             return previous_external_versions[(plugin.id, "claude")]
         return revision(plugin.source).manifest(plugin, "claude").get("version")
@@ -236,19 +239,18 @@ def _verify_external_plugins(
     return records
 
 
-def _fetch_revision(root: Path, source: ExternalGitSource | LatestExternalGitSource) -> GitRevision:
-    requested = source.ref if isinstance(source, ExternalGitSource) else "HEAD"
+def _fetch_revision(root: Path, url: str, requested: str) -> GitRevision:
     root.mkdir()
     _git(root, "init", "--bare", "--quiet")
     try:
-        _git(root, "fetch", "--quiet", "--no-tags", "--depth=1", "--recurse-submodules=no", "--", source.url, requested)
+        _git(root, "fetch", "--quiet", "--no-tags", "--depth=1", "--recurse-submodules=no", "--", url, requested)
     except InstructionHubError as exc:
         raise InstructionHubError(
-            f"cannot fetch external plugin revision {requested} from {source.url}; check the revision and repository access"
+            f"cannot fetch external plugin revision {requested} from {url}; check the revision and repository access"
         ) from exc
     sha = _git(root, "rev-parse", "FETCH_HEAD^{commit}").strip()
-    if isinstance(source, ExternalGitSource) and sha != source.ref:
-        raise InstructionHubError(f"external source did not resolve to the requested commit {source.ref}")
+    if requested != "HEAD" and sha != requested:
+        raise InstructionHubError(f"external source did not resolve to the requested commit {requested}")
     files: dict[str, str] = {}
     for entry in _git(root, "ls-tree", "-r", "-z", sha).split("\0"):
         if entry:

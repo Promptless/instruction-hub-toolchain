@@ -6,7 +6,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Annotated, Generic, Literal, TypeVar
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -231,16 +231,21 @@ class ExternalGitRepository(BaseModel):
         return value
 
 
-class ExternalGitSource(ExternalGitRepository):
-    """An immutable repository revision fetched directly by the plugin host."""
-
-    ref: str = Field(pattern=r"^[0-9a-f]{40}$")
+CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 
 
-class LatestExternalGitSource(ExternalGitRepository):
-    """Follow the upstream default branch when the Hub next resolves sources."""
+class RequestedGitSource(ExternalGitRepository):
+    """A catalog request for a fixed commit or the upstream default-branch tip."""
 
-    ref: Literal["latest"]
+    ref: CommitSha | Literal["latest"]
+
+
+class ResolvedGitSource(ExternalGitRepository):
+    """An immutable commit used by locks, releases, and plugin hosts."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sha: CommitSha
 
 
 class ExternalPluginTarget(BaseModel):
@@ -268,8 +273,8 @@ class ExternalPluginTarget(BaseModel):
         return value
 
 
-class ExternalPluginDefinition(BaseModel):
-    """An upstream plugin included in this Hub's marketplace without compilation."""
+class ExternalPluginMetadata(BaseModel):
+    """Upstream plugin identity and target paths shared by requests and resolutions."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -277,7 +282,6 @@ class ExternalPluginDefinition(BaseModel):
     id: str
     name: str = Field(min_length=1)
     owners: list[str] = Field(default_factory=list)
-    source: ExternalGitSource | LatestExternalGitSource
     targets: dict[ExternalPluginHarness, ExternalPluginTarget] = Field(min_length=1)
 
     @field_validator("id")
@@ -291,7 +295,25 @@ class ExternalPluginDefinition(BaseModel):
         return value
 
 
+class ExternalPluginDefinition(ExternalPluginMetadata):
+    """An upstream plugin declaration in the user-authored catalog."""
+
+    source: RequestedGitSource
+
+
+class ResolvedExternalPluginDefinition(ExternalPluginMetadata):
+    """An upstream plugin with an immutable source, ready for build or verification."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source: ResolvedGitSource
+
+
 HubPluginDefinition = PluginDefinition | ExternalPluginDefinition
+ResolvedHubPluginDefinition = PluginDefinition | ResolvedExternalPluginDefinition
+PluginDefinitionT = TypeVar(
+    "PluginDefinitionT", bound=HubPluginDefinition | ResolvedHubPluginDefinition, covariant=True
+)
 
 
 class AssetMetadata(BaseModel):
@@ -346,10 +368,10 @@ class LoadedAsset(BaseModel):
 
 
 @dataclass(frozen=True)
-class StablePlugin:
-    """Resolved stable plugin and the assets to render into its plugin payload."""
+class StablePlugin(Generic[PluginDefinitionT]):
+    """Selected plugin at the requested or resolved stage, with its local assets."""
 
-    definition: HubPluginDefinition
+    definition: PluginDefinitionT
     assets: tuple[LoadedAsset, ...]
 
 

@@ -140,7 +140,10 @@ def test_mixed_marketplaces_build_offline_without_external_payloads(
     manifest = json.loads((tmp_path / "hub.release.json").read_text())
     assert manifest["schema_version"] == 3
     assert json.loads((tmp_path / "hub.stable.json").read_text())["schema_version"] == 3
-    assert manifest["version_basis"]["plugins"][1] == definition
+    assert manifest["version_basis"]["plugins"][1] == {
+        **definition,
+        "source": {"type": "git", "url": UPSTREAM_URL, "sha": definition["source"]["ref"]},
+    }
     assert all(runtime["plugin_id"] != "doc-detective" for runtime in manifest["managed_runtimes"])
 
 
@@ -201,9 +204,9 @@ def test_release_reader_rejects_invalid_external_provenance(tmp_path: Path, muta
     if mutation == "legacy-schema":
         manifest["schema_version"] = 2
     elif mutation == "bad-pin":
-        plugin["source"]["ref"] = "main"
+        plugin["source"]["sha"] = "main"
     elif mutation == "extra-field":
-        plugin["source"]["sha"] = "a" * 40
+        plugin["source"]["ref"] = "a" * 40
     else:
         plugin["assets"] = []
     _write_release_manifest_with_fresh_identity(manifest_path, manifest)

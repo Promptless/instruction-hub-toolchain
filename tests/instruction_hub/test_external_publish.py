@@ -108,7 +108,10 @@ def test_publish_preserves_external_sources_and_bumps_pin_updates(
     _git(repo, "fetch", "origin")
     release = json.loads(_git_output(repo, "show", f"origin/release/stable:{prefix}hub.release.json"))
     assert release["version"] == "0.1.1"
-    assert release["version_basis"]["plugins"][1] == definition
+    assert release["version_basis"]["plugins"][1] == {
+        **definition,
+        "source": {"type": "git", "url": UPSTREAM_URL, "sha": definition["source"]["ref"]},
+    }
     for branch in ("main", "release/stable"):
         cursor = json.loads(_git_output(repo, "show", f"origin/{branch}:{prefix}.cursor-plugin/marketplace.json"))
         assert cursor["plugins"][1]["source"] == {**sources["cursor"], "sha": definition["source"]["ref"]}

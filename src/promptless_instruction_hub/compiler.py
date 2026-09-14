@@ -24,6 +24,7 @@ from promptless_instruction_hub.models import (
     PIG_PLUGIN_NAME,
     HubConfig,
     MarketplaceDefinition,
+    ResolvedHubPluginDefinition,
     TraceIngestionConfig,
 )
 from promptless_instruction_hub.release.manifests import build_release_manifest, write_release_files
@@ -156,7 +157,7 @@ def verify_hub(hub_root: Path) -> VerifyResult:
     )
 
 
-def _compile_hub(output_root: Path, validation: ValidationResult) -> dict[str, JsonValue]:
+def _compile_hub(output_root: Path, validation: ValidationResult[ResolvedHubPluginDefinition]) -> dict[str, JsonValue]:
     managed_runtimes = render_target_plugins(output_root, validation.config, validation.stable_plugins)
     release_manifest = build_release_manifest(output_root, validation, managed_runtimes)
     write_release_files(output_root, release_manifest)
@@ -182,7 +183,9 @@ def _replace_generated_output(hub_root: Path, output_root: Path) -> None:
         replace_tree(output_root / relative_path, hub_root / relative_path)
 
 
-def _with_version(validation: ValidationResult, version: str) -> ValidationResult:
+def _with_version(
+    validation: ValidationResult[ResolvedHubPluginDefinition], version: str
+) -> ValidationResult[ResolvedHubPluginDefinition]:
     config = HubConfig.model_validate({**validation.config.model_dump(), "version": version})
     return ValidationResult(
         config=config,

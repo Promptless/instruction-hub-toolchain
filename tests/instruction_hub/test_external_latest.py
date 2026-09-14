@@ -13,8 +13,13 @@ from promptless_instruction_hub.cli import main
 from promptless_instruction_hub.compiler import build_hub, init_hub, verify_hub
 from promptless_instruction_hub.config import EXTERNAL_LOCK_PATH
 from promptless_instruction_hub.errors import InstructionHubError
+from promptless_instruction_hub.external_lock import ExternalPluginLock, apply_external_resolutions
 from promptless_instruction_hub.external_plugins import resolve_external_plugins, verify_external_plugins
-from promptless_instruction_hub.models import ExternalPluginDefinition
+from promptless_instruction_hub.models import (
+    ExternalPluginDefinition,
+    ResolvedExternalPluginDefinition,
+    ResolvedGitSource,
+)
 from promptless_instruction_hub.release.versions import read_release_manifest, resolve_publish_version
 from promptless_instruction_hub.render.external import external_marketplace_entry, validate_external_marketplace_source
 from promptless_instruction_hub.validate.hub import validate_hub
@@ -85,7 +90,7 @@ def test_latest_resolves_once_and_builds_the_verified_pin_offline(
     assert yaml.safe_load((hub / "plugins/doc-detective.yaml").read_text()) == definition
     assert json.loads((hub / EXTERNAL_LOCK_PATH).read_text()) == {
         "schema_version": 1,
-        "plugins": {"doc-detective": {"type": "git", "url": UPSTREAM_URL, "ref": sha}},
+        "plugins": {"doc-detective": {"type": "git", "url": UPSTREAM_URL, "sha": sha}},
     }
 
     advance_upstream(upstream, path=path)
@@ -100,10 +105,12 @@ def test_latest_resolves_once_and_builds_the_verified_pin_offline(
         source = json.loads((hub / marketplace / "marketplace.json").read_text())["plugins"][1]["source"]
         assert source["sha"] == sha and "ref" not in source
     _, basis = read_release_manifest(hub / "hub.release.json")
-    assert basis["plugins"][1]["source"] == {"type": "git", "url": UPSTREAM_URL, "ref": sha}
+    assert basis["plugins"][1]["source"] == {"type": "git", "url": UPSTREAM_URL, "sha": sha}
 
 
-@pytest.mark.parametrize("mutation", ["wrong-url", "missing-plugin", "bad-sha", "floating", "bad-schema"])
+@pytest.mark.parametrize(
+    "mutation", ["wrong-url", "missing-plugin", "bad-sha", "floating", "ref-only", "both-fields", "bad-schema"]
+)
 def test_offline_build_rejects_stale_or_invalid_locks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
@@ -118,9 +125,13 @@ def test_offline_build_rejects_stale_or_invalid_locks(
     elif mutation == "missing-plugin":
         lock["plugins"] = {}
     elif mutation == "bad-sha":
-        source["ref"] = "main"
+        source["sha"] = "main"
     elif mutation == "floating":
-        source["ref"] = "latest"
+        source["sha"] = "latest"
+    elif mutation == "ref-only":
+        source["ref"] = source.pop("sha")
+    elif mutation == "both-fields":
+        source["ref"] = source["sha"]
     else:
         lock["schema_version"] = 2
     (hub / EXTERNAL_LOCK_PATH).write_text(json.dumps(lock))
@@ -129,12 +140,13 @@ def test_offline_build_rejects_stale_or_invalid_locks(
     assert not (hub / "hub.release.json").exists()
 
 
-def test_floating_sources_cannot_escape_into_marketplaces_or_release_provenance(tmp_path: Path) -> None:
-    definition = latest_definition()
+@pytest.mark.parametrize("ref", ["latest", "a" * 40])
+def test_requested_sources_cannot_escape_into_marketplaces_or_release_provenance(tmp_path: Path, ref: str) -> None:
+    definition = external_definition(ref)
     with pytest.raises(InstructionHubError, match="resolved before rendering"):
         external_marketplace_entry(ExternalPluginDefinition.model_validate(definition), "cursor")
     with pytest.raises(ValueError, match="pinned external"):
-        validate_external_marketplace_source({"source": "url", "url": UPSTREAM_URL, "ref": "latest"})
+        validate_external_marketplace_source({"source": "url", "url": UPSTREAM_URL, "ref": ref})
     init_hub(tmp_path)
     write_external(tmp_path, external_definition())
     build_hub(tmp_path)
@@ -142,8 +154,43 @@ def test_floating_sources_cannot_escape_into_marketplaces_or_release_provenance(
     manifest = json.loads(path.read_text())
     manifest["version_basis"]["plugins"][1]["source"] = definition["source"]
     _write_release_manifest_with_fresh_identity(path, manifest)
-    with pytest.raises(ValueError, match="pinned to a commit SHA"):
+    with pytest.raises(ValueError, match="invalid version_basis"):
         read_release_manifest(path)
+
+
+@pytest.mark.parametrize("ref", ["latest", "a" * 40])
+def test_resolution_preserves_catalog_requests_and_resolves_only_stable_plugins(tmp_path: Path, ref: str) -> None:
+    init_hub(tmp_path)
+    definition = external_definition(ref)
+    write_external(tmp_path, definition)
+    # An unselected latest plugin does not need a lock or enter the build.
+    unselected = {**latest_definition(), "id": "unselected"}
+    (tmp_path / "plugins/unselected.yaml").write_text(yaml.safe_dump(unselected))
+    validation = validate_hub(tmp_path)
+    lock = ExternalPluginLock(plugins={"doc-detective": ResolvedGitSource(type="git", url=UPSTREAM_URL, sha="b" * 40)})
+    resolved = apply_external_resolutions(validation, lock)
+
+    requested = validation.stable_plugins[1].definition
+    assert isinstance(requested, ExternalPluginDefinition)
+    assert requested.source.ref == ref
+    assert resolved.plugins == validation.plugins
+    assert resolved.plugins["doc-detective"] is requested
+    plugin = resolved.stable_plugins[1].definition
+    assert isinstance(plugin, ResolvedExternalPluginDefinition)
+    assert plugin.source.sha == ("b" * 40 if ref == "latest" else ref)
+    assert [item.definition.id for item in resolved.stable_plugins] == ["pig", "doc-detective"]
+    assert yaml.safe_load((tmp_path / "plugins/doc-detective.yaml").read_text()) == definition
+
+
+def test_switching_latest_to_the_same_fixed_commit_preserves_release_identity(tmp_path: Path) -> None:
+    init_hub(tmp_path)
+    write_external(tmp_path, latest_definition())
+    lock = ExternalPluginLock(plugins={"doc-detective": ResolvedGitSource(type="git", url=UPSTREAM_URL, sha="a" * 40)})
+    (tmp_path / EXTERNAL_LOCK_PATH).write_text(lock.model_dump_json())
+    latest = build_hub(tmp_path)
+    write_external(tmp_path, external_definition())
+    (tmp_path / EXTERNAL_LOCK_PATH).unlink()
+    assert build_hub(tmp_path).release_hash == latest.release_hash
 
 
 @pytest.mark.parametrize("failure", ["same-version", "missing-manifest", "unavailable"])
@@ -237,12 +284,12 @@ def test_publish_refreshes_latest_without_catalog_edits_and_can_roll_back_to_a_p
                 assert source["sha"] == expected_sha and "ref" not in source
             if locked:
                 lock = json.loads(_git_output(repo, "show", f"origin/{branch}:{prefix}{EXTERNAL_LOCK_PATH}"))
-                assert lock["plugins"]["doc-detective"]["ref"] == expected_sha
+                assert lock["plugins"]["doc-detective"]["sha"] == expected_sha
             else:
                 assert EXTERNAL_LOCK_PATH.name not in _git_output(repo, "ls-tree", "-r", f"origin/{branch}")
         release = json.loads(_git_output(repo, "show", f"origin/release/stable:{prefix}hub.release.json"))
         assert release["version"] == version
-        assert release["version_basis"]["plugins"][1]["source"]["ref"] == expected_sha
+        assert release["version_basis"]["plugins"][1]["source"]["sha"] == expected_sha
         assert yaml.safe_load((hub / "plugins/doc-detective.yaml").read_text()) == definition
         assert _git_output(repo, "status", "--short") == ""
 

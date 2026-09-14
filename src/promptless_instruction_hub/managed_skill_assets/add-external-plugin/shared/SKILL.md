@@ -80,8 +80,9 @@ lock when latest is selected. `pig verify-external --hub .` rechecks fixed or
 locked commits without refreshing the lock or changing the worktree.
 
 CI build and publish modes refresh latest, while check mode verifies the lock.
-Each publication records the resolved SHA in both marketplaces and release
-provenance, leaving `ref: latest` in source for the next publication. An upstream
+Catalog definitions use `source.ref` for the requested revision. The generated
+lock, marketplaces, and release provenance use `source.sha` for the resolved
+commit, leaving `ref: latest` in source for the next publication. An upstream
 change advances the Hub release. Latest does not schedule publication or force
 desktop updates. For automatic refreshes, configure the Hub's publish workflow
 to run on a schedule. Consumers use their host's update workflow to refresh
