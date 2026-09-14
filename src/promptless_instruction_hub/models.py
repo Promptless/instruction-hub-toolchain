@@ -234,7 +234,7 @@ class ExternalGitRepository(BaseModel):
 class ExternalGitSource(ExternalGitRepository):
     """An immutable repository revision fetched directly by the plugin host."""
 
-    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    ref: str = Field(pattern=r"^[0-9a-f]{40}$")
 
 
 class LatestExternalGitSource(ExternalGitRepository):

@@ -36,10 +36,14 @@ from .helpers import _git, _git_output, _snapshot_tree, _write_release_manifest_
         ("includes", ["skill:example"]),
         ("targets", {}),
         ("targets", {"gemini": {"path": "."}}),
-        ("source", {"type": "git", "url": UPSTREAM_URL, "sha": "main"}),
+        ("source", {"type": "git", "url": UPSTREAM_URL, "sha": "a" * 40}),
+        ("source", {"type": "git", "url": UPSTREAM_URL, "sha": "a" * 40, "ref": "b" * 40}),
         ("source", {"type": "git", "url": UPSTREAM_URL, "sha": "a" * 40, "ref": "main"}),
         ("source", {"type": "git", "url": UPSTREAM_URL, "sha": "a" * 40, "ref": "latest"}),
         ("source", {"type": "git", "url": UPSTREAM_URL, "ref": "main"}),
+        ("source", {"type": "git", "url": UPSTREAM_URL, "ref": "v1.2.3"}),
+        ("source", {"type": "git", "url": UPSTREAM_URL, "ref": "abcdef0"}),
+        ("source", {"type": "git", "url": UPSTREAM_URL}),
     ],
 )
 def test_invalid_external_definitions_fail_offline(tmp_path: Path, field: str, value: Any) -> None:
@@ -170,7 +174,7 @@ def test_external_pins_participate_in_versioning_across_schema_migration(tmp_pat
     shutil.copytree(hub, previous, dirs_exist_ok=True)
     assert resolve_publish_version(hub, previous_release_root=previous) == "0.1.0"
     old = json.loads((hub / "hub.release.json").read_text())
-    definition["source"]["sha"] = "b" * 40
+    definition["source"]["ref"] = "b" * 40
     write_external(hub, definition)
     assert resolve_publish_version(hub, previous_release_root=previous) == "0.1.1"
     build_hub(hub)
@@ -197,9 +201,9 @@ def test_release_reader_rejects_invalid_external_provenance(tmp_path: Path, muta
     if mutation == "legacy-schema":
         manifest["schema_version"] = 2
     elif mutation == "bad-pin":
-        plugin["source"]["sha"] = "main"
-    elif mutation == "extra-field":
         plugin["source"]["ref"] = "main"
+    elif mutation == "extra-field":
+        plugin["source"]["sha"] = "a" * 40
     else:
         plugin["assets"] = []
     _write_release_manifest_with_fresh_identity(manifest_path, manifest)

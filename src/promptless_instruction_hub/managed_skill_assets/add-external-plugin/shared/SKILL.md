@@ -12,9 +12,9 @@ generated marketplace JSON are build output, not the catalog's source.
 ## Declare the upstream plugin
 
 Inspect the upstream repository at the intended commit. Use a credential-free
-HTTPS Git URL ending in `.git`. Choose a full, 40-character `sha` for a fixed
-commit, or `ref: latest` to follow the default branch at each Hub publication.
-Each target needs its own native manifest beneath the chosen plugin directory:
+HTTPS Git URL ending in `.git`. Set `source.ref` to a full, 40-character commit
+SHA for a fixed pin, or `"latest"` to follow the default branch at each Hub
+publication. Each target needs its own native manifest beneath the chosen plugin directory:
 
 | Target | Required manifest |
 | --- | --- |
@@ -32,7 +32,7 @@ name: Doc Detective
 source:
   type: git
   url: https://github.com/doc-detective/agent-tools.git
-  sha: "<full-40-character-commit-sha>"
+  ref: "<full-40-character-commit-sha>" # or "latest"
 targets:
   claude:
     path: plugins/doc-detective
@@ -42,7 +42,7 @@ targets:
     path: plugins/doc-detective
 ```
 
-To follow latest, replace the `sha` line with `ref: latest`; never set both.
+To follow latest, set `ref: "latest"`.
 Latest means the upstream default-branch tip, not the newest tag or release.
 Other branch and tag names must be resolved to a full SHA for a fixed pin.
 
@@ -87,9 +87,9 @@ desktop updates. For automatic refreshes, configure the Hub's publish workflow
 to run on a schedule. Consumers use their host's update workflow to refresh
 installed plugins.
 
-For fixed updates or rollback, replace `source.ref` (if present) with `source.sha`
-at the desired reviewed commit and repeat these checks. Resolution removes
-unused lock entries. Publication compares the previous release and rejects
+For fixed updates or rollback, set `source.ref` to the desired reviewed commit
+SHA and repeat these checks. Resolution removes unused lock entries. Publication
+compares the previous release and rejects
 Claude source or path changes that keep the same explicit upstream version,
 because Claude may retain its cached plugin. Select a commit with a different
 upstream version; changing the Hub version does not override it. When a previous

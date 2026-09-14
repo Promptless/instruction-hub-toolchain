@@ -57,7 +57,7 @@ def _validate_records(value: JsonValue, basis: dict[str, JsonValue]) -> dict[tup
             source = cast(ExternalGitSource, plugin.source)
             for target, location in plugin.targets.items():
                 if target in cast(list[str], basis["targets"]):
-                    expected.add((plugin.id, target, source.url, source.sha, location.path))
+                    expected.add((plugin.id, target, source.url, source.ref, location.path))
 
     if not isinstance(value, list):
         raise ValueError("verified_external_plugins must be a list")

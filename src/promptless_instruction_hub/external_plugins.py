@@ -100,7 +100,7 @@ def resolve_external_plugins(
                 definition.source, LatestExternalGitSource
             ):
                 lock.plugins[definition.id] = ExternalGitSource(
-                    type="git", url=definition.source.url, sha=revision(definition.source).sha
+                    type="git", url=definition.source.url, ref=revision(definition.source).sha
                 )
         resolved = apply_external_resolutions(validation, lock)
         records = _verify_external_plugins(resolved, revision, previous_release_root, hub_relative_path)
@@ -125,7 +125,7 @@ def _git_revisions() -> Iterator[RevisionReader]:
         cache: dict[tuple[str, str], GitRevision] = {}
 
         def revision(source: ExternalGitSource | LatestExternalGitSource) -> GitRevision:
-            key = (source.url, source.sha if isinstance(source, ExternalGitSource) else "HEAD")
+            key = (source.url, source.ref if isinstance(source, ExternalGitSource) else "HEAD")
             if key not in cache:
                 fetched = _fetch_revision(Path(temp_dir) / str(len(cache)), source)
                 cache[key] = fetched
@@ -237,7 +237,7 @@ def _verify_external_plugins(
 
 
 def _fetch_revision(root: Path, source: ExternalGitSource | LatestExternalGitSource) -> GitRevision:
-    requested = source.sha if isinstance(source, ExternalGitSource) else "HEAD"
+    requested = source.ref if isinstance(source, ExternalGitSource) else "HEAD"
     root.mkdir()
     _git(root, "init", "--bare", "--quiet")
     try:
@@ -247,8 +247,8 @@ def _fetch_revision(root: Path, source: ExternalGitSource | LatestExternalGitSou
             f"cannot fetch external plugin revision {requested} from {source.url}; check the revision and repository access"
         ) from exc
     sha = _git(root, "rev-parse", "FETCH_HEAD^{commit}").strip()
-    if isinstance(source, ExternalGitSource) and sha != source.sha:
-        raise InstructionHubError(f"external source did not resolve to the requested commit {source.sha}")
+    if isinstance(source, ExternalGitSource) and sha != source.ref:
+        raise InstructionHubError(f"external source did not resolve to the requested commit {source.ref}")
     files: dict[str, str] = {}
     for entry in _git(root, "ls-tree", "-r", "-z", sha).split("\0"):
         if entry:

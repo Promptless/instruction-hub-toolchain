@@ -85,7 +85,7 @@ def test_latest_resolves_once_and_builds_the_verified_pin_offline(
     assert yaml.safe_load((hub / "plugins/doc-detective.yaml").read_text()) == definition
     assert json.loads((hub / EXTERNAL_LOCK_PATH).read_text()) == {
         "schema_version": 1,
-        "plugins": {"doc-detective": {"type": "git", "url": UPSTREAM_URL, "sha": sha}},
+        "plugins": {"doc-detective": {"type": "git", "url": UPSTREAM_URL, "ref": sha}},
     }
 
     advance_upstream(upstream, path=path)
@@ -100,7 +100,7 @@ def test_latest_resolves_once_and_builds_the_verified_pin_offline(
         source = json.loads((hub / marketplace / "marketplace.json").read_text())["plugins"][1]["source"]
         assert source["sha"] == sha and "ref" not in source
     _, basis = read_release_manifest(hub / "hub.release.json")
-    assert basis["plugins"][1]["source"] == {"type": "git", "url": UPSTREAM_URL, "sha": sha}
+    assert basis["plugins"][1]["source"] == {"type": "git", "url": UPSTREAM_URL, "ref": sha}
 
 
 @pytest.mark.parametrize("mutation", ["wrong-url", "missing-plugin", "bad-sha", "floating", "bad-schema"])
@@ -118,9 +118,8 @@ def test_offline_build_rejects_stale_or_invalid_locks(
     elif mutation == "missing-plugin":
         lock["plugins"] = {}
     elif mutation == "bad-sha":
-        source["sha"] = "main"
+        source["ref"] = "main"
     elif mutation == "floating":
-        del source["sha"]
         source["ref"] = "latest"
     else:
         lock["schema_version"] = 2
@@ -238,12 +237,12 @@ def test_publish_refreshes_latest_without_catalog_edits_and_can_roll_back_to_a_p
                 assert source["sha"] == expected_sha and "ref" not in source
             if locked:
                 lock = json.loads(_git_output(repo, "show", f"origin/{branch}:{prefix}{EXTERNAL_LOCK_PATH}"))
-                assert lock["plugins"]["doc-detective"]["sha"] == expected_sha
+                assert lock["plugins"]["doc-detective"]["ref"] == expected_sha
             else:
                 assert EXTERNAL_LOCK_PATH.name not in _git_output(repo, "ls-tree", "-r", f"origin/{branch}")
         release = json.loads(_git_output(repo, "show", f"origin/release/stable:{prefix}hub.release.json"))
         assert release["version"] == version
-        assert release["version_basis"]["plugins"][1]["source"]["sha"] == expected_sha
+        assert release["version_basis"]["plugins"][1]["source"]["ref"] == expected_sha
         assert yaml.safe_load((hub / "plugins/doc-detective.yaml").read_text()) == definition
         assert _git_output(repo, "status", "--short") == ""
 
@@ -254,7 +253,7 @@ def test_publish_refreshes_latest_without_catalog_edits_and_can_roll_back_to_a_p
     new_sha = advance_upstream(upstream)
     publish(new_sha, "0.1.1")
 
-    definition["source"] = {"type": "git", "url": UPSTREAM_URL, "sha": sha}
+    definition["source"] = {"type": "git", "url": UPSTREAM_URL, "ref": sha}
     write_external(hub, definition)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "roll back and stop following latest")

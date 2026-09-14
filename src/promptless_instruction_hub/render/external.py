@@ -21,7 +21,7 @@ def external_marketplace_entry(plugin: ExternalPluginDefinition, target: Externa
     source: dict[str, JsonValue] = {
         "source": "url" if path == "." else "git-subdir",
         "url": plugin.source.url,
-        "sha": plugin.source.sha,
+        "sha": plugin.source.ref,
     }
     if path != ".":
         source["path"] = path
@@ -39,7 +39,7 @@ def validate_external_marketplace_source(source: dict[str, JsonValue]) -> None:
     expected = {"source", "url", "sha", "path"} if kind == "git-subdir" else {"source", "url", "sha"}
     if kind not in {"url", "git-subdir"} or set(source) != expected:
         raise ValueError("Expected a pinned external Git marketplace source")
-    ExternalGitSource.model_validate({"type": "git", "url": source["url"], "sha": source["sha"]})
+    ExternalGitSource.model_validate({"type": "git", "url": source["url"], "ref": source["sha"]})
     if kind == "git-subdir":
         target = ExternalPluginTarget.model_validate({"path": source["path"]})
         if target.path == ".":

@@ -98,7 +98,7 @@ def test_publish_preserves_external_sources_and_bumps_pin_updates(
         manifest = json.loads(manifest_path.read_text())
         manifest["version"] = "1.2.4"
         manifest_path.write_text(json.dumps(manifest))
-    definition["source"]["sha"] = commit_upstream(upstream)
+    definition["source"]["ref"] = commit_upstream(upstream)
     write_external(repo / hub_path, definition)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "update upstream pin")
@@ -111,10 +111,10 @@ def test_publish_preserves_external_sources_and_bumps_pin_updates(
     assert release["version_basis"]["plugins"][1] == definition
     for branch in ("main", "release/stable"):
         cursor = json.loads(_git_output(repo, "show", f"origin/{branch}:{prefix}.cursor-plugin/marketplace.json"))
-        assert cursor["plugins"][1]["source"] == {**sources["cursor"], "sha": definition["source"]["sha"]}
+        assert cursor["plugins"][1]["source"] == {**sources["cursor"], "sha": definition["source"]["ref"]}
     assert _git_output(repo, "status", "--short") == ""
 
-    definition["source"]["sha"] = sha
+    definition["source"]["ref"] = sha
     write_external(repo / hub_path, definition)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "roll back upstream pin")
@@ -145,7 +145,7 @@ def test_failed_external_verification_preserves_published_branches(
     assert initial.returncode == 0, initial.stdout + initial.stderr
 
     if failure == "missing-commit":
-        definition["source"]["sha"] = "0" * 40
+        definition["source"]["ref"] = "0" * 40
     else:
         if failure == "same-version":
             (upstream / PLUGIN_PATH / "skills/example/SKILL.md").write_text("# Changed skill\n")
@@ -157,7 +157,7 @@ def test_failed_external_verification_preserves_published_branches(
                 claude = json.loads(claude_path.read_text())
                 claude["version"] = "1.2.4"
                 claude_path.write_text(json.dumps(claude))
-        definition["source"]["sha"] = commit_upstream(upstream)
+        definition["source"]["ref"] = commit_upstream(upstream)
     write_external(repo, definition)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "propose invalid upstream pin")
@@ -208,7 +208,7 @@ def test_previous_release_comparison_respects_host_version_behavior(
             manifest_path.write_text(json.dumps(manifest))
     else:
         (upstream / PLUGIN_PATH / "skills/example/SKILL.md").write_text("# Updated\n")
-    definition["source"]["sha"] = commit_upstream(upstream)
+    definition["source"]["ref"] = commit_upstream(upstream)
     write_external(hub, definition)
     if change == "path":
         with pytest.raises(InstructionHubError, match="retains upstream version"):
@@ -305,7 +305,7 @@ def test_external_source_can_be_replaced_after_old_repository_disappears(
     replacement = tmp_path / "replacement"
     replacement_sha = make_upstream(replacement, monkeypatch)
     if not latest:
-        definition["source"]["sha"] = replacement_sha
+        definition["source"]["ref"] = replacement_sha
     definition["source"]["url"] = "https://replacement.example.test/plugins.git"
     monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{upstream.as_posix()}.insteadOf")
@@ -328,7 +328,7 @@ def test_external_source_can_be_replaced_after_old_repository_disappears(
         manifest_path.write_text(json.dumps(manifest))
     replacement_sha = commit_upstream(replacement)
     if not latest:
-        definition["source"]["sha"] = replacement_sha
+        definition["source"]["ref"] = replacement_sha
         write_external(repo, definition)
         _git(repo, "add", "-A")
         _git(repo, "commit", "-m", "avoid the previously installed version")

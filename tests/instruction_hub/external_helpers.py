@@ -18,7 +18,7 @@ def external_definition(sha: str = "a" * 40, *, path: str = PLUGIN_PATH) -> dict
         "kind": "external",
         "id": "doc-detective",
         "name": "Doc Detective",
-        "source": {"type": "git", "url": UPSTREAM_URL, "sha": sha},
+        "source": {"type": "git", "url": UPSTREAM_URL, "ref": sha},
         "targets": {target: {"path": path} for target in ("claude", "codex", "cursor")},
     }
 

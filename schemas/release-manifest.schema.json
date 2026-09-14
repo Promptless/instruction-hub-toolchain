@@ -447,7 +447,7 @@
           "required": [
             "type",
             "url",
-            "sha"
+            "ref"
           ],
           "properties": {
             "type": {
@@ -458,7 +458,7 @@
               "format": "uri",
               "pattern": "^https://[^/@?#\\s]+/[^?#\\s]+$"
             },
-            "sha": {
+            "ref": {
               "type": "string",
               "pattern": "^[0-9a-f]{40}$"
             }

@@ -264,14 +264,11 @@ writing the resolved version back does not cause another version bump.
 
 ### External plugins
 
-The generated PIG plugin ships an `add-external-plugin` skill for Claude, Codex,
-and Cursor. It guides agents through catalog edits, target selection, commit
-pinning or following latest, verification, updates, and rollback in the Hub's
-source repository.
-
-A Hub can list a third-party plugin alongside its authored plugins. Declare the
-upstream repository and a reviewed, full 40-character commit SHA, then add the
-plugin ID to `stable_plugins`:
+A Hub can list a third-party plugin alongside its authored plugins. Set
+`source.ref` to a reviewed, full 40-character commit SHA for a fixed pin, or
+`"latest"` to follow the upstream default branch at each Hub publication.
+Declare the upstream repository and ref, then add the plugin ID to
+`stable_plugins`:
 
 ```yaml
 # plugins/doc-detective.yaml
@@ -281,7 +278,7 @@ name: Doc Detective
 source:
   type: git
   url: https://github.com/doc-detective/agent-tools.git
-  sha: "<reviewed-40-character-commit-sha>"
+  ref: "<reviewed-40-character-commit-sha>" # or "latest"
 targets:
   claude:
     path: plugins/doc-detective
@@ -291,29 +288,31 @@ targets:
     path: plugins/doc-detective
 ```
 
-Replace the SHA placeholder before validation. Each target path is relative to
-the upstream repository; use `.` for a plugin at its root. External plugins
-support Claude, Codex, and Cursor. Gemini declarations are rejected;
-authored plugins still support all four targets. Only declared, enabled targets
-receive an entry, and each stable external plugin needs at least one enabled
-target. External definitions cannot include local assets or replace `pig`.
+Replace the SHA placeholder with a commit SHA or `"latest"` before validation.
+Each target path is relative to the upstream repository; use `.` for a plugin
+at its root. External plugins support Claude, Codex, and Cursor. Gemini
+declarations are rejected; authored plugins still support all four targets.
+Only declared, enabled targets receive an entry, and each stable external plugin
+needs at least one enabled target. External definitions cannot include local
+assets or replace `pig`.
 
-To follow the upstream default branch at each Hub publication, replace `sha`
-with `ref: latest`:
+To follow the upstream default branch at each Hub publication, set `ref` to
+`"latest"`:
 
 ```yaml
 source:
   type: git
   url: https://github.com/doc-detective/agent-tools.git
-  ref: latest
+  ref: "latest"
 ```
 
 `latest` means the repository's default-branch tip, not its newest tag or hosted
-release. Set exactly one of `sha` or `ref`; other ref values are not supported.
-Run `pig resolve-external --hub .` to fetch and verify the selected commit, then
-commit the generated `hub.external-plugins.lock.json` alongside the definition.
-The lock records immutable SHAs for selected `latest` plugins. Offline builds
-require a matching lock and never resolve upstream themselves.
+release. Other branch and tag names are not supported; resolve them to a full
+commit SHA for a fixed pin. Run `pig resolve-external --hub .` to fetch and verify
+the selected commit, then commit the generated `hub.external-plugins.lock.json`
+alongside the definition. The lock records immutable SHAs for selected `latest`
+plugins. Offline builds require a matching lock and never resolve upstream
+themselves.
 
 The shared CI runner refreshes these resolutions in `build` and `publish` modes.
 Publication resolves each upstream repository once, verifies that commit, and
@@ -322,7 +321,7 @@ both source and release branches while leaving `ref: latest` in the catalog.
 An upstream change therefore advances the next Hub release without a catalog
 edit. With no other Hub changes, an unchanged upstream is a no-op. `check` mode
 verifies the existing lock without refreshing it. To stop following latest or
-roll back, replace `ref` with the desired `sha`; the next resolution removes the
+roll back, set `ref` to the desired commit SHA; the next resolution removes the
 unused lock entry.
 
 Latest refreshes happen when CI runs; this option does not create a schedule or
@@ -397,6 +396,11 @@ do not grant that access. A commit pins repository content, including declared
 MCP configuration, but does not freeze a remote MCP service or dependencies that
 upstream code downloads. Updating the marketplace does not itself prove that an
 already-installed plugin was refreshed by the host.
+
+The generated PIG plugin ships an `add-external-plugin` skill for Claude, Codex,
+and Cursor. It guides agents through catalog edits, target selection, commit
+pinning or following latest, verification, updates, and rollback in the Hub's
+source repository.
 
 ### Migrating existing hubs
 
