@@ -52,7 +52,21 @@ def test_invalid_external_definitions_fail_offline(tmp_path: Path, field: str, v
 
 
 @pytest.mark.parametrize(
-    "path", ["../plugin", "/plugin", "x/../plugin", "x//plugin", "./plugin", "C:/plugin", "x\\y", ""]
+    "path",
+    [
+        "../plugin",
+        "/plugin",
+        "x/../plugin",
+        "x//plugin",
+        "./plugin",
+        "C:/plugin",
+        "x\\y",
+        "",
+        "plugins/review\tdocs",
+        "plugins/review\ndocs",
+        "plugins/review\x00docs",
+        "plugins/review\u00a0docs",
+    ],
 )
 def test_external_plugin_paths_cannot_escape_repo(tmp_path: Path, path: str) -> None:
     init_hub(tmp_path)
@@ -193,7 +207,7 @@ def test_release_reader_rejects_invalid_external_provenance(tmp_path: Path, muta
         read_release_manifest(manifest_path)
 
 
-@pytest.mark.parametrize("path", [".", PLUGIN_PATH])
+@pytest.mark.parametrize("path", [".", PLUGIN_PATH, "plugins/Doc Detective"])
 def test_verifier_reads_pinned_upstream_manifests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -212,6 +226,37 @@ def test_verifier_reads_pinned_upstream_manifests(
         ("cursor", sha, "1.2.3"),
     }
     assert _snapshot_tree(hub) == before
+
+
+@pytest.mark.parametrize("plugin_path", [".", "plugins/Doc Detective"])
+def test_verifier_accepts_spaces_in_component_directories_and_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plugin_path: str
+) -> None:
+    upstream, hub = tmp_path / "upstream", tmp_path / "hub"
+    make_upstream(upstream, monkeypatch, path=plugin_path)
+    plugin = upstream / plugin_path
+    (plugin / "skills/example").rename(plugin / "skills/review docs")
+    (plugin / "hooks/hooks.json").rename(plugin / "hooks/review hooks.json")
+    (plugin / ".mcp.json").rename(plugin / "mcp servers.json")
+    (plugin / "rules").rename(plugin / "review rules")
+    for target in ("claude", "codex", "cursor"):
+        manifest_path = plugin / f".{target}-plugin/plugin.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest.update(
+            skills="./skills/review docs/",
+            hooks="./hooks/review hooks.json",
+            mcpServers=["./mcp servers.json"],
+        )
+        if target == "cursor":
+            manifest["rules"] = "./review rules/"
+        manifest_path.write_text(json.dumps(manifest))
+    sha = commit_upstream(upstream)
+    init_hub(hub)
+    write_external(hub, external_definition(sha, path=plugin_path))
+    records = verify_external_plugins(hub)
+    assert {(record["target"], record["path"]) for record in records} == {
+        (target, plugin_path) for target in ("claude", "codex", "cursor")
+    }
 
 
 @pytest.mark.parametrize("path_kind", ["absolute", "parent", "symlink", "manifest-symlink"])

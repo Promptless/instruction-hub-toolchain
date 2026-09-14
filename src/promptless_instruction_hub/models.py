@@ -260,7 +260,7 @@ class ExternalPluginTarget(BaseModel):
         if (
             not value
             or any(part in {"", ".", ".."} for part in value.split("/"))
-            or any(character.isspace() or ord(character) < 32 for character in value)
+            or any(character != " " and (character.isspace() or ord(character) < 32) for character in value)
             or "\\" in value
             or ":" in value
         ):

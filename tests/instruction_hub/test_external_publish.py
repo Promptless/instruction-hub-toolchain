@@ -28,6 +28,7 @@ from .helpers import _git, _git_output, _init_action_repo, _release_branch_path_
     [
         ("https://github.com", "acme/hub", ".", PLUGIN_PATH),
         ("https://github.com", "acme/hub", "Customer Hub", PLUGIN_PATH),
+        ("https://github.com", "acme/hub", "Customer Hub", "plugins/Doc Detective"),
         ("https://github.com", "acme/hub", ".", "."),
         ("https://gitlab.example.test", "acme/team/hub", "instructions/hub", PLUGIN_PATH),
         ("https://gitlab.example.test", "acme/team/hub", "instructions/hub", "."),
