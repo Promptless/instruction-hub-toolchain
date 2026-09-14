@@ -6,6 +6,7 @@ import json
 import shutil
 from pathlib import Path
 
+from promptless_instruction_hub.agent_skills import read_agent_skill, render_agent_skill
 from promptless_instruction_hub.assets import METADATA_FILE
 from promptless_instruction_hub.fs import copy_tree
 from promptless_instruction_hub.models import Harness, LoadedAsset
@@ -40,6 +41,10 @@ def render_assets_for_target(target_root: Path, target: Harness, assets: list[Lo
 
 def _render_agent_skill(target_root: Path, target: Harness, asset: LoadedAsset) -> None:
     destination = target_root / "skills" / asset.id
+    if asset.type == "agent":
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "SKILL.md").write_text(render_agent_skill(read_agent_skill(asset)), encoding="utf-8")
+        return
     if asset.path.is_dir():
         copy_tree(asset.path, destination, skip_names={METADATA_FILE})
         if target == "codex":

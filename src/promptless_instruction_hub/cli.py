@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from promptless_instruction_hub.agent_skills import AgentSkillWarning
 from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH, write_hub_version
 from promptless_instruction_hub.compiler import build_hub, init_hub, validate_hub, verify_hub
 from promptless_instruction_hub.errors import InstructionHubError
@@ -99,16 +100,19 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
     if args.command == "validate":
         result = validate_hub(args.hub)
+        _print_conversion_warnings(result.warnings)
         print(f"valid Instruction Hub: {len(result.stable_assets)} stable asset(s)")
         return 0
     if args.command == "verify":
         result = verify_hub(args.hub)
+        _print_conversion_warnings(result.warnings)
         print(
             f"verified release {result.release_id} ({result.release_hash[:12]}) across {result.target_count} target(s)"
         )
         return 0
     if args.command == "build":
         result = build_hub(args.hub, check=args.check, version=args.version)
+        _print_conversion_warnings(result.warnings)
         verb = "checked" if result.checked else "built"
         print(f"{verb} release {result.release_id} ({result.release_hash[:12]})")
         return 0
@@ -132,6 +136,11 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
     msg = f"unknown command: {args.command}"
     raise InstructionHubError(msg)
+
+
+def _print_conversion_warnings(warnings: tuple[AgentSkillWarning, ...]) -> None:
+    for warning in warnings:
+        print(f"warning: {warning.message}", file=sys.stderr)
 
 
 if __name__ == "__main__":
