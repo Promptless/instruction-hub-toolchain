@@ -18,9 +18,10 @@ from promptless_instruction_hub.models import (
     ExternalPluginDefinition,
     ExternalPluginHarness,
     ExternalPluginTarget,
+    PluginDefinition,
     SEMVER_RE,
 )
-from promptless_instruction_hub.release.versions import read_release_manifest
+from promptless_instruction_hub.release.versions import read_release_manifest, resolve_publish_version
 from promptless_instruction_hub.validate.hub import validate_hub
 
 MANIFEST_PATHS = {
@@ -69,7 +70,7 @@ class GitRevision:
 def verify_external_plugins(
     hub_root: Path, *, previous_release_root: Path | None = None, hub_relative_path: str = ""
 ) -> list[dict[str, JsonValue]]:
-    """Verify selected upstream manifests, and reject Claude pins hidden by an unchanged version."""
+    """Verify upstream manifests and reject Claude source changes hidden by an unchanged version."""
 
     validation = validate_hub(hub_root)
     plugins = [
@@ -77,7 +78,7 @@ def verify_external_plugins(
         for plugin in validation.stable_plugins
         if isinstance(plugin.definition, ExternalPluginDefinition)
     ]
-    if not plugins:
+    if not plugins and previous_release_root is None:
         return []
     previous: dict[str, ExternalPluginDefinition] = {}
     previous_authored_ids: set[str] = set()
@@ -98,6 +99,20 @@ def verify_external_plugins(
             else:
                 previous_authored_ids.add(cast(str, item["id"]))
 
+    authored_ids = {
+        plugin.definition.id for plugin in validation.stable_plugins if isinstance(plugin.definition, PluginDefinition)
+    }
+    authored_replacements = [
+        plugin
+        for plugin in previous.values()
+        if plugin.id in authored_ids
+        and "claude" in plugin.targets
+        and "claude" in previous_targets
+        and "claude" in validation.config.targets
+    ]
+    if not plugins and not authored_replacements:
+        return []
+
     records: list[dict[str, JsonValue]] = []
     with tempfile.TemporaryDirectory(prefix="pig-external-") as temp_dir:
         cache: dict[tuple[str, str], GitRevision] = {}
@@ -107,6 +122,18 @@ def verify_external_plugins(
             if key not in cache:
                 cache[key] = _fetch_revision(Path(temp_dir) / str(len(cache)), source)
             return cache[key]
+
+        if authored_replacements:
+            publish_version = resolve_publish_version(
+                hub_root, previous_release_root=previous_release_root, hub_relative_path=hub_relative_path
+            )
+            for old in authored_replacements:
+                old_version = revision(old.source).manifest(old, "claude").get("version")
+                if old_version == publish_version:
+                    raise InstructionHubError(
+                        f"{old.id} (claude): authored replacement retains upstream version {old_version}; "
+                        "Claude may keep the cached plugin. Set a different Hub version before publishing."
+                    )
 
         for plugin in plugins:
             for target in sorted(plugin.targets):

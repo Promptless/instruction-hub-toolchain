@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from promptless_instruction_hub.compiler import build_hub, init_hub
+from promptless_instruction_hub.config import write_hub_version
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.external_plugins import verify_external_plugins
 
@@ -231,3 +232,89 @@ def test_authored_to_external_migration_cannot_reuse_claude_version(
     (hub / "hub.yaml").write_text(yaml.safe_dump(config))
     with pytest.raises(InstructionHubError, match="retains upstream version 1.2.3"):
         verify_external_plugins(hub, previous_release_root=previous)
+
+
+def test_external_to_authored_publish_rejects_version_collision_until_hub_version_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sha = make_upstream(tmp_path / "upstream", monkeypatch)
+    hub_path = "Customer Hub"
+    repo = _init_action_repo(tmp_path / "publisher", targets=("claude", "codex"), hub_root_name=hub_path)
+    hub = repo / hub_path
+    write_hub_version(hub, "1.2.2")
+    write_external(hub, external_definition(sha))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "include external plugin")
+    _git(repo, "push")
+    initial = _run_action(repo, tmp_path / "output", hub_root=hub_path)
+    assert initial.returncode == 0, initial.stdout + initial.stderr
+
+    write_external(hub, {"id": "doc-detective", "name": "Authored Doc Detective", "includes": []})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "replace external plugin with authored plugin")
+    _git(repo, "push")
+    before = _git_output(repo, "ls-remote", "origin", "refs/heads/main", "refs/heads/release/stable")
+    collision = _run_action(repo, tmp_path / "output", hub_root=hub_path)
+    assert collision.returncode != 0
+    assert "authored replacement retains upstream version 1.2.3" in collision.stderr
+    assert _git_output(repo, "ls-remote", "origin", "refs/heads/main", "refs/heads/release/stable") == before
+    assert _git_output(repo, "status", "--short") == ""
+
+    write_hub_version(hub, "1.2.4")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "avoid installed upstream version")
+    _git(repo, "push")
+    publish = _run_action(repo, tmp_path / "output", hub_root=hub_path)
+    assert publish.returncode == 0, publish.stdout + publish.stderr
+    _git(repo, "fetch", "origin")
+    for target in ("claude", "codex"):
+        manifest = json.loads(
+            _git_output(
+                repo,
+                "show",
+                f"origin/release/stable:{hub_path}/dist/{target}/doc-detective/.{target}-plugin/plugin.json",
+            )
+        )
+        assert manifest["version"] == "1.2.4"
+    before_rerun = _git_output(repo, "ls-remote", "origin", "refs/heads/main", "refs/heads/release/stable")
+    rerun = _run_action(repo, tmp_path / "output", hub_root=hub_path)
+    assert rerun.returncode == 0, rerun.stdout + rerun.stderr
+    assert _git_output(repo, "ls-remote", "origin", "refs/heads/main", "refs/heads/release/stable") == before_rerun
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["auto-bump", "versionless", "codex-only", "previous-claude-disabled", "current-claude-disabled", "unselected"],
+)
+def test_safe_external_to_authored_migrations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str) -> None:
+    upstream, hub, previous = tmp_path / "upstream", tmp_path / "hub", tmp_path / "previous"
+    sha = make_upstream(upstream, monkeypatch)
+    if change == "versionless":
+        for target in ("claude", "codex"):
+            manifest_path = upstream / PLUGIN_PATH / f".{target}-plugin/plugin.json"
+            manifest = json.loads(manifest_path.read_text())
+            del manifest["version"]
+            manifest_path.write_text(json.dumps(manifest))
+        sha = commit_upstream(upstream)
+    init_hub(hub, version="1.2.3" if change == "auto-bump" else "1.2.2")
+    definition = external_definition(sha)
+    if change == "codex-only":
+        del definition["targets"]["claude"]
+    write_external(hub, definition)
+    config = yaml.safe_load((hub / "hub.yaml").read_text())
+    config["targets"] = ["codex"] if change == "previous-claude-disabled" else ["claude", "codex"]
+    (hub / "hub.yaml").write_text(yaml.safe_dump(config))
+    build_hub(hub)
+    shutil.copytree(hub, previous)
+
+    write_external(hub, {"id": "doc-detective", "name": "Authored Doc Detective", "includes": []})
+    config["targets"] = ["codex"] if change == "current-claude-disabled" else ["claude", "codex"]
+    if change == "unselected":
+        config["stable_plugins"].remove("doc-detective")
+    (hub / "hub.yaml").write_text(yaml.safe_dump(config))
+    if change not in {"auto-bump", "versionless"}:
+        monkeypatch.setattr(
+            "promptless_instruction_hub.external_plugins._fetch_revision",
+            lambda *args: pytest.fail("migration without a Claude replacement fetched an upstream revision"),
+        )
+    assert verify_external_plugins(hub, previous_release_root=previous) == []

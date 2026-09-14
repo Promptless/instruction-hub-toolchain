@@ -336,6 +336,11 @@ a version use the host's commit-based behavior. See the
 [Claude marketplace source and version rules](https://code.claude.com/docs/en/plugin-marketplaces)
 and [Codex marketplace metadata](https://developers.openai.com/plugins/build/plugins#marketplace-metadata).
 
+Replacing an external Claude plugin with an authored plugin also requires the
+resolved Hub release version to differ from the upstream version. If the automatic
+version bump collides, use `pig set-version --hub . --version <new-version>` to
+select a higher Hub version before publishing.
+
 Source and target declarations participate in release versioning, so updating a
 pin advances the Hub release even when authored payloads are unchanged. Mixed
 releases use manifest schema version 3 and record external provenance in
