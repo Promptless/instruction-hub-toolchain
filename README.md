@@ -264,11 +264,9 @@ writing the resolved version back does not cause another version bump.
 
 ### External plugins
 
-A Hub can list a third-party plugin alongside its authored plugins. Set
-`source.ref` to a reviewed, full 40-character commit SHA for a fixed pin, or
-`"latest"` to follow the upstream default branch at each Hub publication.
-Declare the upstream repository and ref, then add the plugin ID to
-`stable_plugins`:
+A Hub can distribute upstream plugins for Claude, Codex, and Cursor. Set
+`source.ref` to a full 40-character commit SHA for a fixed pin, or `"latest"`
+to follow the upstream default branch when the Hub publishes.
 
 ```yaml
 # plugins/doc-detective.yaml
@@ -278,7 +276,7 @@ name: Doc Detective
 source:
   type: git
   url: https://github.com/doc-detective/agent-tools.git
-  ref: "<reviewed-40-character-commit-sha>" # or "latest"
+  ref: "latest"
 targets:
   claude:
     path: plugins/doc-detective
@@ -288,121 +286,24 @@ targets:
     path: plugins/doc-detective
 ```
 
-Replace the SHA placeholder with a commit SHA or `"latest"` before validation.
-Each target path is relative to the upstream repository; use `.` for a plugin
-at its root. External plugins support Claude, Codex, and Cursor. Gemini
-declarations are rejected; authored plugins still support all four targets.
-Only declared, enabled targets receive an entry, and each stable external plugin
-needs at least one enabled target. External definitions cannot include local
-assets or replace `pig`.
+Add the ID to `hub.yaml`'s `stable_plugins`. It must match the upstream manifest's
+`name`. Declare only targets the upstream supports; paths are relative to its
+repository, with `.` for a plugin at the root.
 
-To follow the upstream default branch at each Hub publication, set `ref` to
-`"latest"`:
-
-```yaml
-source:
-  type: git
-  url: https://github.com/doc-detective/agent-tools.git
-  ref: "latest"
-```
-
-`latest` means the repository's default-branch tip, not its newest tag or hosted
-release. Other branch and tag names are not supported; resolve them to a full
-commit SHA for a fixed pin. Run `pig resolve-external --hub .` to fetch and verify
-the selected commit, then commit the generated `hub.external-plugins.lock.json`
-alongside the definition. The catalog uses `source.ref` for the requested revision.
-The lock and release provenance use `source.sha` for the resolved commit;
-generated marketplaces also use `source.sha`. Locks contain only selected
-`latest` plugins. Offline builds require a matching lock for these plugins and
-never resolve upstream themselves.
-
-The shared CI runner refreshes these resolutions in `build` and `publish` modes.
-Publication resolves each upstream repository once, verifies that commit, and
-uses it for versioning and every target's marketplace. It commits the lock on
-both source and release branches while leaving `ref: latest` in the catalog.
-An upstream change therefore advances the next Hub release without a catalog
-edit. With no other Hub changes, an unchanged upstream is a no-op. `check` mode
-verifies the existing lock without refreshing it. To stop following latest or
-roll back, set `ref` to the desired commit SHA; the next resolution removes the
-unused lock entry.
-
-Latest refreshes happen when CI runs; this option does not create a schedule or
-automatically update an already-installed desktop plugin. To follow upstream
-without manual publication, configure the Hub's publish workflow to run on a
-schedule. Consumers still use their host's plugin update workflow.
-
-The compiler emits native `git-subdir` sources (or `url` for repository-root
-plugins), preserving the upstream URL, path, and SHA on both source and release
-branches. It creates no `dist` payload or managed runtime for external plugins.
-The upstream manifest must use the same plugin name as the Hub's `id`. Upstream
-authors, versions, skills, MCP configuration, and hooks remain upstream-owned;
-the Hub's `name` is catalog metadata, not a manifest override. Consumers install
-the plugin from the Hub marketplace without adding the upstream marketplace.
-
-Cursor targets require an upstream `.cursor-plugin/plugin.json`. Cursor entries
-use the same `url`/`git-subdir` source format with `sha`; publication preserves
-that upstream pin rather than rewriting it to the Hub's release branch. These
-source fields are recognized by Cursor 3.19.19's bundled parser and resolver.
-Desktop installation, pin updates, and rollback still need dogfood validation.
-
-`pig validate`, `pig build`, and `pig verify` remain offline. With latest sources,
-run `pig resolve-external --hub .` before building or verifying locally. To
-recheck fixed or already-locked commits without changing the lock, run:
+Verify the upstream plugin and local build:
 
 ```bash
-pig verify-external --hub .
+pig resolve-external --hub .
+pig verify --hub .
 ```
 
-Both external commands fetch the exact commit and check each enabled target's
-manifest name, optional SemVer version, and declared component paths.
-Symlinks and submodules inside the plugin are rejected. Verification
-reads Git objects without checking out files or running upstream hooks or code.
-It reports the upstream version with each verified source. This is structural
-verification; it does not validate every host-specific setting or prove that a
-desktop client can install and run the plugin.
+For `"latest"`, commit the generated `hub.external-plugins.lock.json` alongside
+the definition. Offline builds use this lock; CI build and publish modes refresh
+it. Catalog definitions use `ref`; locks, release provenance, and marketplaces
+use the resolved `sha`. Consumers update installed plugins through their host.
 
-Publication also compares with the previous release. Claude pin/path changes
-that retain the same explicit upstream version are rejected because Claude may
-retain its cached plugin. This also covers replacing an authored plugin with an
-external plugin of the same name and version. Choose an upstream release with a
-different version; changing the Hub version cannot override the upstream manifest. Manifests without
-a version use the host's commit-based behavior. See the
-[Claude marketplace source and version rules](https://code.claude.com/docs/en/plugin-marketplaces)
-and [Codex marketplace metadata](https://developers.openai.com/plugins/build/plugins#marketplace-metadata).
-
-Replacing an external Claude plugin with an authored plugin also requires the
-resolved Hub release version to differ from the upstream version. If the automatic
-version bump collides, use `pig set-version --hub . --version <new-version>` to
-select a higher Hub version before publishing.
-
-The publisher stores verified upstream versions in `hub.external.json` on the
-release branch, bound to the release hash and exact source declarations. Replacing
-an external source or switching to an authored plugin uses this record, so the old
-upstream repository no longer needs to be available. Releases without this record
-fall back to fetching the old pin for the version comparison.
-
-Source and target declarations participate in release versioning, so updating a
-pin advances the Hub release even when authored payloads are unchanged. Mixed
-releases use manifest schema version 3 and record external provenance in
-`version_basis.plugins`; authored-only releases keep version 2. The publisher
-accepts both versions, allowing external plugins to be added or removed without
-resetting release history. Older toolchains cannot consume version 3 releases.
-Fetch or verification failures preserve the previous lock and stop before either
-publish branch is updated. `resolve-external` accepts the same
-`--previous-release-root` and `--hub-relative-path` options as `verify-external`
-to check Claude version transitions before writing new resolutions.
-
-Only credential-free HTTPS Git URLs are accepted. CI and each consuming host
-need their own access to private upstream repositories; Hub checkout credentials
-do not grant that access. A commit pins repository content, including declared
-MCP configuration, but does not freeze a remote MCP service or dependencies that
-upstream code downloads. Updating the marketplace does not itself prove that an
-already-installed plugin was refreshed by the host.
-
-The generated PIG plugin ships an `add-external-plugin` skill for Claude, Codex,
-and Cursor. It guides agents through catalog edits, target selection, commit
-pinning or following latest, verification, updates, and rollback in the Hub's
-source repository.
+See the [external plugin guide](docs/external-plugins.md) for verification,
+updates, rollback, private repositories, and host compatibility.
 
 ### Migrating existing hubs
 
