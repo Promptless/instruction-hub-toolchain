@@ -9,6 +9,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH
+from promptless_instruction_hub.external_lock import load_external_resolutions
 from promptless_instruction_hub.fs import JsonValue, read_json_mapping
 from promptless_instruction_hub.models import (
     ASSET_KINDS,
@@ -16,6 +17,7 @@ from promptless_instruction_hub.models import (
     SEMVER_RE,
     SUPPORTED_HARNESSES,
     ExternalPluginDefinition,
+    ExternalGitSource,
     HubConfig,
 )
 from promptless_instruction_hub.release.hashing import stable_hash
@@ -86,7 +88,17 @@ def resolve_publish_version(
 ) -> str:
     """Resolve the hub release version from the configured version and published output."""
 
-    validation = validate_hub(hub_root)
+    validation = load_external_resolutions(hub_root, validate_hub(hub_root))
+    return resolve_release_version(
+        validation, previous_release_root=previous_release_root, hub_relative_path=hub_relative_path
+    )
+
+
+def resolve_release_version(
+    validation: ValidationResult, *, previous_release_root: Path | None = None, hub_relative_path: str = ""
+) -> str:
+    """Compare resolved source state with the previous immutable release."""
+
     config_version = validation.config.version
     previous_hub_root = _previous_hub_root(previous_release_root, hub_relative_path)
     if previous_hub_root is None:
@@ -355,9 +367,12 @@ def _validate_plugin_basis(manifest_path: Path, package: dict[str, JsonValue], k
     if package.get("kind") == "external":
         _require_exact_keys(manifest_path, package, key_path, frozenset({"kind", "id", "name", "source", "targets"}))
         try:
-            return ExternalPluginDefinition.model_validate(package).id
+            plugin = ExternalPluginDefinition.model_validate(package)
         except ValidationError as exc:
             raise ValueError(f"{manifest_path}: invalid {key_path}: {exc}") from exc
+        if not isinstance(plugin.source, ExternalGitSource):
+            raise ValueError(f"{manifest_path}: released external sources must be pinned to a commit SHA")
+        return plugin.id
     _require_exact_keys(manifest_path, package, key_path, PLUGIN_BASIS_KEYS)
     plugin_id = _require_string(manifest_path, package, "id", display_path=f"{key_path}.id")
     _validate_identifier(manifest_path, plugin_id, f"{key_path}.id")

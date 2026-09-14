@@ -200,14 +200,13 @@ class HookDefinition(BaseModel):
         return value
 
 
-class ExternalGitSource(BaseModel):
-    """A repository revision fetched directly by the plugin host."""
+class ExternalGitRepository(BaseModel):
+    """A portable upstream Git repository locator."""
 
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["git"]
     url: str
-    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
 
     @field_validator("url")
     @classmethod
@@ -230,6 +229,18 @@ class ExternalGitSource(BaseModel):
                 "external source url must be an HTTPS repository URL without credentials, query or fragment"
             )
         return value
+
+
+class ExternalGitSource(ExternalGitRepository):
+    """An immutable repository revision fetched directly by the plugin host."""
+
+    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+class LatestExternalGitSource(ExternalGitRepository):
+    """Follow the upstream default branch when the Hub next resolves sources."""
+
+    ref: Literal["latest"]
 
 
 class ExternalPluginTarget(BaseModel):
@@ -266,7 +277,7 @@ class ExternalPluginDefinition(BaseModel):
     id: str
     name: str = Field(min_length=1)
     owners: list[str] = Field(default_factory=list)
-    source: ExternalGitSource
+    source: ExternalGitSource | LatestExternalGitSource
     targets: dict[ExternalPluginHarness, ExternalPluginTarget] = Field(min_length=1)
 
     @field_validator("id")

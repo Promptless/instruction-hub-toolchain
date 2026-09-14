@@ -120,6 +120,13 @@ while IFS= read -r line; do
   done
 done <<< "$generated_paths_input"
 
+# Resolution is generated with the payload and committed beside source pointers,
+# even when callers customize the list of generated plugin paths.
+external_lock_path="hub.external-plugins.lock.json"
+if [[ " ${generated_paths[*]} " != *" $external_lock_path "* ]]; then
+  generated_paths+=("$external_lock_path")
+fi
+
 validate_release_branch "$release_branch"
 validate_source_branch "$source_branch"
 if [[ "$mode" == "publish" ]]; then
@@ -261,7 +268,7 @@ snapshot_publish_source() {
     echo "Publish requires committed source changes and a clean index." >&2
     exit 1
   fi
-  if [[ -n "$(git -C "$hub_root" ls-files --others --exclude-standard -- hub.yaml plugins assets hub.repo-context.json)" ]]; then
+  if [[ -n "$(git -C "$hub_root" ls-files --others --exclude-standard -- hub.yaml plugins assets hub.repo-context.json "$external_lock_path")" ]]; then
     echo "Publish requires all hub source files to be committed." >&2
     exit 1
   fi
@@ -588,6 +595,14 @@ PY
 prepare_source_commit() {
   local pointer_root="$1"
   local hub_rel="$2"
+  local lock_path="${hub_rel:+$hub_rel/}$external_lock_path"
+  if [[ -f "$payload_root/$lock_path" ]]; then
+    mkdir -p "$(dirname "$pointer_root/$lock_path")"
+    cp "$payload_root/$lock_path" "$pointer_root/$lock_path"
+    marketplace_pointer_paths+=("$lock_path")
+  elif [[ -n "$(git -C "$repo_root" ls-files -- "$lock_path")" ]]; then
+    marketplace_pointer_paths+=("$lock_path")
+  fi
   local worktree
   worktree="$(mktemp -d)"
   rm -rf "$worktree"
@@ -623,7 +638,7 @@ case "$mode" in
   build)
     hub_rel="$(hub_relative_path)"
     pig validate --hub "$hub_root"
-    pig verify-external --hub "$hub_root"
+    pig resolve-external --hub "$hub_root"
     pig build --hub "$hub_root"
     restore_generated_paths_on_default_branch "$hub_rel"
     ;;
@@ -645,10 +660,10 @@ case "$mode" in
     pig validate --hub "$hub_root"
     if copy_previous_release_branch "$previous_release_root"; then
       previous_release_exists=true
-      pig verify-external --hub "$hub_root" --previous-release-root "$previous_release_root" --hub-relative-path "$hub_rel"
+      pig resolve-external --hub "$hub_root" --previous-release-root "$previous_release_root" --hub-relative-path "$hub_rel"
     else
       previous_release_exists=false
-      pig verify-external --hub "$hub_root"
+      pig resolve-external --hub "$hub_root"
     fi
     publish_version="$(resolve_publish_version "$previous_release_root" "$hub_rel" "$previous_release_exists")"
     pig build --hub "$hub_root" --version "$publish_version"

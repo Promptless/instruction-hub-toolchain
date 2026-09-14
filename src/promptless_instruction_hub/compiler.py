@@ -17,6 +17,7 @@ from promptless_instruction_hub.config import (
     load_plugins,
 )
 from promptless_instruction_hub.errors import BuildCheckFailedError
+from promptless_instruction_hub.external_lock import load_external_resolutions
 from promptless_instruction_hub.fs import JsonValue, replace_tree, trees_equal, write_yaml
 from promptless_instruction_hub.models import (
     PIG_PLUGIN_ID,
@@ -120,7 +121,7 @@ def build_hub(hub_root: Path, *, check: bool = False, version: str | None = None
     """Build generated target artifacts and manifests, or check that they are current."""
 
     root = hub_root.resolve()
-    validation = validate_hub(root)
+    validation = load_external_resolutions(root, validate_hub(root))
     if version is not None:
         validation = _with_version(validation, version)
     with tempfile.TemporaryDirectory(prefix="promptless-instruction-hub-") as temp_dir:
@@ -143,7 +144,7 @@ def build_hub(hub_root: Path, *, check: bool = False, version: str | None = None
 def verify_hub(hub_root: Path) -> VerifyResult:
     """Validate and fully compile an Instruction Hub without changing its worktree."""
 
-    validation = validate_hub(hub_root.resolve())
+    validation = load_external_resolutions(hub_root, validate_hub(hub_root.resolve()))
     with tempfile.TemporaryDirectory(prefix="promptless-instruction-hub-verify-") as temp_dir:
         release_manifest = _compile_hub(Path(temp_dir), validation)
     return VerifyResult(

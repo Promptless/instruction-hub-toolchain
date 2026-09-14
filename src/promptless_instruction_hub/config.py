@@ -14,6 +14,7 @@ from promptless_instruction_hub.models import ExternalPluginDefinition, HubConfi
 CONFIG_PATH = Path("hub.yaml")
 PLUGIN_DIR = Path("plugins")
 RELEASE_MANIFEST_PATH = Path("hub.release.json")
+EXTERNAL_LOCK_PATH = Path("hub.external-plugins.lock.json")
 STABLE_CHANNEL_PATH = Path("hub.stable.json")
 REPO_CONTEXT_PATH = Path("hub.repo-context.json")
 MANAGED_RUNTIME_MANIFEST_PATH = Path("hub.managed-runtimes.json")

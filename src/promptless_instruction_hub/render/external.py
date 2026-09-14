@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue
 from promptless_instruction_hub.models import (
     ExternalGitSource,
@@ -14,6 +15,8 @@ from promptless_instruction_hub.models import (
 def external_marketplace_entry(plugin: ExternalPluginDefinition, target: ExternalPluginHarness) -> dict[str, JsonValue]:
     """Point the host at upstream files without overriding their publisher or version."""
 
+    if not isinstance(plugin.source, ExternalGitSource):
+        raise InstructionHubError(f"{plugin.id}: external source must be resolved before rendering")
     path = plugin.targets[target].path
     source: dict[str, JsonValue] = {
         "source": "url" if path == "." else "git-subdir",

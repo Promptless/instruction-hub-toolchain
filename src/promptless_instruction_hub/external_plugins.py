@@ -6,23 +6,31 @@ import json
 import os
 import subprocess
 import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH
+from promptless_instruction_hub.config import EXTERNAL_LOCK_PATH, RELEASE_MANIFEST_PATH
 from promptless_instruction_hub.errors import InstructionHubError
-from promptless_instruction_hub.fs import JsonValue, validate_json_value
+from promptless_instruction_hub.external_lock import (
+    ExternalPluginLock,
+    apply_external_resolutions,
+    load_external_resolutions,
+)
+from promptless_instruction_hub.fs import JsonValue, validate_json_value, write_json
 from promptless_instruction_hub.models import (
     ExternalGitSource,
     ExternalPluginDefinition,
     ExternalPluginHarness,
     ExternalPluginTarget,
+    LatestExternalGitSource,
     PluginDefinition,
     SEMVER_RE,
 )
-from promptless_instruction_hub.release.versions import read_release_manifest, resolve_publish_version
-from promptless_instruction_hub.validate.hub import validate_hub
+from promptless_instruction_hub.release.versions import read_release_manifest, resolve_release_version
+from promptless_instruction_hub.validate.hub import ValidationResult, validate_hub
 
 MANIFEST_PATHS = {
     "claude": ".claude-plugin/plugin.json",
@@ -70,9 +78,68 @@ class GitRevision:
 def verify_external_plugins(
     hub_root: Path, *, previous_release_root: Path | None = None, hub_relative_path: str = ""
 ) -> list[dict[str, JsonValue]]:
-    """Verify upstream manifests and reject Claude source changes hidden by an unchanged version."""
+    """Verify exact pins (including locked latest sources) without changing the Hub."""
+
+    validation = load_external_resolutions(hub_root, validate_hub(hub_root))
+    with _git_revisions() as revision:
+        return _verify_external_plugins(validation, revision, previous_release_root, hub_relative_path)
+
+
+def resolve_external_plugins(
+    hub_root: Path, *, previous_release_root: Path | None = None, hub_relative_path: str = ""
+) -> list[dict[str, JsonValue]]:
+    """Refresh latest sources and save their pins only after every upstream check passes."""
 
     validation = validate_hub(hub_root)
+    lock = ExternalPluginLock()
+    with _git_revisions() as revision:
+        for plugin in validation.stable_plugins:
+            definition = plugin.definition
+            if isinstance(definition, ExternalPluginDefinition) and isinstance(
+                definition.source, LatestExternalGitSource
+            ):
+                lock.plugins[definition.id] = ExternalGitSource(
+                    type="git", url=definition.source.url, sha=revision(definition.source).sha
+                )
+        resolved = apply_external_resolutions(validation, lock)
+        records = _verify_external_plugins(resolved, revision, previous_release_root, hub_relative_path)
+    path = hub_root / EXTERNAL_LOCK_PATH
+    if lock.plugins:
+        # Never leave a partial lock behind if the process stops during the write.
+        with tempfile.TemporaryDirectory(prefix=".pig-external-", dir=hub_root) as temp_dir:
+            staged = Path(temp_dir) / EXTERNAL_LOCK_PATH
+            write_json(staged, lock.model_dump())
+            staged.replace(path)
+    else:
+        path.unlink(missing_ok=True)
+    return records
+
+
+RevisionReader = Callable[[ExternalGitSource | LatestExternalGitSource], GitRevision]
+
+
+@contextmanager
+def _git_revisions() -> Iterator[RevisionReader]:
+    with tempfile.TemporaryDirectory(prefix="pig-external-") as temp_dir:
+        cache: dict[tuple[str, str], GitRevision] = {}
+
+        def revision(source: ExternalGitSource | LatestExternalGitSource) -> GitRevision:
+            key = (source.url, source.sha if isinstance(source, ExternalGitSource) else "HEAD")
+            if key not in cache:
+                fetched = _fetch_revision(Path(temp_dir) / str(len(cache)), source)
+                cache[key] = fetched
+                cache[(source.url, fetched.sha)] = fetched
+            return cache[key]
+
+        yield revision
+
+
+def _verify_external_plugins(
+    validation: ValidationResult,
+    revision: RevisionReader,
+    previous_release_root: Path | None,
+    hub_relative_path: str,
+) -> list[dict[str, JsonValue]]:
     plugins = [
         plugin.definition
         for plugin in validation.stable_plugins
@@ -114,75 +181,65 @@ def verify_external_plugins(
         return []
 
     records: list[dict[str, JsonValue]] = []
-    with tempfile.TemporaryDirectory(prefix="pig-external-") as temp_dir:
-        cache: dict[tuple[str, str], GitRevision] = {}
-
-        def revision(source: ExternalGitSource) -> GitRevision:
-            key = (source.url, source.sha)
-            if key not in cache:
-                cache[key] = _fetch_revision(Path(temp_dir) / str(len(cache)), source)
-            return cache[key]
-
-        if authored_replacements:
-            publish_version = resolve_publish_version(
-                hub_root, previous_release_root=previous_release_root, hub_relative_path=hub_relative_path
-            )
-            for old in authored_replacements:
-                old_version = revision(old.source).manifest(old, "claude").get("version")
-                if old_version == publish_version:
-                    raise InstructionHubError(
-                        f"{old.id} (claude): authored replacement retains upstream version {old_version}; "
-                        "Claude may keep the cached plugin. Set a different Hub version before publishing."
-                    )
-
-        for plugin in plugins:
-            for target in sorted(plugin.targets):
-                if target not in validation.config.targets:
-                    continue
-                manifest = revision(plugin.source).manifest(plugin, target)
-                old = previous.get(plugin.id)
-                old_version = None
-                if (
-                    target == "claude"
-                    and old is not None
-                    and target in old.targets
-                    and target in previous_targets
-                    and (old.source != plugin.source or old.targets[target] != plugin.targets[target])
-                ):
-                    old_version = revision(old.source).manifest(old, target).get("version")
-                elif target == "claude" and target in previous_targets and plugin.id in previous_authored_ids:
-                    old_version = previous_version
-                if old_version is not None and manifest.get("version") == old_version:
-                    raise InstructionHubError(
-                        f"{plugin.id} (claude): changed source retains upstream version {manifest['version']}; "
-                        "Claude may keep the cached plugin. Select an upstream release with a different version."
-                    )
-                records.append(
-                    {
-                        "id": plugin.id,
-                        "target": target,
-                        "url": plugin.source.url,
-                        "sha": plugin.source.sha,
-                        "path": plugin.targets[target].path,
-                        "upstream_version": manifest.get("version"),
-                    }
+    if authored_replacements:
+        publish_version = resolve_release_version(
+            validation, previous_release_root=previous_release_root, hub_relative_path=hub_relative_path
+        )
+        for old in authored_replacements:
+            old_version = revision(old.source).manifest(old, "claude").get("version")
+            if old_version == publish_version:
+                raise InstructionHubError(
+                    f"{old.id} (claude): authored replacement retains upstream version {old_version}; "
+                    "Claude may keep the cached plugin. Set a different Hub version before publishing."
                 )
+
+    for plugin in plugins:
+        for target in sorted(plugin.targets):
+            if target not in validation.config.targets:
+                continue
+            manifest = revision(plugin.source).manifest(plugin, target)
+            old = previous.get(plugin.id)
+            old_version = None
+            if (
+                target == "claude"
+                and old is not None
+                and target in old.targets
+                and target in previous_targets
+                and (old.source != plugin.source or old.targets[target] != plugin.targets[target])
+            ):
+                old_version = revision(old.source).manifest(old, target).get("version")
+            elif target == "claude" and target in previous_targets and plugin.id in previous_authored_ids:
+                old_version = previous_version
+            if old_version is not None and manifest.get("version") == old_version:
+                raise InstructionHubError(
+                    f"{plugin.id} (claude): changed source retains upstream version {manifest['version']}; "
+                    "Claude may keep the cached plugin. Select an upstream release with a different version."
+                )
+            records.append(
+                {
+                    "id": plugin.id,
+                    "target": target,
+                    "url": plugin.source.url,
+                    "sha": revision(plugin.source).sha,
+                    "path": plugin.targets[target].path,
+                    "upstream_version": manifest.get("version"),
+                }
+            )
     return records
 
 
-def _fetch_revision(root: Path, source: ExternalGitSource) -> GitRevision:
+def _fetch_revision(root: Path, source: ExternalGitSource | LatestExternalGitSource) -> GitRevision:
+    requested = source.sha if isinstance(source, ExternalGitSource) else "HEAD"
     root.mkdir()
     _git(root, "init", "--bare", "--quiet")
     try:
-        _git(
-            root, "fetch", "--quiet", "--no-tags", "--depth=1", "--recurse-submodules=no", "--", source.url, source.sha
-        )
+        _git(root, "fetch", "--quiet", "--no-tags", "--depth=1", "--recurse-submodules=no", "--", source.url, requested)
     except InstructionHubError as exc:
         raise InstructionHubError(
-            f"cannot fetch external plugin revision {source.sha} from {source.url}; check the revision and repository access"
+            f"cannot fetch external plugin revision {requested} from {source.url}; check the revision and repository access"
         ) from exc
     sha = _git(root, "rev-parse", "FETCH_HEAD^{commit}").strip()
-    if sha != source.sha:
+    if isinstance(source, ExternalGitSource) and sha != source.sha:
         raise InstructionHubError(f"external source did not resolve to the requested commit {source.sha}")
     files: dict[str, str] = {}
     for entry in _git(root, "ls-tree", "-r", "-z", sha).split("\0"):

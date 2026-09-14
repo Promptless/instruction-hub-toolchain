@@ -38,6 +38,8 @@ from .helpers import _git, _git_output, _snapshot_tree, _write_release_manifest_
         ("targets", {"gemini": {"path": "."}}),
         ("source", {"type": "git", "url": UPSTREAM_URL, "sha": "main"}),
         ("source", {"type": "git", "url": UPSTREAM_URL, "sha": "a" * 40, "ref": "main"}),
+        ("source", {"type": "git", "url": UPSTREAM_URL, "sha": "a" * 40, "ref": "latest"}),
+        ("source", {"type": "git", "url": UPSTREAM_URL, "ref": "main"}),
     ],
 )
 def test_invalid_external_definitions_fail_offline(tmp_path: Path, field: str, value: Any) -> None:

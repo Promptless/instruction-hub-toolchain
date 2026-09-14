@@ -1,6 +1,6 @@
 ---
 name: add-external-plugin
-description: Add a third-party plugin to this Instruction Hub marketplace, or update or roll back its pinned upstream commit. Use when editing the Hub's external plugin catalog; refreshing already-installed plugins is handled by the host's update workflow.
+description: Add a third-party plugin to this Instruction Hub marketplace, follow its latest upstream commit at publication, or update or roll back a pin. Use when editing the Hub's external plugin catalog; refreshing already-installed plugins is handled by the host's update workflow.
 ---
 
 # Add an external plugin
@@ -11,9 +11,9 @@ generated marketplace JSON are build output, not the catalog's source.
 
 ## Declare the upstream plugin
 
-Inspect the upstream repository at the intended commit. Choose a full,
-40-character commit SHA and a credential-free HTTPS Git URL ending in `.git`.
-Branches and tags must be resolved to a commit before writing the definition.
+Inspect the upstream repository at the intended commit. Use a credential-free
+HTTPS Git URL ending in `.git`. Choose a full, 40-character `sha` for a fixed
+commit, or `ref: latest` to follow the default branch at each Hub publication.
 Each target needs its own native manifest beneath the chosen plugin directory:
 
 | Target | Required manifest |
@@ -42,6 +42,10 @@ targets:
     path: plugins/doc-detective
 ```
 
+To follow latest, replace the `sha` line with `ref: latest`; never set both.
+Latest means the upstream default-branch tip, not the newest tag or release.
+Other branch and tag names must be resolved to a full SHA for a fixed pin.
+
 Paths are relative to the upstream repository; use `.` for a repository-root
 plugin. Declare only targets the upstream supports. Gemini external plugins are
 unsupported. At least one declared target must also be enabled in `hub.yaml`.
@@ -57,7 +61,7 @@ From the Hub source directory, run the toolchain CLI:
 
 ```bash
 pig validate --hub .
-pig verify-external --hub .
+pig resolve-external --hub .
 pig verify --hub .
 ```
 
@@ -65,18 +69,31 @@ If `pig` is unavailable, use
 `uvx --from git+https://github.com/Promptless/instruction-hub-toolchain.git pig`
 in its place, using the Hub's configured toolchain revision when pinned.
 
-`verify-external` fetches the exact commit and checks enabled targets' manifest
-names, optional SemVer versions, and declared component paths. It rejects
+`resolve-external` resolves latest once per repository, then checks enabled
+targets' manifest names, optional SemVer versions, and declared component paths. It rejects
 symlinks and submodules inside the plugin without running upstream code. CI and
 each consuming host need their own access to private upstream repositories.
-`validate` and `verify` are offline; they cannot prove the upstream exists.
+For latest sources it writes `hub.external-plugins.lock.json` only after all
+checks pass; commit this generated lock with the catalog changes. `validate`,
+`build`, and `verify` are offline. Builds and verification require a matching
+lock when latest is selected. `pig verify-external --hub .` rechecks fixed or
+locked commits without refreshing the lock or changing the worktree.
 
-For updates or rollback, change `source.sha` to the desired reviewed commit and
-repeat these checks. Publication compares the previous release and rejects
+CI build and publish modes refresh latest, while check mode verifies the lock.
+Each publication records the resolved SHA in both marketplaces and release
+provenance, leaving `ref: latest` in source for the next publication. An upstream
+change advances the Hub release. Latest does not schedule publication or force
+desktop updates. For automatic refreshes, configure the Hub's publish workflow
+to run on a schedule. Consumers use their host's update workflow to refresh
+installed plugins.
+
+For fixed updates or rollback, replace `source.ref` (if present) with `source.sha`
+at the desired reviewed commit and repeat these checks. Resolution removes
+unused lock entries. Publication compares the previous release and rejects
 Claude source or path changes that keep the same explicit upstream version,
 because Claude may retain its cached plugin. Select a commit with a different
 upstream version; changing the Hub version does not override it. When a previous
-release checkout is available, run `pig verify-external --hub .
+release checkout is available, run `pig resolve-external --hub .
 --previous-release-root /path/to/previous-release` to check this before CI.
 For a nested Hub, also pass `--hub-relative-path <path-within-repository>`.
 
