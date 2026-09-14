@@ -565,7 +565,7 @@ for plugin in plugins:
     if not isinstance(plugin, dict):
         fail("Expected marketplace plugins to be objects.")
     source = plugin.get("source")
-    if platform in {"claude", "codex"} and isinstance(source, dict) and source.get("source") != "local":
+    if platform in {"claude", "codex", "cursor"} and isinstance(source, dict) and source.get("source") != "local":
         validate_external_marketplace_source(source)
         continue
     path = plugin_local_path(plugin)

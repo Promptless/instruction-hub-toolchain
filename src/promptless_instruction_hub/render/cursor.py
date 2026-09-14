@@ -6,7 +6,8 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from promptless_instruction_hub.fs import write_json
-from promptless_instruction_hub.models import HubConfig, PluginDefinition, StablePlugin
+from promptless_instruction_hub.models import ExternalPluginDefinition, HubConfig, PluginDefinition, StablePlugin
+from promptless_instruction_hub.render.external import external_marketplace_entry
 from promptless_instruction_hub.render.common import (
     RenderedAssets,
     base_plugin_manifest,
@@ -45,13 +46,16 @@ def write_marketplace(output_root: Path, config: HubConfig, plugins: Sequence[St
         "owner": {"name": config.org},
         "metadata": {"description": f"{config.marketplace.name} marketplace."},
         "plugins": [
-            {
+            external_marketplace_entry(stable_plugin.definition, "cursor")
+            if isinstance(stable_plugin.definition, ExternalPluginDefinition)
+            else {
                 "name": stable_plugin.definition.id,
                 "source": f"dist/cursor/{stable_plugin.definition.id}",
                 "description": plugin_description(config, stable_plugin.definition),
             }
             for stable_plugin in plugins
-            if isinstance(stable_plugin.definition, PluginDefinition)
+            if not isinstance(stable_plugin.definition, ExternalPluginDefinition)
+            or "cursor" in stable_plugin.definition.targets
         ],
     }
     write_json(output_root / ".cursor-plugin/marketplace.json", marketplace)

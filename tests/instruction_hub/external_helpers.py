@@ -19,7 +19,7 @@ def external_definition(sha: str = "a" * 40, *, path: str = PLUGIN_PATH) -> dict
         "id": "doc-detective",
         "name": "Doc Detective",
         "source": {"type": "git", "url": UPSTREAM_URL, "sha": sha},
-        "targets": {target: {"path": path} for target in ("claude", "codex")},
+        "targets": {target: {"path": path} for target in ("claude", "codex", "cursor")},
     }
 
 
@@ -37,7 +37,7 @@ def make_upstream(root: Path, monkeypatch: pytest.MonkeyPatch, *, path: str = PL
     _git(root, "config", "user.name", "Upstream Author")
     _git(root, "config", "user.email", "upstream@example.test")
     plugin = root / path
-    for target in ("claude", "codex"):
+    for target in ("claude", "codex", "cursor"):
         manifest = plugin / f".{target}-plugin/plugin.json"
         manifest.parent.mkdir(parents=True)
         manifest.write_text(
@@ -47,8 +47,9 @@ def make_upstream(root: Path, monkeypatch: pytest.MonkeyPatch, *, path: str = PL
                     "version": "1.2.3",
                     "author": {"name": "Upstream Author"},
                     "skills": "./skills/",
-                    "mcpServers": "./.mcp.json",
+                    "mcpServers": "./mcp.json" if target == "cursor" else "./.mcp.json",
                     "hooks": "./hooks/hooks.json",
+                    **({"rules": "./rules/"} if target == "cursor" else {}),
                 }
             )
         )
@@ -56,7 +57,10 @@ def make_upstream(root: Path, monkeypatch: pytest.MonkeyPatch, *, path: str = PL
     (plugin / "skills/example/SKILL.md").write_text("---\nname: example\ndescription: Example skill\n---\n# Example\n")
     (plugin / "hooks").mkdir()
     (plugin / "hooks/hooks.json").write_text('{"hooks": {}}')
+    (plugin / "rules").mkdir()
+    (plugin / "rules/example.mdc").write_text("---\nalwaysApply: false\n---\n# Example rule\n")
     (plugin / ".mcp.json").write_text('{"mcpServers": {"upstream": {"url": "https://upstream.example.test/mcp"}}}')
+    (plugin / "mcp.json").write_text((plugin / ".mcp.json").read_text())
     # Route a valid HTTPS declaration to a local Git fixture in this test only.
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{root.as_posix()}.insteadOf")

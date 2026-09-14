@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Literal
-
 from promptless_instruction_hub.fs import JsonValue
-from promptless_instruction_hub.models import ExternalGitSource, ExternalPluginDefinition, ExternalPluginTarget
+from promptless_instruction_hub.models import (
+    ExternalGitSource,
+    ExternalPluginDefinition,
+    ExternalPluginHarness,
+    ExternalPluginTarget,
+)
 
 
-def external_marketplace_entry(
-    plugin: ExternalPluginDefinition, target: Literal["claude", "codex"]
-) -> dict[str, JsonValue]:
+def external_marketplace_entry(plugin: ExternalPluginDefinition, target: ExternalPluginHarness) -> dict[str, JsonValue]:
     """Point the host at upstream files without overriding their publisher or version."""
 
     path = plugin.targets[target].path

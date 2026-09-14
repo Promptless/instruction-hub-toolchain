@@ -474,6 +474,9 @@
             },
             "codex": {
               "$ref": "#/$defs/external_target"
+            },
+            "cursor": {
+              "$ref": "#/$defs/external_target"
             }
           }
         }

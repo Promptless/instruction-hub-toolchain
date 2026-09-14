@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tests.config_helpers import enable_trace_ingestion
 
@@ -19,6 +20,35 @@ from .helpers import (
     _git,
     _snapshot_tree,
 )
+
+
+def test_build_ships_external_plugin_authoring_skill_in_pig(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    init_hub(hub_root, marketplace_id="acme-tools")
+    (hub_root / "plugins/dev.yaml").write_text("id: dev\nname: Dev\nincludes: []\n")
+    config_path = hub_root / "hub.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config["stable_plugins"].append("dev")
+    config_path.write_text(yaml.safe_dump(config))
+
+    build_hub(hub_root)
+
+    for target, manifest_path in (
+        ("claude", ".claude-plugin/plugin.json"),
+        ("codex", ".codex-plugin/plugin.json"),
+        ("cursor", ".cursor-plugin/plugin.json"),
+    ):
+        plugin_root = hub_root / "dist" / target / "pig"
+        manifest = json.loads((plugin_root / manifest_path).read_text())
+        skill = (plugin_root / "skills/add-external-plugin/SKILL.md").read_text()
+        assert manifest["skills"] == "./skills/"
+        metadata = yaml.safe_load(skill.split("---", 2)[1])
+        assert metadata["name"] == "add-external-plugin"
+        assert metadata["description"]
+        assert "marketplace `acme-tools`" in skill
+        assert "{{ instruction_hub_" not in skill
+        assert not (hub_root / "dist" / target / "dev/skills/add-external-plugin").exists()
+    assert not (hub_root / "dist/gemini/pig/skills/add-external-plugin").exists()
 
 
 def test_build_emits_target_outputs_and_deterministic_manifests(tmp_path: Path) -> None:

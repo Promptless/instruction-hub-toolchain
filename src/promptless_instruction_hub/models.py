@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Harness = Literal["claude", "codex", "gemini", "cursor"]
+ExternalPluginHarness = Literal["claude", "codex", "cursor"]
 AssetKind = Literal["skill", "rule", "agent", "command", "hook", "mcp"]
 SupportMode = Literal["agent-skill", "native", "verbatim", "projected", "unsupported"]
 
@@ -20,6 +21,7 @@ ASSET_KINDS: tuple[AssetKind, ...] = ("skill", "rule", "agent", "command", "hook
 PIG_PLUGIN_ID = "pig"
 PIG_PLUGIN_NAME = "PIG"
 UPDATE_INSTRUCTION_HUB_SKILL_ID = "update-instruction-hub"
+ADD_EXTERNAL_PLUGIN_SKILL_ID = "add-external-plugin"
 IDENTIFIER_PATTERN = r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
 IDENTIFIER_RE = re.compile(IDENTIFIER_PATTERN)
 SEMVER_RE = re.compile(
@@ -265,7 +267,7 @@ class ExternalPluginDefinition(BaseModel):
     name: str = Field(min_length=1)
     owners: list[str] = Field(default_factory=list)
     source: ExternalGitSource
-    targets: dict[Literal["claude", "codex"], ExternalPluginTarget] = Field(min_length=1)
+    targets: dict[ExternalPluginHarness, ExternalPluginTarget] = Field(min_length=1)
 
     @field_validator("id")
     @classmethod

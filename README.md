@@ -264,6 +264,10 @@ writing the resolved version back does not cause another version bump.
 
 ### External plugins
 
+The generated PIG plugin ships an `add-external-plugin` skill for Claude, Codex,
+and Cursor. It guides agents through catalog edits, target selection, commit
+pinning, verification, updates, and rollback in the Hub's source repository.
+
 A Hub can list a third-party plugin alongside its authored plugins. Declare the
 upstream repository and a reviewed, full 40-character commit SHA, then add the
 plugin ID to `stable_plugins`:
@@ -282,11 +286,13 @@ targets:
     path: plugins/doc-detective
   codex:
     path: plugins/doc-detective
+  cursor:
+    path: plugins/doc-detective
 ```
 
 Replace the SHA placeholder before validation. Each target path is relative to
 the upstream repository; use `.` for a plugin at its root. External plugins
-currently support Claude and Codex. Cursor and Gemini declarations are rejected;
+support Claude, Codex, and Cursor. Gemini declarations are rejected;
 authored plugins still support all four targets. Only declared, enabled targets
 receive an entry, and each stable external plugin needs at least one enabled
 target. External definitions cannot include local assets or replace `pig`.
@@ -298,6 +304,12 @@ The upstream manifest must use the same plugin name as the Hub's `id`. Upstream
 authors, versions, skills, MCP configuration, and hooks remain upstream-owned;
 the Hub's `name` is catalog metadata, not a manifest override. Consumers install
 the plugin from the Hub marketplace without adding the upstream marketplace.
+
+Cursor targets require an upstream `.cursor-plugin/plugin.json`. Cursor entries
+use the same `url`/`git-subdir` source format with `sha`; publication preserves
+that upstream pin rather than rewriting it to the Hub's release branch. These
+source fields are recognized by Cursor 3.19.19's bundled parser and resolver.
+Desktop installation, pin updates, and rollback still need dogfood validation.
 
 `pig validate`, `pig build`, and `pig verify` remain offline. Run the separate
 network check before publication:

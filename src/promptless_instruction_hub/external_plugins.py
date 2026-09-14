@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 
 from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH
 from promptless_instruction_hub.errors import InstructionHubError
@@ -16,13 +16,18 @@ from promptless_instruction_hub.fs import JsonValue, validate_json_value
 from promptless_instruction_hub.models import (
     ExternalGitSource,
     ExternalPluginDefinition,
+    ExternalPluginHarness,
     ExternalPluginTarget,
     SEMVER_RE,
 )
 from promptless_instruction_hub.release.versions import read_release_manifest
 from promptless_instruction_hub.validate.hub import validate_hub
 
-MANIFEST_PATHS = {"claude": ".claude-plugin/plugin.json", "codex": ".codex-plugin/plugin.json"}
+MANIFEST_PATHS = {
+    "claude": ".claude-plugin/plugin.json",
+    "codex": ".codex-plugin/plugin.json",
+    "cursor": ".cursor-plugin/plugin.json",
+}
 
 
 @dataclass(frozen=True)
@@ -33,7 +38,7 @@ class GitRevision:
     sha: str
     files: dict[str, str]
 
-    def manifest(self, plugin: ExternalPluginDefinition, target: Literal["claude", "codex"]) -> dict[str, JsonValue]:
+    def manifest(self, plugin: ExternalPluginDefinition, target: ExternalPluginHarness) -> dict[str, JsonValue]:
         prefix = plugin.targets[target].path
         prefix = "" if prefix == "." else prefix + "/"
         files = {name.removeprefix(prefix): mode for name, mode in self.files.items() if name.startswith(prefix)}
@@ -181,7 +186,10 @@ def _git(root: Path, *arguments: str) -> str:
 def _validate_component_paths(
     plugin_id: str, target: str, manifest: dict[str, JsonValue], files: dict[str, str]
 ) -> None:
-    for field in ("skills", "commands", "agents", "hooks", "mcpServers", "lspServers"):
+    fields = ("skills", "commands", "agents", "hooks", "mcpServers", "lspServers")
+    if target == "cursor":
+        fields += ("rules",)
+    for field in fields:
         if field not in manifest:
             continue
         value = manifest[field]

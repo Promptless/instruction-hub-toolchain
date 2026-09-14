@@ -35,7 +35,6 @@ from .helpers import _git, _git_output, _snapshot_tree, _write_release_manifest_
         ("id", "pig"),
         ("includes", ["skill:example"]),
         ("targets", {}),
-        ("targets", {"cursor": {"path": "."}}),
         ("targets", {"gemini": {"path": "."}}),
         ("source", {"type": "git", "url": UPSTREAM_URL, "sha": "main"}),
         ("source", {"type": "git", "url": UPSTREAM_URL, "sha": "a" * 40, "ref": "main"}),
@@ -80,12 +79,14 @@ def test_external_plugin_urls_are_portable_and_credential_free(tmp_path: Path, u
         validate_hub(tmp_path)
 
 
+@pytest.mark.parametrize("cursor_path", [".", PLUGIN_PATH])
 def test_mixed_marketplaces_build_offline_without_external_payloads(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cursor_path: str
 ) -> None:
     init_hub(tmp_path)
     definition = external_definition()
     definition["targets"]["codex"]["path"] = "."
+    definition["targets"]["cursor"]["path"] = cursor_path
     write_external(tmp_path, definition)
     monkeypatch.setattr(
         subprocess, "run", lambda *args, **kwargs: pytest.fail("offline compilation attempted a process")
@@ -105,7 +106,16 @@ def test_mixed_marketplaces_build_offline_without_external_payloads(
     assert codex[1]["source"] == {"source": "url", "url": UPSTREAM_URL, "sha": "a" * 40}
     assert "version" not in codex[1] and "author" not in codex[1]
     cursor = json.loads((tmp_path / ".cursor-plugin/marketplace.json").read_text())["plugins"]
-    assert [entry["name"] for entry in cursor] == ["pig"]
+    assert cursor[0]["source"] == "dist/cursor/pig"
+    assert cursor[1] == {
+        "name": "doc-detective",
+        "source": {
+            "source": "url" if cursor_path == "." else "git-subdir",
+            "url": UPSTREAM_URL,
+            "sha": "a" * 40,
+            **({"path": cursor_path} if cursor_path != "." else {}),
+        },
+    }
     assert not list((tmp_path / "dist").glob("*/doc-detective"))
     manifest = json.loads((tmp_path / "hub.release.json").read_text())
     assert manifest["schema_version"] == 3
@@ -117,11 +127,13 @@ def test_mixed_marketplaces_build_offline_without_external_payloads(
 def test_only_declared_enabled_targets_are_emitted(tmp_path: Path) -> None:
     init_hub(tmp_path)
     definition = external_definition()
-    del definition["targets"]["codex"]
+    definition["targets"] = {"claude": {"path": PLUGIN_PATH}}
     write_external(tmp_path, definition)
     build_hub(tmp_path)
     codex = json.loads((tmp_path / ".agents/plugins/marketplace.json").read_text())
     assert [plugin["name"] for plugin in codex["plugins"]] == ["pig"]
+    cursor = json.loads((tmp_path / ".cursor-plugin/marketplace.json").read_text())
+    assert [plugin["name"] for plugin in cursor["plugins"]] == ["pig"]
     config = yaml.safe_load((tmp_path / "hub.yaml").read_text())
     config["targets"] = ["cursor", "gemini"]
     (tmp_path / "hub.yaml").write_text(yaml.safe_dump(config))
@@ -195,6 +207,7 @@ def test_verifier_reads_pinned_upstream_manifests(
     assert {(record["target"], record["sha"], record["upstream_version"]) for record in records} == {
         ("claude", sha, "1.2.3"),
         ("codex", sha, "1.2.3"),
+        ("cursor", sha, "1.2.3"),
     }
     assert _snapshot_tree(hub) == before
 
@@ -225,6 +238,7 @@ def test_verifier_rejects_previous_hub_paths_outside_release(tmp_path: Path, pat
         verify_external_plugins(hub, previous_release_root=previous, hub_relative_path=hub_relative_path)
 
 
+@pytest.mark.parametrize("target", ["claude", "codex", "cursor"])
 @pytest.mark.parametrize(
     "failure",
     [
@@ -239,10 +253,12 @@ def test_verifier_rejects_previous_hub_paths_outside_release(tmp_path: Path, pat
         "submodule",
     ],
 )
-def test_upstream_verification_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+def test_upstream_verification_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, target: str
+) -> None:
     upstream, hub = tmp_path / "upstream", tmp_path / "hub"
     sha = make_upstream(upstream, monkeypatch)
-    manifest_path = upstream / PLUGIN_PATH / ".claude-plugin/plugin.json"
+    manifest_path = upstream / PLUGIN_PATH / f".{target}-plugin/plugin.json"
     manifest = json.loads(manifest_path.read_text())
     if failure == "missing-commit":
         sha = "0" * 40
@@ -272,6 +288,39 @@ def test_upstream_verification_failures(tmp_path: Path, monkeypatch: pytest.Monk
     init_hub(hub)
     write_external(hub, external_definition(sha))
     with pytest.raises(InstructionHubError):
+        verify_external_plugins(hub)
+
+
+def test_cursor_only_hub_verifies_only_enabled_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    upstream, hub = tmp_path / "upstream", tmp_path / "hub"
+    make_upstream(upstream, monkeypatch)
+    (upstream / PLUGIN_PATH / ".claude-plugin/plugin.json").unlink()
+    (upstream / PLUGIN_PATH / ".codex-plugin/plugin.json").unlink()
+    sha = commit_upstream(upstream)
+    init_hub(hub)
+    config = yaml.safe_load((hub / "hub.yaml").read_text())
+    config["targets"] = ["cursor"]
+    (hub / "hub.yaml").write_text(yaml.safe_dump(config))
+    write_external(hub, external_definition(sha))
+    assert [record["target"] for record in verify_external_plugins(hub)] == ["cursor"]
+    build_hub(hub)
+    assert read_release_manifest(hub / "hub.release.json")[1]["targets"] == ["cursor"]
+    cursor = json.loads((hub / ".cursor-plugin/marketplace.json").read_text())
+    assert [plugin["name"] for plugin in cursor["plugins"]] == ["pig", "doc-detective"]
+
+
+@pytest.mark.parametrize("rules", ["./../../outside", "./absent"])
+def test_cursor_rules_must_exist_inside_plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rules: str) -> None:
+    upstream, hub = tmp_path / "upstream", tmp_path / "hub"
+    make_upstream(upstream, monkeypatch)
+    manifest_path = upstream / PLUGIN_PATH / ".cursor-plugin/plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["rules"] = rules
+    manifest_path.write_text(json.dumps(manifest))
+    sha = commit_upstream(upstream)
+    init_hub(hub)
+    write_external(hub, external_definition(sha))
+    with pytest.raises(InstructionHubError, match=r"\(cursor\): .*rules"):
         verify_external_plugins(hub)
 
 

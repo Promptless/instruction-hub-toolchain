@@ -13,6 +13,7 @@ from promptless_instruction_hub.commands import read_command, validate_verbatim_
 from promptless_instruction_hub.config import load_hub_config, load_plugins
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.hook_definitions import validate_hook_definition
+from promptless_instruction_hub.managed_skills import MANAGED_SKILL_SOURCES
 from promptless_instruction_hub.mcp_config import read_mcp_servers
 from promptless_instruction_hub.models import (
     PIG_PLUGIN_ID,
@@ -137,8 +138,10 @@ def _validate_invocation_destinations(plugin: StablePlugin, target: Harness) -> 
     owners: dict[str, str] = {}
     invocation_owners: dict[str, str] = {}
     if plugin.definition.id == PIG_PLUGIN_ID:
-        owners[f"skills/{UPDATE_INSTRUCTION_HUB_SKILL_ID}"] = "compiler-managed skill"
-        invocation_owners[UPDATE_INSTRUCTION_HUB_SKILL_ID] = "compiler-managed skill"
+        for skill_id, sources in MANAGED_SKILL_SOURCES.items():
+            if skill_id == UPDATE_INSTRUCTION_HUB_SKILL_ID or target in sources:
+                owners[f"skills/{skill_id}"] = "compiler-managed skill"
+                invocation_owners[skill_id] = "compiler-managed skill"
     for asset in plugin.assets:
         support = asset.metadata.support[target]
         directory = "skills"
@@ -204,10 +207,12 @@ def _validate_mcp_assets(assets: dict[str, LoadedAsset]) -> None:
 
 def _validate_managed_skill_reservations(plugins: dict[str, HubPluginDefinition]) -> None:
     pig_plugin = plugins.get(PIG_PLUGIN_ID)
-    reserved_ref = f"skill:{UPDATE_INSTRUCTION_HUB_SKILL_ID}"
-    if isinstance(pig_plugin, PluginDefinition) and reserved_ref in pig_plugin.includes:
-        msg = f"plugin {PIG_PLUGIN_ID!r} cannot include reserved managed asset {reserved_ref!r}"
-        raise InstructionHubError(msg)
+    if isinstance(pig_plugin, PluginDefinition):
+        for skill_id in MANAGED_SKILL_SOURCES:
+            reserved_ref = f"skill:{skill_id}"
+            if reserved_ref in pig_plugin.includes:
+                msg = f"plugin {PIG_PLUGIN_ID!r} cannot include reserved managed asset {reserved_ref!r}"
+                raise InstructionHubError(msg)
 
 
 def _resolve_stable_plugins(

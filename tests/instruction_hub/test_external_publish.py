@@ -27,6 +27,8 @@ from .helpers import _git, _git_output, _init_action_repo, _release_branch_path_
     [
         ("https://github.com", "acme/hub", ".", PLUGIN_PATH),
         ("https://github.com", "acme/hub", "Customer Hub", PLUGIN_PATH),
+        ("https://github.com", "acme/hub", ".", "."),
+        ("https://gitlab.example.test", "acme/team/hub", "instructions/hub", PLUGIN_PATH),
         ("https://gitlab.example.test", "acme/team/hub", "instructions/hub", "."),
     ],
 )
@@ -52,6 +54,7 @@ def test_publish_preserves_external_sources_and_bumps_pin_updates(
     for target, marketplace in (
         ("claude", ".claude-plugin/marketplace.json"),
         ("codex", ".agents/plugins/marketplace.json"),
+        ("cursor", ".cursor-plugin/marketplace.json"),
     ):
         source_entries = json.loads(_git_output(repo, "show", f"origin/main:{prefix}{marketplace}"))["plugins"]
         release_entries = json.loads(_git_output(repo, "show", f"origin/release/stable:{prefix}{marketplace}"))[
@@ -66,12 +69,21 @@ def test_publish_preserves_external_sources_and_bumps_pin_updates(
             **({"path": plugin_path} if plugin_path != "." else {}),
         }
         assert "version" not in source_entries[1] and "author" not in source_entries[1]
-        assert source_entries[0]["source"] == {
-            "source": "git-subdir",
-            "url": f"{server}/{repository}.git",
-            "path": f"{prefix}dist/{target}/pig",
-            "ref": "release/stable",
-        }
+        if target == "cursor" and server == "https://github.com":
+            assert source_entries[0]["source"] == {
+                "type": "github",
+                "owner": "acme",
+                "repo": "hub",
+                "path": f"{prefix}dist/cursor/pig",
+                "ref": "release/stable",
+            }
+        else:
+            assert source_entries[0]["source"] == {
+                "source": "git-subdir",
+                "url": f"{server}/{repository}.git",
+                "path": f"{prefix}dist/{target}/pig",
+                "ref": "release/stable",
+            }
     for target in ("claude", "codex", "cursor", "gemini"):
         assert not _release_branch_path_exists(repo, f"{prefix}dist/{target}/doc-detective")
     before = _git_output(repo, "ls-remote", "origin", "refs/heads/main", "refs/heads/release/stable")
@@ -79,7 +91,7 @@ def test_publish_preserves_external_sources_and_bumps_pin_updates(
     assert rerun.returncode == 0, rerun.stdout + rerun.stderr
     assert _git_output(repo, "ls-remote", "origin", "refs/heads/main", "refs/heads/release/stable") == before
 
-    for target in ("claude", "codex"):
+    for target in ("claude", "codex", "cursor"):
         manifest_path = upstream / plugin_path / f".{target}-plugin/plugin.json"
         manifest = json.loads(manifest_path.read_text())
         manifest["version"] = "1.2.4"
@@ -95,16 +107,33 @@ def test_publish_preserves_external_sources_and_bumps_pin_updates(
     release = json.loads(_git_output(repo, "show", f"origin/release/stable:{prefix}hub.release.json"))
     assert release["version"] == "0.1.1"
     assert release["version_basis"]["plugins"][1] == definition
+    for branch in ("main", "release/stable"):
+        cursor = json.loads(_git_output(repo, "show", f"origin/{branch}:{prefix}.cursor-plugin/marketplace.json"))
+        assert cursor["plugins"][1]["source"] == {**sources["cursor"], "sha": definition["source"]["sha"]}
     assert _git_output(repo, "status", "--short") == ""
 
+    definition["source"]["sha"] = sha
+    write_external(repo / hub_path, definition)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "roll back upstream pin")
+    _git(repo, "push")
+    rollback = _run_action(repo, tmp_path / "output", hub_root=hub_path, extra_env=extra_env)
+    assert rollback.returncode == 0, rollback.stdout + rollback.stderr
+    _git(repo, "fetch", "origin")
+    for branch in ("main", "release/stable"):
+        cursor = json.loads(_git_output(repo, "show", f"origin/{branch}:{prefix}.cursor-plugin/marketplace.json"))
+        assert cursor["plugins"][1]["source"] == sources["cursor"]
+    release = json.loads(_git_output(repo, "show", f"origin/release/stable:{prefix}hub.release.json"))
+    assert release["version"] == "0.1.2"
 
-@pytest.mark.parametrize("failure", ["missing-commit", "same-version", "missing-manifest"])
+
+@pytest.mark.parametrize("failure", ["missing-commit", "same-version", "missing-manifest", "missing-cursor-manifest"])
 def test_failed_external_verification_preserves_published_branches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     upstream = tmp_path / "upstream"
     sha = make_upstream(upstream, monkeypatch)
-    repo = _init_action_repo(tmp_path / "publisher", targets=("claude", "codex"))
+    repo = _init_action_repo(tmp_path / "publisher", targets=("claude", "codex", "cursor"))
     definition = external_definition(sha)
     write_external(repo, definition)
     _git(repo, "add", "-A")
@@ -119,7 +148,13 @@ def test_failed_external_verification_preserves_published_branches(
         if failure == "same-version":
             (upstream / PLUGIN_PATH / "skills/example/SKILL.md").write_text("# Changed skill\n")
         else:
-            (upstream / PLUGIN_PATH / ".claude-plugin/plugin.json").unlink()
+            target = "cursor" if failure == "missing-cursor-manifest" else "claude"
+            (upstream / PLUGIN_PATH / f".{target}-plugin/plugin.json").unlink()
+            if target == "cursor":
+                claude_path = upstream / PLUGIN_PATH / ".claude-plugin/plugin.json"
+                claude = json.loads(claude_path.read_text())
+                claude["version"] = "1.2.4"
+                claude_path.write_text(json.dumps(claude))
         definition["source"]["sha"] = commit_upstream(upstream)
     write_external(repo, definition)
     _git(repo, "add", "-A")
@@ -132,6 +167,8 @@ def test_failed_external_verification_preserves_published_branches(
     assert _git_output(repo, "status", "--short") == ""
     if failure == "same-version":
         assert "retains upstream version 1.2.3" in result.stderr
+    elif failure == "missing-cursor-manifest":
+        assert "missing upstream manifest plugins/doc-detective/.cursor-plugin/plugin.json" in result.stderr
 
 
 @pytest.mark.parametrize("mode", ["build", "check"])
@@ -145,7 +182,7 @@ def test_ci_modes_fail_for_unavailable_external_pin(tmp_path: Path, monkeypatch:
     assert "cannot fetch external plugin revision" in result.stderr
 
 
-@pytest.mark.parametrize("change", ["path", "versionless", "codex-only"])
+@pytest.mark.parametrize("change", ["path", "versionless", "codex-only", "cursor-only"])
 def test_previous_release_comparison_respects_host_version_behavior(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
@@ -153,8 +190,8 @@ def test_previous_release_comparison_respects_host_version_behavior(
     sha = make_upstream(upstream, monkeypatch)
     init_hub(hub)
     definition = external_definition(sha)
-    if change == "codex-only":
-        del definition["targets"]["claude"]
+    if change.endswith("-only"):
+        definition["targets"] = {change.removesuffix("-only"): {"path": PLUGIN_PATH}}
     write_external(hub, definition)
     build_hub(hub)
     shutil.copytree(hub, previous)

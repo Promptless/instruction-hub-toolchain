@@ -235,10 +235,11 @@ def test_converted_agent_cannot_overwrite_authored_skill(tmp_path: Path, mode: s
         validate_hub(tmp_path)
 
 
-def test_converted_agent_cannot_overwrite_managed_skill(tmp_path: Path) -> None:
+@pytest.mark.parametrize("skill_id", ["update-instruction-hub", "add-external-plugin"])
+def test_converted_agent_cannot_overwrite_managed_skill(tmp_path: Path, skill_id: str) -> None:
     """Managed PIG skill names are reserved before rendering begins."""
 
-    _write_agent(tmp_path, role="update-instruction-hub")
+    _write_agent(tmp_path, role=skill_id)
 
     with pytest.raises(InstructionHubError, match="compiler-managed skill"):
         validate_hub(tmp_path)
