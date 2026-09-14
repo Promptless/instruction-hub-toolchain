@@ -531,8 +531,8 @@ Claude-style hooks. Claude Desktop has no hook-provided current transcript and
 starts with idle catch-up.
 
 Hook timeouts cover the launcher, while collection runs in a detached process.
-The generated Codex `SessionEnd` hook uses its host's 3-second maximum; startup
-hooks use 30 seconds and the other terminal hooks use 390 seconds.
+Terminal hooks use a shared 3-second launcher budget on every host, which also
+fits Codex's `SessionEnd` maximum. Startup hooks use 30 seconds.
 
 A collection follows this order:
 

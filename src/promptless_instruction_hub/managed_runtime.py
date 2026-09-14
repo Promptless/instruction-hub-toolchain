@@ -29,10 +29,10 @@ HOST_RUNTIME_OUTPUT_DIR = "runtime"
 # collection supervisor, and emits already-pending notices. Browser, network, trace
 # discovery, and ledger work stay off the hook's critical path.
 HOST_RUNTIME_SESSION_START_HOOK_TIMEOUT_SECONDS = 30
-HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS = 390
-# Codex caps synchronous SessionEnd hooks at 3s; collection runs detached.
+# Terminal hooks only launch detached collectors. Use a short launcher budget
+# for every host/event, within Codex's 3s SessionEnd maximum.
 # https://learn.chatgpt.com/docs/hooks#config-shape
-CODEX_SESSION_END_HOOK_TIMEOUT_SECONDS = 3
+HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS = 3
 HOST_RUNTIME_CHANNEL = "stable"
 HOST_RUNTIME_VERSION = "0.2.9"
 MANAGED_RUNTIME_MANIFEST = MANAGED_RUNTIME_MANIFEST_PATH
@@ -248,7 +248,7 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
         "hooks": [
             {
                 "type": "command",
-                "timeout": _host_runtime_hook_timeout(target, event_name),
+                "timeout": _host_runtime_hook_timeout(event_name),
                 "statusMessage": (
                     "Checking Promptless host runtime"
                     if event_name == "SessionStart"
@@ -263,11 +263,9 @@ def _host_runtime_hook_entry(target: Harness, event_name: str) -> dict[str, Json
     return hook_entry
 
 
-def _host_runtime_hook_timeout(target: Harness, event_name: str) -> int:
+def _host_runtime_hook_timeout(event_name: str) -> int:
     if event_name == "SessionStart":
         return HOST_RUNTIME_SESSION_START_HOOK_TIMEOUT_SECONDS
-    if target == "codex" and event_name == "SessionEnd":
-        return CODEX_SESSION_END_HOOK_TIMEOUT_SECONDS
     return HOST_RUNTIME_TERMINAL_HOOK_TIMEOUT_SECONDS
 
 

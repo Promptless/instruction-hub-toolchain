@@ -49,23 +49,19 @@ from .helpers import (
 )
 
 
-def test_build_emits_host_specific_hook_timeouts(tmp_path: Path) -> None:
+def test_build_emits_short_terminal_hook_timeouts_for_all_hosts(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     init_hub(hub_root, org="Promptless")
     enable_trace_ingestion(hub_root)
 
     build_hub(hub_root)
 
-    expected_timeouts = {
-        "codex": {"SessionStart": 30, "Stop": 390, "SessionEnd": 3, "SubagentStop": 390},
-        "claude": {"SessionStart": 30, "Stop": 390, "SessionEnd": 390, "SubagentStop": 390},
-    }
-    for target, timeouts in expected_timeouts.items():
+    for target in ("codex", "claude"):
         hook_path = hub_root / "dist" / target / "pig" / "hooks/hooks.json"
         hooks = json.loads(hook_path.read_text())["hooks"]
         assert {
             event: [hook["timeout"] for group in groups for hook in group["hooks"]] for event, groups in hooks.items()
-        } == {event: [timeout] for event, timeout in timeouts.items()}
+        } == {"SessionStart": [30], "Stop": [3], "SessionEnd": [3], "SubagentStop": [3]}
 
 
 def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
@@ -329,6 +325,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                     input=input_text,
                     capture_output=True,
                     check=False,
+                    timeout=hook["timeout"],
                 )
             if root is not None:
                 env_vars["PLUGIN_ROOT"] = str(root)
@@ -340,6 +337,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
                 input=input_text,
                 capture_output=True,
                 check=False,
+                timeout=hook["timeout"],
             )
 
         def make_stale_root_with_sibling_runtime(lifecycle: str) -> Path:
@@ -601,24 +599,30 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
         assert_quiet_success(rooted)
         assert_startup_calls()
 
-        if target == "codex" and os.name == "posix":
+        if os.name == "posix":
             reset_stub_calls()
             session_end_hook = hook_events["SessionEnd"][0]["hooks"][0]
-            collect_release_file = tmp_path / "codex-collect-release"
+            session_end_command = (
+                [session_end_hook["command"], *session_end_hook["args"]]
+                if target == "claude"
+                else session_end_hook["command"]
+            )
+            root_env = {"CLAUDE_PLUGIN_ROOT" if target == "claude" else "PLUGIN_ROOT": str(stub_root)}
+            collect_release_file = tmp_path / f"{target}-collect-release"
             stdin_payload = json.dumps(
                 {
-                    "session_id": "codex_session_1",
-                    "transcript_path": str(tmp_path / "codex-session.jsonl"),
+                    "session_id": f"{target}_session_1",
+                    "transcript_path": str(tmp_path / f"{target}-session.jsonl"),
                 }
             )
             hook_process: subprocess.Popen[str] | None = None
             try:
                 hook_process = subprocess.Popen(
-                    session_end_hook["command"],
-                    shell=True,
+                    session_end_command,
+                    shell=target == "codex",
                     env=_clean_env(
-                        HOME=str(tmp_path / "codex-process-group-home"),
-                        PLUGIN_ROOT=str(stub_root),
+                        HOME=str(tmp_path / f"{target}-process-group-home"),
+                        **root_env,
                         PROMPTLESS_STUB_CALL_LOG=str(stub_call_log),
                         PROMPTLESS_STUB_ATTEMPT_LOG=str(stub_attempt_log),
                         PROMPTLESS_STUB_STARTED_LOG=str(stub_started_log),
@@ -658,7 +662,7 @@ def test_build_injects_managed_bootstrap_runtime(tmp_path: Path) -> None:
             assert_stdin_entries_eventually(
                 [
                     {
-                        "argv": ["collect", "--host", "codex", "--lifecycle", "session_end", "--quiet"],
+                        "argv": ["collect", "--host", target, "--lifecycle", "session_end", "--quiet"],
                         "stdin": stdin_payload,
                     }
                 ]
