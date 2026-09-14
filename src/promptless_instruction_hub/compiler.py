@@ -7,6 +7,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from promptless_instruction_hub.agent_skills import AgentSkillWarning
 from promptless_instruction_hub.config import (
     CONFIG_PATH,
     PLUGIN_DIR,
@@ -57,6 +58,7 @@ class BuildResult:
     target_count: int
     asset_count: int
     checked: bool
+    warnings: tuple[AgentSkillWarning, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,7 @@ class VerifyResult:
     release_hash: str
     target_count: int
     asset_count: int
+    warnings: tuple[AgentSkillWarning, ...] = ()
 
 
 def init_hub(
@@ -133,6 +136,7 @@ def build_hub(hub_root: Path, *, check: bool = False, version: str | None = None
         target_count=len(validation.config.targets),
         asset_count=len(validation.stable_assets),
         checked=check,
+        warnings=validation.warnings,
     )
 
 
@@ -147,6 +151,7 @@ def verify_hub(hub_root: Path) -> VerifyResult:
         release_hash=str(release_manifest["release_hash"]),
         target_count=len(validation.config.targets),
         asset_count=len(validation.stable_assets),
+        warnings=validation.warnings,
     )
 
 
@@ -183,6 +188,7 @@ def _with_version(validation: ValidationResult, version: str) -> ValidationResul
         plugins=validation.plugins,
         assets=validation.assets,
         stable_plugins=validation.stable_plugins,
+        warnings=validation.warnings,
     )
 
 

@@ -354,6 +354,52 @@ Every generated plugin embeds local metadata as root files inside each plugin:
 - `hub.managed-runtimes.json`: Promptless-managed runtime metadata for plugins
   that include managed-runtime artifacts.
 
+### Agent definitions as Codex skills
+
+An agent can ship as a native Claude subagent and a Codex skill from the same
+Markdown source. Set its adjacent `<id>.asset.yaml` file to:
+
+```yaml
+support:
+  claude:
+    mode: native
+  codex:
+    mode: agent-skill
+```
+
+Keep the `agent:<id>` reference in the plugin's `includes` list. The compiler
+writes `skills/<id>/SKILL.md` into the Codex plugin and registers it as a skill.
+Release metadata retains the source agent identity. Conversion is opt-in,
+Codex-only, and accepts `.md` files; directory-based agents are not converted.
+
+The generated skill contains the full authored procedure and instructions to
+delegate it to one child. An assigned specialist executes the procedure directly
+without delegating the same role again. The parent relays clarification questions
+and answers, then returns the result. If subagent tools are unavailable, the
+instructions require stopping. The model must follow these instructions; Codex has
+no documented skill frontmatter that enforces subagent execution. See the
+[Codex skill documentation](https://developers.openai.com/codex/skills).
+
+Source frontmatter must have a nonempty `description` of at most 1,024 characters.
+Use a shared portable description and put invocation examples in the body. The
+generated skill name is the asset ID. Optional `name`, `model`, and `color` fields
+are accepted; the generated skill omits model and color settings and tells the
+parent to launch the child without model or reasoning overrides.
+
+`tools` and `disallowedTools` accept comma-separated strings or YAML lists.
+They become advisory instructions with their original tool names; the compiler
+does not map names between hosts. An empty `tools` list means the specialist
+must not use tools. `pig validate`, `pig verify`, and `pig build` print one warning
+per included converted agent that declares either field. Codex does not enforce
+these restrictions through skill metadata. Write required behavior in the shared
+procedure without claiming that a host enforces it.
+
+Conversion rejects other frontmatter fields, invalid descriptions, and skill
+destination collisions, including names reserved for compiler-managed skills.
+The compiler does not truncate descriptions or rewrite procedures. The
+[implementation plan](docs/exec-plans/2026-09-13-codex-agent-skills.md) records the
+design and verification scope.
+
 The old `.promptless/instruction-hub.yaml` and generated `.promptless/...`
 layout is not read or migrated by this toolchain. Existing hubs must rename
 their config to `hub.yaml` and regenerate output with `pig build`.
