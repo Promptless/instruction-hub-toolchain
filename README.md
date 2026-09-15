@@ -354,6 +354,94 @@ Every generated plugin embeds local metadata as root files inside each plugin:
 - `hub.managed-runtimes.json`: Promptless-managed runtime metadata for plugins
   that include managed-runtime artifacts.
 
+### Portable commands
+
+Keep an explicitly invoked workflow as `command:<id>` in a plugin's `includes`.
+Author it in `assets/commands/<id>.md`:
+
+```markdown
+---
+description: Rebase the current PR onto main and report the result.
+---
+
+Fetch the latest main, rebase the current PR branch, and resolve conflicts.
+```
+
+The compiler preserves the asset ID and the complete procedure. It chooses the
+target's format and registers exactly one entry:
+
+| Target | Generated file | Invocation control |
+| --- | --- | --- |
+| Codex | `skills/<id>/SKILL.md` | `agents/openai.yaml` sets `policy.allow_implicit_invocation: false` |
+| Claude | `skills/<id>/SKILL.md` | Frontmatter sets `disable-model-invocation: true` |
+| Cursor | `skills/<id>/SKILL.md` | Frontmatter sets `disable-model-invocation: true` |
+| Gemini | `commands/<id>.toml` | Native slash command |
+
+For example, Codex gets `rebase-pr`, with its normal plugin namespace, instead of
+the `source-command-rebase-pr` name produced by Codex's legacy command importer.
+No additional Markdown command is emitted alongside a converted skill.
+Release metadata still records `command:rebase-pr` as the source asset.
+
+Commands without a `support` table default to native delivery on all hub targets.
+An explicit table is an allowlist: omitted targets remain unsupported. Existing
+`mode: native` command declarations now select conversion; explicit
+`mode: unsupported` exclusions remain effective. For example:
+
+```yaml
+# assets/commands/rebase-pr.asset.yaml
+support:
+  claude:
+    mode: native
+  codex:
+    mode: native
+  cursor:
+    mode: native
+  gemini:
+    mode: unsupported
+    reason: Not enabled for this workflow.
+```
+
+Portable command frontmatter requires a nonempty `description` of at most 1,024
+characters without angle-bracket invocation syntax. Optional `name` must match
+the asset ID. Names are limited to 64 characters; Codex's combined
+`plugin-id:command-id` must also fit that limit. Optional
+`disable-model-invocation` and `user-invocable` must be `true`: commands always
+require explicit invocation. Use a skill asset for automatic selection.
+
+Claude conversion also preserves `argument-hint`, `$ARGUMENTS`, `$ARGUMENTS[N]`,
+and `$N`. Other targets reject these fields and substitutions. Portable workflows
+can instead describe how to use the context supplied with the invocation. The
+compiler rejects unsupported frontmatter, including `allowed-tools`, `model`,
+and `context`, and host-specific dynamic context syntax such as shell injection,
+Gemini `{{args}}` / `@{...}`, and Claude path variables. It does not silently drop
+permissions, tool restrictions, subagent behavior, or template expansion.
+
+For a command that needs host-specific features, set that target to
+`mode: verbatim`. This copies a single native `.md` file for Claude/Cursor or a
+native `.toml` file for Gemini, including its metadata and substitutions. Gemini
+TOML must contain a nonempty `prompt` string. Codex has no native command format
+in this contract; author a Codex skill asset for features outside conversion.
+Directory command bundles are not supported by conversion or verbatim delivery.
+The existing `projected` mode remains an inert Markdown projection, not a
+registered, executable command.
+
+Validation rejects command/skill invocation collisions within each plugin,
+including converted agents and compiler-managed skills. Before adopting this
+compiler, remove redundant command wrappers whose names already belong to a
+skill, or give the workflows distinct names. Native files that previously used
+`mode: native` and require unsupported syntax must switch to `mode: verbatim`.
+After publishing, refresh the installed plugin and reload the harness to replace
+cached command imports.
+
+These adapters follow the documented invocation controls for
+[Codex skills](https://developers.openai.com/codex/skills),
+[Claude skills](https://code.claude.com/docs/en/skills),
+[Cursor skills](https://cursor.com/docs/skills), and
+[Gemini custom commands](https://geminicli.com/docs/cli/custom-commands/).
+Artifact checks validate file formats, names, registration, and invocation
+settings; installation, command-picker behavior, and refresh still need testing
+in each supported harness version.
+
 ### Agent definitions as Codex skills
 
 An agent can ship as a native Claude subagent and a Codex skill from the same
