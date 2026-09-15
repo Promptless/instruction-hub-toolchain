@@ -14,6 +14,7 @@ from promptless_instruction_hub.fs import (
     read_yaml_mapping,
     read_yaml_value,
 )
+from promptless_instruction_hub.release.hashing import stable_hash
 from promptless_instruction_hub.models import (
     ASSET_KINDS,
     AssetKind,
@@ -182,12 +183,15 @@ def _load_directory_asset(
         default_asset_source_path(path),
         default_support,
     )
+    content_hash = directory_hash(path, skip_names={METADATA_FILE})
+    if metadata.hook is not None:
+        content_hash = stable_hash({"content_hash": content_hash, "hook": metadata.hook.model_dump(exclude_none=True)})
     return LoadedAsset(
         id=metadata.id,
         type=asset_kind,
         path=path,
         metadata=metadata,
-        content_hash=directory_hash(path, skip_names={METADATA_FILE}),
+        content_hash=content_hash,
     )
 
 

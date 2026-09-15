@@ -9,6 +9,7 @@ from promptless_instruction_hub.agent_skills import AgentSkillWarning, read_agen
 from promptless_instruction_hub.assets import load_assets, validate_no_literal_secrets, validate_no_symlinks
 from promptless_instruction_hub.config import load_hub_config, load_plugins
 from promptless_instruction_hub.errors import InstructionHubError
+from promptless_instruction_hub.hook_definitions import validate_hook_definition
 from promptless_instruction_hub.mcp_config import read_mcp_servers
 from promptless_instruction_hub.models import (
     PIG_PLUGIN_ID,
@@ -54,6 +55,8 @@ def validate_hub(hub_root: Path) -> ValidationResult:
     plugins = load_plugins(root)
     validate_no_symlinks(root)
     assets = load_assets(root)
+    for asset in assets.values():
+        validate_hook_definition(asset)
     validate_no_literal_secrets(root)
     _validate_target_support(config, assets)
     _validate_mcp_assets(assets)

@@ -410,6 +410,105 @@ Hubs follow the latest merged toolchain on `main`. GitHub callers use `@main`;
 GitLab callers use the `/main/` template URL and the default `toolchain-ref: main`.
 Resolved commit hashes in CI logs identify the compiler used for a build.
 
+## Authored hooks
+
+Register `hook:<id>` in a plugin's includes. Keep its Python script and one
+`asset.yaml` declaration in `assets/hooks/<id>/`. For example:
+
+```yaml
+support:
+  claude: {mode: native}
+  codex: {mode: native}
+  cursor: {mode: native}
+hook:
+  entrypoint: run.py
+  timeout: 75
+  status_message: Checking credentials
+  bindings:
+    claude:
+      - {event: PostToolUseFailure, matcher: Bash}
+    codex:
+      - {event: PostToolUse, matcher: Bash}
+    cursor:
+      - {event: postToolUseFailure, matcher: Shell}
+```
+
+The compiler generates the native JSON, plugin-root paths, Python 3.9+ prerequisite
+check, and a shared input/output adapter. No installed toolchain package is needed
+on the user's machine. Generated launchers use a POSIX shell. Entrypoints must be existing `.py` files inside the bundle;
+unknown fields, invalid bindings, and conflicting definitions fail validation.
+Changing the declaration changes the asset's content hash and release identity.
+
+Bindings deliberately name native events: the compiler does not guess equivalent
+triggers across harnesses. The portable adapter supports Claude's `SessionStart`,
+`PostToolUse`, and `PostToolUseFailure`; Codex's `SessionStart` and `PostToolUse`;
+and Cursor's `sessionStart`, `postToolUse`, and `postToolUseFailure`.
+Bindings must cover exactly the targets marked `native` for this asset.
+
+Scripts read one JSON object on stdin:
+
+```json
+{
+  "event": "tool_result",
+  "cwd": "/workspace/repo",
+  "shell": {
+    "command": "python helper.py",
+    "output": "command output",
+    "exit_code": 1,
+    "status": "failed"
+  }
+}
+```
+
+`event` is `session_start` or `tool_result`. `shell` is null for startup and
+non-shell tools. Its status is `success`, `failed`, `unknown`, `running`,
+`cancelled`, `timeout`, or `permission_denied`. A missing exit code stays null;
+in particular, Codex can emit raw output with an `unknown` status. Hooks must not
+assume that unknown means failed. Cursor uses its reported cwd, falling back to
+its first workspace root. A missing working directory remains null.
+
+Emit `{"context": "Message for the agent"}` on stdout, or leave stdout empty to
+stay quiet. Use stderr for diagnostics. The adapter wraps context in the native
+response envelope and preserves a nonzero script exit. Scripts execute in the
+adapter's process, so cancellation signals reach their handlers directly. The
+adapter does not retry commands, start background workers, or infer recovery
+policy; those decisions belong to the hook script.
+
+### Native JSON escape hatch
+
+For other events, runtimes, or host features, keep `hooks.<target>.json` and shared
+scripts in the bundle instead of declaring `hook:` in `asset.yaml`. A shared
+`hooks.json` is used when the target-specific file is absent. Mixing a portable
+declaration with native JSON in one bundle is rejected; separate bundles can mix
+freely within a plugin. Existing single-file JSON hooks and other legacy native
+files remain supported.
+
+The compiler copies bundles to `hooks/<id>/` and combines selected configurations
+at `hooks/hooks.json`, appending handlers in asset-reference order, joining
+descriptions, and rejecting conflicting top-level metadata. Native JSON must
+contain a `hooks` object whose event values are arrays of handler objects. PIG's
+managed lifecycle hooks are appended afterward when ingestion is enabled; other
+plugins receive only their own hooks.
+
+### Hub-owned behavioral tests
+
+The shared PR workflow supports an optional test job. Configure it in the hub's
+existing workflow alongside `hub-root`; keep the tests with their source assets:
+
+```yaml
+with:
+  hub-root: .
+  test-command: python -m unittest discover -s tests -v
+  test-runs-on: macos-latest
+  test-python-version: "3.9"
+```
+
+With no `test-command`, no test job runs. The default runner is `ubuntu-latest`
+and the default Python version is `3.9`. The toolchain owns checkout, interpreter
+setup, execution, and failure propagation. The hub owns the command and test
+requirements; add its test paths to the workflow's PR filters. Test commands are
+trusted repository code, run without persisted checkout credentials.
+
 ## Managed PIG Assets
 
 The toolchain injects the harness-specific `update-instruction-hub`

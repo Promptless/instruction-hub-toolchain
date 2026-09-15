@@ -1,0 +1,11 @@
+support:
+  claude: {mode: native}
+  codex: {mode: native}
+  cursor: {mode: native}
+hook:
+  entrypoint: run.py
+  timeout: 5
+  bindings:
+    claude: [{event: SessionStart, matcher: 'startup|resume'}]
+    codex: [{event: SessionStart, matcher: 'startup|resume'}]
+    cursor: [{event: sessionStart}]
