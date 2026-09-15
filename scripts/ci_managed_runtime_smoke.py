@@ -138,6 +138,10 @@ def _build_hub(toolchain: Sequence[os.PathLike[str] | str], workspace: Path) -> 
     plugin_root = hub_root / "dist" / "codex" / "pig"
     if not plugin_root.is_dir():
         raise AssertionError(f"installed toolchain did not build the Codex plugin at {plugin_root}")
+    for target in ("claude", "codex", "cursor"):
+        skill_path = hub_root / "dist" / target / "pig/skills/add-external-plugin/SKILL.md"
+        if not skill_path.is_file():
+            raise AssertionError(f"installed toolchain did not ship the external plugin authoring skill: {skill_path}")
     return plugin_root
 
 

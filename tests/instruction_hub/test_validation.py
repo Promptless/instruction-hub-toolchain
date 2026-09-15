@@ -61,15 +61,16 @@ def test_validate_rejects_unknown_package_refs(tmp_path: Path) -> None:
         validate_hub(hub_root)
 
 
-def test_validate_rejects_authored_update_instruction_hub_skill_in_pig(tmp_path: Path) -> None:
+@pytest.mark.parametrize("skill_id", ["update-instruction-hub", "add-external-plugin"])
+def test_validate_rejects_authored_managed_skill_in_pig(tmp_path: Path, skill_id: str) -> None:
     hub_root = tmp_path / "hub"
-    skill_root = hub_root / "assets/skills/update-instruction-hub"
+    skill_root = hub_root / "assets/skills" / skill_id
     init_hub(hub_root)
     skill_root.mkdir(parents=True)
     (skill_root / "SKILL.md").write_text("# Customer updater\n")
-    (hub_root / "plugins/pig.yaml").write_text("id: pig\nname: PIG\nincludes:\n  - skill:update-instruction-hub\n")
+    (hub_root / "plugins/pig.yaml").write_text(f"id: pig\nname: PIG\nincludes:\n  - skill:{skill_id}\n")
 
-    with pytest.raises(InstructionHubError, match="reserved managed asset 'skill:update-instruction-hub'"):
+    with pytest.raises(InstructionHubError, match=f"reserved managed asset 'skill:{skill_id}'"):
         validate_hub(hub_root)
 
 

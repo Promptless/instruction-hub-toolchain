@@ -181,6 +181,39 @@ def test_commands_cannot_shadow_authored_or_managed_skills(tmp_path: Path, targe
     assert list((tmp_path / "dist").iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("target", "mode"),
+    [("claude", "native"), ("codex", "native"), ("cursor", "native"), ("claude", "verbatim"), ("cursor", "verbatim")],
+)
+def test_command_cannot_shadow_external_plugin_managed_skill(tmp_path: Path, target: str, mode: str) -> None:
+    _write_command(tmp_path, name="add-external-plugin", support={target: {"mode": mode}})
+    with pytest.raises(InstructionHubError, match="compiler-managed skill"):
+        build_hub(tmp_path)
+    assert list((tmp_path / "dist").iterdir()) == []
+
+
+def test_external_plugin_skill_name_is_available_for_gemini_commands(tmp_path: Path) -> None:
+    _write_command(tmp_path, name="add-external-plugin", support={"gemini": {"mode": "native"}})
+    build_hub(tmp_path)
+    command = tmp_path / "dist/gemini/pig/commands/add-external-plugin.toml"
+    assert tomllib.loads(command.read_text())["prompt"] == BODY
+
+
+@pytest.mark.parametrize("target", ["claude", "codex"])
+def test_authored_skill_alias_cannot_shadow_external_plugin_managed_skill(tmp_path: Path, target: str) -> None:
+    _write_command(tmp_path, support={target: {"mode": "native"}})
+    hub_config = yaml.safe_load((tmp_path / "hub.yaml").read_text())
+    hub_config["targets"] = [target]
+    (tmp_path / "hub.yaml").write_text(yaml.safe_dump(hub_config))
+    skill = tmp_path / "assets/skills/aliased"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: add-external-plugin\ndescription: Alias\n---\nBody\n")
+    (tmp_path / "plugins/pig.yaml").write_text("id: pig\nname: PIG\nincludes: [skill:aliased]\n")
+    with pytest.raises(InstructionHubError, match="invocation 'add-external-plugin' conflicts"):
+        build_hub(tmp_path)
+    assert list((tmp_path / "dist").iterdir()) == []
+
+
 def test_command_cannot_overwrite_converted_agent(tmp_path: Path) -> None:
     _write_command(tmp_path)
     source = tmp_path / f"assets/agents/{NAME}.md"

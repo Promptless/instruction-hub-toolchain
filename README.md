@@ -238,7 +238,7 @@ required `plugins/pig.yaml` created by `pig init` in `stable_plugins`.
 The compiler uses `marketplace.id` as the marketplace name and each plugin's
 `id` as its native name. It adds no prefix or suffix. IDs use lowercase letters,
 digits, and hyphens, with a letter or digit at each end. Plugin display names
-come from `name` where the target supports them. Output goes to
+come from `name` where the target supports them. Authored plugin output goes to
 `dist/{target}/{plugin.id}/`. Gemini receives extensions with the same plugin
 IDs; it has no generated marketplace manifest.
 
@@ -261,6 +261,56 @@ branches. Publish requires committed source files and a clean index.
 An unchanged rerun creates no commits. If only one branch needs a content change,
 the other receives an empty recording commit so Git checks both leases. Merely
 writing the resolved version back does not cause another version bump.
+
+### External plugins
+
+A Hub can distribute upstream plugins for Claude, Codex, and Cursor. Set
+`source.ref` to a full 40-character commit SHA for a fixed pin, or `"latest"`
+to follow the upstream default branch when the Hub publishes.
+
+```yaml
+# plugins/doc-detective.yaml
+kind: external
+id: doc-detective
+name: Doc Detective
+source:
+  type: git
+  url: https://github.com/doc-detective/agent-tools.git
+  ref: "latest"
+targets:
+  claude:
+    path: plugins/doc-detective
+  codex:
+    path: plugins/doc-detective
+  cursor:
+    path: plugins/doc-detective
+```
+
+Add the ID to `hub.yaml`'s `stable_plugins`. It must match the upstream manifest's
+`name`. Declare only targets the upstream supports; paths are relative to its
+repository, with `.` for a plugin at the root.
+
+Verify the upstream plugin and local build:
+
+```bash
+pig resolve-external --hub .
+pig verify --hub .
+```
+
+For `"latest"`, commit the generated `hub.external-plugins.lock.json` alongside
+the definition. Offline builds use this lock; CI build and publish modes refresh
+it. Catalog definitions use `ref`; locks, release provenance, and marketplaces
+use the resolved `sha`. Consumers update installed plugins through their host.
+
+The generated PIG plugin includes an
+[`add-external-plugin` skill](src/promptless_instruction_hub/managed_skill_assets/add-external-plugin/shared/SKILL.md)
+with instructions for verification, updates, rollback, private repositories,
+and host compatibility.
+
+When an authored plugin replaces an external Claude plugin, the resolved Hub
+release version must differ from the previous upstream version. If the automatic
+bump collides, choose a higher version with
+`pig set-version --hub . --version <new-version>` before publishing.
 
 ### Migrating existing hubs
 
@@ -292,8 +342,9 @@ skill namespaces, choose explicit IDs such as `acme-dev` for customer plugins.
 The compiler never adds that prefix automatically. The managed PIG plugin
 continues to require the ID `pig`.
 
-`hub.release.json` and `hub.stable.json` both use `schema_version: 2` and the
-same top-level `version`. Runtime enrollment metadata still uses `plugin_version`
+`hub.release.json` and `hub.stable.json` share a schema version (2 for authored-only
+releases, 3 when external plugins are selected) and the same top-level `version`.
+Runtime enrollment metadata still uses `plugin_version`
 for the installed plugin's version and `package_id` for the source plugin ID.
 Runtime `plugin_id` matches the literal ID in the native plugin manifest.
 
@@ -484,9 +535,7 @@ procedure without claiming that a host enforces it.
 
 Conversion rejects other frontmatter fields, invalid descriptions, and skill
 destination collisions, including names reserved for compiler-managed skills.
-The compiler does not truncate descriptions or rewrite procedures. The
-[implementation plan](docs/exec-plans/2026-09-13-codex-agent-skills.md) records the
-design and verification scope.
+The compiler does not truncate descriptions or rewrite procedures.
 
 The old `.promptless/instruction-hub.yaml` and generated `.promptless/...`
 layout is not read or migrated by this toolchain. Existing hubs must rename
@@ -497,6 +546,16 @@ their config to `hub.yaml` and regenerate output with `pig build`.
 Hubs follow the latest merged toolchain on `main`. GitHub callers use `@main`;
 GitLab callers use the `/main/` template URL and the default `toolchain-ref: main`.
 Resolved commit hashes in CI logs identify the compiler used for a build.
+
+Releases containing external plugins use manifest schema 3 and record their
+provenance in `version_basis.plugins`; authored-only releases use schema 2.
+The publisher accepts both. Upgrade older toolchains before consuming schema 3
+releases.
+
+The publisher stores verified upstream versions in release-side
+`hub.external.json`, bound to the release hash and exact source declarations.
+Version comparisons use this record even if the old repository is unavailable.
+Releases without this record require fetching the old pin.
 
 ## Authored hooks
 

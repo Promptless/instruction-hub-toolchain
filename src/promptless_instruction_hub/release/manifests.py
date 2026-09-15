@@ -7,21 +7,28 @@ from pathlib import Path
 from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH, STABLE_CHANNEL_PATH
 from promptless_instruction_hub.fs import JsonValue, directory_hash, write_json
 from promptless_instruction_hub.managed_runtime import ManagedRuntimeRecord
-from promptless_instruction_hub.models import LoadedAsset, StablePlugin
+from promptless_instruction_hub.models import (
+    ResolvedHubPluginDefinition,
+    ResolvedExternalPluginDefinition,
+    LoadedAsset,
+    StablePlugin,
+)
 from promptless_instruction_hub.release.hashing import stable_hash
 from promptless_instruction_hub.validate.hub import ValidationResult
 
 
 def build_release_manifest(
     output_root: Path,
-    validation: ValidationResult,
+    validation: ValidationResult[ResolvedHubPluginDefinition],
     managed_runtimes: tuple[ManagedRuntimeRecord, ...],
 ) -> dict[str, JsonValue]:
     """Build the deterministic release manifest for generated target output."""
 
     target_hashes = build_target_hashes(output_root, validation)
     base_manifest: dict[str, JsonValue] = {
-        "schema_version": 2,
+        "schema_version": 3
+        if any(isinstance(plugin.definition, ResolvedExternalPluginDefinition) for plugin in validation.stable_plugins)
+        else 2,
         "org": validation.config.org,
         "version": validation.config.version,
         "marketplace": {
@@ -43,7 +50,7 @@ def build_release_manifest(
 
 def build_release_version_basis(
     output_root: Path,
-    validation: ValidationResult,
+    validation: ValidationResult[ResolvedHubPluginDefinition],
     managed_runtimes: tuple[ManagedRuntimeRecord, ...],
 ) -> dict[str, JsonValue]:
     """Return the output-affecting state that should move plugin versions."""
@@ -63,7 +70,9 @@ def build_release_version_basis(
     }
 
 
-def build_target_hashes(output_root: Path, validation: ValidationResult) -> dict[str, JsonValue]:
+def build_target_hashes(
+    output_root: Path, validation: ValidationResult[ResolvedHubPluginDefinition]
+) -> dict[str, JsonValue]:
     """Return deterministic hashes for generated target output."""
 
     return {
@@ -79,7 +88,7 @@ def write_release_files(output_root: Path, release_manifest: dict[str, JsonValue
     write_json(
         output_root / STABLE_CHANNEL_PATH,
         {
-            "schema_version": 2,
+            "schema_version": release_manifest["schema_version"],
             "channel": "stable",
             "release_id": release_manifest["release_id"],
             "release_hash": release_manifest["release_hash"],
@@ -103,8 +112,10 @@ def _asset_manifest(asset: LoadedAsset) -> dict[str, JsonValue]:
     }
 
 
-def _plugin_version_basis(stable_plugin: StablePlugin) -> dict[str, JsonValue]:
+def _plugin_version_basis(stable_plugin: StablePlugin[ResolvedHubPluginDefinition]) -> dict[str, JsonValue]:
     plugin = stable_plugin.definition
+    if isinstance(plugin, ResolvedExternalPluginDefinition):
+        return plugin.model_dump(exclude={"owners"})
     return {
         "id": plugin.id,
         "name": plugin.name,

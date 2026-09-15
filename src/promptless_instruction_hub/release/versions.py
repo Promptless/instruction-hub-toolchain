@@ -6,9 +6,20 @@ import re
 import tempfile
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from promptless_instruction_hub.config import RELEASE_MANIFEST_PATH
+from promptless_instruction_hub.external_lock import load_external_resolutions
 from promptless_instruction_hub.fs import JsonValue, read_json_mapping
-from promptless_instruction_hub.models import ASSET_KINDS, IDENTIFIER_RE, SEMVER_RE, SUPPORTED_HARNESSES, HubConfig
+from promptless_instruction_hub.models import (
+    ASSET_KINDS,
+    IDENTIFIER_RE,
+    SEMVER_RE,
+    SUPPORTED_HARNESSES,
+    ResolvedExternalPluginDefinition,
+    ResolvedHubPluginDefinition,
+    HubConfig,
+)
 from promptless_instruction_hub.release.hashing import stable_hash
 from promptless_instruction_hub.release.manifests import build_release_version_basis
 from promptless_instruction_hub.render.plugins import render_target_plugins
@@ -77,7 +88,20 @@ def resolve_publish_version(
 ) -> str:
     """Resolve the hub release version from the configured version and published output."""
 
-    validation = validate_hub(hub_root)
+    validation = load_external_resolutions(hub_root, validate_hub(hub_root))
+    return resolve_release_version(
+        validation, previous_release_root=previous_release_root, hub_relative_path=hub_relative_path
+    )
+
+
+def resolve_release_version(
+    validation: ValidationResult[ResolvedHubPluginDefinition],
+    *,
+    previous_release_root: Path | None = None,
+    hub_relative_path: str = "",
+) -> str:
+    """Compare resolved source state with the previous immutable release."""
+
     config_version = validation.config.version
     previous_hub_root = _previous_hub_root(previous_release_root, hub_relative_path)
     if previous_hub_root is None:
@@ -87,11 +111,7 @@ def resolve_publish_version(
     if not previous_manifest_path.is_file():
         raise ValueError(f"{previous_manifest_path}: previous release is missing its release manifest")
 
-    previous_manifest = read_json_mapping(previous_manifest_path)
-    previous_version, previous_basis = _read_authoritative_release_manifest(
-        previous_manifest_path,
-        previous_manifest,
-    )
+    previous_version, previous_basis = read_release_manifest(previous_manifest_path)
     current_basis = _build_current_version_basis(validation, version=previous_version)
     if previous_basis == current_basis:
         return _max_semver(config_version, previous_version)
@@ -113,10 +133,10 @@ def _previous_hub_root(previous_release_root: Path | None, hub_relative_path: st
     raise ValueError(msg)
 
 
-def _read_authoritative_release_manifest(
-    manifest_path: Path,
-    manifest: dict[str, JsonValue],
-) -> tuple[str, dict[str, JsonValue]]:
+def read_release_manifest(manifest_path: Path) -> tuple[str, dict[str, JsonValue]]:
+    """Read and validate an authoritative release before using its version or sources."""
+
+    manifest = read_json_mapping(manifest_path)
     version = _read_manifest_version(manifest_path, manifest)
     version_basis = _read_manifest_version_basis(manifest_path, manifest)
     _validate_release_manifest(manifest_path, manifest, version, version_basis)
@@ -151,8 +171,8 @@ def _validate_release_manifest(
 
 def _validate_schema_version(manifest_path: Path, manifest: dict[str, JsonValue]) -> None:
     schema_version = _lookup_path(manifest_path, manifest, "schema_version")
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 2:
-        msg = f"{manifest_path}: schema_version must be 2"
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {2, 3}:
+        msg = f"{manifest_path}: schema_version must be 2 or 3"
         raise ValueError(msg)
 
 
@@ -195,6 +215,8 @@ def _version_basis_assets_by_ref(
     )
     for plugin_index, plugin_value in enumerate(plugins):
         package = _require_mapping_value(manifest_path, plugin_value, f"version_basis.plugins[{plugin_index}]")
+        if package.get("kind") == "external":
+            continue
         plugin_assets = _require_list(
             manifest_path,
             package,
@@ -235,7 +257,9 @@ def _validate_release_identity(
         raise ValueError(msg)
 
 
-def _build_current_version_basis(validation: ValidationResult, *, version: str) -> dict[str, JsonValue]:
+def _build_current_version_basis(
+    validation: ValidationResult[ResolvedHubPluginDefinition], *, version: str
+) -> dict[str, JsonValue]:
     versioned_validation = _with_version(validation, version)
     with tempfile.TemporaryDirectory(prefix="promptless-instruction-hub-version-") as temp_dir:
         output_root = Path(temp_dir)
@@ -247,7 +271,9 @@ def _build_current_version_basis(validation: ValidationResult, *, version: str) 
         return build_release_version_basis(output_root, versioned_validation, managed_runtimes)
 
 
-def _with_version(validation: ValidationResult, version: str) -> ValidationResult:
+def _with_version(
+    validation: ValidationResult[ResolvedHubPluginDefinition], version: str
+) -> ValidationResult[ResolvedHubPluginDefinition]:
     config = HubConfig.model_validate({**validation.config.model_dump(), "version": version})
     return ValidationResult(
         config=config,
@@ -314,6 +340,11 @@ def _validate_manifest_version_basis(
     plugin_ids: list[str] = []
     for index, plugin_value in enumerate(plugins):
         package = _require_mapping_value(manifest_path, plugin_value, f"version_basis.plugins[{index}]")
+        if package.get("kind") == "external":
+            if manifest.get("schema_version") != 3:
+                raise ValueError(f"{manifest_path}: external plugins require schema_version 3")
+            if not set(_require_mapping(manifest_path, package, "targets")).intersection(targets):
+                raise ValueError(f"{manifest_path}: external plugin has no enabled Hub target")
         plugin_ids.append(_validate_plugin_basis(manifest_path, package, f"version_basis.plugins[{index}]"))
     if plugin_ids != stable_plugins:
         msg = f"{manifest_path}: version_basis.plugins ids must match version_basis.stable_plugins"
@@ -340,6 +371,13 @@ def _validate_marketplace_object(manifest_path: Path, plugin: dict[str, JsonValu
 
 
 def _validate_plugin_basis(manifest_path: Path, package: dict[str, JsonValue], key_path: str) -> str:
+    if package.get("kind") == "external":
+        _require_exact_keys(manifest_path, package, key_path, frozenset({"kind", "id", "name", "source", "targets"}))
+        try:
+            plugin = ResolvedExternalPluginDefinition.model_validate(package)
+        except ValidationError as exc:
+            raise ValueError(f"{manifest_path}: invalid {key_path}: {exc}") from exc
+        return plugin.id
     _require_exact_keys(manifest_path, package, key_path, PLUGIN_BASIS_KEYS)
     plugin_id = _require_string(manifest_path, package, "id", display_path=f"{key_path}.id")
     _validate_identifier(manifest_path, plugin_id, f"{key_path}.id")

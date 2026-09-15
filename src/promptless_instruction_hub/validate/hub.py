@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Generic
 
 import yaml
 
@@ -13,14 +14,18 @@ from promptless_instruction_hub.commands import read_command, validate_verbatim_
 from promptless_instruction_hub.config import load_hub_config, load_plugins
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.hook_definitions import validate_hook_definition
+from promptless_instruction_hub.managed_skills import MANAGED_SKILL_SOURCES
 from promptless_instruction_hub.mcp_config import read_mcp_servers
 from promptless_instruction_hub.models import (
     PIG_PLUGIN_ID,
     UPDATE_INSTRUCTION_HUB_SKILL_ID,
     Harness,
     HubConfig,
+    HubPluginDefinition,
+    ExternalPluginDefinition,
     LoadedAsset,
     PluginDefinition,
+    PluginDefinitionT,
     StablePlugin,
 )
 
@@ -35,13 +40,13 @@ SUPPORT_MODES_BY_ASSET_TYPE = {
 
 
 @dataclass(frozen=True)
-class ValidationResult:
-    """Loaded and validated Instruction Hub source state."""
+class ValidationResult(Generic[PluginDefinitionT]):
+    """Original catalog and stable plugins at the requested or resolved source stage."""
 
     config: HubConfig
-    plugins: dict[str, PluginDefinition]
+    plugins: dict[str, HubPluginDefinition]
     assets: dict[str, LoadedAsset]
-    stable_plugins: tuple[StablePlugin, ...]
+    stable_plugins: tuple[StablePlugin[PluginDefinitionT], ...]
     warnings: tuple[AgentSkillWarning, ...] = ()
 
     @property
@@ -51,7 +56,7 @@ class ValidationResult:
         return _resolve_stable_assets(self.stable_plugins)
 
 
-def validate_hub(hub_root: Path) -> ValidationResult:
+def validate_hub(hub_root: Path) -> ValidationResult[HubPluginDefinition]:
     """Validate config, plugins, target support, secrets, and asset references."""
 
     root = hub_root.resolve()
@@ -102,7 +107,7 @@ def _validate_support_modes(asset: LoadedAsset) -> None:
 
 
 def _validate_agent_skills(
-    config: HubConfig, assets: dict[str, LoadedAsset], stable_plugins: tuple[StablePlugin, ...]
+    config: HubConfig, assets: dict[str, LoadedAsset], stable_plugins: tuple[StablePlugin[HubPluginDefinition], ...]
 ) -> tuple[AgentSkillWarning, ...]:
     if "codex" not in config.targets:
         return ()
@@ -129,14 +134,16 @@ def _validate_commands(config: HubConfig, assets: dict[str, LoadedAsset]) -> Non
                 validate_verbatim_command(asset, target)
 
 
-def _validate_invocation_destinations(plugin: StablePlugin, target: Harness) -> None:
+def _validate_invocation_destinations(plugin: StablePlugin[HubPluginDefinition], target: Harness) -> None:
     """Commands and skills share invocation names even in different directories."""
 
     owners: dict[str, str] = {}
     invocation_owners: dict[str, str] = {}
     if plugin.definition.id == PIG_PLUGIN_ID:
-        owners[f"skills/{UPDATE_INSTRUCTION_HUB_SKILL_ID}"] = "compiler-managed skill"
-        invocation_owners[UPDATE_INSTRUCTION_HUB_SKILL_ID] = "compiler-managed skill"
+        for skill_id, sources in MANAGED_SKILL_SOURCES.items():
+            if skill_id == UPDATE_INSTRUCTION_HUB_SKILL_ID or target in sources:
+                owners[f"skills/{skill_id}"] = "compiler-managed skill"
+                invocation_owners[skill_id] = "compiler-managed skill"
     for asset in plugin.assets:
         support = asset.metadata.support[target]
         directory = "skills"
@@ -200,26 +207,33 @@ def _validate_mcp_assets(assets: dict[str, LoadedAsset]) -> None:
             read_mcp_servers(asset.path, default_server_name=asset.id)
 
 
-def _validate_managed_skill_reservations(plugins: dict[str, PluginDefinition]) -> None:
+def _validate_managed_skill_reservations(plugins: dict[str, HubPluginDefinition]) -> None:
     pig_plugin = plugins.get(PIG_PLUGIN_ID)
-    reserved_ref = f"skill:{UPDATE_INSTRUCTION_HUB_SKILL_ID}"
-    if pig_plugin is not None and reserved_ref in pig_plugin.includes:
-        msg = f"plugin {PIG_PLUGIN_ID!r} cannot include reserved managed asset {reserved_ref!r}"
-        raise InstructionHubError(msg)
+    if isinstance(pig_plugin, PluginDefinition):
+        for skill_id in MANAGED_SKILL_SOURCES:
+            reserved_ref = f"skill:{skill_id}"
+            if reserved_ref in pig_plugin.includes:
+                msg = f"plugin {PIG_PLUGIN_ID!r} cannot include reserved managed asset {reserved_ref!r}"
+                raise InstructionHubError(msg)
 
 
 def _resolve_stable_plugins(
     config: HubConfig,
-    plugins: dict[str, PluginDefinition],
+    plugins: dict[str, HubPluginDefinition],
     assets: dict[str, LoadedAsset],
-) -> tuple[StablePlugin, ...]:
-    stable_plugins: list[StablePlugin] = []
+) -> tuple[StablePlugin[HubPluginDefinition], ...]:
+    stable_plugins: list[StablePlugin[HubPluginDefinition]] = []
     missing_refs: set[str] = set()
     for plugin_id in config.stable_plugins:
         plugin = plugins.get(plugin_id)
         if plugin is None:
             msg = f"stable plugin not found: {plugin_id}"
             raise InstructionHubError(msg)
+        if isinstance(plugin, ExternalPluginDefinition):
+            if not set(plugin.targets).intersection(config.targets):
+                raise InstructionHubError(f"external plugin {plugin.id!r} has no enabled Hub target")
+            stable_plugins.append(StablePlugin(definition=plugin, assets=()))
+            continue
         missing_refs.update(ref for ref in plugin.includes if ref not in assets)
         plugin_assets = tuple(assets[ref] for ref in sorted(plugin.includes) if ref in assets)
         stable_plugins.append(StablePlugin(definition=plugin, assets=plugin_assets))
@@ -229,6 +243,6 @@ def _resolve_stable_plugins(
     return tuple(stable_plugins)
 
 
-def _resolve_stable_assets(stable_plugins: tuple[StablePlugin, ...]) -> tuple[LoadedAsset, ...]:
+def _resolve_stable_assets(stable_plugins: tuple[StablePlugin[PluginDefinitionT], ...]) -> tuple[LoadedAsset, ...]:
     assets_by_ref = {asset.ref: asset for stable_plugin in stable_plugins for asset in stable_plugin.assets}
     return tuple(assets_by_ref[ref] for ref in sorted(assets_by_ref))

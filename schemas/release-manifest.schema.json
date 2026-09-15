@@ -20,7 +20,10 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 2
+      "enum": [
+        2,
+        3
+      ]
     },
     "org": {
       "type": "string",
@@ -282,38 +285,14 @@
           "type": "array",
           "minItems": 1,
           "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-              "id",
-              "name",
-              "includes",
-              "assets"
-            ],
-            "properties": {
-              "id": {
-                "type": "string",
-                "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+            "oneOf": [
+              {
+                "$ref": "#/$defs/authored_plugin"
               },
-              "name": {
-                "type": "string",
-                "minLength": 1
-              },
-              "includes": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "pattern": "^(skill|rule|agent|command|hook|mcp):[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
-                },
-                "uniqueItems": true
-              },
-              "assets": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/properties/assets/items"
-                }
+              {
+                "$ref": "#/$defs/external_plugin"
               }
-            }
+            ]
           }
         }
       }
@@ -402,6 +381,146 @@
           "minLength": 1
         }
       }
+    },
+    "authored_plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "includes",
+        "assets"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "includes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^(skill|rule|agent|command|hook|mcp):[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+          },
+          "uniqueItems": true
+        },
+        "assets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/properties/assets/items"
+          }
+        }
+      }
+    },
+    "external_plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "id",
+        "name",
+        "source",
+        "targets"
+      ],
+      "properties": {
+        "kind": {
+          "const": "external"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$",
+          "not": {
+            "const": "pig"
+          }
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "url",
+            "sha"
+          ],
+          "properties": {
+            "type": {
+              "const": "git"
+            },
+            "url": {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https://[^/@?#\\s]+/[^?#\\s]+$"
+            },
+            "sha": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            }
+          }
+        },
+        "targets": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "claude": {
+              "$ref": "#/$defs/external_target"
+            },
+            "codex": {
+              "$ref": "#/$defs/external_target"
+            },
+            "cursor": {
+              "$ref": "#/$defs/external_target"
+            }
+          }
+        }
+      }
+    },
+    "external_target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^(?:\\.|(?!\\.{1,2}(?:/|$))[^/\\\\:]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\:]+)*)$",
+          "not": {
+            "pattern": "[^\\S ]|[\\u0000-\\u001f]"
+          }
+        }
+      }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "schema_version": {
+            "const": 2
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "version_basis": {
+            "properties": {
+              "plugins": {
+                "items": {
+                  "$ref": "#/$defs/authored_plugin"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

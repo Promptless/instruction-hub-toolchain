@@ -9,11 +9,12 @@ from pydantic import ValidationError
 
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import read_yaml_mapping
-from promptless_instruction_hub.models import HubConfig, PluginDefinition
+from promptless_instruction_hub.models import ExternalPluginDefinition, HubConfig, HubPluginDefinition, PluginDefinition
 
 CONFIG_PATH = Path("hub.yaml")
 PLUGIN_DIR = Path("plugins")
 RELEASE_MANIFEST_PATH = Path("hub.release.json")
+EXTERNAL_LOCK_PATH = Path("hub.external-plugins.lock.json")
 STABLE_CHANNEL_PATH = Path("hub.stable.json")
 REPO_CONTEXT_PATH = Path("hub.repo-context.json")
 MANAGED_RUNTIME_MANIFEST_PATH = Path("hub.managed-runtimes.json")
@@ -44,10 +45,10 @@ def load_hub_config(hub_root: Path) -> HubConfig:
         raise InstructionHubError(msg) from exc
 
 
-def load_plugins(hub_root: Path) -> dict[str, PluginDefinition]:
+def load_plugins(hub_root: Path) -> dict[str, HubPluginDefinition]:
     """Load plugin definitions from `plugins/*.yaml`."""
 
-    plugins: dict[str, PluginDefinition] = {}
+    plugins: dict[str, HubPluginDefinition] = {}
     if (hub_root / "packages").exists():
         msg = (
             f"{hub_root / 'packages'}: legacy plugin directory; move packages/*.yaml to plugins/ and remove packages/. "
@@ -59,7 +60,9 @@ def load_plugins(hub_root: Path) -> dict[str, PluginDefinition]:
         return plugins
     for plugin_path in sorted(plugins_dir.glob("*.yaml")):
         try:
-            plugin_definition = PluginDefinition.model_validate(read_yaml_mapping(plugin_path))
+            raw_plugin = read_yaml_mapping(plugin_path)
+            model = ExternalPluginDefinition if raw_plugin.get("kind") == "external" else PluginDefinition
+            plugin_definition = model.model_validate(raw_plugin)
         except ValidationError as exc:
             msg = f"invalid plugin definition {plugin_path}: {exc}"
             raise InstructionHubError(msg) from exc
