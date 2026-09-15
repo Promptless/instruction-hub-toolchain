@@ -12,7 +12,6 @@ from contextlib import redirect_stdout
 import io
 import json
 from pathlib import Path
-import re
 import runpy
 import sys
 
@@ -45,11 +44,18 @@ def _shell_result(host: str, event: dict) -> dict:
     response = event.get("tool_response")
     if response is None:
         response = event.get("tool_output")
-    if isinstance(response, str):
+    # Cursor documents tool_output as a serialized response envelope. Codex's
+    # string is ordinary command output, even when it happens to contain JSON.
+    if host == "cursor" and isinstance(response, str):
         try:
-            response = json.loads(response)
+            envelope = json.loads(response)
         except ValueError:
             pass
+        else:
+            if isinstance(envelope, dict) and any(
+                key in envelope for key in ("exit_code", "exitCode", "exitCodeNumber", "stdout", "stderr", "output")
+            ):
+                response = envelope
     error = event.get("error", event.get("error_message"))
     code = None
     status = "unknown" if host == "codex" else "success"
@@ -61,9 +67,6 @@ def _shell_result(host: str, event: dict) -> dict:
         )
     elif isinstance(response, str):
         output = response
-        match = re.search(r"(?:Process exited with code|(?:Process )?exit code[:=]?)\s*(\d+)", output, re.I)
-        if match:
-            code = int(match.group(1))
     if not isinstance(code, int) or isinstance(code, bool):
         code = None
     if code is not None:

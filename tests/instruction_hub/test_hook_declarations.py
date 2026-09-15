@@ -178,9 +178,30 @@ def test_cursor_cwd_fallback_and_codex_running_result() -> None:
     codex["tool_response"] = {"session_id": 123, "output": "still running"}
     assert normalize_event("codex", codex)["shell"]["status"] == "running"
     codex["tool_response"] = "Process exit code: 0\nerror example"
-    assert normalize_event("codex", codex)["shell"]["status"] == "success"
+    assert normalize_event("codex", codex)["shell"]["status"] == "unknown"
     codex["tool_response"] = "Process exited with code 255\nerror"
-    assert normalize_event("codex", codex)["shell"]["exit_code"] == 255
+    assert normalize_event("codex", codex)["shell"]["exit_code"] is None
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        '{"message": "SSO session expired"}',
+        '["error", 1]',
+        '"plain JSON string"',
+        "255",
+        '{"exit_code": 0, "stdout": "printed JSON, not a host envelope"}',
+        "Documentation: Process exited with code 1 means failure",
+        "Documentation: Process exit code: 0 means success",
+    ],
+)
+def test_codex_raw_output_is_preserved_without_inventing_status(output: str) -> None:
+    raw = event("codex")
+    raw["tool_response"] = output
+    shell = normalize_event("codex", raw)["shell"]
+    assert shell["output"] == output
+    assert shell["exit_code"] is None
+    assert shell["status"] == "unknown"
 
 
 def test_runner_rejects_bad_output_and_preserves_failure_and_silence(tmp_path: Path) -> None:
