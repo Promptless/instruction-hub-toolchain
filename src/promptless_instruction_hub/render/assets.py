@@ -11,15 +11,19 @@ from promptless_instruction_hub.assets import METADATA_FILE
 from promptless_instruction_hub.fs import copy_tree
 from promptless_instruction_hub.models import Harness, LoadedAsset
 from promptless_instruction_hub.render.common import RenderedAssets, directory_for, manifest_key_for
+from promptless_instruction_hub.render.hooks import render_native_hooks
 
 
 def render_assets_for_target(target_root: Path, target: Harness, assets: list[LoadedAsset]) -> RenderedAssets:
     """Render source assets for one target and return manifest membership."""
 
     rendered: RenderedAssets = {"skills": [], "rules": [], "agents": [], "commands": [], "hooks": []}
+    rendered["hooks"] = render_native_hooks(target_root, target, assets)
     for asset in assets:
         support = asset.metadata.support[target]
         if support.mode == "unsupported" or asset.type == "mcp":
+            continue
+        if asset.type == "hook" and support.mode == "native":
             continue
         if support.mode == "agent-skill":
             _render_agent_skill(target_root, target, asset)

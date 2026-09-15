@@ -410,6 +410,29 @@ Hubs follow the latest merged toolchain on `main`. GitHub callers use `@main`;
 GitLab callers use the `/main/` template URL and the default `toolchain-ref: main`.
 Resolved commit hashes in CI logs identify the compiler used for a build.
 
+## Authored native hooks
+
+Register hook bundles with `hook:<id>` in a plugin's includes. A directory under
+`assets/hooks/<id>/` contains `asset.yaml`, its scripts, and a native
+`hooks.<target>.json` file for each supported target (`claude`, `codex`, `cursor`,
+or `gemini`). A shared `hooks.json` is used only when the target-specific file is
+absent. Declare each supported target with `mode: native`; hooks otherwise default
+to unsupported. A supported bundle without either configuration fails the build.
+
+The compiler copies the bundle to `hooks/<id>/` in the generated plugin and
+combines selected configurations at `hooks/hooks.json`. Author commands against
+that installed location using the host's plugin-root variable. The compiler does
+not rewrite event names, commands, matchers, timeout units, or response semantics.
+It appends handler arrays in asset-reference order, joins descriptions, and rejects
+conflicting top-level metadata. Hook configurations must contain a `hooks` object
+whose event values are arrays of handler objects.
+
+Existing single-file native JSON hook assets remain supported and join the same
+merge. Legacy non-JSON native files retain their original paths and contents.
+PIG's managed lifecycle hooks are appended afterward when ingestion is
+enabled. Other plugins can ship their own authored hooks without receiving PIG's
+managed runtime.
+
 ## Managed PIG Assets
 
 The toolchain injects the harness-specific `update-instruction-hub`
