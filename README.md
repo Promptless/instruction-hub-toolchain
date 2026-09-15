@@ -302,8 +302,15 @@ the definition. Offline builds use this lock; CI build and publish modes refresh
 it. Catalog definitions use `ref`; locks, release provenance, and marketplaces
 use the resolved `sha`. Consumers update installed plugins through their host.
 
-See the [external plugin guide](docs/external-plugins.md) for verification,
-updates, rollback, private repositories, and host compatibility.
+The generated PIG plugin includes an
+[`add-external-plugin` skill](src/promptless_instruction_hub/managed_skill_assets/add-external-plugin/shared/SKILL.md)
+with instructions for verification, updates, rollback, private repositories,
+and host compatibility.
+
+When an authored plugin replaces an external Claude plugin, the resolved Hub
+release version must differ from the previous upstream version. If the automatic
+bump collides, choose a higher version with
+`pig set-version --hub . --version <new-version>` before publishing.
 
 ### Migrating existing hubs
 
@@ -528,9 +535,7 @@ procedure without claiming that a host enforces it.
 
 Conversion rejects other frontmatter fields, invalid descriptions, and skill
 destination collisions, including names reserved for compiler-managed skills.
-The compiler does not truncate descriptions or rewrite procedures. The
-[implementation plan](docs/exec-plans/2026-09-13-codex-agent-skills.md) records the
-design and verification scope.
+The compiler does not truncate descriptions or rewrite procedures.
 
 The old `.promptless/instruction-hub.yaml` and generated `.promptless/...`
 layout is not read or migrated by this toolchain. Existing hubs must rename
@@ -541,6 +546,16 @@ their config to `hub.yaml` and regenerate output with `pig build`.
 Hubs follow the latest merged toolchain on `main`. GitHub callers use `@main`;
 GitLab callers use the `/main/` template URL and the default `toolchain-ref: main`.
 Resolved commit hashes in CI logs identify the compiler used for a build.
+
+Releases containing external plugins use manifest schema 3 and record their
+provenance in `version_basis.plugins`; authored-only releases use schema 2.
+The publisher accepts both. Upgrade older toolchains before consuming schema 3
+releases.
+
+The publisher stores verified upstream versions in release-side
+`hub.external.json`, bound to the release hash and exact source declarations.
+Version comparisons use this record even if the old repository is unavailable.
+Releases without this record require fetching the old pin.
 
 ## Authored hooks
 
