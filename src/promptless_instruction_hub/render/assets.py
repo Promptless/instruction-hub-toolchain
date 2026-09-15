@@ -8,6 +8,7 @@ from pathlib import Path
 
 from promptless_instruction_hub.agent_skills import read_agent_skill, render_agent_skill
 from promptless_instruction_hub.assets import METADATA_FILE
+from promptless_instruction_hub.commands import read_command, render_command
 from promptless_instruction_hub.fs import copy_tree
 from promptless_instruction_hub.models import Harness, LoadedAsset
 from promptless_instruction_hub.render.common import RenderedAssets, directory_for, manifest_key_for
@@ -25,6 +26,10 @@ def render_assets_for_target(target_root: Path, target: Harness, assets: list[Lo
             continue
         if asset.type == "hook" and support.mode == "native":
             continue
+        if asset.type == "command" and support.mode == "native":
+            render_command(target_root, target, read_command(asset, target))
+            rendered["commands" if target == "gemini" else "skills"].append(asset.id)
+            continue
         if support.mode == "agent-skill":
             _render_agent_skill(target_root, target, asset)
             rendered["skills"].append(asset.id)
@@ -33,7 +38,7 @@ def render_assets_for_target(target_root: Path, target: Harness, assets: list[Lo
             _render_cursor_rule(target_root, asset)
             rendered["rules"].append(asset.id)
             continue
-        if support.mode == "native":
+        if support.mode in {"native", "verbatim"}:
             _render_native_asset(target_root, asset)
             rendered[manifest_key_for(asset.type)].append(asset.id)
             continue

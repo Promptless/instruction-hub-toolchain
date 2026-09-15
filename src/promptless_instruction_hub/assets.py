@@ -103,6 +103,8 @@ def default_asset_support(asset_kind: AssetKind) -> dict[Harness, TargetSupport]
         return default_skill_support()
     if asset_kind == "mcp":
         return default_mcp_support()
+    if asset_kind == "command":
+        return {target: TargetSupport(mode="native") for target in SUPPORTED_HARNESSES}
     return unsupported_support("Non-portable assets require explicit target support in v1.")
 
 
@@ -161,12 +163,14 @@ def _iter_non_skill_assets(kind_dir: Path, asset_kind: AssetKind) -> Iterable[Lo
             yield _load_directory_asset(asset_path, asset_kind, default_support)
             continue
         if asset_path.name.endswith(SIDECAR_METADATA_SUFFIX):
-            _validate_sidecar_has_asset_file(kind_dir, asset_path)
+            _validate_sidecar_has_asset_file(kind_dir, asset_path, asset_kind)
             continue
         if asset_path.name == METADATA_FILE:
             msg = f"unexpected metadata file in asset directory: {asset_path}"
             raise InstructionHubError(msg)
-        if asset_path.suffix not in SUPPORTED_FILE_SUFFIXES:
+        if asset_path.suffix not in SUPPORTED_FILE_SUFFIXES and not (
+            asset_kind == "command" and asset_path.suffix == ".toml"
+        ):
             msg = f"unsupported asset file extension for {asset_path}; expected one of {SUPPORTED_FILE_SUFFIXES}"
             raise InstructionHubError(msg)
         yield _load_file_asset(asset_path, asset_kind, default_support)
@@ -227,6 +231,10 @@ def _load_metadata(
         raw_metadata.setdefault("type", asset_kind)
         raw_metadata.setdefault("title", default_title)
         raw_metadata.setdefault("source_path", default_source_path)
+        # Existing command support tables are allowlists. Do not start shipping
+        # a previously host-specific command to undeclared targets.
+        if asset_kind == "command" and isinstance(raw_metadata.get("support"), dict):
+            default_support = unsupported_support("Command target is not explicitly enabled.")
         _merge_default_support(raw_metadata, default_support)
         return _validate_metadata_type(metadata_path, AssetMetadata.model_validate(raw_metadata), asset_kind)
     return AssetMetadata(
@@ -362,9 +370,10 @@ def _validate_metadata_type(metadata_path: Path, metadata: AssetMetadata, asset_
     raise InstructionHubError(msg)
 
 
-def _validate_sidecar_has_asset_file(kind_dir: Path, metadata_path: Path) -> None:
+def _validate_sidecar_has_asset_file(kind_dir: Path, metadata_path: Path, asset_kind: AssetKind) -> None:
     asset_id = metadata_path.name.removesuffix(SIDECAR_METADATA_SUFFIX)
-    for suffix in SUPPORTED_FILE_SUFFIXES:
+    suffixes = (*SUPPORTED_FILE_SUFFIXES, ".toml") if asset_kind == "command" else SUPPORTED_FILE_SUFFIXES
+    for suffix in suffixes:
         if (kind_dir / f"{asset_id}{suffix}").exists():
             return
     msg = f"sidecar metadata has no matching asset file: {metadata_path}"

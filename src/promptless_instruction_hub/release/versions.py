@@ -65,7 +65,7 @@ MANAGED_RUNTIME_KEYS = frozenset(
     }
 )
 SUPPORT_KEYS = frozenset({"mode", "reason"})
-SUPPORT_MODES = frozenset({"agent-skill", "native", "projected", "unsupported"})
+SUPPORT_MODES = frozenset({"agent-skill", "native", "verbatim", "projected", "unsupported"})
 HOST_RUNTIME_ID = "host-runtime"
 
 

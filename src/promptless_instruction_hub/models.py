@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 Harness = Literal["claude", "codex", "gemini", "cursor"]
 AssetKind = Literal["skill", "rule", "agent", "command", "hook", "mcp"]
-SupportMode = Literal["agent-skill", "native", "projected", "unsupported"]
+SupportMode = Literal["agent-skill", "native", "verbatim", "projected", "unsupported"]
 
 SUPPORTED_HARNESSES: tuple[Harness, ...] = ("claude", "codex", "gemini", "cursor")
 ASSET_KINDS: tuple[AssetKind, ...] = ("skill", "rule", "agent", "command", "hook", "mcp")

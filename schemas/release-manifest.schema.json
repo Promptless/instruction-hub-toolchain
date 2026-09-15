@@ -392,6 +392,7 @@
           "enum": [
             "agent-skill",
             "native",
+            "verbatim",
             "projected",
             "unsupported"
           ]
