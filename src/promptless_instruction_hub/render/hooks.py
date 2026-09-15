@@ -5,9 +5,11 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+from promptless_instruction_hub import hook_runtime
 from promptless_instruction_hub.assets import METADATA_FILE
 from promptless_instruction_hub.errors import InstructionHubError
 from promptless_instruction_hub.fs import JsonValue, copy_tree, read_json_mapping, write_json
+from promptless_instruction_hub.hook_definitions import RUNNER_NAME, render_hook_definition
 from promptless_instruction_hub.models import Harness, LoadedAsset
 
 
@@ -31,8 +33,14 @@ def render_native_hooks(target_root: Path, target: Harness, assets: list[LoadedA
             hook_root.mkdir(parents=True, exist_ok=True)
             shutil.copy2(asset.path, hook_root / asset.path.name)
             continue
-        source = _config_path(asset, target)
-        config = _read_config(source)
+        if asset.metadata.hook is not None:
+            source = asset.path / METADATA_FILE
+            config = render_hook_definition(asset, target)
+            hook_root.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(hook_runtime.__file__, hook_root / RUNNER_NAME)
+        else:
+            source = _config_path(asset, target)
+            config = _read_config(source)
         has_config = True
         for key, value in config.items():
             if key == "hooks":

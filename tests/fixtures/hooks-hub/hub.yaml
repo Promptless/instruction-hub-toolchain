@@ -1,0 +1,7 @@
+org: Hook workflow test
+marketplace:
+  id: hook-workflow-test
+  name: Hook workflow test
+version: 0.1.0
+stable_plugins: [pig]
+targets: [claude, codex, cursor]

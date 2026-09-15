@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -163,6 +163,39 @@ class PluginDefinition(BaseModel):
         return [validate_asset_ref(asset_ref) for asset_ref in value]
 
 
+class HookBinding(BaseModel):
+    """An explicitly chosen native event and optional matcher."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    event: str = Field(min_length=1)
+    matcher: str | None = Field(default=None, min_length=1)
+
+
+class HookDefinition(BaseModel):
+    """Portable Python hook entrypoint with explicit native event bindings."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    entrypoint: str
+    timeout: int = Field(gt=0, le=86400)
+    status_message: str | None = Field(default=None, min_length=1)
+    bindings: dict[Harness, list[HookBinding]] = Field(min_length=1)
+
+    @field_validator("entrypoint")
+    @classmethod
+    def validate_entrypoint(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts or "\\" in value or "\0" in value or path.suffix != ".py":
+            raise ValueError("hook entrypoint must be a relative .py path inside the bundle")
+        return value
+
+    @field_validator("bindings")
+    @classmethod
+    def require_bindings(cls, value: dict[Harness, list[HookBinding]]) -> dict[Harness, list[HookBinding]]:
+        if any(not entries for entries in value.values()):
+            raise ValueError("hook binding lists must not be empty")
+        return value
+
+
 class AssetMetadata(BaseModel):
     """Optional per-asset metadata stored next to source content."""
 
@@ -173,6 +206,13 @@ class AssetMetadata(BaseModel):
     title: str | None = None
     source_path: str | None = None
     support: dict[Harness, TargetSupport] = Field(default_factory=dict)
+    hook: HookDefinition | None = None
+
+    @model_validator(mode="after")
+    def require_hook_asset(self) -> "AssetMetadata":
+        if self.hook is not None and self.type != "hook":
+            raise ValueError("hook declarations are only supported on hook assets")
+        return self
 
     @field_validator("id")
     @classmethod

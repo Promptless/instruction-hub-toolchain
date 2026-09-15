@@ -169,3 +169,22 @@ def test_instruction_hub_schema_requires_non_empty_lists() -> None:
     assert schema["properties"]["stable_plugins"]["contains"] == {"const": "pig"}
     assert schema["properties"]["stable_plugins"]["default"] == ["pig"]
     assert schema["properties"]["targets"]["minItems"] == 1
+
+
+def test_optional_hub_tests_keep_command_and_platform_in_caller_configuration() -> None:
+    import os
+    import subprocess
+    import yaml
+
+    workflow = yaml.safe_load((WORKFLOWS / "pr-check.yml").read_text())
+    job = workflow["jobs"]["hub-tests"]
+    assert job["if"] == "${{ inputs.test-command != '' }}"
+    assert job["runs-on"] == "${{ inputs.test-runs-on }}"
+    assert job["steps"][0]["with"]["persist-credentials"] is False
+    assert job["steps"][1]["with"]["python-version"] == "${{ inputs.test-python-version }}"
+    step = job["steps"][2]
+    assert step["working-directory"] == "${{ inputs.hub-root }}"
+    assert step["env"]["HUB_TEST_COMMAND"] == "${{ inputs.test-command }}"
+    # Run the actual workflow shell step; a failing hub suite must fail the CI job.
+    result = subprocess.run(["bash", "-c", step["run"]], env={**os.environ, "HUB_TEST_COMMAND": "exit 23"})
+    assert result.returncode == 23
