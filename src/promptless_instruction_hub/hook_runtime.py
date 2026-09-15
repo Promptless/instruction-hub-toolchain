@@ -8,12 +8,12 @@ Keep this module standard-library-only, without package-relative imports.
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stdout
-import io
 import json
+import os
 from pathlib import Path
 import runpy
 import sys
+import tempfile
 
 EVENTS = {
     "claude": {"SessionStart": "session_start", "PostToolUse": "tool_result", "PostToolUseFailure": "tool_result"},
@@ -97,25 +97,44 @@ def feedback(host: str, event: dict, context: str) -> dict:
 
 def execute(entrypoint: Path, event: dict) -> str | None:
     """Run an ordinary script in-process with a host-independent stdin/stdout contract."""
-    original_stdin, original_argv = sys.stdin, sys.argv
+    original_stdin, original_stdout, original_argv = sys.stdin, sys.stdout, sys.argv
     original_path = sys.path[:]
-    output = io.StringIO()
-    try:
-        sys.stdin = io.StringIO(json.dumps(event))
-        sys.argv = [str(entrypoint)]
-        sys.path.insert(0, str(entrypoint.parent))
-        with redirect_stdout(output):
+    # Real descriptors also cover os.read/write and subprocesses inheriting stdio.
+    # Temporary files are private and automatically removed; nothing is persisted.
+    with (
+        tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdin,
+        tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout,
+    ):
+        stdin.write(json.dumps(event))
+        stdin.seek(0)
+        original_stdout.flush()
+        saved_stdin, saved_stdout = os.dup(0), os.dup(1)
+        try:
+            os.dup2(stdin.fileno(), 0)
+            os.dup2(stdout.fileno(), 1)
+            sys.stdin, sys.stdout = stdin, stdout
+            sys.argv = [str(entrypoint)]
+            sys.path.insert(0, str(entrypoint.parent))
             try:
                 runpy.run_path(str(entrypoint), run_name="__main__")
             except SystemExit as exc:
                 if exc.code not in (None, 0):
                     raise
-    finally:
-        sys.stdin, sys.argv = original_stdin, original_argv
-        sys.path[:] = original_path
-    if not output.getvalue().strip():
+        finally:
+            try:
+                stdout.flush()
+            finally:
+                sys.stdin, sys.stdout, sys.argv = original_stdin, original_stdout, original_argv
+                sys.path[:] = original_path
+                os.dup2(saved_stdin, 0)
+                os.dup2(saved_stdout, 1)
+                os.close(saved_stdin)
+                os.close(saved_stdout)
+        stdout.seek(0)
+        output = stdout.read()
+    if not output.strip():
         return None
-    response = json.loads(output.getvalue())
+    response = json.loads(output)
     if not isinstance(response, dict) or set(response) - {"context"}:
         raise ValueError("hook output must be an object containing only context")
     context = response.get("context")

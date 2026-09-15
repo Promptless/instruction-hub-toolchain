@@ -258,3 +258,28 @@ def test_runner_delivers_cancellation_directly_to_hook(tmp_path: Path) -> None:
         if process.poll() is None:
             process.kill()
             process.communicate()
+
+
+@pytest.mark.parametrize("delegate", [False, True])
+def test_runner_normalizes_descriptor_and_inherited_subprocess_stdio(tmp_path: Path, delegate: bool) -> None:
+    from promptless_instruction_hub import hook_runtime
+
+    script = tmp_path / "stdio.py"
+    child = (
+        "import json, os\n"
+        "event = json.loads(os.read(0, 65536))\n"
+        "os.write(1, json.dumps({'context': event['event']}).encode())\n"
+    )
+    script.write_text(
+        f"import subprocess, sys\nsubprocess.run([sys.executable, '-c', {child!r}], check=True)\n"
+        if delegate
+        else child
+    )
+    result = subprocess.run(
+        [sys.executable, str(Path(hook_runtime.__file__)), "--host", "codex", "--entrypoint", str(script)],
+        input=json.dumps(event("codex")),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"] == "tool_result"
